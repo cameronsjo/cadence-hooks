@@ -1028,9 +1028,14 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
         if word.is_some_and(|w| w == "()" || w.starts_with('(')) {
             continue; // the definition itself
         }
-        match seen.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, calls)) => *calls += 1,
-            None => seen.push((name, 1)),
+        // A substitution's segment also comes back with its output spliced
+        // in (`g diff -- README` for `g diff -- $(printf README)`): only the
+        // spelling the command writes is a call site to count.
+        if command.contains(segment.as_str()) {
+            match seen.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, calls)) => *calls += 1,
+                None => seen.push((name, 1)),
+            }
         }
         let Some(word) = word else {
             continue;
@@ -1056,6 +1061,7 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
 
 /// Git's options that move where a call reads its config or runs from.
 const REDIRECTING_OPTIONS: &[&str] = &[
+    "-C",
     "-c",
     "--git-dir",
     "--work-tree",
@@ -1064,36 +1070,88 @@ const REDIRECTING_OPTIONS: &[&str] = &[
     "--namespace",
 ];
 
-/// Does the command spell one of git's redirecting options (lowercased, so
-/// `-C` counts as `-c`) more often than its parsed git calls use them? The
-/// extra one sits inside a value an expansion hands git (`opts="-C ../x";
-/// git $opts ship`), where the alias probe cannot follow it.
-fn hides_redirecting_option(command: &str, calls: &[GitCall]) -> bool {
-    let plain = spelled(command);
-    let bounded = |at: usize, len: usize| {
-        let before = plain[..at].chars().next_back();
-        let after = plain[at + len..].chars().next();
-        !before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-            && after.is_none_or(|c| c.is_whitespace() || matches!(c, '=' | ')' | ';'))
+/// Does the command spell one of git's redirecting options more often than
+/// its git calls parse one? The extra one sits inside a value an expansion
+/// hands git (`opts="-C ../x"; git $opts ship`), where the alias probe
+/// cannot follow it. Only segments that can hand git a word are read: a git
+/// call, a call of a function the command defines, an assignment, `for`,
+/// `set` or a declaration; another tool's own options (`wc -c`, `grep -C 2`,
+/// `bash -c`) and prose an `echo` prints are not git's. `-C` and `-c` match
+/// in their own case. A wrapper body's git call is counted once, not once
+/// per call of the wrapper.
+fn hides_redirecting_option(command: &str) -> bool {
+    let Some(definitions) = function_definitions(command) else {
+        return true;
     };
+    let names: Vec<&str> = definitions.iter().map(|(n, _)| n.as_str()).collect();
+    let feeds_git = |segment: &str| {
+        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+        let Some(first) = tokens.first() else {
+            return false;
+        };
+        let word = unescape_word(first);
+        let word = word.as_ref();
+        word.contains(['=', '$', '`', '(', '['])
+            || names.contains(&word)
+            || !git_calls(segment, ".").is_empty()
+            || tokens.get(1).is_some_and(|w| w.starts_with('('))
+            || matches!(
+                word,
+                "git"
+                    | "for"
+                    | "select"
+                    | "set"
+                    | "export"
+                    | "local"
+                    | "declare"
+                    | "typeset"
+                    | "readonly"
+                    | "function"
+            )
+    };
+    let options = |text: &str| -> Vec<String> {
+        let plain: String = text
+            .chars()
+            .filter(|c| !matches!(c, '\\' | '"' | '\''))
+            .collect();
+        let mut found = Vec::new();
+        for option in REDIRECTING_OPTIONS {
+            for (at, _) in plain.match_indices(option) {
+                let before = plain[..at].chars().next_back();
+                let after = plain[at + option.len()..].chars().next();
+                if !before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                    && after.is_none_or(|c| c.is_whitespace() || matches!(c, '=' | ')' | ';'))
+                {
+                    found.push((*option).to_string());
+                }
+            }
+        }
+        found
+    };
+    let spelled_options: Vec<String> = cadence_hooks_core::shell::command_segments(command)
+        .iter()
+        .filter(|segment| feeds_git(segment))
+        .flat_map(|segment| options(segment))
+        .collect();
+    // Parsed once each: the command with every function body blanked out
+    // (so no call inlines a body), plus each body on its own.
+    let mut outside = command.as_bytes().to_vec();
+    for (_, range) in &definitions {
+        outside[range.clone()].fill(b' ');
+    }
+    let outside = String::from_utf8_lossy(&outside).into_owned();
+    let mut parsed: Vec<GitCall> = git_calls(&outside, ".");
+    for (_, range) in &definitions {
+        parsed.extend(git_calls(&command[range.clone()], "."));
+    }
     REDIRECTING_OPTIONS.iter().any(|option| {
-        let spelled_count = plain
-            .match_indices(option)
-            .filter(|(at, _)| bounded(*at, option.len()))
-            .count();
-        let parsed: usize = calls
+        let spelled_count = spelled_options.iter().filter(|o| o == option).count();
+        let parsed_count = parsed
             .iter()
-            .map(|call| {
-                call.globals
-                    .iter()
-                    .filter(|g| {
-                        let g = g.to_ascii_lowercase();
-                        g == *option || g.starts_with(&format!("{option}="))
-                    })
-                    .count()
-            })
-            .sum();
-        spelled_count > parsed
+            .flat_map(|call| call.globals.iter())
+            .filter(|g| *g == option || g.starts_with(&format!("{option}=")))
+            .count();
+        spelled_count > parsed_count
     })
 }
 
@@ -1410,9 +1468,12 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             if !may_name_push(command)
                 && hints.aliases.is_empty()
                 && !spelled(command).contains("alias.")
-                && !hides_redirecting_option(command, calls)
-                && (!call.dir_unresolved
-                    || (is_positional_parameter(&sub) && wrapper_sites_are_builtins(command)))
+                && !hides_redirecting_option(command)
+                && (if is_positional_parameter(&sub) {
+                    wrapper_sites_are_builtins(command)
+                } else {
+                    !call.dir_unresolved
+                })
             {
                 let env = env.get_or_insert_with(|| CommandEnv::of(command));
                 let ask_git = call.bare && !env.path_moved;
@@ -4037,6 +4098,13 @@ mod tests {
             "opts=\"--git-dir=../other/.git\"; git $opts ship",
             "c=\"--git-dir=../other/.git ship\"; git $=c",
             "opts=\"--exec-path=../bin\"; git $opts ship",
+            "opts=(-C ../other); git \"${opts[@]}\" ship",
+            "set -- -C ../other ship; git \"$@\"",
+            // A wrapper's body is parsed once, so its calls cannot mask an
+            // option elsewhere, and a call site's own option is read.
+            "g() { git -C . \"$@\"; }; g -C ../other sy",
+            "g() { git -C . \"$@\"; }; g status; g log -1; opts=\"-C ../other\"; git $opts ship",
+            "env git -C . status; opts=\"-C ../other\"; git $opts ship",
         ] {
             assert_blocks(&fx.run(cmd), &["resolve"]);
         }
@@ -4056,6 +4124,10 @@ mod tests {
             "F=$(mktemp)\ncat > \"$F\" <<'EOF'\nx\nEOF\ng() { git -C . \"$@\"; }\ng log --oneline -1",
             "git $X origin main",
             "git \"$(echo pu)sh\" origin main",
+            // Another tool's options and prose are not git's.
+            "for c in status log; do git $c; done | wc -c",
+            "for c in status log; do git $c; done; grep -C 2 x f; make -C build; bash -c true",
+            "echo \"use git -C dir\"; for c in status; do git $c; done",
             // polish's shape: a `-C` directory this guard cannot follow.
             "g() { git -C \"$REPO\" -c core.hooksPath=/dev/null \"$@\"; }\n\
              g status --porcelain > \"$RV/s\"\n{ g diff -U10 \"$BASE\" --; } > \"$OUT\"\n\
