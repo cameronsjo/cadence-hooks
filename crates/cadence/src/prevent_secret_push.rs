@@ -85,7 +85,12 @@
 //! writes it with `git config`; the subcommand word carries `$` or a backtick
 //! (except a wrapper function whose body is one plain `git … "$@"` and whose
 //! every call site in the command hands it a literal builtin that cannot
-//! push, cameronsjo/cadence-hooks#1338);
+//! push, cameronsjo/cadence-hooks#1338, and except a command that spells no
+//! `push`, `send-pack` or `remote-` with quotes and backslashes dropped, no
+//! pushing alias name the probed config defines, writes no alias, has
+//! autocorrect off and does not redirect its config; an unresolved `-C` there
+//! passes only through a wrapper whose call sites are all literal builtins,
+//! cameronsjo/cadence-hooks#1356, #1360);
 //! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
 //! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
 //! `XDG_CONFIG_HOME` name, or `HOME=`, anywhere in the command read with its
@@ -151,7 +156,9 @@
 //! written by the same command through anything but `git config`/`git remote`
 //! (an editor, a redirect into `.git/config`); a pushed commit on another
 //! branch that adds a submodule the index and top-level `.gitmodules` do not
-//! show. The `help.autocorrect` existence check asks git, and searches
+//! show; a push subcommand an expansion builds from pieces (`"$(echo pu)sh"`)
+//! or reads from outside the command (an unassigned variable, a file). The
+//! `help.autocorrect` existence check asks git, and searches
 //! `PATH`, with the hook's own `PATH`, which may differ from the command's.
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
@@ -965,20 +972,67 @@ fn unreadable_directory_token(command: &str) -> Option<String> {
 /// Does the command spell a subcommand that publishes objects anywhere, in
 /// any case: `push`, the raw push plumbing, or a remote helper? An expansion
 /// that names git's subcommand can only pick one the command writes out.
+/// Quotes and backslashes are dropped first, as the shell joins `pu''sh` and
+/// `p\ush` into `push`.
 fn may_name_push(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    lower.contains("push")
-        || lower.contains("remote-")
-        || RAW_PUSH_COMMANDS.iter().any(|raw| lower.contains(raw))
+    let plain = spelled(command);
+    plain.contains("push")
+        || plain.contains("remote-")
+        || RAW_PUSH_COMMANDS.iter().any(|raw| plain.contains(raw))
+}
+
+/// The command lowercased, with quotes and backslashes removed.
+fn spelled(command: &str) -> String {
+    command
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '"' | '\''))
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// Does the command spell, in any case, the name of an alias `dir`'s config
 /// defines that can run a push?
-fn spells_a_pushing_alias(command: &str, cfg: &AliasConfig, dir: &str, ask_git: bool) -> bool {
-    let lower = command.to_ascii_lowercase();
+fn spells_a_pushing_alias(plain: &str, cfg: &AliasConfig, dir: &str, ask_git: bool) -> bool {
     cfg.aliases.keys().any(|name| {
-        lower.contains(name.as_str()) && alias_runs_push(cfg, dir, name, ask_git).is_some()
+        plain.contains(name.as_str()) && alias_runs_push(cfg, dir, name, ask_git).is_some()
     })
+}
+
+/// Does every visible call of a function this command defines hand it a
+/// literal builtin that cannot push? Used where a wrapper's `-C` directory
+/// cannot be followed, so a repository-local alias there cannot be probed:
+/// the call sites themselves must name no alias at all.
+fn wrapper_sites_are_builtins(command: &str) -> bool {
+    let Some(definitions) = function_definitions(command) else {
+        return false;
+    };
+    let names: Vec<&str> = definitions.iter().map(|(n, _)| n.as_str()).collect();
+    if names.is_empty() {
+        return false;
+    }
+    cadence_hooks_core::shell::command_segments(command)
+        .iter()
+        .all(|segment| {
+            let tokens =
+                executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+            let Some(first) = tokens.first() else {
+                return true;
+            };
+            if !names.contains(&unescape_word(first).as_ref()) {
+                return true;
+            }
+            let Some(word) = tokens.get(1) else {
+                return true;
+            };
+            if word == "()" || word.starts_with('(') {
+                return true; // the definition itself
+            }
+            let sub = unescape_word(word);
+            !word.contains(['$', '`', '*', '?', '['])
+                && !sub.starts_with('-')
+                && !WRAPPER_UNSAFE_SUBCOMMANDS.contains(&sub.as_ref())
+                && is_builtin(&sub, false)
+        })
 }
 
 /// The spellings of a function's positional parameters a wrapper hands git
@@ -1285,13 +1339,20 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             // loop or wrapper that never writes `push`, nor the name of an
             // alias that pushes, is not a push. A name built from pieces or
             // read from a file is outside the threat model.
-            if !may_name_push(command) {
+            // An alias this same command writes, a redirected config, or an
+            // unresolved `-C` outside a wrapper whose call sites are all
+            // literal builtins keeps the old verdict; an unresolved `-C` is
+            // then probed where the command runs, for the user's and
+            // system aliases.
+            if !may_name_push(command)
+                && hints.aliases.is_empty()
+                && (!call.dir_unresolved
+                    || (is_positional_parameter(&sub) && wrapper_sites_are_builtins(command)))
+            {
                 let env = env.get_or_insert_with(|| CommandEnv::of(command));
                 let ask_git = call.bare && !env.path_moved;
-                // An unresolved `-C "$REPO"` is probed where the command
-                // runs, which still reads the user's and system aliases; a
-                // repository-local one elsewhere is not seen.
-                if config_redirected(env.blind, call).is_none() {
+                let capped = !probed.contains_key(&call.dir) && probed.len() >= MAX_ALIAS_PROBES;
+                if config_redirected(env.blind, call).is_none() && !capped {
                     let cfg = probed.entry(call.dir.clone()).or_insert_with(|| {
                         alias_config(&call.dir).map_err(|stop| match stop {
                             Stop::Refused(why) => why,
@@ -1300,7 +1361,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
                     });
                     if let Ok(cfg) = cfg
                         && !cfg.autocorrect
-                        && !spells_a_pushing_alias(command, cfg, &call.dir, ask_git)
+                        && !spells_a_pushing_alias(&spelled(command), cfg, &call.dir, ask_git)
                     {
                         continue;
                     }
@@ -3885,6 +3946,18 @@ mod tests {
             "git `echo push` origin main",
             "for c in status push; do git $c; done",
             "c=SEND-PACK; git $c origin",
+            // Quotes and backslashes the shell joins still spell a push.
+            "for c in status p\\ush; do git $c origin main; done",
+            "c=pu''sh; git $c origin main",
+            // An alias this same command writes, or a redirected config.
+            "git config alias.sy '!./ship.sh'; for c in sy; do git $c; done",
+            "for c in st; do git --git-dir=/x $c; done",
+            "GIT_DIR=/x; for c in st; do git $c; done",
+            // An unresolved `-C` outside a wrapper, or a wrapper call site
+            // that is not a literal builtin (a repository-local alias there
+            // cannot be probed).
+            "for c in status; do git -C \"$R\" $c; done",
+            "g() { git -C \"$REPO\" \"$@\"; }; g sync; echo $(date)",
         ] {
             assert_blocks(&fx.run(cmd), &["resolve"]);
         }
@@ -4349,30 +4422,32 @@ mod tests {
             // block whenever the boundary is unsure (review C1).
             "gg() {\n  git \"$@\"  # don't page\n}\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
             "gg() { git \"$@\"; echo $'\\''; }\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
-            "gg() { git \"$@\"; } # wrapper\ngg status",
             // A body that is more than one plain git invocation.
             "gg() { git \"$@\"; git push origin main; }; gg status",
-            "gg() { cd /tmp && git \"$@\"; }; gg status",
-            "gg() { git \"$@\" | cat; }; gg status",
             // Not a function's positional parameters at all.
             "bash -c 'git \"$@\"' _ push origin main",
             "set -- push origin main; git \"$@\"",
         ] {
             let r = fx.run(command);
-            // A command that spells no push cannot reach one through the
-            // wrapper, whatever its body looks like (#1356, #1360).
-            if !may_name_push(command) {
-                assert_eq!(r.outcome, Outcome::Allow, "{command}: {:?}", r.message);
-                continue;
-            }
             assert_eq!(r.outcome, Outcome::Block, "{command}: {:?}", r.message);
             assert_blocks(&r, &["cannot resolve"]);
         }
-        // A config override git cannot see the value of stays blocked by the
-        // push reading itself, not by the wrapper's.
-        assert_eq!(
-            fx.run("gg() { git -c \"$K\" \"$@\"; }; gg status").outcome,
-            Outcome::Block
+        // Bodies the wrapper reading refuses (a comment, more than one plain
+        // git call): still refused there, but a command that spells no push
+        // passes on the expansion rule instead (#1356, #1360).
+        for command in [
+            "gg() { git \"$@\"; } # wrapper\ngg status",
+            "gg() { cd /tmp && git \"$@\"; }; gg status",
+            "gg() { git \"$@\" | cat; }; gg status",
+        ] {
+            assert!(!wrapper_calls_cannot_push(command), "{command}");
+            assert_allows(&fx.run(command));
+        }
+        // A `-c` override whose value git cannot see is refused by
+        // `push_invocations`, which reads it as a possible push.
+        assert_blocks(
+            &fx.run("gg() { git -c \"$K\" \"$@\"; }; gg status"),
+            &["could not resolve which repository or refs"],
         );
         // A call site naming an alias that pushes: the old verdict.
         fx.git(&["config", "alias.pu", "push"]);
