@@ -88,8 +88,11 @@
 //! push, cameronsjo/cadence-hooks#1338, and except a command that spells no
 //! `push`, `send-pack` or `remote-` with quotes and backslashes dropped, no
 //! pushing alias name the probed config defines, writes no alias, has
-//! autocorrect off and does not redirect its config; an unresolved `-C` there
-//! passes only through a wrapper whose call sites are all literal builtins,
+//! autocorrect off and does not redirect its config, nor spells a `-C`, `-c`,
+//! `--git-dir`, `--work-tree`, `--exec-path`, `--config-env` or `--namespace`
+//! its git calls do not parse as their own; an unresolved `-C` there
+//! passes only through a wrapper whose call sites are all literal builtins
+//! and whose name the command uses nowhere else,
 //! cameronsjo/cadence-hooks#1356, #1360);
 //! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
 //! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
@@ -1010,29 +1013,88 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
     if names.is_empty() {
         return false;
     }
-    cadence_hooks_core::shell::command_segments(command)
-        .iter()
-        .all(|segment| {
-            let tokens =
-                executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
-            let Some(first) = tokens.first() else {
-                return true;
-            };
-            if !names.contains(&unescape_word(first).as_ref()) {
-                return true;
-            }
-            let Some(word) = tokens.get(1) else {
-                return true;
-            };
-            if word == "()" || word.starts_with('(') {
-                return true; // the definition itself
-            }
-            let sub = unescape_word(word);
-            !word.contains(['$', '`', '*', '?', '['])
-                && !sub.starts_with('-')
-                && !WRAPPER_UNSAFE_SUBCOMMANDS.contains(&sub.as_ref())
-                && is_builtin(&sub, false)
-        })
+    let segments = cadence_hooks_core::shell::command_segments(command);
+    let mut seen: Vec<(&str, usize)> = Vec::new();
+    for segment in &segments {
+        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let first = unescape_word(first);
+        let Some(&name) = names.iter().find(|n| **n == first.as_ref()) else {
+            continue;
+        };
+        let word = tokens.get(1);
+        if word.is_some_and(|w| w == "()" || w.starts_with('(')) {
+            continue; // the definition itself
+        }
+        match seen.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, calls)) => *calls += 1,
+            None => seen.push((name, 1)),
+        }
+        let Some(word) = word else {
+            continue;
+        };
+        let sub = unescape_word(word);
+        if word.contains(['$', '`', '*', '?', '['])
+            || sub.starts_with('-')
+            || WRAPPER_UNSAFE_SUBCOMMANDS.contains(&sub.as_ref())
+            || !is_builtin(&sub, false)
+        {
+            return false;
+        }
+    }
+    // A call behind a prefix this does not read as the command word (`time
+    // g ship`, `FOO=1 g ship`, `coproc g ship`) is not a segment's first
+    // word: every other occurrence of the name keeps the old verdict.
+    names.iter().all(|name| {
+        let defined = definitions.iter().filter(|(n, _)| n == name).count();
+        let calls = seen.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
+        word_occurrences(command, name) == defined + calls
+    })
+}
+
+/// Git's options that move where a call reads its config or runs from.
+const REDIRECTING_OPTIONS: &[&str] = &[
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--exec-path",
+    "--config-env",
+    "--namespace",
+];
+
+/// Does the command spell one of git's redirecting options (lowercased, so
+/// `-C` counts as `-c`) more often than its parsed git calls use them? The
+/// extra one sits inside a value an expansion hands git (`opts="-C ../x";
+/// git $opts ship`), where the alias probe cannot follow it.
+fn hides_redirecting_option(command: &str, calls: &[GitCall]) -> bool {
+    let plain = spelled(command);
+    let bounded = |at: usize, len: usize| {
+        let before = plain[..at].chars().next_back();
+        let after = plain[at + len..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            && after.is_none_or(|c| c.is_whitespace() || matches!(c, '=' | ')' | ';'))
+    };
+    REDIRECTING_OPTIONS.iter().any(|option| {
+        let spelled_count = plain
+            .match_indices(option)
+            .filter(|(at, _)| bounded(*at, option.len()))
+            .count();
+        let parsed: usize = calls
+            .iter()
+            .map(|call| {
+                call.globals
+                    .iter()
+                    .filter(|g| {
+                        let g = g.to_ascii_lowercase();
+                        g == *option || g.starts_with(&format!("{option}="))
+                    })
+                    .count()
+            })
+            .sum();
+        spelled_count > parsed
+    })
 }
 
 /// The spellings of a function's positional parameters a wrapper hands git
@@ -1348,6 +1410,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             if !may_name_push(command)
                 && hints.aliases.is_empty()
                 && !spelled(command).contains("alias.")
+                && !hides_redirecting_option(command, calls)
                 && (!call.dir_unresolved
                     || (is_positional_parameter(&sub) && wrapper_sites_are_builtins(command)))
             {
@@ -3961,6 +4024,19 @@ mod tests {
             // cannot be probed).
             "for c in status; do git -C \"$R\" $c; done",
             "g() { git -C \"$REPO\" \"$@\"; }; g sync; echo $(date)",
+            // A call site behind a prefix is not a segment's first word.
+            "g() { git -C \"$REPO\" \"$@\"; }; g status; time g ship",
+            "g() { git -C \"$REPO\" \"$@\"; }; g status; time -p g ship",
+            "g() { git -C \"$REPO\" \"$@\"; }; g status; FOO=1 g ship",
+            "g() { git -C \"$REPO\" \"$@\"; }; g status; coproc g ship",
+            // Options an expansion hands git move the call where the probe
+            // cannot follow.
+            "opts=\"-C ../other\"; git $opts ship",
+            "c=\"-C ../other ship\"; git $=c",
+            "for a in \"-C ../other ship\" \"status\"; do git $=a; done",
+            "opts=\"--git-dir=../other/.git\"; git $opts ship",
+            "c=\"--git-dir=../other/.git ship\"; git $=c",
+            "opts=\"--exec-path=../bin\"; git $opts ship",
         ] {
             assert_blocks(&fx.run(cmd), &["resolve"]);
         }
