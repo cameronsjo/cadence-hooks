@@ -159,8 +159,12 @@
 //! written by the same command through anything but `git config`/`git remote`
 //! (an editor, a redirect into `.git/config`); a pushed commit on another
 //! branch that adds a submodule the index and top-level `.gitmodules` do not
-//! show; a push subcommand an expansion builds from pieces (`"$(echo pu)sh"`)
-//! or reads from outside the command (an unassigned variable, a file). The
+//! show; a push subcommand an expansion builds from pieces (`"$(echo pu)sh"`,
+//! `c=pu; git ${c}sh`) or reads from outside the command (an unassigned
+//! variable, a file, the environment). An ANSI-C string, a brace expansion,
+//! or a parameter operator in the subcommand word (`${v:0:2}sh`) keeps the
+//! old verdict instead, as does a `-C` the text cannot read as a directory
+//! (`git commit -C HEAD`, prose naming a path that does not exist). The
 //! `help.autocorrect` existence check asks git, and searches
 //! `PATH`, with the hook's own `PATH`, which may differ from the command's.
 //!
@@ -986,11 +990,38 @@ fn may_name_push(command: &str) -> bool {
 
 /// The command lowercased, with quotes and backslashes removed.
 fn spelled(command: &str) -> String {
-    command
+    unquoted(command).to_ascii_lowercase()
+}
+
+/// The text with line continuations joined and quotes and backslashes
+/// removed, as the shell joins `pu''sh`, `p\ush` and `pu\<newline>sh`.
+fn unquoted(text: &str) -> String {
+    text.replace("\\\n", "")
         .chars()
         .filter(|c| !matches!(c, '\\' | '"' | '\''))
-        .collect::<String>()
-        .to_ascii_lowercase()
+        .collect()
+}
+
+/// Does the command write a word in a form [`unquoted`] does not model: an
+/// ANSI-C `$'…'` string, or a brace expansion (`pu{s,}h`)? Either can spell
+/// `push`, an alias name or `-C` without the plain text holding it, so the
+/// expansion pass keeps the old verdict.
+fn unmodeled_spelling(command: &str) -> bool {
+    static BRACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\{[^{}\s]*(,|\.\.)[^{}\s]*\}").expect("pattern should compile")
+    });
+    command.contains("$'") || BRACE.is_match(command)
+}
+
+/// Does an expansion subcommand word assemble its value with a parameter
+/// operator (`${CMD:-pu}sh`, `${v:0:2}`, `${x/a/b}`)? The name is then built
+/// in the word itself, where no spelling check can see it.
+fn operator_expansion(word: &str) -> bool {
+    static OP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\$\{[#!]?[A-Za-z_0-9@*]*[^}A-Za-z_0-9@*]")
+            .expect("pattern should compile")
+    });
+    OP.is_match(word)
 }
 
 /// Does the command spell, in any case, the name of an alias `dir`'s config
@@ -1011,6 +1042,23 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
     };
     let names: Vec<&str> = definitions.iter().map(|(n, _)| n.as_str()).collect();
     if names.is_empty() {
+        return false;
+    }
+    // A positional git call outside every function body is not a wrapper's
+    // (`bash -c 'git -C "$0" "$1"' ../x ship`, `set -- ship; git "$@"`): a
+    // decoy wrapper's call sites say nothing about it.
+    let mut outside = command.as_bytes().to_vec();
+    for (_, range) in &definitions {
+        outside[range.clone()].fill(b' ');
+    }
+    if git_calls(&String::from_utf8_lossy(&outside), ".")
+        .iter()
+        .any(|call| {
+            call.rest
+                .first()
+                .is_some_and(|sub| is_positional_parameter(sub))
+        })
+    {
         return false;
     }
     let segments = cadence_hooks_core::shell::command_segments(command);
@@ -1070,10 +1118,7 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
 /// may create it first; a count (`grep -C 2`) is skipped, and another tool's
 /// directory (`make -C build`) is probed harmlessly.
 fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
-    let plain: String = command
-        .chars()
-        .filter(|c| !matches!(c, '\\' | '"' | '\''))
-        .collect();
+    let plain = unquoted(command);
     if plain.contains("--exec-path") || plain.contains("--config-env") {
         return None;
     }
@@ -1147,10 +1192,7 @@ fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
 /// A git call's `-C` value as [`named_dirs`] reads the text: quotes and
 /// backslashes dropped.
 fn spelled_value(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !matches!(c, '\\' | '"' | '\''))
-        .collect()
+    unquoted(value)
 }
 
 /// The spellings of a function's positional parameters a wrapper hands git
@@ -1464,7 +1506,8 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             // then probed where the command runs, for the user's and
             // system aliases.
             if !may_name_push(command)
-                && hints.aliases.is_empty()
+                && !unmodeled_spelling(command)
+                && !operator_expansion(&call.rest[0])
                 && !spelled(command).contains("alias.")
                 && (if is_positional_parameter(&sub) {
                     wrapper_sites_are_builtins(command)
@@ -4128,6 +4171,19 @@ mod tests {
             ": ${opts:=-C ../other}; git $opts ship",
             "opts=${opts:-\"-C ../other\"}; git $opts ship",
             "cp -r ../other ../o2; opts=\"-C ../o2\"; git $opts ship",
+            // A positional git call outside a decoy wrapper is not its.
+            "g() { git \"$@\"; }; g status; bash -c 'git -C \"$0\" \"$1\"' ../other ship",
+            "g() { git \"$@\"; }; g status; set -- ship; git -C \"$R\" \"$@\"",
+            // Spellings the plain text does not hold: a line continuation, an
+            // ANSI-C string, a brace expansion, a parameter operator.
+            "c=pu\\\nsh; git $c origin main",
+            "c=$'\\x70ush'; git $c origin main",
+            "for c in status pu{s,}h; do git $c origin main; done",
+            "opts=\"-\\\nC ../other\"; git $opts ship",
+            "git ${v:0:2}sh origin main",
+            // A remote helper, and more directories than the probe reads.
+            "for c in status remote-ext; do git $c; done",
+            "for c in status; do git $c; done; ls -C . -C .. -C ../other -C ../other/.git -C ../..",
             // A value read from a here-string, a pipe or `printf -v`.
             "read -r opts <<< \"-C ../other\"; git $opts ship",
             "printf -v opts '%s' \"-C ../other\"; git $opts ship",
@@ -4158,6 +4214,8 @@ mod tests {
             // `-C` naming a path that does not exist, even in prose, keeps
             // the old verdict: the command may create it first.)
             "for c in status log; do git $c; done; grep -C 2 x f; make -C .; bash -c true",
+            // A `-C` inside a longer word is not one.
+            "echo build-C nope; for c in status; do git $c; done",
             // polish's shape: a `-C` directory this guard cannot follow.
             "g() { git -C \"$REPO\" -c core.hooksPath=/dev/null \"$@\"; }\n\
              g status --porcelain > \"$RV/s\"\n{ g diff -U10 \"$BASE\" --; } > \"$OUT\"\n\
