@@ -88,9 +88,9 @@
 //! push, cameronsjo/cadence-hooks#1338, and except a command that spells no
 //! `push`, `send-pack` or `remote-` with quotes and backslashes dropped, no
 //! pushing alias name the probed config defines, writes no alias, has
-//! autocorrect off and does not redirect its config, nor spells a `-C`, `-c`,
-//! `--git-dir`, `--work-tree`, `--exec-path`, `--config-env` or `--namespace`
-//! its git calls do not parse as their own; an unresolved `-C` there
+//! autocorrect off and does not redirect its config, probed in every
+//! directory the command names after a `-C` or `--git-dir`; an unresolved
+//! `-C` there
 //! passes only through a wrapper whose call sites are all literal builtins
 //! and whose name the command uses nowhere else,
 //! cameronsjo/cadence-hooks#1356, #1360);
@@ -1059,133 +1059,87 @@ fn wrapper_sites_are_builtins(command: &str) -> bool {
     })
 }
 
-/// Git's options that move where a call reads its config or runs from.
-const REDIRECTING_OPTIONS: &[&str] = &[
-    "-C",
-    "-c",
-    "--git-dir",
-    "--work-tree",
-    "--exec-path",
-    "--config-env",
-    "--namespace",
-];
-
-/// Does the command spell one of git's redirecting options more often than
-/// its git calls parse one? The extra one sits inside a value an expansion
-/// hands git (`opts="-C ../x"; git $opts ship`), where the alias probe
-/// cannot follow it. Another known tool's own options (`wc -c`, `grep -C 2`,
-/// `bash -c`) and prose an `echo` prints are not git's, unless the command
-/// also reads a value from a here-doc, here-string, pipe or `printf -v`. `-C` and `-c` match
-/// in their own case. A wrapper body's git call is counted once, not once
-/// per call of the wrapper.
-fn hides_redirecting_option(command: &str) -> bool {
-    let Some(definitions) = function_definitions(command) else {
-        return true;
-    };
-    // A value can also reach git from a here-doc or here-string body, or a
-    // reader (`read`, `mapfile`, `xargs`, `printf -v`): then every segment
-    // is read, as the producer could be any command.
-    let readers = command.contains("<<")
-        || ["read", "readarray", "mapfile", "xargs", "-v"]
-            .iter()
-            .any(|word| word_occurrences(command, word) > 0);
-    // Otherwise a segment run by a tool with its own `-c`/`-C`, or one that
-    // prints prose, hands git nothing.
-    let others_options = |segment: &str| {
-        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
-        tokens.first().is_some_and(|first| {
-            matches!(
-                unescape_word(first).as_ref(),
-                "echo"
-                    | "wc"
-                    | "grep"
-                    | "egrep"
-                    | "fgrep"
-                    | "rg"
-                    | "head"
-                    | "tail"
-                    | "sort"
-                    | "uniq"
-                    | "cut"
-                    | "bash"
-                    | "sh"
-                    | "zsh"
-                    | "dash"
-                    | "python"
-                    | "python3"
-                    | "node"
-                    | "ruby"
-                    | "perl"
-                    | "curl"
-                    | "make"
-                    | "tar"
-                    | "ls"
-                    | "jq"
-                    | "psql"
-                    | "rustc"
-                    | "cargo"
-                    | "docker"
-                    | "cp"
-                    | "mv"
-                    | "sed"
-                    | "awk"
-                    | "du"
-                    | "df"
-                    | "tr"
-                    | "diff"
-                    | "cmp"
-            ) && git_calls(segment, ".").is_empty()
-        })
-    };
-    let options = |text: &str| -> Vec<String> {
-        let plain: String = text
-            .chars()
-            .filter(|c| !matches!(c, '\\' | '"' | '\''))
-            .collect();
-        let mut found = Vec::new();
-        for option in REDIRECTING_OPTIONS {
-            for (at, _) in plain.match_indices(option) {
-                let before = plain[..at].chars().next_back();
-                let after = plain[at + option.len()..].chars().next();
-                if !before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-                    && after.is_none_or(|c| c.is_whitespace() || matches!(c, '=' | ')' | ';'))
-                {
-                    found.push((*option).to_string());
-                }
-            }
-        }
-        found
-    };
-    // A here-doc body is in no segment, so a reader reads the whole text.
-    let spelled_options: Vec<String> = if readers {
-        options(command)
-    } else {
-        cadence_hooks_core::shell::command_segments(command)
-            .iter()
-            .filter(|segment| !others_options(segment))
-            .flat_map(|segment| options(segment))
-            .collect()
-    };
-    // Parsed once each: the command with every function body blanked out
-    // (so no call inlines a body), plus each body on its own.
+/// The directories the command names after a `-C` or `--git-dir` anywhere
+/// in its text (quotes and backslashes dropped), relative to `at`: an
+/// expansion can hand git any of them (`opts="-C ../x"; git $opts ship`,
+/// `f() { echo "-C ../x"; }; git $(f) ship`), so the alias probe reads each.
+/// `None` keeps the old verdict: a value this cannot read (an expansion that
+/// is not a git call's own parsed `-C`, an option with no value after it),
+/// or `--exec-path`/`--config-env`, which move git somewhere no probe sees.
+/// A path that does not exist holds no config and is left out; another
+/// tool's `-C` (`grep -C 2`, `make -C build`) is probed harmlessly.
+fn named_dirs(command: &str, at: &str) -> Option<Vec<String>> {
+    let plain: String = command
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '"' | '\''))
+        .collect();
+    if plain.contains("--exec-path") || plain.contains("--config-env") {
+        return None;
+    }
+    // The values git calls the parser read take as their own `-C`, each
+    // counted once: the command with every function body blanked out (so no
+    // call inlines a body), plus each body on its own.
+    let definitions = function_definitions(command)?;
     let mut outside = command.as_bytes().to_vec();
     for (_, range) in &definitions {
         outside[range.clone()].fill(b' ');
     }
-    let outside = String::from_utf8_lossy(&outside).into_owned();
-    let mut parsed: Vec<GitCall> = git_calls(&outside, ".");
+    let mut own = git_calls(&String::from_utf8_lossy(&outside), ".");
     for (_, range) in &definitions {
-        parsed.extend(git_calls(&command[range.clone()], "."));
+        own.extend(git_calls(&command[range.clone()], "."));
     }
-    REDIRECTING_OPTIONS.iter().any(|option| {
-        let spelled_count = spelled_options.iter().filter(|o| o == option).count();
-        let parsed_count = parsed
-            .iter()
-            .flat_map(|call| call.globals.iter())
-            .filter(|g| *g == option || g.starts_with(&format!("{option}=")))
-            .count();
-        spelled_count > parsed_count
-    })
+    let mut own_values: Vec<String> = own
+        .iter()
+        .flat_map(|call| {
+            call.globals
+                .windows(2)
+                .filter(|pair| pair[0] == "-C")
+                .map(|pair| spelled_value(&pair[1]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut dirs = Vec::new();
+    for option in ["-C", "--git-dir"] {
+        for (pos, _) in plain.match_indices(option) {
+            let before = plain[..pos].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+                continue;
+            }
+            let after = &plain[pos + option.len()..];
+            let value = match after.chars().next() {
+                Some('=') if option == "--git-dir" => &after[1..],
+                Some(c) if c.is_whitespace() => after.trim_start(),
+                Some(c) if c.is_ascii_alphanumeric() || c == '-' => continue, // `-Cx`, `--git-dirs`
+                _ => return None,
+            };
+            let value: String = value
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')'))
+                .collect();
+            if value.is_empty() {
+                return None;
+            }
+            if value.contains(['$', '`']) {
+                let i = own_values.iter().position(|v| *v == value)?;
+                own_values.swap_remove(i);
+                continue;
+            }
+            let dir = resolve_cd_target(&value, at);
+            if std::path::Path::new(&dir).exists() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    Some(dirs)
+}
+
+/// A git call's `-C` value as [`named_dirs`] reads the text: quotes and
+/// backslashes dropped.
+fn spelled_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '"' | '\''))
+        .collect()
 }
 
 /// The spellings of a function's positional parameters a wrapper hands git
@@ -1501,7 +1455,6 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             if !may_name_push(command)
                 && hints.aliases.is_empty()
                 && !spelled(command).contains("alias.")
-                && !hides_redirecting_option(command)
                 && (if is_positional_parameter(&sub) {
                     wrapper_sites_are_builtins(command)
                 } else {
@@ -1510,17 +1463,28 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             {
                 let env = env.get_or_insert_with(|| CommandEnv::of(command));
                 let ask_git = call.bare && !env.path_moved;
-                let capped = !probed.contains_key(&call.dir) && probed.len() >= MAX_ALIAS_PROBES;
-                if config_redirected(env.blind, call).is_none() && !capped {
-                    let cfg = probed.entry(call.dir.clone()).or_insert_with(|| {
-                        alias_config(&call.dir).map_err(|stop| match stop {
-                            Stop::Refused(why) => why,
-                            Stop::Found(_) => String::new(),
+                let plain = spelled(command);
+                if config_redirected(env.blind, call).is_none()
+                    && let Some(mut dirs) = named_dirs(command, &call.dir)
+                {
+                    if !dirs.contains(&call.dir) {
+                        dirs.insert(0, call.dir.clone());
+                    }
+                    let fresh = dirs.iter().filter(|d| !probed.contains_key(*d)).count();
+                    let capped = probed.len() + fresh > MAX_ALIAS_PROBES;
+                    if !capped
+                        && dirs.iter().all(|dir| {
+                            let cfg = probed.entry(dir.clone()).or_insert_with(|| {
+                                alias_config(dir).map_err(|stop| match stop {
+                                    Stop::Refused(why) => why,
+                                    Stop::Found(_) => String::new(),
+                                })
+                            });
+                            cfg.as_ref().is_ok_and(|cfg| {
+                                !cfg.autocorrect
+                                    && !spells_a_pushing_alias(&plain, cfg, dir, ask_git)
+                            })
                         })
-                    });
-                    if let Ok(cfg) = cfg
-                        && !cfg.autocorrect
-                        && !spells_a_pushing_alias(&spelled(command), cfg, &call.dir, ask_git)
                     {
                         continue;
                     }
@@ -4099,6 +4063,13 @@ mod tests {
     #[test]
     fn unresolvable_subcommand_word_blocks() {
         let fx = Fx::new("subvar");
+        // A sibling repository whose own config defines pushing aliases, for
+        // the rows that move git there through an expansion.
+        let other = fx.work.parent().unwrap().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git_out(&other, &["init", "-q"]);
+        git_out(&other, &["config", "alias.ship", "push origin HEAD"]);
+        git_out(&other, &["config", "alias.sy", "!git push origin HEAD"]);
         for cmd in [
             "X=push; git $X origin main",
             "X=push; git ${X} origin main",
@@ -4138,6 +4109,11 @@ mod tests {
             "g() { git -C . \"$@\"; }; g -C ../other sy",
             "g() { git -C . \"$@\"; }; g status; g log -1; opts=\"-C ../other\"; git $opts ship",
             "env git -C . status; opts=\"-C ../other\"; git $opts ship",
+            // An option a helper prints, or a stdin producer hands on.
+            "repo_opts() { echo \"-C $1\"; }; git $(repo_opts ../other) ship",
+            "f() { echo \"-C ../other\"; }; for c in status ship; do git $(f) $c; done",
+            "echo \"-C ../other\" | { opts=$(cat); git $opts ship; }",
+            "o=-C; git $o ../other ship",
             // A value read from a here-string, a pipe or `printf -v`.
             "read -r opts <<< \"-C ../other\"; git $opts ship",
             "printf -v opts '%s' \"-C ../other\"; git $opts ship",
