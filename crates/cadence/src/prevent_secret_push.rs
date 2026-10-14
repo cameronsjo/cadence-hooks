@@ -4516,7 +4516,9 @@ mod tests {
         // passes on the expansion rule instead (#1356, #1360).
         for command in [
             "gg() { git \"$@\"; } # wrapper\ngg status",
-            "gg() { cd /tmp && git \"$@\"; }; gg status",
+            // `cd .`, not `/tmp`: the probe runs in the directory the body moves
+            // to, and Windows runners have no `/tmp`, which keeps the old verdict.
+            "gg() { cd . && git \"$@\"; }; gg status",
             "gg() { git \"$@\" | cat; }; gg status",
         ] {
             assert!(!wrapper_calls_cannot_push(command), "{command}");
