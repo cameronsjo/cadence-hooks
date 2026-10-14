@@ -1073,41 +1073,69 @@ const REDIRECTING_OPTIONS: &[&str] = &[
 /// Does the command spell one of git's redirecting options more often than
 /// its git calls parse one? The extra one sits inside a value an expansion
 /// hands git (`opts="-C ../x"; git $opts ship`), where the alias probe
-/// cannot follow it. Only segments that can hand git a word are read: a git
-/// call, a call of a function the command defines, an assignment, `for`,
-/// `set` or a declaration; another tool's own options (`wc -c`, `grep -C 2`,
-/// `bash -c`) and prose an `echo` prints are not git's. `-C` and `-c` match
+/// cannot follow it. Another known tool's own options (`wc -c`, `grep -C 2`,
+/// `bash -c`) and prose an `echo` prints are not git's, unless the command
+/// also reads a value from a here-doc, here-string, pipe or `printf -v`. `-C` and `-c` match
 /// in their own case. A wrapper body's git call is counted once, not once
 /// per call of the wrapper.
 fn hides_redirecting_option(command: &str) -> bool {
     let Some(definitions) = function_definitions(command) else {
         return true;
     };
-    let names: Vec<&str> = definitions.iter().map(|(n, _)| n.as_str()).collect();
-    let feeds_git = |segment: &str| {
+    // A value can also reach git from a here-doc or here-string body, or a
+    // reader (`read`, `mapfile`, `xargs`, `printf -v`): then every segment
+    // is read, as the producer could be any command.
+    let readers = command.contains("<<")
+        || ["read", "readarray", "mapfile", "xargs", "-v"]
+            .iter()
+            .any(|word| word_occurrences(command, word) > 0);
+    // Otherwise a segment run by a tool with its own `-c`/`-C`, or one that
+    // prints prose, hands git nothing.
+    let others_options = |segment: &str| {
         let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
-        let Some(first) = tokens.first() else {
-            return false;
-        };
-        let word = unescape_word(first);
-        let word = word.as_ref();
-        word.contains(['=', '$', '`', '(', '['])
-            || names.contains(&word)
-            || !git_calls(segment, ".").is_empty()
-            || tokens.get(1).is_some_and(|w| w.starts_with('('))
-            || matches!(
-                word,
-                "git"
-                    | "for"
-                    | "select"
-                    | "set"
-                    | "export"
-                    | "local"
-                    | "declare"
-                    | "typeset"
-                    | "readonly"
-                    | "function"
-            )
+        tokens.first().is_some_and(|first| {
+            matches!(
+                unescape_word(first).as_ref(),
+                "echo"
+                    | "wc"
+                    | "grep"
+                    | "egrep"
+                    | "fgrep"
+                    | "rg"
+                    | "head"
+                    | "tail"
+                    | "sort"
+                    | "uniq"
+                    | "cut"
+                    | "bash"
+                    | "sh"
+                    | "zsh"
+                    | "dash"
+                    | "python"
+                    | "python3"
+                    | "node"
+                    | "ruby"
+                    | "perl"
+                    | "curl"
+                    | "make"
+                    | "tar"
+                    | "ls"
+                    | "jq"
+                    | "psql"
+                    | "rustc"
+                    | "cargo"
+                    | "docker"
+                    | "cp"
+                    | "mv"
+                    | "sed"
+                    | "awk"
+                    | "du"
+                    | "df"
+                    | "tr"
+                    | "diff"
+                    | "cmp"
+            ) && git_calls(segment, ".").is_empty()
+        })
     };
     let options = |text: &str| -> Vec<String> {
         let plain: String = text
@@ -1128,11 +1156,16 @@ fn hides_redirecting_option(command: &str) -> bool {
         }
         found
     };
-    let spelled_options: Vec<String> = cadence_hooks_core::shell::command_segments(command)
-        .iter()
-        .filter(|segment| feeds_git(segment))
-        .flat_map(|segment| options(segment))
-        .collect();
+    // A here-doc body is in no segment, so a reader reads the whole text.
+    let spelled_options: Vec<String> = if readers {
+        options(command)
+    } else {
+        cadence_hooks_core::shell::command_segments(command)
+            .iter()
+            .filter(|segment| !others_options(segment))
+            .flat_map(|segment| options(segment))
+            .collect()
+    };
     // Parsed once each: the command with every function body blanked out
     // (so no call inlines a body), plus each body on its own.
     let mut outside = command.as_bytes().to_vec();
@@ -4105,6 +4138,11 @@ mod tests {
             "g() { git -C . \"$@\"; }; g -C ../other sy",
             "g() { git -C . \"$@\"; }; g status; g log -1; opts=\"-C ../other\"; git $opts ship",
             "env git -C . status; opts=\"-C ../other\"; git $opts ship",
+            // A value read from a here-string, a pipe or `printf -v`.
+            "read -r opts <<< \"-C ../other\"; git $opts ship",
+            "printf -v opts '%s' \"-C ../other\"; git $opts ship",
+            "echo \"-C ../other\" | while read o; do git $o ship; done",
+            "opts=$(cat <<'EOF'\n-C ../other\nEOF\n); git $opts ship",
         ] {
             assert_blocks(&fx.run(cmd), &["resolve"]);
         }
