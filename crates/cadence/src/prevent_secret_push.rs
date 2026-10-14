@@ -1339,13 +1339,15 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
             // loop or wrapper that never writes `push`, nor the name of an
             // alias that pushes, is not a push. A name built from pieces or
             // read from a file is outside the threat model.
-            // An alias this same command writes, a redirected config, or an
+            // An alias this same command writes or sets with `-c`, a
+            // redirected config, or an
             // unresolved `-C` outside a wrapper whose call sites are all
             // literal builtins keeps the old verdict; an unresolved `-C` is
             // then probed where the command runs, for the user's and
             // system aliases.
             if !may_name_push(command)
                 && hints.aliases.is_empty()
+                && !spelled(command).contains("alias.")
                 && (!call.dir_unresolved
                     || (is_positional_parameter(&sub) && wrapper_sites_are_builtins(command)))
             {
@@ -3951,6 +3953,7 @@ mod tests {
             "c=pu''sh; git $c origin main",
             // An alias this same command writes, or a redirected config.
             "git config alias.sy '!./ship.sh'; for c in sy; do git $c; done",
+            "for c in status ship; do git -c alias.ship='!./release.sh' $c; done",
             "for c in st; do git --git-dir=/x $c; done",
             "GIT_DIR=/x; for c in st; do git $c; done",
             // An unresolved `-C` outside a wrapper, or a wrapper call site
