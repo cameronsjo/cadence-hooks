@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`prevent-secret-push` no longer refuses git calls that cannot push because their subcommand comes from an expansion.** A read-only loop (`for c in rev-parse status; do git $c; done`, zsh's `git $=c`) or a `g() { git … "$@"; }` wrapper in a command that also held a heredoc or `$(…)` was refused as an unscannable push, though nothing in the command could name one. An expansion can only pick a subcommand the command spells, so the guard now lets it through when the command spells no `push`, `send-pack` or `remote-` helper (in any case), git's config where the call runs (the user's and system config, plus the repository's when its directory is known) defines no pushing alias whose name the command spells, and `help.autocorrect` is off. polish's old `g()` recipes pass again. A push name built from pieces (`"$(echo pu)sh"`) or never assigned in the command is outside the threat model. (#1356, #1360)
+
 ## [0.126.0] - 2026-10-12
 
 ### Security
