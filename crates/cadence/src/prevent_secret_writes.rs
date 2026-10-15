@@ -1049,6 +1049,28 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1391: bash and zsh write `.env` inside the
+    /// directory `d<C>x` (measured), but the redirect target ended at `<C>`
+    /// and the guard judged `d`.
+    #[test]
+    fn redirect_into_a_directory_named_with_a_non_blank_is_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for c in ['\u{a0}', '\u{b}', '\u{3000}'] {
+            for (command, outcome) in [
+                (format!("echo A=1 > d{c}x/.env"), Block),
+                (format!("echo A=1 >> d{c}x/.env"), Block),
+                (format!("echo A=1 > d{c}x/out.txt"), Allow),
+            ] {
+                let result = SecretWritesGuard::default().run(&make_bash(&command));
+                assert_eq!(result.outcome, outcome, "{command:?}");
+            }
+        }
+        for (command, outcome) in [("echo A=1 > .env", Block), ("echo A=1 > out.txt", Allow)] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command}");
+        }
+    }
+
     #[test]
     fn service_account_json_blocked() {
         assert!(is_blocked(

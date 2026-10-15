@@ -6962,6 +6962,36 @@ mod tests {
     }
 
     #[test]
+    fn secret_read_behind_a_hash_glued_to_a_paren_blocked() {
+        // cameronsjo/cadence-hooks#1391: bash, zsh or both run the read in
+        // each of these; the glued `#` let a `'` hide it from this guard.
+        assert_bash(
+            &[
+                "(#'\ncat ~/.ssh/id_ed25519\n#'\n)",
+                "(true)#'\ncat ~/.ssh/id_ed25519\n#'",
+                "if (#'\ncat ~/.ssh/id_ed25519\n#'\n) then :; fi",
+                "true|(#'\ncat ~/.ssh/id_ed25519\n#'\n)",
+                "case a in a)#'\ncat ~/.ssh/id_ed25519\n#'\n;; esac",
+                "cat =(#'\ncat ~/.ssh/id_ed25519\n#'\n)",
+                "(( 1 # $(cat ~/.ssh/id_ed25519) ))",
+                "cat <<E\u{a0}x\nE\n'\nE\u{a0}x\ncat ~/.ssh/id_ed25519\n#'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a `#` glued to a paren hides no line",
+        );
+        assert_bash(
+            &[
+                "ls # it's fine",
+                "(cd /tmp && ls) # cat ~/.ssh/id_ed25519",
+                "echo \"a#b\" ${#v} $#",
+                "cat <<EOF\ncat ~/.ssh/id_ed25519\nEOF",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "controls",
+        );
+    }
+
+    #[test]
     fn globs_sharing_letters_with_no_stem_allowed() {
         // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
         // `jks` and `cadence` shares `den` with `credentials`, but only a
