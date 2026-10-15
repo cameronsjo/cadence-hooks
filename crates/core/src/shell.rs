@@ -18355,6 +18355,42 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_scanner_comment_starts_only_after_bash_blanks() {
+        // cameronsjo/cadence-hooks#1389 (PR #1390 review, finding 4): the
+        // heredoc line scanner ([`scan_command_line`]) decides where a
+        // comment starts by the same rule as [`comment_spans`]. In
+        // `cat x<C># <<E` bash reads `x<C>#` as one word, so `<<E` opens a
+        // heredoc, its body is the `'` line, and the push after `E` runs.
+        // Reading `<C>` as a blank turned `# <<E` into a comment, so the `'`
+        // opened a quote that hid the push.
+        for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
+            let line = format!("cat x{c}# <<E");
+            let found = heredoc_introducers(&line);
+            assert_eq!(found.len(), 1, "{line:?}");
+            assert_eq!(found[0].word, "E", "{line:?}");
+            let command = format!("{line}\n'\nE\ngit push --force origin main\n#'");
+            let stripped = strip_heredoc_bodies(&command);
+            assert!(
+                stripped.lines().all(|l| l != "'"),
+                "{command:?} kept the heredoc body: {stripped:?}"
+            );
+            assert!(
+                split_segments(&stripped)
+                    .iter()
+                    .any(|s| s.trim() == "git push --force origin main"),
+                "{command:?} hid the push: {stripped:?}"
+            );
+        }
+        // Controls: after a real blank the `#` opens a comment, so the `<<E`
+        // behind it is comment text and no heredoc opens.
+        for line in ["cat x # <<E", "cat x\t# <<E", "cat x;# <<E"] {
+            assert!(heredoc_introducers(line).is_empty(), "{line:?}");
+        }
+        let command = "cat x # <<E\n'\nE\ngit push --force origin main\n#'";
+        assert_eq!(strip_heredoc_bodies(command), command);
+    }
+
+    #[test]
     fn tokenize_keeps_double_quoted_content_in_one_token() {
         assert_eq!(
             tokenize(r#"gh pr create --body "see --body-file foo""#),
