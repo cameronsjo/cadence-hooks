@@ -1071,6 +1071,25 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1391 review: bash and zsh read `((` as two
+    /// subshells when its matching `)` is not followed by `)`, so the `#`
+    /// starts a comment (or `<<` a heredoc) and the write on the next line
+    /// runs. Reading `((` as arithmetic let the `'` hide that line.
+    #[test]
+    fn redirect_after_a_double_paren_subshell_is_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("((echo a #'\necho A=1 > .env\n#'\n) )", Block),
+            ("true | ((echo a #'\necho A=1 > .env\n#'\n) )", Block),
+            ("((cat <<E\n'\nE\n) )\necho A=1 > .env\n#'", Block),
+            ("(( x = 1 <<E ))\necho A=1 > .env\nE", Block),
+            ("(( x = 1 + 2 )); echo A=1 > out.txt", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command:?}");
+        }
+    }
+
     #[test]
     fn service_account_json_blocked() {
         assert!(is_blocked(

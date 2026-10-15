@@ -6992,6 +6992,33 @@ mod tests {
     }
 
     #[test]
+    fn secret_read_behind_a_double_paren_subshell_blocked() {
+        // cameronsjo/cadence-hooks#1391 review: `((` whose matching `)` is
+        // not followed by `)` is two subshells in bash and zsh, so `#` starts
+        // a comment and the read on the next line runs.
+        assert_bash(
+            &[
+                "((echo a #'\ncat .env\n#'\n) )",
+                "((echo a #'\ncat .env\n#'\n);true)",
+                "true; ((echo a #'\ncat .env\n#'\n) )",
+                "true | ((echo a #'\ncat .env\n#'\n) )",
+                "if ((echo a #'\ncat .env\n#'\n) ) then :; fi",
+                "echo $( ((echo a #'\ncat .env\n#'\n) ) )",
+                "((cat <<E\n'\nE\n) )\ncat .env\n#'",
+                "(( 1 #'\n))'\n))\ncat .env\n'",
+                "(( 1 # x )); cat '.env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a `#` or `<<` inside `((` hides no line",
+        );
+        assert_bash(
+            &["(( x = 1 + 2 ))", "((i++))", "(( y = 1 << 2 )); ls"],
+            cadence_hooks_core::Outcome::Allow,
+            "arithmetic controls",
+        );
+    }
+
+    #[test]
     fn globs_sharing_letters_with_no_stem_allowed() {
         // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
         // `jks` and `cadence` shares `den` with `credentials`, but only a

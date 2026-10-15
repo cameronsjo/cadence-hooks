@@ -1196,6 +1196,54 @@ mod tests {
     }
 
     #[test]
+    fn force_push_behind_a_double_paren_subshell_blocked() {
+        // cameronsjo/cadence-hooks#1391 review: bash and zsh read `((` as
+        // arithmetic only when its matching `)` is followed by `)`. Otherwise
+        // it is two subshells, the `#` starts a comment, and the push runs
+        // (measured on bash 5.3 and zsh 5.9). Reading `((` as arithmetic let
+        // the `'` hide the push.
+        let push = "git push --force origin main";
+        for shape in [
+            "((echo a #'\nPUSH\n#'\n) )",
+            "((echo a #'\nPUSH\n#'\n);true)",
+            "true; ((echo a #'\nPUSH\n#'\n) )",
+            "true | ((echo a #'\nPUSH\n#'\n) )",
+            "if ((echo a #'\nPUSH\n#'\n) ) then :; fi",
+            "echo $( ((echo a #'\nPUSH\n#'\n) ) )",
+            "((echo '))' #'\nPUSH\n#'\n) )",
+            "(( (echo a #'\nPUSH\n#'\n) ) )",
+            // zsh runs this one: `<<E` is a heredoc in the subshell reading.
+            "((cat <<E\n'\nE\n) )\nPUSH\n#'",
+            // Arithmetic in both shells, and bash runs the push: the `'`
+            // after `#` is a quote there, and `<<` a shift.
+            "(( 1 #'\n))'\n))\nPUSH\n'",
+            "(( x = 1 <<E ))\nPUSH\nE",
+        ] {
+            let command = shape.replace("PUSH", push);
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: genuine arithmetic stays allowed.
+        for command in [
+            "(( x = 1 + 2 ))",
+            "((i++))",
+            "for ((i=0; i<3; i++)); do echo $i; done",
+            "(( y = 1 << 2 )) && git status",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn force_push_after_a_heredoc_with_a_non_blank_in_its_delimiter_blocked() {
         // cameronsjo/cadence-hooks#1391: bash and zsh keep NBSP and VT in
         // the delimiter, so the body ends at `E<C>x` and the push runs.

@@ -8083,6 +8083,8 @@ struct HeredocLex {
     /// whether it sits inside `$( … )` without walking a stack a `(` flood
     /// made deep.
     substs: usize,
+    /// How many [`Opener::Arith`] entries `open` holds ([`paren_step`]).
+    arith: usize,
     backticks: bool,
     /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
     /// be bounded, stop trying, so an opener flood stays linear.
@@ -8221,11 +8223,31 @@ fn scan_command_line(
                 if c == ')' && innermost == Some(Opener::Subst) {
                     lex.substs -= 1;
                 }
-                let (glued, consumed) = paren_step(&mut lex.open, c, boundary, prev, next);
+                let (glued, consumed) =
+                    paren_step(&mut lex.open, &mut lex.arith, c, boundary, prev, next);
                 if consumed {
                     j += 1;
                 }
                 ambiguous = glued;
+            }
+            // The [`comment_spans`] stop inside `((…))`
+            // ([`CommentKind::Unresolved`]): everything from here on is code,
+            // so no heredoc after it hides a line.
+            '#' | '<'
+                if lex.arith > 0
+                    && !comment_context(innermost)
+                    && unresolved_in_arith(
+                        c,
+                        boundary || was_ambiguous,
+                        chars.get(j + 1).copied(),
+                    ) =>
+            {
+                return CommandLine {
+                    end: chars.len(),
+                    introducers,
+                    skipped_heredoc,
+                    joins,
+                };
             }
             '{' if matches!(
                 innermost,
@@ -8592,7 +8614,11 @@ enum Opener {
     /// A `(` inside a word (`f()`, a zsh glob `x(a)`, a bash extglob `@(a)`).
     WordParen,
     /// `((…))` arithmetic command where a word could begin. No comment starts
-    /// inside it: `(( 1 # $(cmd) ))` runs `cmd` in bash and zsh.
+    /// inside it: `(( 1 # $(cmd) ))` runs `cmd` in bash and zsh. But bash and
+    /// zsh commit to arithmetic only when the matching `)` is followed by `)`;
+    /// otherwise `((` is two nested subshells, where a `#` after a blank IS a
+    /// comment and `<<` IS a heredoc. Neither reading is safe for the other,
+    /// so a `#` or `<<` there ends the scan ([`CommentKind::Unresolved`]).
     Arith,
 }
 
@@ -8603,6 +8629,17 @@ fn comment_context(innermost: Option<Opener>) -> bool {
         innermost,
         None | Some(Opener::Subst | Opener::Group | Opener::ProcSub | Opener::WordParen)
     )
+}
+
+/// Inside `((…))`, does unquoted `c` start a [`CommentKind::Unresolved`]
+/// span? A `#` where a comment could begin (`at_word`: a word boundary or
+/// glued to a paren), or the `<` of a `<<`. `next` is the character after `c`.
+fn unresolved_in_arith(c: char, at_word: bool, next: Option<char>) -> bool {
+    match c {
+        '#' => at_word,
+        '<' => next == Some('<'),
+        _ => false,
+    }
 }
 
 /// Track an unquoted `(` or `)` for the comment scanners ([`comment_spans`],
@@ -8625,8 +8662,12 @@ fn comment_context(innermost: Option<Opener>) -> bool {
 ///   word, and runs a `; cmd` after them.
 /// - After `)` that closes `$(…)`, `$((…))` or `<(…)`, the word goes on in
 ///   both shells (`$(true)#'`, `<(true)#; cmd`), so `#` is plain text there.
+///
+/// `arith` counts the [`Opener::Arith`] entries on `open`, so a scanner can
+/// ask whether it is anywhere inside `((…))` without walking the stack.
 fn paren_step(
     open: &mut Vec<Opener>,
+    arith: &mut usize,
     c: char,
     boundary: bool,
     before: Option<char>,
@@ -8643,6 +8684,7 @@ fn paren_step(
         }
         if boundary && next == Some('(') {
             open.push(Opener::Arith);
+            *arith += 1;
             return (false, true);
         }
         open.push(if boundary || before == Some('=') {
@@ -8663,6 +8705,7 @@ fn paren_step(
         }
         Some(Opener::Arith) => {
             open.pop();
+            *arith -= 1;
             (true, next == Some(')'))
         }
         Some(Opener::Group | Opener::WordParen) => {
@@ -8684,6 +8727,14 @@ enum CommentKind {
     /// backslash in it replaced by `;`, so its text is read as code and no
     /// quote it holds can swallow the lines after it.
     Ambiguous,
+    /// A `#` after a blank, or a `<<`, inside a word-start `((`. If bash and
+    /// zsh read `((` as arithmetic, a `'` after it opens a quote and `<<` is
+    /// a shift; if they read nested subshells, the `#` starts a comment and
+    /// `<<` a heredoc. Each reading has a payload the other hides
+    /// (cameronsjo/cadence-hooks#1391), so the span runs to the end of the
+    /// input and is kept, with every quote and backslash removed and every
+    /// backtick turned into `;`: all of it is read as code.
+    Unresolved,
 }
 
 /// Byte ranges of `#` comments in `text` — from the `#` up to (not including)
@@ -8746,6 +8797,8 @@ fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
     let mut before: Option<char> = None;
     let mut quote: Option<Quote> = None;
     let mut open: Vec<Opener> = Vec::new();
+    // How many [`Opener::Arith`] entries `open` holds ([`paren_step`]).
+    let mut arith = 0usize;
     let mut backticks = false;
     let mut boundary = true;
     let mut chars = text.char_indices().peekable();
@@ -8869,12 +8922,28 @@ fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
             // shape already fails that way and is measured to do so.
             '(' | ')' => {
                 let next = chars.peek().map(|&(_, n)| n);
-                let (glued, consumed) = paren_step(&mut open, c, boundary, prev, next);
+                let (glued, consumed) = paren_step(&mut open, &mut arith, c, boundary, prev, next);
                 if consumed {
                     chars.next();
                 }
                 ambiguous = glued;
                 boundary = false;
+            }
+            // Inside `((…))` the shells read `#` and `<<` one way if `((` is
+            // arithmetic and another if it is two subshells; see
+            // [`CommentKind::Unresolved`]. [`scan_command_line`] stops at the
+            // same characters.
+            '#' | '<'
+                if arith > 0
+                    && !comment_context(open.last().copied())
+                    && unresolved_in_arith(
+                        c,
+                        boundary || was_ambiguous,
+                        chars.peek().map(|&(_, n)| n),
+                    ) =>
+            {
+                spans.push((i, text.len(), CommentKind::Unresolved));
+                break;
             }
             // Only nested once an expansion is already open, so a bare
             // `{ group; }` never pushes.
@@ -8926,6 +8995,11 @@ fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
 /// An [`CommentKind::Ambiguous`] span is kept instead, with `'`, `"`, `` ` ``
 /// and `\` turned into `;`: its text stays visible as commands, and none of
 /// its quotes, backticks or escapes reaches past its own line.
+///
+/// An [`CommentKind::Unresolved`] span is kept to the end of the input, with
+/// `'`, `"` and `\` removed and `` ` `` turned into `;`. Removing the quotes
+/// rather than splitting on them keeps a quoted word whole: `cat '.env'`
+/// reads as `cat .env`, not as `cat` and a separate `.env`.
 pub fn strip_comments(command: &str) -> String {
     let spans = comment_spans_with_kind(command);
     if spans.is_empty() {
@@ -8935,11 +9009,21 @@ pub fn strip_comments(command: &str) -> String {
     let mut cursor = 0;
     for (start, end, kind) in spans {
         out.push_str(&command[cursor..start]);
-        if kind == CommentKind::Ambiguous {
-            out.extend(command[start..end].chars().map(|c| match c {
-                '\'' | '"' | '`' | '\\' => ';',
-                other => other,
-            }));
+        match kind {
+            CommentKind::Comment => {}
+            CommentKind::Ambiguous => {
+                out.extend(command[start..end].chars().map(|c| match c {
+                    '\'' | '"' | '`' | '\\' => ';',
+                    other => other,
+                }));
+            }
+            CommentKind::Unresolved => {
+                out.extend(command[start..end].chars().filter_map(|c| match c {
+                    '\'' | '"' | '\\' => None,
+                    '`' => Some(';'),
+                    other => Some(other),
+                }));
+            }
         }
         cursor = end;
     }
@@ -18690,6 +18774,71 @@ mod tests {
         assert!(
             segments.iter().any(|s| s.trim() == "cat .env"),
             "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn double_paren_hash_or_heredoc_keeps_every_later_line_as_code() {
+        // cameronsjo/cadence-hooks#1391 review: bash and zsh read `((` as
+        // arithmetic only when its matching `)` is followed by `)`; otherwise
+        // it is two subshells, where `#` starts a comment and `<<` a heredoc.
+        // In arithmetic a `'` after `#` is a quote and `<<` a shift. Each
+        // reading hides a line the other runs, so from the `#` or `<<` on the
+        // text is kept as code with no quote in it.
+        for command in [
+            // Subshells (bash and zsh run `cat .env`).
+            "((echo a #'\ncat .env\n#'\n) )",
+            "((echo a #'\ncat .env\n#'\n);true)",
+            "true; ((echo a #'\ncat .env\n#'\n) )",
+            "true | ((echo a #'\ncat .env\n#'\n) )",
+            "if ((echo a #'\ncat .env\n#'\n) ) then :; fi",
+            "echo $( ((echo a #'\ncat .env\n#'\n) ) )",
+            "((echo '))' #'\ncat .env\n#'\n) )",
+            "(( (echo a #'\ncat .env\n#'\n) ) )",
+            // A heredoc in the subshell reading (zsh runs `cat .env`).
+            "((cat <<E\n'\nE\n) )\ncat .env\n#'",
+            // Arithmetic (bash runs `cat .env`).
+            "(( 1 #'\n))'\n))\ncat .env\n'",
+            "(( x = 1 <<E ))\ncat .env\nE",
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|s| s.trim() == "cat .env"),
+                "{command:?}: {segments:?}"
+            );
+        }
+        // The span runs to the end of the input; its quotes and backslashes
+        // go, and a backtick becomes `;`.
+        assert_eq!(
+            comment_spans_with_kind("((a #'\nb\n) )"),
+            vec![(4, 12, CommentKind::Unresolved)]
+        );
+        assert_eq!(
+            strip_comments("(( 1 # '.e'nv \\x `y` ))\nz"),
+            "(( 1 # .env x ;y; ))\nz"
+        );
+        // The heredoc scanner stops at the same place, so it cuts no body
+        // after it either: past that point its quote state is a guess.
+        for command in [
+            "((cat <<E\n'\nE\n) )\ncat .env",
+            "(( 1 # x ))\ncat <<E\ncat .env\nE",
+        ] {
+            assert_eq!(strip_heredoc_bodies(command), command, "{command:?}");
+        }
+        // Controls: arithmetic with no `#` or `<<` is unchanged, `16#ff` and
+        // `${#a}` are not at a word start, and `$((…))` keeps its old reading.
+        for command in [
+            "(( x = 1 + 2 ))",
+            "((i++))",
+            "(( x = 16#ff ))",
+            "if (( ${#a[@]} > 0 )); then echo '#'; fi",
+            "echo $(( 1 << 2 ))",
+        ] {
+            assert_eq!(strip_comments(command), command, "{command:?}");
+        }
+        assert_eq!(
+            strip_heredoc_bodies("echo $(( 1 << 2 ))\ncat .env\n2"),
+            "echo $(( 1 << 2 ))\ncat .env\n2"
         );
     }
 
