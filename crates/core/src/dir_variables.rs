@@ -359,7 +359,9 @@ impl<'a> Scan<'a> {
                 continue;
             }
             match c {
-                b' ' | b'\t' | b'\r' => {
+                // bash's blanks only: a CR is a word character to bash, so
+                // `x\r#` is one word and no comment (cadence-hooks#1389).
+                b' ' | b'\t' => {
                     self.end_word()?;
                     self.i += 1;
                 }
@@ -1206,6 +1208,16 @@ mod tests {
 
     /// Reads outside a directory operand stay as written: the rewrite is
     /// scoped to what the guards resolve.
+    #[test]
+    fn a_carriage_return_before_hash_opens_no_comment() {
+        // cadence-hooks#1389: bash reads `x\r#` as one word, so the `git -C`
+        // after the `;` runs and its read resolves like any other.
+        assert_eq!(
+            resolved("M=/a; echo x\r#; git -C \"$M\" commit"),
+            "M=/a; echo x\r#; git -C \"/a\" commit"
+        );
+    }
+
     #[test]
     fn rewrites_only_directory_operands() {
         for command in [

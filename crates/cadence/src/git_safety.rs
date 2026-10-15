@@ -1093,6 +1093,64 @@ mod tests {
     }
 
     #[test]
+    fn force_push_behind_a_non_blank_before_hash_blocked() {
+        // cameronsjo/cadence-hooks#1389: bash and zsh read `x<C>#` as one
+        // word for U+3000, NBSP, VT, FF and CR, so no comment starts and the
+        // push runs. Reading `<C>` as a blank hid it from this guard.
+        for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
+            let command = format!("echo x{c}#; git push --force origin main");
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: the plain push blocks; a real comment, `;` and all, is
+        // inert to bash and stays allowed.
+        let result = GitSafetyGuard.run(&make_bash_input("echo x; git push --force origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        for command in [
+            "echo x # git push --force origin main",
+            "echo x #; git push --force origin main",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_push_after_a_heredoc_behind_a_non_blank_before_hash_blocked() {
+        // cameronsjo/cadence-hooks#1389 (PR #1390 review, finding 4): in
+        // `cat x<C># <<E` bash and zsh read `x<C>#` as one word, so `<<E`
+        // opens a heredoc whose body is the `'` line, and the push after `E`
+        // runs. Reading `<C>` as a blank in the heredoc scanner made `# <<E`
+        // a comment, and the `'` then quoted the push out of sight.
+        for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
+            let command = format!("cat x{c}# <<E\n'\nE\ngit push --force origin main\n#'");
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Control: after a real blank `# <<E` is a comment, the `'` quotes
+        // through `#'`, and no push runs; the guard allows it as before.
+        let command = "cat x # <<E\n'\nE\ngit push --force origin main\n#'";
+        let result = GitSafetyGuard.run(&make_bash_input(command));
+        assert_eq!(
+            result.outcome,
+            cadence_hooks_core::Outcome::Allow,
+            "{command:?}"
+        );
+    }
+
+    #[test]
     fn force_push_through_a_wrapper_utility_blocked() {
         // cadence-hooks#1144: each wrapper runs the push (measured with
         // canaries); `su -c` was read by prevent-secret-leaks' own scan but
