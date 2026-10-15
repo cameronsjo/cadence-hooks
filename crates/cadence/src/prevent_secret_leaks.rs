@@ -6932,6 +6932,36 @@ mod tests {
     }
 
     #[test]
+    fn secret_read_behind_a_non_blank_before_hash_blocked() {
+        // cameronsjo/cadence-hooks#1389: bash and zsh read `x<C>#` as one
+        // word for U+3000, NBSP, VT, FF and CR, so no comment starts and the
+        // read runs. Reading `<C>` as a blank hid it from this guard.
+        let commands: Vec<String> = ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r']
+            .iter()
+            .map(|c| format!("echo x{c}#; cat ~/.ssh/id_ed25519"))
+            .collect();
+        let commands: Vec<&str> = commands.iter().map(String::as_str).collect();
+        assert_bash(
+            &commands,
+            cadence_hooks_core::Outcome::Block,
+            "a non-blank before `#` opens no comment",
+        );
+        assert_bash(
+            &["cat ~/.ssh/id_ed25519", "echo x; cat ~/.ssh/id_ed25519"],
+            cadence_hooks_core::Outcome::Block,
+            "controls",
+        );
+        assert_bash(
+            &[
+                "echo x # cat ~/.ssh/id_ed25519",
+                "echo x #; cat ~/.ssh/id_ed25519",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a real comment is inert",
+        );
+    }
+
+    #[test]
     fn globs_sharing_letters_with_no_stem_allowed() {
         // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
         // `jks` and `cadence` shares `den` with `credentials`, but only a

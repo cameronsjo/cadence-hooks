@@ -8254,7 +8254,9 @@ fn scan_command_line(
             }
             _ => {}
         }
-        boundary = matches!(c, '\n' | ';' | '&' | '|') || c.is_whitespace();
+        // The [`comment_spans`] boundary set, bash's blanks only
+        // (cameronsjo/cadence-hooks#1389).
+        boundary = matches!(c, ';' | '&' | '|') || is_bash_blank(c);
         j += 1;
     }
     CommandLine {
@@ -8746,7 +8748,12 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 }
             }
             '\n' | ';' | '&' | '|' => boundary = true,
-            other => boundary = other.is_whitespace(),
+            // Only bash's blanks end a word. VT, FF, CR, NBSP and U+3000 are
+            // word characters to bash and zsh, so `x<NBSP>#; cmd` is the word
+            // `x<NBSP>#` and runs `cmd`; reading them as blanks opened a
+            // comment there and hid `cmd` from every guard
+            // (cameronsjo/cadence-hooks#1389).
+            other => boundary = is_bash_blank(other),
         }
     }
     spans
@@ -10406,9 +10413,10 @@ const COMMAND_LEADING_RESERVED_WORDS: &[&str] = &[
     "!", "{", "if", "then", "else", "elif", "do", "while", "until", "time",
 ];
 
-/// A character that ends a shell word: a blank or a metacharacter.
+/// A character that ends a shell word: a bash blank or a metacharacter
+/// (cameronsjo/cadence-hooks#1389).
 fn is_word_break(c: char) -> bool {
-    c.is_whitespace() || ";&|()<>".contains(c)
+    is_bash_blank(c) || ";&|()<>".contains(c)
 }
 
 /// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
@@ -18303,6 +18311,47 @@ mod tests {
         ] {
             assert_eq!(tokenize(command), want, "{command:?}");
         }
+    }
+
+    #[test]
+    fn comment_starts_only_after_bash_blanks() {
+        // cameronsjo/cadence-hooks#1389: `#` opens a comment only at the
+        // start of a word, and only space, tab and newline (plus `;&|`) end
+        // a word. bash and zsh read `x<C>#` as one word for each of these and
+        // run the command after the `;`.
+        for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
+            let command = format!("echo x{c}#; cat .env");
+            let segments = split_segments(&command);
+            assert!(
+                segments.iter().any(|s| s.trim() == "cat .env"),
+                "{command:?} hid the command after the `;`: {segments:?}"
+            );
+            let lines = format!("echo x{c}# a\ncat .env");
+            assert!(
+                split_segments(&lines)
+                    .iter()
+                    .any(|s| s.trim() == "cat .env"),
+                "{lines:?}"
+            );
+        }
+        // Controls: a real comment still runs to the end of its line, `;`
+        // included, after every bash blank.
+        for command in [
+            "echo x #; cat .env",
+            "echo x\t#; cat .env",
+            "echo x;#; cat .env",
+        ] {
+            let segments = split_segments(command);
+            assert!(
+                !segments.iter().any(|s| s.contains("cat .env")),
+                "{command:?}: {segments:?}"
+            );
+        }
+        assert!(
+            split_segments("echo x # c\ncat .env")
+                .iter()
+                .any(|s| s.trim() == "cat .env")
+        );
     }
 
     #[test]
