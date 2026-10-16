@@ -1244,6 +1244,42 @@ mod tests {
     }
 
     #[test]
+    fn quoted_force_push_word_after_a_rewritten_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review C1 and C2: the span after a
+        // `<<` in `((`, or after a `#` glued to a paren, is kept with its
+        // quotes rewritten. Removing them read `$'--force'` as `$--force`;
+        // turning them into `;` split the word. bash and zsh run each push
+        // as `--force`; the guard now also reads the span as written.
+        for command in [
+            "(( x <<= 1 )); git push $'--force' origin main",
+            "if (( n << 1 > 4 )); then :; fi; git push $'--force' origin main",
+            "(( x = 1 << 2 )); git push --force origin $'main'",
+            "(( 1 # x ))\ngit push $'--force' origin main",
+            "a=(x)#; git push $'--force' origin main",
+            "(true)#; git push '--force' origin main",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Control: a quoted non-force push behind the same spans.
+        for command in [
+            "(( x <<= 1 )); git push origin $'feature'",
+            "a=(x)#; git status '--short'",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn force_push_after_a_heredoc_with_a_non_blank_in_its_delimiter_blocked() {
         // cameronsjo/cadence-hooks#1391: bash and zsh keep NBSP and VT in
         // the delimiter, so the body ends at `E<C>x` and the push runs.

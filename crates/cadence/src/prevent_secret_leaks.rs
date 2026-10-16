@@ -7019,6 +7019,38 @@ mod tests {
     }
 
     #[test]
+    fn quoted_secret_read_after_a_rewritten_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review C1 and C2: the span after a
+        // `<<` in `((`, or after a `#` glued to a paren, is kept with its
+        // quotes rewritten. Removing them read `$'.env'` as `$.env`; turning
+        // them into `;` split `'.env'` off `cat`. bash and zsh read `.env`
+        // in each; the guard now also reads the span as written.
+        assert_bash(
+            &[
+                "(( x = 1 << 2 )); cat $'.env'",
+                "(( x = 1 << 2 )); cat $'\\x2eenv'",
+                "(( x = 1 << 2 )); cat .e$'nv'",
+                "(( x = 1 << 2 )); cat $\".env\"",
+                "(( 1 # x ))\ncat $'.env'",
+                "(( x = 1 << 2 )); f=$'.env'; cat \"$f\"",
+                "a=(x)#; cat '.env'",
+                "a=(x)#; cat $'.env'",
+                "(true)#; cat \".env\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a rewritten span keeps its quoted words",
+        );
+        assert_bash(
+            &[
+                "(( x = 1 << 2 )); cat $'notes.txt'",
+                "a=(x)#; cat 'notes.txt'",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "controls",
+        );
+    }
+
+    #[test]
     fn globs_sharing_letters_with_no_stem_allowed() {
         // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
         // `jks` and `cadence` shares `den` with `credentials`, but only a

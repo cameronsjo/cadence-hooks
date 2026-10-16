@@ -8394,9 +8394,31 @@ fn split_segments_impl(
     // [`strip_heredoc_bodies`] gave two scanners that could disagree, and the
     // permissive one discards commands bash executes. [`comment_spans`] is the
     // single implementation both callers share.
-    let command = strip_comments(&command);
-    let command = command.as_str();
+    //
+    // A span one shell reads as a comment and another as code is rewritten
+    // so its quotes cannot hide later lines, and that rewrite changes what a
+    // quoted word means. Its original lines are split as well, one line at a
+    // time, and their segments appended, so a guard sees both readings
+    // ([`strip_comments_with_readings`]). Each block's last segment gets a
+    // `"\n"` operator, as if the lines followed one another.
+    let (stripped, originals) = strip_comments_with_readings(&command);
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
+    for text in std::iter::once(stripped.as_str()).chain(originals) {
+        if let Some(last) = segments.last_mut() {
+            last.1.get_or_insert("\n");
+        }
+        split_text_into(text, join_redirect_amp, &mut segments);
+    }
+    segments
+}
+
+/// The [`split_segments_impl`] loop over text whose heredoc bodies and
+/// comments are already gone. Appends to `segments`.
+fn split_text_into(
+    command: &str,
+    join_redirect_amp: bool,
+    segments: &mut Vec<(String, Option<&'static str>)>,
+) {
     let mut current = String::new();
     let mut quote: Option<Quote> = None;
     let all: Vec<char> = command.chars().collect();
@@ -8525,7 +8547,7 @@ fn split_segments_impl(
                 } else {
                     "&"
                 };
-                flush_segment_with_op(&mut segments, &mut current, op);
+                flush_segment_with_op(segments, &mut current, op);
             }
             '|' => {
                 // `>|` is the force-clobber redirect operator, not a pipe —
@@ -8540,11 +8562,11 @@ fn split_segments_impl(
                     } else {
                         "|"
                     };
-                    flush_segment_with_op(&mut segments, &mut current, op);
+                    flush_segment_with_op(segments, &mut current, op);
                 }
             }
-            ';' => flush_segment_with_op(&mut segments, &mut current, ";"),
-            '\n' => flush_segment_with_op(&mut segments, &mut current, "\n"),
+            ';' => flush_segment_with_op(segments, &mut current, ";"),
+            '\n' => flush_segment_with_op(segments, &mut current, "\n"),
             _ => current.push(c),
         }
     }
@@ -8552,7 +8574,6 @@ fn split_segments_impl(
     if !trimmed.is_empty() {
         segments.push((trimmed.to_string(), None));
     }
-    segments
 }
 
 /// Whether `text` ends, with no space before the next character, in an
@@ -9000,12 +9021,38 @@ fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
 /// `'`, `"` and `\` removed and `` ` `` turned into `;`. Removing the quotes
 /// rather than splitting on them keeps a quoted word whole: `cat '.env'`
 /// reads as `cat .env`, not as `cat` and a separate `.env`.
+///
+/// Neither rewrite keeps every reading: removing quotes turns `$'.env'` into
+/// `$.env`, and turning them into `;` splits `cat '.env'` in two. Callers that
+/// hand segments to guards use [`strip_comments_with_readings`], which also
+/// returns the spans' original text.
 pub fn strip_comments(command: &str) -> String {
+    strip_comments_with_readings(command).0
+}
+
+/// [`strip_comments`], plus the original text of every
+/// [`CommentKind::Ambiguous`] and [`CommentKind::Unresolved`] span, cut at
+/// each newline.
+///
+/// The rewrite in the first value stops a quote in the span from hiding the
+/// lines after it, but it changes what a quoted word means
+/// (cameronsjo/cadence-hooks#1393 review). The original lines keep each word
+/// as the shell reads it — `$'--force'`, `'.env'`, `$'\x2eenv'` — and, read
+/// one line at a time, no quote in them reaches the next line. A guard that
+/// reads both sees every reading, and blocks if any one of them trips a rule.
+///
+/// Spans never overlap and an `Unresolved` span ends the scan, so the lines
+/// add at most the input's length again. A line with no `'`, `"`, `` ` `` or
+/// `\` is left out: the rewrite changes only those characters, so it already
+/// reads that line as written.
+pub(crate) fn strip_comments_with_readings(command: &str) -> (String, Vec<&str>) {
+    let rewritten = |line: &&str| line.contains(['\'', '"', '`', '\\']);
     let spans = comment_spans_with_kind(command);
     if spans.is_empty() {
-        return command.to_string();
+        return (command.to_string(), Vec::new());
     }
     let mut out = String::with_capacity(command.len());
+    let mut originals = Vec::new();
     let mut cursor = 0;
     for (start, end, kind) in spans {
         out.push_str(&command[cursor..start]);
@@ -9016,6 +9063,7 @@ pub fn strip_comments(command: &str) -> String {
                     '\'' | '"' | '`' | '\\' => ';',
                     other => other,
                 }));
+                originals.extend(command[start..end].split('\n').filter(rewritten));
             }
             CommentKind::Unresolved => {
                 out.extend(command[start..end].chars().filter_map(|c| match c {
@@ -9023,12 +9071,13 @@ pub fn strip_comments(command: &str) -> String {
                     '`' => Some(';'),
                     other => Some(other),
                 }));
+                originals.extend(command[start..end].split('\n').filter(rewritten));
             }
         }
         cursor = end;
     }
     out.push_str(&command[cursor..]);
-    out
+    (out, originals)
 }
 
 /// Push `current` (trimmed) onto `segments` paired with the operator that
@@ -18839,6 +18888,63 @@ mod tests {
         assert_eq!(
             strip_heredoc_bodies("echo $(( 1 << 2 ))\ncat .env\n2"),
             "echo $(( 1 << 2 ))\ncat .env\n2"
+        );
+    }
+
+    #[test]
+    fn rewritten_span_is_also_read_as_written() {
+        // cameronsjo/cadence-hooks#1393 review C1 and C2: removing the quotes
+        // in an `Unresolved` span read `$'.env'` as `$.env`, and turning them
+        // into `;` in an `Ambiguous` span split `cat '.env'` in two. bash and
+        // zsh read each word below whole, so the segments must hold it whole.
+        for (command, want) in [
+            ("(( x = 1 << 2 )); cat $'.env'", "cat $'.env'"),
+            (
+                "(( x <<= 1 )); git push $'--force' origin main",
+                "git push $'--force' origin main",
+            ),
+            ("(( 1 # x ))\ncat $\".env\"", "cat $\".env\""),
+            ("(( x = 1 << 2 )); f=$'.env'; cat \"$f\"", "cat \"$f\""),
+            ("a=(x)#; cat '.env'", "cat '.env'"),
+            (
+                "a=(x)#; git push $'--force' origin main",
+                "git push $'--force' origin main",
+            ),
+            ("a=(x)#; echo k > '.env'", "echo k > '.env'"),
+        ] {
+            let segments = split_segments(command);
+            assert!(
+                segments.iter().any(|s| s == want),
+                "{command:?}: {segments:?}"
+            );
+        }
+        // The original text is cut at each newline, so its quotes still hide
+        // nothing: the line after a stray `'` is its own segment.
+        let (stripped, originals) = strip_comments_with_readings("((echo a #'\ncat .env\n#'\n) )");
+        assert_eq!(stripped, "((echo a #\ncat .env\n#\n) )");
+        assert_eq!(originals, ["#'", "#'"]);
+        assert!(split_segments("((echo a #'\ncat .env\n#'\n) )").contains(&"cat .env".to_string()));
+        // An ambiguous span stops at its newline.
+        let (_, originals) = strip_comments_with_readings("(true)#'x\ncat '.env'");
+        assert_eq!(originals, ["#'x"]);
+        // A span line with nothing the rewrite changes is not repeated, and a
+        // real comment adds nothing.
+        for command in ["(( y = 1 << 2 ))", "(( 1 # x ))\nls", "git status # it's"] {
+            assert!(
+                strip_comments_with_readings(command).1.is_empty(),
+                "{command:?}"
+            );
+        }
+        // The appended block follows a `"\n"`, and the last segment still
+        // carries no operator.
+        assert_eq!(
+            split_segments_with_ops("(( x = 1 << 2 )); cat $'.env'"),
+            [
+                ("(( x = 1 << 2 ))".to_string(), Some(";")),
+                ("cat $.env".to_string(), Some("\n")),
+                ("<< 2 ))".to_string(), Some(";")),
+                ("cat $'.env'".to_string(), None),
+            ]
         );
     }
 

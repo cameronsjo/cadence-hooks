@@ -1090,6 +1090,26 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1393 review C2: a `#` glued to a paren
+    /// starts a span bash runs as code. Its quotes were turned into `;`, so
+    /// `> '.env'` became `> ;.env;` and the target was lost. The guard now
+    /// also reads the span as written.
+    #[test]
+    fn quoted_redirect_target_after_a_rewritten_span_is_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("a=(x)#; echo A=1 > '.env'", Block),
+            ("a=(x)#; echo A=1 > \".env\"", Block),
+            ("a=(x)#; echo A=1 > $'.env'", Block),
+            ("(true)#; echo A=1 >> '.env'", Block),
+            ("(( x = 1 << 2 )); echo A=1 > $'.env'", Block),
+            ("a=(x)#; echo A=1 > 'out.txt'", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command:?}");
+        }
+    }
+
     #[test]
     fn service_account_json_blocked() {
         assert!(is_blocked(
