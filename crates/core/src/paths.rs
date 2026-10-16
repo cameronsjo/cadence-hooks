@@ -126,8 +126,8 @@ pub const MAX_UNTRUSTED_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MiB
 ///
 /// [`read_capped`] collapses all four to `None`, which is the right answer for
 /// a config load that fails open either way. A caller that must *say something*
-/// about an oversized file — the body-budget guard — needs them apart, so the
-/// detailed readers hand back this instead.
+/// about an oversized file needs them apart, so the detailed readers hand back
+/// this instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CappedReadError {
     /// Missing, permission-denied, or any other IO error. The file is not

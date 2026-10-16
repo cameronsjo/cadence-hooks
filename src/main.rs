@@ -441,16 +441,6 @@ enum GuardrailsCommands {
     GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
     WarnPrIssueLink,
-    /// Measure gh pr/issue bodies against a per-surface word budget
-    GuardBodyBudget {
-        /// Measure this file instead of running as a hook: prints one JSON
-        /// line and exits without reading stdin.
-        #[arg(long, value_name = "FILE")]
-        measure: Option<String>,
-        /// Surface to measure against: `pr`, `comment`, or `issue`.
-        #[arg(long, value_name = "SURFACE", default_value = "pr")]
-        surface: String,
-    },
     /// Nudge when `gh issue create` targets a repo other than the canonical issue tracker
     WarnIssueTracker,
     /// Nudge on repo create/publicize when name or description telegraphs sensitive content
@@ -728,14 +718,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::EnforcementStatus => "enforcement-status",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
-            // `--measure` is a CLI action, not a hook: it reads a file the
-            // operator named, prints one JSON line, and never touches stdin.
-            // Resolving it to the hook name would let CADENCE_DISABLE exit
-            // before anything was printed, breaking the one-line contract.
-            GuardrailsCommands::GuardBodyBudget {
-                measure: Some(_), ..
-            } => return None,
-            GuardrailsCommands::GuardBodyBudget { .. } => "guard-body-budget",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
             GuardrailsCommands::WarnInlineBody => "warn-inline-body",
@@ -1087,10 +1069,6 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::InjectGhWriteContext => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::inject_gh_write_context::InjectGhWriteContext),
-                pre,
-            ),
-            GuardrailsCommands::GuardBodyBudget { measure: None, .. } => CheckPlan::new(
-                Box::new(cadence_hooks_guardrails::guard_body_budget::GuardBodyBudget),
                 pre,
             ),
             GuardrailsCommands::EnforceWorktree => CheckPlan::new(
@@ -1804,13 +1782,6 @@ fn main() {
             _ => unreachable!("check subcommands dispatch through check_plan"),
         },
         Commands::Guardrails(cmd) => match cmd {
-            GuardrailsCommands::GuardBodyBudget { measure, surface } => match measure {
-                Some(file) => process::exit(
-                    cadence_hooks_guardrails::guard_body_budget::run_measure(&file, &surface)
-                        .into(),
-                ),
-                None => unreachable!("guard-body-budget dispatches through check_plan"),
-            },
             GuardrailsCommands::DismissMainBranchWarn { for_, reason } => {
                 finish_dismiss(
                     cadence_hooks_guardrails::dismiss_main_branch_warn::perform_dismiss(

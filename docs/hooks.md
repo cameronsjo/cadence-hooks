@@ -149,7 +149,6 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-subagent-worktree` | PreToolUse (Agent, Task) | Warn when dispatching a subagent from main while a sibling worktree exists | self-disable |
 | `enforcement-status` | SessionStart | Report when `CADENCE_BYPASS=1` or `CADENCE_DISABLE` names a protected guard | run |
 | `guard-read-model` | PreToolUse (Read, Grep, read-shaped `mcp__*` tools) | Block a read when the resolved session model is denied by policy (opt-in via `CADENCE_READ_MODEL_GUARD_MODELS`) | run |
-| `guard-body-budget` | PreToolUse (Bash) | Measure `gh pr`/`gh issue` bodies against a per-surface word budget (nudge mode by default; `CADENCE_BODY_BUDGET_MODE=block` blocks) | run |
 | `warn-going-public` | PreToolUse (Bash) | Nudge on repo create/publicize when the name or description telegraphs sensitive content | run |
 | `warn-inline-body` | PreToolUse (Bash) | Nudge when `gh pr create`/`gh issue create` posts an inline `--body` longer than 200 characters instead of `--body-file` | run |
 

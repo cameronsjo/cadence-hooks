@@ -8,13 +8,13 @@
 //!
 //! A `PreToolUse` check on Bash. For every `gh pr create` / `gh issue create`
 //! segment of the command, it takes the **last** body flag (the one `gh` uses,
-//! via [`guard_body_budget::last_body_flag`]) and nudges when that flag is an
+//! via [`body_args::last_body_flag`]) and nudges when that flag is an
 //! inline `--body`/`-b` whose value is longer than [`INLINE_BODY_MAX_CHARS`].
 //! A short inline body (`--body "Fixes the typo."`) stays silent — the
 //! threshold is what keeps one-liners cheap. A `--body-file`/`-F` body is the
 //! sanctioned path and is never judged.
 //!
-//! Segment detection reuses the body-budget guard's pre-processing
+//! Segment detection uses the shared pre-processing
 //! ([`executable_tokens`] + [`skip_transparent_prefixes`]), so `command gh`,
 //! `env X=1 gh`, `if …; then gh …` and chained commands resolve the same way
 //! there as here.
@@ -26,9 +26,9 @@
 //!
 //! Warn only — exit 0 with the message as additional context. No I/O at all.
 //!
-//! [`guard_body_budget::last_body_flag`]: crate::guard_body_budget::last_body_flag
+//! [`body_args::last_body_flag`]: crate::body_args::last_body_flag
 
-use crate::guard_body_budget::{BodyArg, last_body_flag};
+use crate::body_args::{BodyArg, last_body_flag};
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, skip_transparent_prefixes,
     strip_group_wrappers,
