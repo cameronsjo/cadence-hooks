@@ -1,10 +1,10 @@
 //! Extraction of `gh`/`git` body and title flag values from a command segment.
 //!
 //! Shared by every guard that has to look at what a posting command is about to
-//! send: the redaction scanner reads bodies for blocklist hits, the body-budget
-//! guard measures their size. Both need the same answer to "what text does this
-//! command post?", and a second copy of this flag table would drift from the
-//! first the moment `gh` grows a spelling.
+//! send: the redaction scanner reads bodies for blocklist hits, and the
+//! guardrails nudges read the body flag and the review body. All need the same
+//! answer to "what text does this command post?", and a second copy of this
+//! flag table would drift from the first the moment `gh` grows a spelling.
 //!
 //! Callers must gate the segment themselves — a file-body flag is *read* here,
 //! so handing this a non-posting segment performs I/O the guard has no business

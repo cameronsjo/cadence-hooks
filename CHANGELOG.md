@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **`guardrails guard-body-budget` is gone.** The word-budget check on `gh pr`/`gh issue` bodies is deleted from the binary with its clap subcommand (including the `--measure`/`--surface` CLI action), registry row, tests, fixtures and docs, along with the `CADENCE_BODY_BUDGET_*` variables and the `body_budget` config section (cameronsjo/cadence-hooks#1373). It never blocked by default, it restated the writing-pull-requests caps with its own number, and its last three open issues (#1379, #1385, #1396) were false nudges. The body-flag helpers `warn-inline-body` and `warn-unreviewed-ready-flip` share moved to `crates/guardrails/src/body_args.rs` unchanged. The `cadence-guardrails` plugin stops calling it in cameronsjo/cadence#1727. A plugin pin older than that still calls the removed subcommand; the wrapper sees "unrecognized subcommand" and exits 0, printing its once-a-day "binary is stale … Guards are NOT running" notice until the plugin updates. That notice is wrong in this case (only the retired check is inert). A leftover `body_budget` section in a repo's config is ignored, and a stale `CADENCE_DISABLE=guard-body-budget` names no hook and disables nothing.
+
 ### Security
 
 - **A non-blank character before `#` no longer hides the next command from the guards.** The shared segmenter's comment check treated every Unicode whitespace character as a word boundary, so in `echo x<C>#; cmd` it read `#` as a comment and dropped `cmd`. bash and zsh read `x<C>#` as one word for U+3000, NBSP, VT, FF and CR, and run `cmd`. `git-safety` and `prevent-secret-leaks` allowed a force push or a key read written that way. The comment check in `comment_spans` and the command-line scanner now end a word only at space, tab, newline and `;&|`, the set the tokenizer has used since #1055. The `case` keyword scan and the directory-variable resolver use bash's blanks too. (cameronsjo/cadence-hooks#1389)
