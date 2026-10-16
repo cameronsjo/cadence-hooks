@@ -546,7 +546,8 @@ fn proc_paths(text: &str) -> impl Iterator<Item = &str> {
 /// Only the LAST component of a `/proc/…` path is judged
 /// ([`component_may_be_environ`]), so `/proc/$$/fd` and `/proc/$PPID/status`
 /// stay silent while `/proc/$$/environ`, `/proc/*/environ` and
-/// `/proc/self/env*` nudge. Read on the raw text AND the quote-removed words,
+/// `/proc/self/env*` nudge. Read on the text AND the quote-removed words, both
+/// with data heredoc bodies removed (a shell-fed body stays),
 /// so `envi''ron` and `"/proc/self/environ"` are seen. A relative word ending
 /// in `environ` counts once the command `cd`s or `pushd`s under `/proc`
 /// (`cd /proc/self && cat environ`); `grep environ /proc/self/status` does not. Anything reaching procfs without
@@ -556,7 +557,11 @@ fn command_reads_process_environ(command: &str) -> bool {
     if !command.contains("/pro") && !command.contains(['\'', '"', '\\']) {
         return false;
     }
-    let words = tokenize(&without_data_heredocs(command));
+    // A data heredoc's body is text a program receives, not a path the shell
+    // opens: a script writing prose that names `/proc/1/environ` reads
+    // nothing (#1380). Both passes read the command with those bodies gone.
+    let text = without_data_heredocs(command);
+    let words = tokenize(&text);
     let last_is_environ = |path: &str| {
         // `/proc/<pid>/environ` at the least: `/proc/*` lists pids, not an
         // environment.
@@ -567,7 +572,7 @@ fn command_reads_process_environ(command: &str) -> bool {
                 .next()
                 .is_some_and(component_may_be_environ)
     };
-    if proc_paths(command).any(last_is_environ)
+    if proc_paths(&text).any(last_is_environ)
         || words
             .iter()
             .flat_map(|w| proc_paths(w))
@@ -9252,6 +9257,8 @@ mod tests {
                 "cd /proc/self && cat environ",
                 "cat /proc/*/environ",
                 "x=$(cat /proc/self/environ | tr a b)",
+                "bash <<'EOF'\ncat /proc/self/environ\nEOF",
+                "cat /proc/self/environ <<'EOF'\nunrelated\nEOF",
             ],
             cadence_hooks_core::Outcome::Nudge,
             "a procfs environment is the env dump by another name",
@@ -9269,6 +9276,9 @@ mod tests {
                 "ls /proc/*",
                 "grep environ /proc/self/status",
                 "grep -r environ src/",
+                // #1380: the path is prose in a script's data heredoc.
+                "python3 -I - <<'EOF'\nopen('spec.md','w').write('reads /proc/1/environ')\nEOF",
+                "cat > notes.md <<EOF\nthreat: /proc/self/environ holds tokens\nEOF",
             ],
             cadence_hooks_core::Outcome::Allow,
             "procfs files other than environ are not an environment",

@@ -1098,7 +1098,14 @@ fn place_deletions(
         let mut operands = Vec::new();
         deletion_operands(raw, 0, &mut operands);
         for operand in operands {
-            if looks_absolute(&operand) || operand.starts_with('~') {
+            // An operand that opens with an expansion holds whatever the
+            // variable holds, usually an absolute path (a `mktemp -d` dir),
+            // so the `cd` says nothing about where it lands. Leave it to the
+            // cwd reading rather than blocking every vault ancestor (#1382).
+            if looks_absolute(&operand)
+                || operand.starts_with('~')
+                || operand.starts_with(['$', '`'])
+            {
                 continue;
             }
             let joined = format!("{dir}/{operand}");
@@ -1909,6 +1916,10 @@ mod tests {
             ("cd $HOME && rm -rf proj/build", Allow),
             ("echo $(cd sub; rm -f x)", Allow),
             ("echo $(cd /tmp && rm x.md)", Allow),
+            // #1382: a variable operand's value does not depend on the `cd`.
+            ("cd / && rm -rf \"$t\"", Allow),
+            ("cd ~ && rm -rf \"${t}/x\"", Allow),
+            ("cd /home && rm -rf $t", Allow),
             (
                 "cd \"$OBSIDIAN_VAULT\" && git status && cd $HOME/proj && rm -rf build",
                 Allow,

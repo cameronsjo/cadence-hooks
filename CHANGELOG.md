@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`redact-external-content` no longer scans an Edit or Write to a file outside every git work tree.** Such a file cannot leave the machine without a post (`--body-file`, `-F`, a gist operand, `gh api` fields), and those are scanned when they post. A tool's local config in the home directory was blocked for holding the tool's own name. This replaces the narrower temp-root code-file exemption (#1013): prose drafts under `/tmp` are now exempt too, for the same reason. A file inside a work tree, and an MCP write with no path, keep the scan. (cameronsjo/cadence#1708)
+
+### Fixed
+
+- **The process-environment nudge ignores a path that is only text in a data heredoc.** A `python3 - <<'EOF'` script writing prose that named `/proc/1/environ` drew the nudge though nothing read the file. Both of the matcher's passes now read the command with data heredoc bodies removed; a body fed to a shell keeps the nudge. (cameronsjo/cadence-hooks#1380)
+- **`trash-guard` no longer blocks `cd <vault ancestor> && rm -rf "$t"`.** The guard joined an unresolved variable operand onto the `cd` directory, so any `cd` to `/`, `~` or another vault ancestor turned a `mktemp -d` cleanup into a block, while the same `rm` without the `cd` passed. A variable's value does not depend on the directory, so an operand that opens with an expansion is no longer placed by the `cd`. (cameronsjo/cadence-hooks#1382)
+
 ### Security
 
 - **A non-blank character before `#` no longer hides the next command from the guards.** The shared segmenter's comment check treated every Unicode whitespace character as a word boundary, so in `echo x<C>#; cmd` it read `#` as a comment and dropped `cmd`. bash and zsh read `x<C>#` as one word for U+3000, NBSP, VT, FF and CR, and run `cmd`. `git-safety` and `prevent-secret-leaks` allowed a force push or a key read written that way. The comment check in `comment_spans` and the command-line scanner now end a word only at space, tab, newline and `;&|`, the set the tokenizer has used since #1055. The `case` keyword scan and the directory-variable resolver use bash's blanks too. (cameronsjo/cadence-hooks#1389)
