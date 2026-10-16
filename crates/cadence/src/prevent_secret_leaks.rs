@@ -9279,6 +9279,12 @@ mod tests {
                 // #1380: the path is prose in a script's data heredoc.
                 "python3 -I - <<'EOF'\nopen('spec.md','w').write('reads /proc/1/environ')\nEOF",
                 "cat > notes.md <<EOF\nthreat: /proc/self/environ holds tokens\nEOF",
+                // Known miss, accepted under cadence-hooks#1373: the guard
+                // cannot tell an interpreter heredoc that reads the path from
+                // one that only names it, and this is a nudge. Same for a
+                // body fed to `ssh`, which is not a shell reader here.
+                "python3 - <<'EOF'\nprint(open('/proc/1/environ').read())\nEOF",
+                "ssh host <<EOF\ncat /proc/1/environ\nEOF",
             ],
             cadence_hooks_core::Outcome::Allow,
             "procfs files other than environ are not an environment",

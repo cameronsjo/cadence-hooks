@@ -26,11 +26,11 @@ use std::path::{Component, Path, PathBuf};
 
 /// Is `file_path` a local file outside every git work tree?
 ///
-/// Such a file cannot leave the machine by itself: the only way out is a
-/// post (`--body-file`, `-F`, a gist operand, `gh api` fields), and those are
-/// scanned when they post. So an Edit or Write to it skips the identity pass
-/// (cameronsjo/cadence#1708; this generalizes the temp-root code exemption of
-/// #1013, #716, #603).
+/// Such a file cannot leave the machine by itself. For code and config the
+/// caller skips the identity pass on it (cameronsjo/cadence#1708; this
+/// generalizes the temp-root code exemption of #1013, #716, #603); a prose
+/// draft keeps the pass ([`is_prose_draft`]), because some posts read a file
+/// in ways the post-time scan does not follow.
 ///
 /// All of these must hold, or the write is scanned as before:
 ///
@@ -40,8 +40,10 @@ use std::path::{Component, Path, PathBuf};
 ///   ancestor that exists, is a git work tree: a file in a checkout can be
 ///   committed, and the post-time scan does not see commits' file content.
 ///
-/// The residual: a later `cp`, `git add` of a copy, or `chezmoi add` can bring
-/// the text into a repo with no Edit call. The leak-ledger scan is that net.
+/// The residuals: a later `cp`, `git add` of a copy, or `chezmoi add` can bring
+/// the text into a repo with no Edit call, and a bare-repo dotfiles setup
+/// (`--git-dir=~/.dotfiles --work-tree=~`) has no `.git` above the files it
+/// tracks. The leak-ledger scan is the net for both.
 pub(super) fn is_outside_git_tree(file_path: Option<&str>) -> bool {
     let Some(raw) = file_path.filter(|p| !p.is_empty()) else {
         return false;
@@ -53,6 +55,32 @@ pub(super) fn is_outside_git_tree(file_path: Option<&str>) -> bool {
     let resolved = resolve_deepest(path);
     let dir = resolved.parent().and_then(Path::to_str).unwrap_or("/");
     cadence_hooks_core::paths::find_git_root(dir).is_none()
+}
+
+/// Is `file_path` a prose draft: Markdown, plain text, or a bare name with no
+/// extension (`/tmp/body`)? Such a file is what a post reads through `--body
+/// "$(cat F)"`, `git commit -m "$(cat F)"` or `cat F | … --body-file -`, none
+/// of which the post-time scan follows, so it keeps the Write scan outside a
+/// work tree too. A dotfile (`.zshrc`) is config, not a draft. No path reads
+/// as a draft.
+pub(super) fn is_prose_draft(file_path: Option<&str>) -> bool {
+    let Some(name) = file_path
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+    else {
+        return true;
+    };
+    if name.starts_with('.') {
+        return false;
+    }
+    match name.rsplit_once('.') {
+        None => true,
+        Some((_, ext)) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "md" | "markdown" | "mdx" | "txt" | "text" | "rst" | "adoc" | "org" | "eml"
+        ),
+    }
 }
 
 /// Canonicalize the deepest existing ancestor of `path` and re-append the rest.

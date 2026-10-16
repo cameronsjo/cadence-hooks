@@ -1425,7 +1425,7 @@ fn reconcile_findings(
 /// The Write/Edit surface: the identity pass **only**, over introduced
 /// fragments.
 ///
-/// Two deliberate narrowings, both load-bearing:
+/// Three deliberate narrowings, all load-bearing:
 ///
 /// 1. **Shaped tiers never run here.** A local file edit has no audience, and
 ///    `resolve_dest_tier`'s public(3) fallback would nudge on every `/Users/…`
@@ -1438,6 +1438,10 @@ fn reconcile_findings(
 ///    edit — including the edit that removes the term. (Its `None`-on-unreadable
 ///    default is also self-locking, and its own docs warn blocking guards off
 ///    it.)
+/// 3. **Code and config outside every git work tree are not scanned.** They
+///    cannot leave the machine without a post, and the post is scanned
+///    (cameronsjo/cadence#1708). A prose draft is still scanned there
+///    ([`context::is_prose_draft`]).
 ///
 /// The residual this accepts: content entering a file by some other route (a
 /// `sed -i`, an external editor) is not seen here. Named in ADR-0041; the
@@ -1463,12 +1467,13 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         return CheckResult::allow();
     }
 
-    // A file outside every git work tree never leaves the machine on its own:
-    // the only way out is a post (`--body-file`, `-F`, a gist operand), and
-    // that post-time scan is the real gate (cameronsjo/cadence#1708). A file
-    // inside a work tree keeps the scan, because the post-time scan never
-    // sees a commit's file content. An MCP write has no path and is scanned.
-    if context::is_outside_git_tree(file_path) {
+    // Code or config outside every git work tree never leaves the machine on
+    // its own (cameronsjo/cadence#1708). A prose draft keeps the scan even
+    // there: it is the file a later `--body "$(cat F)"` or `cat F |` posts,
+    // and the post-time scan does not read through either. A file inside a
+    // work tree keeps the scan, because the post-time scan never sees a
+    // commit's file content. An MCP write has no path and is scanned.
+    if context::is_outside_git_tree(file_path) && !context::is_prose_draft(file_path) {
         return CheckResult::allow();
     }
 
@@ -2755,10 +2760,16 @@ mod cli_scan_tests {
 mod tests {
     use super::*;
 
-    /// A path inside this crate's checkout, which is a git work tree, so the
-    /// outside-git exemption never applies to it.
+    /// A path inside a scratch git work tree, so the outside-git exemption
+    /// never applies to it, wherever the source itself sits.
     fn in_repo(name: &str) -> String {
-        format!("{}/{name}", env!("CARGO_MANIFEST_DIR"))
+        static REPO: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let root = REPO.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir").keep();
+            std::fs::create_dir(dir.join(".git")).expect("mkdir .git");
+            dir
+        });
+        format!("{}/{name}", root.display())
     }
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
@@ -5661,14 +5672,22 @@ destinations = ["me/*", "them/exact"]
     #[cfg(unix)]
     #[test]
     fn writes_outside_a_work_tree_skip_the_identity_scan() {
-        // (tool, path, expected). Outside every work tree the text cannot
-        // leave without a post, and the post is scanned (cadence#1708); inside
-        // one it can be committed, so the scan stays.
+        // (tool, path, expected). Outside every work tree, code and config
+        // cannot leave without a post (cadence#1708); a prose draft and
+        // anything inside a work tree keep the scan.
         let table: Vec<(&str, String, Outcome)> = vec![
             ("Write", "/tmp/scratch/poll.sh".into(), Outcome::Allow),
-            ("Write", "/tmp/notes.md".into(), Outcome::Allow),
-            ("Write", "/tmp/draft".into(), Outcome::Allow),
-            ("Edit", "/tmp/notes.md".into(), Outcome::Allow),
+            ("Write", "/home/u/.zshrc".into(), Outcome::Allow),
+            (
+                "Edit",
+                "/home/u/.config/tool/config.toml".into(),
+                Outcome::Allow,
+            ),
+            // A prose draft is what `--body "$(cat F)"` posts unscanned.
+            ("Write", "/tmp/notes.md".into(), Outcome::Block),
+            ("Write", "/tmp/draft".into(), Outcome::Block),
+            ("Edit", "/tmp/notes.md".into(), Outcome::Block),
+            ("Write", "/tmp/body.txt".into(), Outcome::Block),
             ("Write", in_repo("poll.sh"), Outcome::Block),
             ("Write", in_repo("notes.md"), Outcome::Block),
             ("Edit", in_repo("notes.md"), Outcome::Block),
