@@ -925,7 +925,6 @@ fn merge_scan(out: &mut Scan, extra: Scan) {
     out.unresolved_commit = out.unresolved_commit.take().or(extra.unresolved_commit);
     out.unreadable = out.unreadable.take().or(extra.unreadable);
     out.union_cd_dirs.extend(extra.union_cd_dirs);
-    out.cd_names_cwd |= extra.cd_names_cwd;
     for target in extra.read_commits {
         if !out.read_commits.contains(&target) {
             out.read_commits.push(target);
@@ -1142,9 +1141,11 @@ struct Scan {
     /// directory. A primary among them blocks even when the session cwd names
     /// the same checkout (cameronsjo/cadence-hooks#1383).
     read_commits: Vec<CommitTarget>,
-    /// Does a `cd` (or `env -C`) the union walk read land in the session cwd?
-    /// Then the cwd is a directory the command names, not only a stand-in.
-    cd_names_cwd: bool,
+    /// The first top-level segment (by [`union_segments`] index) holding a
+    /// `cd` (or `env -C`) the union walk read as landing in the session cwd.
+    /// A commit after it is in a directory the command names, not only a
+    /// stand-in. Local to one walk: [`merge_scan`] keeps the first walk's.
+    cd_names_cwd: Option<usize>,
 }
 
 /// The words a segment's command runs with: every unquoted redirection (and a
@@ -2821,15 +2822,32 @@ fn union_scan_bodies(command: &str, bodies: &[String], cwd: &str, env: CdEnv<'_>
     let child = CdEnv { home: None, ..env };
     let mut dirs = vec![cwd.to_string()];
     let mut unresolved = None;
-    let mut named_cwd = false;
-    union_dirs(command, 0, env, &mut dirs, &mut unresolved, &mut named_cwd);
+    // A body's segments are counted apart from the command's, so neither
+    // orders a `cd` against a body's commit: every cwd target there is a guess.
+    let mut named_cwd = None;
+    union_dirs(
+        command,
+        0,
+        None,
+        env,
+        &mut dirs,
+        &mut unresolved,
+        &mut named_cwd,
+    );
     for body in bodies {
-        union_dirs(body, 1, child, &mut dirs, &mut unresolved, &mut named_cwd);
+        union_dirs(
+            body,
+            1,
+            None,
+            child,
+            &mut dirs,
+            &mut unresolved,
+            &mut named_cwd,
+        );
     }
     let mut out = Scan {
         unresolved_cd: unresolved,
         union_cd_dirs: dirs[1..].to_vec(),
-        cd_names_cwd: named_cwd,
         ..Scan::default()
     };
     for body in bodies {
@@ -2838,7 +2856,7 @@ fn union_scan_bodies(command: &str, bodies: &[String], cwd: &str, env: CdEnv<'_>
             exports: Some(&exports),
             ..child
         };
-        union_commits(body, 1, &dirs, (None, None), env, &mut out);
+        union_commits(body, 1, None, &dirs, (None, None), env, &mut out);
     }
     out
 }
@@ -3003,15 +3021,23 @@ fn union_scan(command: &str, cwd: &str, env: CdEnv<'_>) -> Scan {
     };
     let mut dirs = vec![cwd.to_string()];
     let mut unresolved = None;
-    let mut named_cwd = false;
-    union_dirs(command, 0, env, &mut dirs, &mut unresolved, &mut named_cwd);
+    let mut named_cwd = None;
+    union_dirs(
+        command,
+        0,
+        None,
+        env,
+        &mut dirs,
+        &mut unresolved,
+        &mut named_cwd,
+    );
     let mut out = Scan {
         unresolved_cd: unresolved,
         union_cd_dirs: dirs[1..].to_vec(),
         cd_names_cwd: named_cwd,
         ..Scan::default()
     };
-    union_commits(command, 0, &dirs, (None, None), env, &mut out);
+    union_commits(command, 0, None, &dirs, (None, None), env, &mut out);
     if let Some(what) = &exports.unreadable
         && !out.commits.is_empty()
         && out.unreadable.is_none()
@@ -3139,17 +3165,20 @@ fn union_segments(script: &str) -> Vec<(String, Vec<MarkedToken>)> {
 fn union_dirs(
     script: &str,
     depth: usize,
+    top: Option<usize>,
     env: CdEnv<'_>,
     dirs: &mut Vec<String>,
     unresolved: &mut Option<String>,
-    named_cwd: &mut bool,
+    named_cwd: &mut Option<usize>,
 ) {
     let note = |what: String, unresolved: &mut Option<String>| {
         if unresolved.is_none() {
             *unresolved = Some(what);
         }
     };
-    for (segment, marked) in union_segments(script) {
+    for (index, (segment, marked)) in union_segments(script).into_iter().enumerate() {
+        // The top-level segment this one runs within.
+        let at = top.unwrap_or(index);
         let words = command_tokens(&marked);
         let (argv, chdirs) = peel_with_chdirs(strip_compound_heads(&words));
         if let Some(head) = argv.first()
@@ -3170,7 +3199,9 @@ fn union_dirs(
                 match landed {
                     Some(dir) if dirs.len() < MAX_UNION_DIRS => {
                         let dir = normalize_target(&dir);
-                        *named_cwd |= dir == dirs[0];
+                        if dir == dirs[0] && named_cwd.is_none() {
+                            *named_cwd = Some(at);
+                        }
                         if !dirs.contains(&dir) {
                             dirs.push(dir);
                         }
@@ -3226,7 +3257,9 @@ fn union_dirs(
                         match target {
                             Some(dir) if dirs.len() < MAX_UNION_DIRS => {
                                 let dir = normalize_target(&dir);
-                                *named_cwd |= dir == dirs[0];
+                                if dir == dirs[0] && named_cwd.is_none() {
+                                    *named_cwd = Some(at);
+                                }
                                 if !dirs.contains(&dir) {
                                     dirs.push(dir);
                                 }
@@ -3253,6 +3286,7 @@ fn union_dirs(
                 union_dirs(
                     &child,
                     depth + 1,
+                    Some(at),
                     CdEnv { home: None, ..env },
                     dirs,
                     unresolved,
@@ -3277,6 +3311,7 @@ fn union_dirs(
 fn union_commits(
     script: &str,
     depth: usize,
+    top: Option<usize>,
     dirs: &[String],
     inherited_env: (Option<&str>, Option<&str>),
     env: CdEnv<'_>,
@@ -3286,7 +3321,9 @@ fn union_commits(
     // level reads its commits in order; a nested script runs wherever its
     // parent is.
     let mut moved = depth > 0;
-    for (segment, marked) in union_segments(script) {
+    for (index, (segment, marked)) in union_segments(script).into_iter().enumerate() {
+        // The top-level segment this one runs within.
+        let at = top.unwrap_or(index);
         let words = command_tokens(&marked);
         let heads = strip_compound_heads(&words);
         let argv = peel_command_prefixes(heads);
@@ -3297,7 +3334,9 @@ fn union_commits(
             Vec::new()
         };
         let ahead_of_any_move = !moved;
-        if cd_word(&marked).is_some() || may_change_directory(argv) || !children.is_empty() {
+        // Read as [`union_dirs`] reads a `cd`: any word of the segment, so one
+        // behind `then`, `do` or a function's `{` counts too.
+        if names_a_directory_change(&marked) || may_change_directory(argv) {
             moved = true;
         }
         let (work_tree, git_dir) = git_env_overrides(heads);
@@ -3311,6 +3350,7 @@ fn union_commits(
                     union_commits(
                         &child,
                         depth + 1,
+                        Some(at),
                         dirs,
                         (work_tree, git_dir),
                         child_env,
@@ -3322,6 +3362,7 @@ fn union_commits(
                 union_commits(
                     &child,
                     depth + 1,
+                    Some(at),
                     dirs,
                     (work_tree, git_dir),
                     child_env,
@@ -3380,8 +3421,10 @@ fn union_commits(
                 let anywhere =
                     commit_targets_of(argv, PROBE_DIR, work_tree, git_dir, env, &mut scratch);
                 for target in &targets {
-                    let read =
-                        i > 0 || ahead_of_any_move || out.cd_names_cwd || anywhere.contains(target);
+                    let read = i > 0
+                        || ahead_of_any_move
+                        || out.cd_names_cwd.is_some_and(|k| k < at)
+                        || anywhere.contains(target);
                     if read && !out.read_commits.contains(target) {
                         out.read_commits.push(target.clone());
                     }
@@ -3432,28 +3475,27 @@ fn union_commits(
 /// depends on the directory it runs from.
 const PROBE_DIR: &str = "/nonexistent/enforce-worktree-probe";
 
-/// Could this command change the shell's directory other than through `cd`
-/// (which [`cd_word`] reads)? It names a directory-stack builtin, or runs
-/// code the walk reads as a child script (`eval`, `source`). An unknown
-/// command is assumed not to: reading its later commit as placed only
-/// keeps the block the guard gave before (cameronsjo/cadence-hooks#1383).
+/// Does any word of a segment name `cd`, `pushd` or `popd`, read as
+/// [`union_dirs`] reads one?
+fn names_a_directory_change(marked: &[MarkedToken]) -> bool {
+    marked.iter().any(|t| {
+        let word = unescape_word(&t.text);
+        let word = word.rsplit(['(', '`']).next().unwrap_or("");
+        matches!(word, "cd" | "pushd" | "popd")
+    })
+}
+
+/// Could this command change the shell's directory other than through a
+/// `cd` word? It runs code in the current shell (`eval`, `source`, a trap
+/// action), or redefines what `cd` does. A command substitution or child
+/// shell cannot move this shell, and an unknown command is assumed not to:
+/// reading its later commit as placed only keeps the block the guard gave
+/// before (cameronsjo/cadence-hooks#1383).
 fn may_change_directory(argv: &[String]) -> bool {
     argv.first().is_some_and(|verb| {
         matches!(
             command_word(verb).as_ref(),
-            "pushd"
-                | "popd"
-                | "eval"
-                | "source"
-                | "."
-                | "exec"
-                | "builtin"
-                | "command"
-                | "alias"
-                | "enable"
-                | "set"
-                | "shopt"
-                | "trap"
+            "eval" | "source" | "." | "exec" | "builtin" | "command" | "alias" | "enable" | "trap"
         )
     })
 }
@@ -4518,10 +4560,11 @@ fn inchain_dismissed_without_cd(
     union_dirs(
         command,
         0,
+        None,
         union_env(command, env),
         &mut dirs,
         &mut unresolved,
-        &mut false,
+        &mut None,
     );
     if dirs.len() != 1 || unresolved.is_some() {
         return dismissed;
@@ -4539,7 +4582,7 @@ fn inchain_dismissed_without_cd(
         } else if !active.is_empty() {
             // Only a commit under an active dismissal is recorded.
             let mut found = Scan::default();
-            union_commits(segment, 0, &dirs, (None, None), env, &mut found);
+            union_commits(segment, 0, None, &dirs, (None, None), env, &mut found);
             for target in found.commits {
                 if let Some(reason) = active.get(&target) {
                     dismissed.entry(target).or_insert_with(|| reason.clone());
@@ -5412,6 +5455,24 @@ mod tests {
     /// `Scratch::new(&scratch_root(), "tag")` at each of them.
     fn scratch(tag: &str) -> Scratch {
         Scratch::new(&scratch_root(), tag)
+    }
+
+    /// The verdict for a commit the walk reads as landing in `dir` itself (a
+    /// scratch root, not a fixture repo): it follows the checkout the test
+    /// tree sits in, a primary on CI and often a linked worktree locally.
+    fn enclosing_verdict(dir: &Path) -> Outcome {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap();
+        let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && is_primary_checkout(&root) {
+            Outcome::Block
+        } else {
+            Outcome::Nudge
+        }
     }
 
     /// The two walks that cross the leading prefix region MUST stop at the same
@@ -10378,12 +10439,13 @@ mod tests {
         // The guard can only guess where these land, so it warns instead
         // (cadence-hooks#1383).
         {
+            // `cd {w}/..` lands in the scratch root itself.
             let cmd = format!("cd {w}/..; OLDPWD={p}; cd {w}; OLDPWD={p}; cd -; git commit -m x");
             let mut input = make_bash(&cmd);
             input.cwd = Some(w.clone());
             assert_eq!(
                 run_enforce(&input, &cfg(false, false)).outcome,
-                Outcome::Nudge,
+                enclosing_verdict(scratch.path()),
                 "{cmd:?}"
             );
         }
@@ -10603,7 +10665,6 @@ mod tests {
         let p = primary.to_string_lossy().into_owned();
         for cmd in [
             "cd \"$X\" && git commit -m x".to_string(),
-            format!("cd {p}/.. ; OLDPWD={p}; cd -; git commit -m x"),
             "cd - && git commit -m x".to_string(),
             "eval \"$CMD\"; git commit -m x".to_string(),
         ] {
@@ -10616,6 +10677,12 @@ mod tests {
                 "{cmd}"
             );
         }
+        // `cd {p}/..` lands in the scratch root itself.
+        let cmd = format!("cd {p}/.. ; OLDPWD={p}; cd -; git commit -m x");
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, enclosing_verdict(scratch.path()), "{cmd}");
         // Without a commit there is nothing to block.
         let mut input = make_bash("cd \"$X\" && ls");
         input.cwd = Some(wt.to_string_lossy().into_owned());
@@ -10851,6 +10918,15 @@ mod tests {
         for cmd in [
             format!("(cd {w} && git commit -m x)"),
             format!("cd {w} && git commit -m x || echo failed"),
+            // A cd back to the session cwd after the commit names it too late.
+            format!("cd {w} && git commit -m x || true; cd {p}"),
+            format!("(cd {w} && git commit -m x); cd {p}"),
+            format!("cd {w} && git commit -m x &>/tmp/log; cd {p} && git status"),
+            // A cd behind a compound keyword or in a function is a move.
+            format!("if [ -d {w} ]; then cd {w}; fi; git commit -m x"),
+            format!("for f in a; do cd {w}; git commit -m x; done"),
+            format!("while false; do cd {w}; done; git commit -m x"),
+            format!("f(){{ cd {w}; }}; f; git commit -m x"),
         ] {
             assert_eq!(run(&cmd, &p), Outcome::Nudge, "{cmd}");
         }
@@ -10876,6 +10952,9 @@ mod tests {
             format!("git commit -m x && git push 2>&1 | tail -2 || echo failed; cd {w}"),
             format!("git commit -m x; (cd {w} && ls)"),
             format!("git commit -m \"$(cat msg)\"; cd {w}"),
+            // Neither `set` nor a command substitution moves the shell.
+            format!("set -euo pipefail; git commit -m x || true; cd {w}"),
+            format!("msg=$(git log -1 --format=%s); git commit -m x; cd {w}"),
         ] {
             assert_eq!(run(&cmd, &p), Outcome::Block, "from P: {cmd}");
         }
@@ -11349,7 +11428,6 @@ mod tests {
         for cmd in [
             "cd link/../sub2 && git commit -m x".to_string(),
             "cd link/../sub2; git commit -m x".to_string(),
-            "cd link/../.git && cd .. && git commit -m x".to_string(),
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(w.clone());
@@ -11359,6 +11437,13 @@ mod tests {
                 "{cmd:?}"
             );
         }
+        // Lexically `cd ..` from `wt/.git` lands in the scratch root itself.
+        let mut input = make_bash("cd link/../.git && cd .. && git commit -m x");
+        input.cwd = Some(w.clone());
+        assert_eq!(
+            run_enforce(&input, &cfg(false, false)).outcome,
+            enclosing_verdict(scratch.path())
+        );
         let allowed = [
             (
                 w.clone(),
@@ -11844,7 +11929,6 @@ mod tests {
             "git -C link/../sub commit -m x".to_string(),
             "GIT_DIR=link/../.git git commit -m x".to_string(),
             "git --git-dir=link/../.git commit -m x".to_string(),
-            "trap 'cd repo && git commit -m x' EXIT; cd ..".to_string(),
             "git -C \"$V\" commit -m x".to_string(),
             "git --work-tree=\"$V\" commit -m x".to_string(),
             "GIT_DIR=$V git commit -m x".to_string(),
@@ -11852,6 +11936,11 @@ mod tests {
         for cmd in &guessed_from_w {
             assert_eq!(outcome_from(&wt, cmd), Outcome::Nudge, "{cmd:?}");
         }
+        // `cd ..` from the worktree lands in the scratch root itself.
+        assert_eq!(
+            outcome_from(&wt, "trap 'cd repo && git commit -m x' EXIT; cd .."),
+            enclosing_verdict(scratch.path())
+        );
         for cmd in ["git -C \"$V\" commit -m x", "env -i git commit -m x"] {
             assert_eq!(outcome_from(&primary, cmd), Outcome::Block, "{cmd:?}");
         }
