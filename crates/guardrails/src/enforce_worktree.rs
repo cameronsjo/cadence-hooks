@@ -925,6 +925,12 @@ fn merge_scan(out: &mut Scan, extra: Scan) {
     out.unresolved_commit = out.unresolved_commit.take().or(extra.unresolved_commit);
     out.unreadable = out.unreadable.take().or(extra.unreadable);
     out.union_cd_dirs.extend(extra.union_cd_dirs);
+    out.cd_names_cwd |= extra.cd_names_cwd;
+    for target in extra.read_commits {
+        if !out.read_commits.contains(&target) {
+            out.read_commits.push(target);
+        }
+    }
 }
 
 /// Test stand-in for the on-disk probes: every path exists, so the parser
@@ -1130,6 +1136,15 @@ struct Scan {
     /// cannot be read. The session cwd is judged too ([`scan_prepared`]).
     unreadable: Option<String>,
     union_cd_dirs: Vec<String>,
+    /// Commit targets the union walk read rather than guessed: a commit whose
+    /// target does not depend on the directory the shell is in (`git -C
+    /// <abs>`), or one at the top level ahead of anything that may change
+    /// directory. A primary among them blocks even when the session cwd names
+    /// the same checkout (cameronsjo/cadence-hooks#1383).
+    read_commits: Vec<CommitTarget>,
+    /// Does a `cd` (or `env -C`) the union walk read land in the session cwd?
+    /// Then the cwd is a directory the command names, not only a stand-in.
+    cd_names_cwd: bool,
 }
 
 /// The words a segment's command runs with: every unquoted redirection (and a
@@ -2806,13 +2821,15 @@ fn union_scan_bodies(command: &str, bodies: &[String], cwd: &str, env: CdEnv<'_>
     let child = CdEnv { home: None, ..env };
     let mut dirs = vec![cwd.to_string()];
     let mut unresolved = None;
-    union_dirs(command, 0, env, &mut dirs, &mut unresolved);
+    let mut named_cwd = false;
+    union_dirs(command, 0, env, &mut dirs, &mut unresolved, &mut named_cwd);
     for body in bodies {
-        union_dirs(body, 1, child, &mut dirs, &mut unresolved);
+        union_dirs(body, 1, child, &mut dirs, &mut unresolved, &mut named_cwd);
     }
     let mut out = Scan {
         unresolved_cd: unresolved,
         union_cd_dirs: dirs[1..].to_vec(),
+        cd_names_cwd: named_cwd,
         ..Scan::default()
     };
     for body in bodies {
@@ -2986,10 +3003,12 @@ fn union_scan(command: &str, cwd: &str, env: CdEnv<'_>) -> Scan {
     };
     let mut dirs = vec![cwd.to_string()];
     let mut unresolved = None;
-    union_dirs(command, 0, env, &mut dirs, &mut unresolved);
+    let mut named_cwd = false;
+    union_dirs(command, 0, env, &mut dirs, &mut unresolved, &mut named_cwd);
     let mut out = Scan {
         unresolved_cd: unresolved,
         union_cd_dirs: dirs[1..].to_vec(),
+        cd_names_cwd: named_cwd,
         ..Scan::default()
     };
     union_commits(command, 0, &dirs, (None, None), env, &mut out);
@@ -3123,6 +3142,7 @@ fn union_dirs(
     env: CdEnv<'_>,
     dirs: &mut Vec<String>,
     unresolved: &mut Option<String>,
+    named_cwd: &mut bool,
 ) {
     let note = |what: String, unresolved: &mut Option<String>| {
         if unresolved.is_none() {
@@ -3150,6 +3170,7 @@ fn union_dirs(
                 match landed {
                     Some(dir) if dirs.len() < MAX_UNION_DIRS => {
                         let dir = normalize_target(&dir);
+                        *named_cwd |= dir == dirs[0];
                         if !dirs.contains(&dir) {
                             dirs.push(dir);
                         }
@@ -3205,6 +3226,7 @@ fn union_dirs(
                         match target {
                             Some(dir) if dirs.len() < MAX_UNION_DIRS => {
                                 let dir = normalize_target(&dir);
+                                *named_cwd |= dir == dirs[0];
                                 if !dirs.contains(&dir) {
                                     dirs.push(dir);
                                 }
@@ -3234,6 +3256,7 @@ fn union_dirs(
                     CdEnv { home: None, ..env },
                     dirs,
                     unresolved,
+                    named_cwd,
                 );
             }
         }
@@ -3259,17 +3282,31 @@ fn union_commits(
     env: CdEnv<'_>,
     out: &mut Scan,
 ) {
+    // Has a segment that may change directory been passed yet? Only the top
+    // level reads its commits in order; a nested script runs wherever its
+    // parent is.
+    let mut moved = depth > 0;
     for (segment, marked) in union_segments(script) {
         let words = command_tokens(&marked);
         let heads = strip_compound_heads(&words);
         let argv = peel_command_prefixes(heads);
+        // Read once: each reading is charged to [`UnionWork`].
+        let children = if depth < MAX_WRAPPER_DEPTH {
+            union_children(argv, &segment)
+        } else {
+            Vec::new()
+        };
+        let ahead_of_any_move = !moved;
+        if cd_word(&marked).is_some() || may_change_directory(argv) || !children.is_empty() {
+            moved = true;
+        }
         let (work_tree, git_dir) = git_env_overrides(heads);
         let work_tree = work_tree.or(inherited_env.0);
         let git_dir = git_dir.or(inherited_env.1);
         if depth < MAX_WRAPPER_DEPTH {
             let deferred = installs_trap_action(&words);
             let child_env = CdEnv { home: None, ..env };
-            for child in union_children(argv, &segment) {
+            for child in children {
                 if !deferred {
                     union_commits(
                         &child,
@@ -3330,11 +3367,26 @@ fn union_commits(
             out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
         let mut found = false;
-        for dir in dirs {
+        for (i, dir) in dirs.iter().enumerate() {
             detect_mutations(argv, &segment, dir, &mut out.mutations);
             let targets =
                 commit_targets_of(argv, dir, work_tree, git_dir, env, &mut out.unreadable);
             found |= !targets.is_empty();
+            if !targets.is_empty() {
+                // Only the session cwd standing in after a possible move is a
+                // guess: a directory a `cd` names, the cwd ahead of any move,
+                // or a target the directory does not decide is read.
+                let mut scratch = None;
+                let anywhere =
+                    commit_targets_of(argv, PROBE_DIR, work_tree, git_dir, env, &mut scratch);
+                for target in &targets {
+                    let read =
+                        i > 0 || ahead_of_any_move || out.cd_names_cwd || anywhere.contains(target);
+                    if read && !out.read_commits.contains(target) {
+                        out.read_commits.push(target.clone());
+                    }
+                }
+            }
             out.commits.extend(targets);
             // An exported `GIT_DIR`/`GIT_WORK_TREE` reaches every commit that
             // does not set its own (cadence-hooks#1113 item 4).
@@ -3374,6 +3426,36 @@ fn union_commits(
             out.commits.extend(dirs.iter().map(|d| normalize_target(d)));
         }
     }
+}
+
+/// A directory no command runs in, for asking whether a commit's target
+/// depends on the directory it runs from.
+const PROBE_DIR: &str = "/nonexistent/enforce-worktree-probe";
+
+/// Could this command change the shell's directory other than through `cd`
+/// (which [`cd_word`] reads)? It names a directory-stack builtin, or runs
+/// code the walk reads as a child script (`eval`, `source`). An unknown
+/// command is assumed not to: reading its later commit as placed only
+/// keeps the block the guard gave before (cameronsjo/cadence-hooks#1383).
+fn may_change_directory(argv: &[String]) -> bool {
+    argv.first().is_some_and(|verb| {
+        matches!(
+            command_word(verb).as_ref(),
+            "pushd"
+                | "popd"
+                | "eval"
+                | "source"
+                | "."
+                | "exec"
+                | "builtin"
+                | "command"
+                | "alias"
+                | "enable"
+                | "set"
+                | "shopt"
+                | "trap"
+        )
+    })
 }
 
 /// Could `script`, nested past the depth the union walk reads, run a git
@@ -4439,6 +4521,7 @@ fn inchain_dismissed_without_cd(
         union_env(command, env),
         &mut dirs,
         &mut unresolved,
+        &mut false,
     );
     if dirs.len() != 1 || unresolved.is_some() {
         return dismissed;
@@ -4675,10 +4758,11 @@ fn as_guess(result: CheckResult) -> CheckResult {
 /// Do `a` and `b` name the same directory, ignoring a trailing slash?
 fn same_dir(a: &str, b: &str) -> bool {
     let trim = |p: &str| {
+        let p = lexical_normalize(p);
         if p.len() > 1 {
             p.trim_end_matches('/').to_string()
         } else {
-            p.to_string()
+            p
         }
     };
     trim(a) == trim(b)
@@ -5129,6 +5213,8 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 unresolved_commit,
                 unreadable,
                 union_cd_dirs,
+                read_commits,
+                cd_names_cwd: _,
             } = scan_prepared(command, cwd, env, plain.as_ref());
             // A leading `&&`-chained `dismiss-enforce-worktree` for the SAME
             // repo licenses a commit ordered after it (#323): the dismiss will
@@ -5199,6 +5285,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     // reads as a primary blocks whatever the guess says.
                     let guessed = plain.is_none()
                         && same_dir(&target, cwd)
+                        && !read_commits.contains(&target)
                         && (!union_cd_dirs.is_empty() || unresolved_cd.is_some());
                     if !guessed {
                         return result;
@@ -5211,7 +5298,11 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 }
             }
             if let Some(result) = guess {
-                return as_guess(result);
+                // A bypass another target used is still recorded.
+                return match bypassed.and_then(|b| b.bypass) {
+                    Some(bypass) => as_guess(result).with_bypass(bypass),
+                    None => as_guess(result),
+                };
             }
             // A non-plain command whose `cd` the guard cannot read may commit
             // anywhere. From a primary the session cwd is already a target and
@@ -10772,6 +10863,19 @@ mod tests {
             "(cd sub && git commit -m x)".to_string(),
             "cd sub && git commit -m x || echo failed".to_string(),
             "cd sub || exit 1; git commit -am x".to_string(),
+            // A target the directory does not decide, or a cd that names the
+            // primary, is read even when it names the session cwd.
+            format!("(cd {w} && cargo build); git -C {p} commit -m x"),
+            format!("(cd {w} && cargo build); git -C {p}/ commit -m x"),
+            format!("(cd {w} && cargo build); git --git-dir={p}/.git --work-tree={p} commit -m x"),
+            format!("(cd {w} && cargo build); cd {p} && git commit -m x"),
+            format!("git -C {p} commit -m y; for f in a; do cd {w}; git commit -m x; done"),
+            // A commit ahead of every cd runs in the session cwd.
+            format!("git commit -m x || true; cd {w}"),
+            format!("git add -A && git commit -m x && (cd {w} && git log -1)"),
+            format!("git commit -m x && git push 2>&1 | tail -2 || echo failed; cd {w}"),
+            format!("git commit -m x; (cd {w} && ls)"),
+            format!("git commit -m \"$(cat msg)\"; cd {w}"),
         ] {
             assert_eq!(run(&cmd, &p), Outcome::Block, "from P: {cmd}");
         }
