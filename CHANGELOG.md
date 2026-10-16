@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **`redact-external-content` no longer scans an Edit or Write to code or config outside every git work tree.** A tool's local config in the home directory was blocked for holding the tool's own name, though such a file cannot leave the machine without a post. This widens the temp-root code-file exemption (#1013) from temp roots to anywhere outside a work tree. Prose drafts (Markdown, plain text, a bare name like `/tmp/body`) keep the scan everywhere, because `--body "$(cat F)"` and `cat F | … --body-file -` post them without the post-time scan reading the file. A file inside a work tree, and an MCP write with no path, keep the scan too. (cameronsjo/cadence#1708)
+- **`redact-external-content` no longer scans an Edit or Write to code or config outside every git work tree.** A tool's local config in the home directory was blocked for holding the tool's own name, though such a file cannot leave the machine without a post. This widens the temp-root code-file exemption (#1013) from temp roots to anywhere outside a work tree. Only a known code or config extension, or a dotfile like `.zshrc`, is exempt: anything else (Markdown, plain text, `.msg`, a hidden `.pr-body.md`, a bare name like `/tmp/body`) reads as a prose draft and keeps the scan everywhere, because `--body "$(cat F)"` and `cat F | … --body-file -` post them without the post-time scan reading the file. A file inside a work tree, and an MCP write with no path, keep the scan too. (cameronsjo/cadence#1708)
 
 ### Fixed
 

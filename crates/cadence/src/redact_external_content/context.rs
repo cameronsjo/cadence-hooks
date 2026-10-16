@@ -57,12 +57,14 @@ pub(super) fn is_outside_git_tree(file_path: Option<&str>) -> bool {
     cadence_hooks_core::paths::find_git_root(dir).is_none()
 }
 
-/// Is `file_path` a prose draft: Markdown, plain text, or a bare name with no
-/// extension (`/tmp/body`)? Such a file is what a post reads through `--body
-/// "$(cat F)"`, `git commit -m "$(cat F)"` or `cat F | … --body-file -`, none
-/// of which the post-time scan follows, so it keeps the Write scan outside a
-/// work tree too. A dotfile (`.zshrc`) is config, not a draft. No path reads
-/// as a draft.
+/// Is `file_path` anything but code or config? Prose is what a post reads
+/// through `--body "$(cat F)"`, `git commit -m "$(cat F)"` or `cat F | …
+/// --body-file -`, none of which the post-time scan follows, so it keeps the
+/// Write scan outside a work tree too. Only a name this function knows as
+/// code or config is exempt: a dotfile with no other dot (`.zshrc`), or a
+/// code or config extension. Everything else, including `.md`, `.msg`, a bare
+/// `/tmp/body`, a hidden `.pr-body.md` and a `notes.md.bak`, reads as a draft,
+/// as does no path at all.
 pub(super) fn is_prose_draft(file_path: Option<&str>) -> bool {
     let Some(name) = file_path
         .map(Path::new)
@@ -71,17 +73,21 @@ pub(super) fn is_prose_draft(file_path: Option<&str>) -> bool {
     else {
         return true;
     };
-    if name.starts_with('.') {
-        return false;
-    }
-    match name.rsplit_once('.') {
-        None => true,
-        Some((_, ext)) => matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "md" | "markdown" | "mdx" | "txt" | "text" | "rst" | "adoc" | "org" | "eml"
-        ),
-    }
+    let stem = name.strip_prefix('.').unwrap_or(name);
+    let Some((_, ext)) = stem.rsplit_once('.') else {
+        // `.zshrc` is config; a bare `body` or `draft` is prose.
+        return !name.starts_with('.');
+    };
+    !CODE_OR_CONFIG_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
 }
+
+/// Extensions [`is_prose_draft`] reads as code or config.
+const CODE_OR_CONFIG_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "ps1", "py", "rb", "pl", "lua", "js", "mjs", "cjs", "ts", "mts",
+    "cts", "jsx", "tsx", "go", "rs", "c", "h", "cc", "cpp", "hpp", "java", "kt", "swift", "cs",
+    "php", "sql", "vim", "el", "nix", "toml", "yaml", "yml", "json", "jsonc", "json5", "ini",
+    "conf", "cfg", "plist", "xml", "env", "lock", "tmpl", "service", "desktop",
+];
 
 /// Canonicalize the deepest existing ancestor of `path` and re-append the rest.
 fn resolve_deepest(path: &Path) -> PathBuf {
