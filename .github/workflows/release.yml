@@ -163,7 +163,7 @@ jobs:
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ARCHIVE }}
@@ -351,7 +351,7 @@ jobs:
       # Replace each macOS artifact in place, so `release` downloads the
       # signed tarball under the name it already expects.
       - name: Upload signed macos-x86_64
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-x86_64
           path: signed/cadence-hooks-${{ github.ref_name }}-macos-x86_64.tar.gz
@@ -360,7 +360,7 @@ jobs:
           retention-days: 1
 
       - name: Upload signed macos-aarch64
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-aarch64
           path: signed/cadence-hooks-${{ github.ref_name }}-macos-aarch64.tar.gz
