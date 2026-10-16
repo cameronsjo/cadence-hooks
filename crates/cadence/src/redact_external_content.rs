@@ -1425,7 +1425,7 @@ fn reconcile_findings(
 /// The Write/Edit surface: the identity pass **only**, over introduced
 /// fragments.
 ///
-/// Two deliberate narrowings, both load-bearing:
+/// Three deliberate narrowings, all load-bearing:
 ///
 /// 1. **Shaped tiers never run here.** A local file edit has no audience, and
 ///    `resolve_dest_tier`'s public(3) fallback would nudge on every `/Users/…`
@@ -1438,6 +1438,10 @@ fn reconcile_findings(
 ///    edit — including the edit that removes the term. (Its `None`-on-unreadable
 ///    default is also self-locking, and its own docs warn blocking guards off
 ///    it.)
+/// 3. **Code and config outside every git work tree are not scanned.** They
+///    cannot leave the machine without a post, and the post is scanned
+///    (cameronsjo/cadence#1708). A prose draft is still scanned there
+///    ([`context::is_prose_draft`]).
 ///
 /// The residual this accepts: content entering a file by some other route (a
 /// `sed -i`, an external editor) is not seen here. Named in ADR-0041; the
@@ -1463,12 +1467,13 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         return CheckResult::allow();
     }
 
-    // A code or config file under a temp root never leaves the machine on its
-    // own — a helper script, a repro fixture, the session journal's scripts —
-    // so the identity pass is skipped for it (#1013, #716, #603). Prose
-    // (`.md`, `.txt`, no extension) keeps the scan even there, because a draft
-    // can be handed to `--body-file`; that post-time scan is the real gate.
-    if context::is_scratch_code_path(file_path) {
+    // Code or config outside every git work tree never leaves the machine on
+    // its own (cameronsjo/cadence#1708). A prose draft keeps the scan even
+    // there: it is the file a later `--body "$(cat F)"` or `cat F |` posts,
+    // and the post-time scan does not read through either. A file inside a
+    // work tree keeps the scan, because the post-time scan never sees a
+    // commit's file content. An MCP write has no path and is scanned.
+    if context::is_outside_git_tree(file_path) && !context::is_prose_draft(file_path) {
         return CheckResult::allow();
     }
 
@@ -2754,6 +2759,18 @@ mod cli_scan_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path inside a scratch git work tree, so the outside-git exemption
+    /// never applies to it, wherever the source itself sits.
+    fn in_repo(name: &str) -> String {
+        static REPO: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let root = REPO.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir").keep();
+            std::fs::create_dir(dir.join(".git")).expect("mkdir .git");
+            dir
+        });
+        format!("{}/{name}", root.display())
+    }
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
 
@@ -4724,7 +4741,7 @@ term = "acmecorp"
             let input = HookInput {
                 tool_name: Some("Write".into()),
                 tool_input: Some(cadence_hooks_core::ToolInput {
-                    file_path: Some("/tmp/notes.md".into()),
+                    file_path: Some(in_repo("notes.md")),
                     content: Some("we ship acmecorp tooling".into()),
                     ..Default::default()
                 }),
@@ -4742,7 +4759,7 @@ term = "acmecorp"
             let input = HookInput {
                 tool_name: Some("Edit".into()),
                 tool_input: Some(cadence_hooks_core::ToolInput {
-                    file_path: Some("/tmp/notes.md".into()),
+                    file_path: Some(in_repo("notes.md")),
                     old_string: Some("we ship acmecorp tooling".into()),
                     new_string: Some("we ship the tooling".into()),
                     ..Default::default()
@@ -4763,7 +4780,7 @@ term = "acmecorp"
             let input = HookInput {
                 tool_name: Some("Edit".into()),
                 tool_input: Some(cadence_hooks_core::ToolInput {
-                    file_path: Some("/tmp/notes.md".into()),
+                    file_path: Some(in_repo("notes.md")),
                     old_string: Some("the acmecorp policy".into()),
                     new_string: Some("the acmecorp policy, see also the acmecorp runbook".into()),
                     ..Default::default()
@@ -4786,7 +4803,7 @@ term = "acmecorp"
             let input = HookInput {
                 tool_name: Some("Edit".into()),
                 tool_input: Some(cadence_hooks_core::ToolInput {
-                    file_path: Some("/tmp/notes.md".into()),
+                    file_path: Some(in_repo("notes.md")),
                     old_string: Some("the acmecorp policy is old".into()),
                     new_string: Some("the acmecorp policy is current".into()),
                     ..Default::default()
@@ -4834,6 +4851,8 @@ term = "acmecorp"
         // The control that keeps the exemption honest: the identical content
         // written to any OTHER path still blocks. Without this, an exemption
         // that matched everything would look just as green.
+        // Inside a work tree, so the outside-git exemption cannot excuse it.
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let other = dir.path().join("notes.md");
         assert_eq!(
             RedactExternalContent
@@ -4853,7 +4872,7 @@ term = "acmecorp"
             let input = HookInput {
                 tool_name: Some("Write".into()),
                 tool_input: Some(cadence_hooks_core::ToolInput {
-                    file_path: Some("/tmp/notes.md".into()),
+                    file_path: Some(in_repo("notes.md")),
                     content: Some("see /Users/alice/proj and cadence:attune".into()),
                     ..Default::default()
                 }),
@@ -5308,7 +5327,7 @@ destinations = ["me/*", "them/exact"]
             let input = HookInput {
                 tool_name: Some("Write".into()),
                 tool_input: Some(cadence_hooks_core::ToolInput {
-                    file_path: Some("/home/u/repo/notes.md".into()),
+                    file_path: Some(in_repo("notes.md")),
                     content: Some("acmecorp".into()),
                     ..Default::default()
                 }),
@@ -5652,27 +5671,38 @@ destinations = ["me/*", "them/exact"]
     // Windows paths lose their backslashes to shell escaping, as in real bash.
     #[cfg(unix)]
     #[test]
-    fn scratch_code_writes_skip_the_identity_scan_but_prose_does_not() {
-        // (tool, path, expected). The `.md`/`.txt`/no-extension rows are the
-        // pins that keep prose drafts blocked even under a temp root.
-        let table: &[(&str, &str, Outcome)] = &[
-            ("Write", "/tmp/scratch/poll.sh", Outcome::Allow),
-            ("Write", "/tmp/repro.py", Outcome::Allow),
-            ("Write", "/tmp/fixture.json", Outcome::Allow),
-            ("Write", "/private/tmp/x.yml", Outcome::Allow),
-            ("Edit", "/tmp/scratch/poll.sh", Outcome::Allow),
-            ("Write", "/tmp/notes.md", Outcome::Block),
-            ("Write", "/tmp/notes.txt", Outcome::Block),
-            ("Write", "/tmp/draft", Outcome::Block),
-            ("Edit", "/tmp/notes.md", Outcome::Block),
-            // Not under a temp root, or escaping one.
-            ("Write", "/home/u/repo/poll.sh", Outcome::Block),
-            ("Write", "/tmp/../home/u/poll.sh", Outcome::Block),
+    fn writes_outside_a_work_tree_skip_the_identity_scan() {
+        // (tool, path, expected). Outside every work tree, code and config
+        // cannot leave without a post (cadence#1708); a prose draft and
+        // anything inside a work tree keep the scan.
+        let table: Vec<(&str, String, Outcome)> = vec![
+            ("Write", "/tmp/scratch/poll.sh".into(), Outcome::Allow),
+            ("Write", "/home/u/.zshrc".into(), Outcome::Allow),
+            (
+                "Edit",
+                "/home/u/.config/tool/config.toml".into(),
+                Outcome::Allow,
+            ),
+            // A prose draft is what `--body "$(cat F)"` posts unscanned.
+            ("Write", "/tmp/notes.md".into(), Outcome::Block),
+            ("Write", "/tmp/draft".into(), Outcome::Block),
+            ("Edit", "/tmp/notes.md".into(), Outcome::Block),
+            ("Write", "/tmp/body.txt".into(), Outcome::Block),
+            ("Write", "/tmp/.pr-body.md".into(), Outcome::Block),
+            ("Write", "/tmp/commit.msg".into(), Outcome::Block),
+            ("Write", "/tmp/notes.md.bak".into(), Outcome::Block),
+            ("Write", "/tmp/fix.patch".into(), Outcome::Block),
+            ("Write", in_repo("poll.sh"), Outcome::Block),
+            ("Write", in_repo("notes.md"), Outcome::Block),
+            ("Edit", in_repo("notes.md"), Outcome::Block),
+            // A traversal is never judged outside.
+            ("Write", "/tmp/../home/u/poll.sh".into(), Outcome::Block),
+            ("Write", "notes.md".into(), Outcome::Block),
         ];
         with_env(FIXTURE, &[], || {
-            for (tool, path, want) in table {
+            for (tool, path, want) in &table {
                 let ti = cadence_hooks_core::ToolInput {
-                    file_path: Some((*path).into()),
+                    file_path: Some(path.clone()),
                     content: (*tool == "Write").then(|| "we ship acmecorp tooling".into()),
                     new_string: (*tool == "Edit").then(|| "we ship acmecorp tooling".into()),
                     old_string: (*tool == "Edit").then(|| "we ship".into()),

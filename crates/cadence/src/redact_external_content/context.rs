@@ -2,8 +2,8 @@
 //!
 //! Three questions the guard asks that the term list cannot answer:
 //!
-//! - **Is this Write a local scratch script?** ([`is_scratch_code_path`],
-//!   cameronsjo/cadence-hooks#1013, #716, #603.)
+//! - **Can this Write leave the machine by itself?** ([`is_outside_git_tree`],
+//!   cameronsjo/cadence#1708, after cameronsjo/cadence-hooks#1013, #716, #603.)
 //! - **Which repo does this command post to?** ([`post_targets`] and the two
 //!   verdicts built on it: [`shared_destination`] for `destinations`-scoped
 //!   allows, #630, and [`all_owned`] for the harness-vocabulary downgrade,
@@ -24,76 +24,70 @@ use cadence_hooks_core::shell::{
 };
 use std::path::{Component, Path, PathBuf};
 
-/// Extensions of files that are code or config a person runs, not prose a
-/// person posts. `.txt`, `.md` and extensionless files are deliberately absent:
-/// they can be handed to `--body-file`, so they keep the block wherever they
-/// live.
-const SCRATCH_CODE_EXTENSIONS: &[&str] =
-    &["sh", "py", "rs", "js", "ts", "json", "toml", "yaml", "yml"];
-
-/// Temp roots a Write may be exempt under: `/tmp`, its macOS spelling,
-/// `$TMPDIR`, and `$CLAUDE_CODE_TMPDIR` (Claude Code's own temp override, which
-/// is where the session scratchpad lives when set). The session scratchpad
-/// under the default `/tmp/claude-<uid>/…` is already inside `/tmp`; no other
-/// scratchpad location under the Claude config dir is detectable, so none is
-/// guessed.
-fn temp_roots() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
-    for var in ["TMPDIR", "CLAUDE_CODE_TMPDIR"] {
-        if let Ok(v) = std::env::var(var)
-            && !v.is_empty()
-        {
-            roots.push(PathBuf::from(v));
-        }
-    }
-    roots
-}
-
-/// Is `file_path` a code/config file under a temp root, outside any git work
-/// tree? See [`is_scratch_code_path_in`].
-pub(super) fn is_scratch_code_path(file_path: Option<&str>) -> bool {
-    is_scratch_code_path_in(file_path, &temp_roots())
-}
-
-/// The pure form of [`is_scratch_code_path`], roots passed in.
+/// Is `file_path` a local file outside every git work tree?
+///
+/// Such a file cannot leave the machine by itself. For code and config the
+/// caller skips the identity pass on it (cameronsjo/cadence#1708; this
+/// generalizes the temp-root code exemption of #1013, #716, #603); a prose
+/// draft keeps the pass ([`is_prose_draft`]), because some posts read a file
+/// in ways the post-time scan does not follow.
 ///
 /// All of these must hold, or the write is scanned as before:
 ///
-/// - the extension is in [`SCRATCH_CODE_EXTENSIONS`] (case-insensitive);
-/// - the path is absolute and carries no `..` component;
-/// - it lies under a root, judged after resolving symlinks on the deepest
-///   ancestor that exists — a `/tmp/link -> ~/repo` path resolves out of the
-///   root and is scanned;
-/// - no ancestor of the path is a git work tree: a file in a checkout that
-///   happens to live under `/tmp` can be committed, and the post-time scan
-///   does not see commits' file content.
-pub(super) fn is_scratch_code_path_in(file_path: Option<&str>, roots: &[PathBuf]) -> bool {
+/// - the path is non-empty, absolute, and carries no `..` component (an MCP
+///   write has no path and is always scanned);
+/// - no ancestor of the path, judged after resolving symlinks on the deepest
+///   ancestor that exists, is a git work tree: a file in a checkout can be
+///   committed, and the post-time scan does not see commits' file content.
+///
+/// The residuals: a later `cp`, `git add` of a copy, or `chezmoi add` can bring
+/// the text into a repo with no Edit call, and a bare-repo dotfiles setup
+/// (`--git-dir=~/.dotfiles --work-tree=~`) has no `.git` above the files it
+/// tracks. The leak-ledger scan is the net for both.
+pub(super) fn is_outside_git_tree(file_path: Option<&str>) -> bool {
     let Some(raw) = file_path.filter(|p| !p.is_empty()) else {
         return false;
     };
     let path = Path::new(raw);
-    let ext_ok = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| SCRATCH_CODE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
-    if !ext_ok || !path.is_absolute() {
-        return false;
-    }
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return false;
     }
     let resolved = resolve_deepest(path);
-    let under_root = roots.iter().any(|root| {
-        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        // A root of `/` (a stray TMPDIR=/) would exempt everything.
-        root.parent().is_some() && resolved.starts_with(&root)
-    });
-    if !under_root {
-        return false;
-    }
     let dir = resolved.parent().and_then(Path::to_str).unwrap_or("/");
     cadence_hooks_core::paths::find_git_root(dir).is_none()
 }
+
+/// Is `file_path` anything but code or config? Prose is what a post reads
+/// through `--body "$(cat F)"`, `git commit -m "$(cat F)"` or `cat F | …
+/// --body-file -`, none of which the post-time scan follows, so it keeps the
+/// Write scan outside a work tree too. Only a name this function knows as
+/// code or config is exempt: a dotfile with no other dot (`.zshrc`), or a
+/// code or config extension. Everything else, including `.md`, `.msg`, a bare
+/// `/tmp/body`, a hidden `.pr-body.md` and a `notes.md.bak`, reads as a draft,
+/// as does no path at all.
+pub(super) fn is_prose_draft(file_path: Option<&str>) -> bool {
+    let Some(name) = file_path
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+    else {
+        return true;
+    };
+    let stem = name.strip_prefix('.').unwrap_or(name);
+    let Some((_, ext)) = stem.rsplit_once('.') else {
+        // `.zshrc` is config; a bare `body` or `draft` is prose.
+        return !name.starts_with('.');
+    };
+    !CODE_OR_CONFIG_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+/// Extensions [`is_prose_draft`] reads as code or config.
+const CODE_OR_CONFIG_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "ps1", "py", "rb", "pl", "lua", "js", "mjs", "cjs", "ts", "mts",
+    "cts", "jsx", "tsx", "go", "rs", "c", "h", "cc", "cpp", "hpp", "java", "kt", "swift", "cs",
+    "php", "sql", "vim", "el", "nix", "toml", "yaml", "yml", "json", "jsonc", "json5", "ini",
+    "conf", "cfg", "plist", "xml", "env", "lock", "tmpl", "service", "desktop",
+];
 
 /// Canonicalize the deepest existing ancestor of `path` and re-append the rest.
 fn resolve_deepest(path: &Path) -> PathBuf {
@@ -311,92 +305,40 @@ pub(super) fn all_owned_with(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    fn roots() -> Vec<PathBuf> {
-        vec![PathBuf::from("/tmp")]
-    }
-
-    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
-    // Windows paths lose their backslashes to shell escaping, as in real bash.
-    #[cfg(unix)]
     #[test]
-    fn scratch_exemption_table() {
-        // (path, exempt?) — code under a temp root is exempt; anything that
-        // could be posted, or escapes the root, is not.
-        let table: &[(&str, bool)] = &[
-            ("/tmp/x/poll.sh", true),
-            ("/tmp/repro.py", true),
-            ("/tmp/a/b/c.rs", true),
-            ("/tmp/a.js", true),
-            ("/tmp/a.ts", true),
-            ("/tmp/a.json", true),
-            ("/tmp/a.toml", true),
-            ("/tmp/a.yaml", true),
-            ("/tmp/a.yml", true),
-            ("/tmp/POLL.SH", true),
-            // Prose drafts stay blocked in a temp root: `--body-file` posts them.
-            ("/tmp/notes.md", false),
-            ("/tmp/notes.txt", false),
-            ("/tmp/notes", false),
-            ("/tmp/.env", false),
-            ("/tmp/notes.sh.md", false),
-            // Outside every root.
-            ("/home/u/repo/poll.sh", false),
-            ("/tmpfoo/poll.sh", false),
-            ("poll.sh", false),
-            ("./tmp/poll.sh", false),
-            // Traversal out of the root.
-            ("/tmp/../home/u/poll.sh", false),
-            ("/tmp/x/../../etc/poll.sh", false),
-            ("", false),
-        ];
-        for (path, want) in table {
-            assert_eq!(
-                is_scratch_code_path_in(Some(path), &roots()),
-                *want,
-                "path: {path:?}"
-            );
+    fn outside_git_tree_needs_a_plain_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("notes.md");
+        assert!(is_outside_git_tree(plain.to_str()));
+        assert!(is_outside_git_tree(dir.path().join("a/b/c.toml").to_str()));
+        for path in ["", "notes.md", "./tmp/notes.md"] {
+            assert!(!is_outside_git_tree(Some(path)), "path: {path:?}");
         }
-        assert!(!is_scratch_code_path_in(None, &roots()));
+        let traversal = format!("{}/../notes.md", dir.path().display());
+        assert!(!is_outside_git_tree(Some(&traversal)));
+        assert!(!is_outside_git_tree(None));
     }
 
     #[test]
-    #[cfg(unix)]
-    fn scratch_exemption_refuses_a_symlink_out_of_the_root() {
-        let outside = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-        let via_link = link.join("poll.sh");
-        let roots = vec![root.path().to_path_buf()];
-        assert!(!is_scratch_code_path_in(via_link.to_str(), &roots));
-        // Control: the same shape without the escape is exempt.
-        let inside = root.path().join("poll.sh");
-        assert!(is_scratch_code_path_in(inside.to_str(), &roots));
-    }
-
-    #[test]
-    fn scratch_exemption_refuses_a_git_work_tree_under_the_root() {
+    fn a_file_in_a_git_work_tree_is_not_outside() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        let roots = vec![root.path().to_path_buf()];
-        assert!(!is_scratch_code_path_in(
-            repo.join("scripts/poll.sh").to_str(),
-            &roots
-        ));
-        assert!(is_scratch_code_path_in(
-            root.path().join("poll.sh").to_str(),
-            &roots
-        ));
+        assert!(!is_outside_git_tree(repo.join("notes.md").to_str()));
+        assert!(!is_outside_git_tree(repo.join("deep/new/x.sh").to_str()));
+        assert!(is_outside_git_tree(root.path().join("notes.md").to_str()));
     }
 
     #[test]
-    fn a_root_of_slash_exempts_nothing() {
-        assert!(!is_scratch_code_path_in(
-            Some("/home/u/poll.sh"),
-            &[PathBuf::from("/")]
-        ));
+    #[cfg(unix)]
+    fn a_symlink_into_a_work_tree_is_not_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link = elsewhere.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        assert!(!is_outside_git_tree(link.join("notes.md").to_str()));
     }
 
     #[test]

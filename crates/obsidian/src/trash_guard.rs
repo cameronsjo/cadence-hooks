@@ -1025,8 +1025,25 @@ fn moved_deletion_operands(
     let text = with_known_dirs(command, vault, home);
     let mut budget = MAX_MOVED_BODY_BYTES;
     let mut judged = 0;
-    place_deletions(&text, cwd, 0, &mut budget, &mut judged, meta, &mut out);
+    let vault = collapse_dots(&normalize_path(vault));
+    let walk = Walk {
+        vault: &vault,
+        meta,
+    };
+    place_deletions(&text, cwd, 0, &mut budget, &mut judged, &walk, &mut out);
     out
+}
+
+/// What every level of [`place_deletions`] reads but never changes.
+struct Walk<'a> {
+    /// The vault, normalized the way placed directories are.
+    vault: &'a str,
+    meta: &'a dyn FileMeta,
+}
+
+/// Is `dir` the vault or a directory inside it, read lexically?
+fn inside(dir: &str, vault: &str) -> bool {
+    dir == vault || dir.starts_with(&format!("{vault}/"))
 }
 
 /// What [`moved_deletion_operands`] found.
@@ -1057,9 +1074,10 @@ fn place_deletions(
     depth: usize,
     budget: &mut usize,
     judged: &mut usize,
-    meta: &dyn FileMeta,
+    walk: &Walk,
     out: &mut Placed,
 ) {
+    let meta = walk.meta;
     // A `||` may run the deletion only because a `cd` failed (`cd /x ||
     // rm …`, `cd /x || true; rm …`): such a script lifts nothing.
     let lifts = base != UNRESOLVABLE_DIR && !script.contains("||");
@@ -1098,7 +1116,16 @@ fn place_deletions(
         let mut operands = Vec::new();
         deletion_operands(raw, 0, &mut operands);
         for operand in operands {
-            if looks_absolute(&operand) || operand.starts_with('~') {
+            // An operand that opens with an expansion holds whatever the
+            // variable holds, usually an absolute path (a `mktemp -d` dir),
+            // so a `cd` to a vault ancestor says nothing about where it
+            // lands: leave it to the cwd reading rather than blocking every
+            // ancestor (#1382). A `cd` into the vault itself still judges it
+            // there, as a note name it most likely is.
+            if looks_absolute(&operand)
+                || operand.starts_with('~')
+                || (operand.starts_with(['$', '`']) && !inside(&dir, walk.vault))
+            {
                 continue;
             }
             let joined = format!("{dir}/{operand}");
@@ -1127,7 +1154,7 @@ fn place_deletions(
             return;
         };
         *budget = left;
-        place_deletions(&body, body_base, depth + 1, budget, judged, meta, out);
+        place_deletions(&body, body_base, depth + 1, budget, judged, walk, out);
     }
 }
 
@@ -1909,6 +1936,18 @@ mod tests {
             ("cd $HOME && rm -rf proj/build", Allow),
             ("echo $(cd sub; rm -f x)", Allow),
             ("echo $(cd /tmp && rm x.md)", Allow),
+            // #1382: a variable operand's value does not depend on the `cd`.
+            ("cd / && rm -rf \"$t\"", Allow),
+            ("cd ~ && rm -rf \"${t}/x\"", Allow),
+            ("cd /home && rm -rf $t", Allow),
+            // ...but a `cd` into the vault judges it there, as a note name.
+            ("cd \"$OBSIDIAN_VAULT\" && rm \"$f\"", Block),
+            ("cd \"$OBSIDIAN_VAULT/Inbox\" && rm -f \"$note\"", Block),
+            ("cd $OBSIDIAN_VAULT && rm -rf \"$dir\"", Block),
+            (
+                "cd \"$OBSIDIAN_VAULT\" && for f in Inbox/*.md; do rm \"$f\"; done",
+                Block,
+            ),
             (
                 "cd \"$OBSIDIAN_VAULT\" && git status && cd $HOME/proj && rm -rf build",
                 Allow,
