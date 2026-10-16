@@ -7051,6 +7051,31 @@ mod tests {
     }
 
     #[test]
+    fn secret_read_after_a_quote_opened_in_a_kept_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review: a quote that opens after a
+        // `#` glued to a paren and closes on a later line hid the `cat .env`
+        // after it from both earlier readings; bash runs it.
+        assert_bash(
+            &[
+                "a=(x)#; echo \"a\nb\"\ncat .env",
+                "a=(x)#; echo 'a\nb'\ncat .env",
+                "a=(x)#; echo 'a\ncat <<'EOF'\nb'\ncat .env\nEOF",
+                "(( x <<= 1 ))\necho 'a\nb'\ncat .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "quote across lines",
+        );
+        assert_bash(
+            &[
+                "a=(x)#; echo \"a\nb\"\ncat notes.txt",
+                "a=(x)#; echo 'a\nb'\nls",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "controls",
+        );
+    }
+
+    #[test]
     fn globs_sharing_letters_with_no_stem_allowed() {
         // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
         // `jks` and `cadence` shares `den` with `credentials`, but only a

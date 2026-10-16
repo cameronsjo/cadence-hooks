@@ -1280,6 +1280,42 @@ mod tests {
     }
 
     #[test]
+    fn force_push_after_a_quote_opened_in_a_kept_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review: a quote that opens after a
+        // `#` glued to a paren and closes on a later line. The rewrite and
+        // the line-by-line reading both cut the quote at the span's newline,
+        // so its closer opened a quote over the push. bash pairs the quotes
+        // and runs the push; the guard now reads the span as written too.
+        for command in [
+            "a=(x)#; echo \"a\nb\"\ngit push --force origin main",
+            "a=(x)#; echo 'a\nb'\ngit push --force origin main",
+            "a=(x)#; echo $'a\nb'\ngit push --force origin main",
+            "( a=(x)#; echo \"a\nb\"\ngit push --force origin main )",
+            "a=(x)#; echo \"a\ncat <<EOF\nb\"\ngit push --force origin main\nEOF",
+            "(( x <<= 1 ))\necho 'a\nb'\ngit push --force origin main",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: a non-force push and a status behind the same quote.
+        for command in [
+            "a=(x)#; echo \"a\nb\"\ngit push origin feature",
+            "a=(x)#; echo 'a\nb'\ngit status",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn force_push_after_a_heredoc_with_a_non_blank_in_its_delimiter_blocked() {
         // cameronsjo/cadence-hooks#1391: bash and zsh keep NBSP and VT in
         // the delimiter, so the body ends at `E<C>x` and the push runs.

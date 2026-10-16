@@ -7557,8 +7557,21 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
 pub fn strip_heredoc_bodies(command: &str) -> String {
+    strip_heredoc_bodies_reading(command, false)
+}
+
+/// [`strip_heredoc_bodies`], or with `ambiguous_as_code` set, read the way
+/// [`strip_comments_as_written`] reads a `#` glued to a paren: as a word
+/// character, so a quote opened after it stays open across lines and a `<<`
+/// inside that quote opens no heredoc.
+fn strip_heredoc_bodies_reading(command: &str, ambiguous_as_code: bool) -> String {
     let mut work = WorkBudget::for_input(command.len());
-    strip_heredoc_bodies_bounded(command, MAX_HEREDOC_SPAN_DEPTH, &mut work)
+    strip_heredoc_bodies_bounded(
+        command,
+        MAX_HEREDOC_SPAN_DEPTH,
+        &mut work,
+        ambiguous_as_code,
+    )
 }
 
 /// How many levels of heredoc-inside-a-carried-span [`strip_heredoc_bodies`]
@@ -7611,10 +7624,15 @@ impl WorkBudget {
 /// runs. Resolving the span's own heredocs first reads it the way bash does.
 /// Past the depth cap, or once the shared work budget is spent, the span is
 /// spliced raw (the prior behavior): unstripped, never dropped.
-fn carried_span(span: &str, depth: usize, work: &mut WorkBudget) -> String {
+fn carried_span(
+    span: &str,
+    depth: usize,
+    work: &mut WorkBudget,
+    ambiguous_as_code: bool,
+) -> String {
     match depth.checked_sub(1) {
         Some(rest) if span.contains("<<") && work.charge(span.len()) => {
-            strip_heredoc_bodies_bounded(span, rest, work)
+            strip_heredoc_bodies_bounded(span, rest, work, ambiguous_as_code)
         }
         _ => span.to_string(),
     }
@@ -7633,14 +7651,22 @@ fn budgeted_spans(body: &str, work: &mut WorkBudget) -> Vec<String> {
     }
 }
 
-fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudget) -> String {
+fn strip_heredoc_bodies_bounded(
+    command: &str,
+    depth: usize,
+    work: &mut WorkBudget,
+    ambiguous_as_code: bool,
+) -> String {
     let chars: Vec<char> = command.chars().collect();
     let byte_of: Vec<usize> = command
         .char_indices()
         .map(|(b, _)| b)
         .chain(std::iter::once(command.len()))
         .collect();
-    let mut lex = HeredocLex::default();
+    let mut lex = HeredocLex {
+        ambiguous_as_code,
+        ..HeredocLex::default()
+    };
     let mut out: Vec<String> = Vec::new();
     let mut pos = 0;
     loop {
@@ -7759,7 +7785,7 @@ fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudg
                 let body = body.strip_suffix('\n').unwrap_or(&body);
                 for span in budgeted_spans(body, work) {
                     line.push('\n');
-                    line.push_str(&carried_span(&span, depth, work));
+                    line.push_str(&carried_span(&span, depth, work, ambiguous_as_code));
                 }
             }
             next = end.resume;
@@ -8124,6 +8150,9 @@ struct HeredocLex {
     /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
     /// be bounded, stop trying, so an opener flood stays linear.
     exhausted: SpanLatch,
+    /// Read a `#` glued to a paren as a word character
+    /// ([`strip_heredoc_bodies_reading`]).
+    ambiguous_as_code: bool,
 }
 
 /// A heredoc operator [`scan_command_line`] found, by char index.
@@ -8297,7 +8326,10 @@ fn scan_command_line(
             // A comment, or an ambiguous `#` glued to a paren, which
             // [`comment_spans`] reports and [`strip_comments`] keeps as code:
             // either way no quote, heredoc or continuation in it is read here.
-            '#' if (boundary || was_ambiguous) && comment_context(innermost) && !lex.backticks => {
+            '#' if (boundary || (was_ambiguous && !lex.ambiguous_as_code))
+                && comment_context(innermost)
+                && !lex.backticks =>
+            {
                 j = chars[j..]
                     .iter()
                     .position(|&c| c == '\n')
@@ -8421,6 +8453,7 @@ fn split_segments_impl(
     // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
     // with the body scan, because the shell reads one logical line and only
     // then begins a heredoc body on the line after it (#475).
+    let original = command;
     let command = strip_heredoc_bodies(command);
     // Comments are removed as a pass, not as an arm in the loop below. The
     // condition is not "the previous character was a space" — it also depends
@@ -8441,9 +8474,19 @@ fn split_segments_impl(
     // a `cd` moves to) must not read these as one script: the appended lines
     // would start where the rewrite's reading ended. Such a walk uses
     // [`split_segment_readings`] instead.
-    let (stripped, originals) = strip_comments_with_readings(&command);
+    //
+    // A third reading keeps each such span exactly as written and splits the
+    // whole command at once, so a quote that opens in the span pairs with its
+    // closer on a later line as bash pairs it. It starts from the command
+    // before its heredoc bodies were stripped, because a `<<` inside that
+    // quote opens no heredoc in bash ([`as_written_reading`]).
+    let readings = strip_comments_reading_whole(&command, false);
+    let as_written = as_written_reading(original, &readings);
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
-    for text in std::iter::once(stripped.as_str()).chain(originals) {
+    for text in std::iter::once(readings.stripped.as_str())
+        .chain(readings.originals)
+        .chain(as_written.as_deref())
+    {
         split_piece_into(text, join_redirect_amp, &mut segments);
     }
     segments
@@ -8470,28 +8513,37 @@ fn split_piece_into(
 /// The first reading is the rewrite [`strip_comments`] makes of a span that
 /// bash and zsh read apart. When that rewrite changed a line, a second
 /// reading follows: the whole command as written, each rewritten line split
-/// on its own ([`strip_comments_reading_whole`]). Neither is what the shell
-/// surely runs, so a walk reads each from the same start and judges every
-/// place either one puts a command; chaining one into the other would start
-/// the second where the first ended, and apply a relative `cd` twice
-/// (cameronsjo/cadence-hooks#1393 review). [`split_segments_with_ops`] keeps
-/// the old shape, the rewrite plus the rewritten lines in one list, for
-/// guards that judge each segment on its own.
+/// on its own ([`strip_comments_reading_whole`]). When the command holds such
+/// a span, a third reading keeps every span as written and splits the whole
+/// command at once, so a quote opened in a span closes where bash closes it
+/// ([`strip_comments_as_written`]). None is what the shell surely runs, so a
+/// walk reads each from the same start and judges every place any one puts a
+/// command; chaining one into the next would start it where the previous one
+/// ended, and apply a relative `cd` twice (cameronsjo/cadence-hooks#1393
+/// review). [`split_segments_with_ops`] keeps the old shape, every reading in
+/// one list, for guards that judge each segment on its own.
 pub(crate) fn split_segment_readings(
     command: &str,
     join_redirect_amp: bool,
 ) -> Vec<Vec<(String, Option<&'static str>)>> {
+    let original = command;
     let command = strip_heredoc_bodies(command);
-    let (stripped, _, pieces) = strip_comments_reading_whole(&command, true);
+    let comment_readings = strip_comments_reading_whole(&command, true);
+    let as_written = as_written_reading(original, &comment_readings);
     let mut rewrite = Vec::new();
-    split_text_into(&stripped, join_redirect_amp, &mut rewrite);
+    split_text_into(&comment_readings.stripped, join_redirect_amp, &mut rewrite);
     let mut readings = vec![rewrite];
-    if !pieces.is_empty() {
+    if !comment_readings.pieces.is_empty() {
         let mut written = Vec::new();
-        for piece in &pieces {
+        for piece in &comment_readings.pieces {
             split_piece_into(piece, join_redirect_amp, &mut written);
         }
         readings.push(written);
+    }
+    if let Some(text) = &as_written {
+        let mut whole = Vec::new();
+        split_text_into(text, join_redirect_amp, &mut whole);
+        readings.push(whole);
     }
     readings
 }
@@ -8894,6 +8946,15 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
 
 /// [`comment_spans`] with each span's [`CommentKind`].
 fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
+    comment_spans_scan(text, false)
+}
+
+/// [`comment_spans_with_kind`], or with `ambiguous_as_code` set, the spans of
+/// the reading in which every `#` glued to a paren is a word character: no
+/// [`CommentKind::Ambiguous`] span is returned, and the scan goes on through
+/// that text with its quotes, so a quote opened there pairs with its closer
+/// on a later line as bash pairs it ([`strip_comments_as_written`]).
+fn comment_spans_scan(text: &str, ambiguous_as_code: bool) -> Vec<(usize, usize, CommentKind)> {
     let mut spans = Vec::new();
     // Set by an unquoted `(` or `)` after which a `#` is ambiguous
     // ([`paren_step`]); cleared by every other character.
@@ -9064,7 +9125,7 @@ fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
                 open.pop();
                 boundary = false;
             }
-            '#' if (boundary || was_ambiguous)
+            '#' if (boundary || (was_ambiguous && !ambiguous_as_code))
                 && comment_context(open.last().copied())
                 && !backticks =>
             {
@@ -9130,8 +9191,64 @@ pub fn strip_comments(command: &str) -> String {
 /// `\` is left out: the rewrite changes only those characters, so it already
 /// reads that line as written.
 pub(crate) fn strip_comments_with_readings(command: &str) -> (String, Vec<&str>) {
-    let (stripped, originals, _) = strip_comments_reading_whole(command, false);
-    (stripped, originals)
+    let readings = strip_comments_reading_whole(command, false);
+    (readings.stripped, readings.originals)
+}
+
+/// `command` with its comments removed and every [`CommentKind::Ambiguous`]
+/// and [`CommentKind::Unresolved`] span kept exactly as written, or `None`
+/// when this text equals `rewrite` (the [`strip_comments`] text). Called
+/// only for a command that holds such a span ([`as_written_reading`]).
+///
+/// The other two readings cut a span's quotes off at its newline: the
+/// rewrite changes them, and the original lines are split one at a time. A
+/// quote that opens in the span and closes on a later line then ends early,
+/// and the line after the closer reads as quoted text. bash takes the `#` as
+/// a word character there and pairs the quotes across the lines, so it runs
+/// that line: `a=(x)#; echo "a` ⏎ `b"` ⏎ `git push --force origin main`
+/// (cameronsjo/cadence-hooks#1393 review). Here an `Ambiguous` `#` is code
+/// ([`comment_spans_scan`]) and the scan keeps the quote open across lines;
+/// an `Unresolved` span is already code to the end of the input, so it is
+/// kept as is.
+fn strip_comments_as_written(command: &str, rewrite: &str) -> Option<String> {
+    let mut out = String::with_capacity(command.len());
+    let mut cursor = 0;
+    for (start, end, kind) in comment_spans_scan(command, true) {
+        if kind == CommentKind::Comment {
+            out.push_str(&command[cursor..start]);
+            cursor = end;
+        }
+    }
+    out.push_str(&command[cursor..]);
+    (out != rewrite).then_some(out)
+}
+
+/// What [`strip_comments_reading_whole`] returns.
+struct CommentReadings<'a> {
+    /// The [`strip_comments`] text.
+    stripped: String,
+    /// Each rewritten span line as written ([`strip_comments_with_readings`]).
+    originals: Vec<&'a str>,
+    /// The whole command as written, in pieces to split one at a time.
+    pieces: Vec<String>,
+    /// Whether some span was kept as code rather than removed: the command
+    /// has a reading [`as_written_reading`] adds.
+    kept_span: bool,
+}
+
+/// The third reading of `original` (before its heredoc bodies were stripped)
+/// when `readings` kept a span: heredoc bodies and comments removed with
+/// every `#` glued to a paren read as code ([`strip_heredoc_bodies_reading`],
+/// [`strip_comments_as_written`]). A `<<` inside a quote that opened in such
+/// a span opens no heredoc in that reading, so its "body" is still code:
+/// `a=(x)#; echo "a` ⏎ `cat <<EOF` ⏎ `b"` ⏎ `git push --force origin main`
+/// ⏎ `EOF` runs the push in bash.
+fn as_written_reading(original: &str, readings: &CommentReadings<'_>) -> Option<String> {
+    if !readings.kept_span {
+        return None;
+    }
+    let text = strip_heredoc_bodies_reading(original, true);
+    strip_comments_as_written(&text, &readings.stripped)
 }
 
 /// Whether a line of a rewritten span holds a character the rewrite changes.
@@ -9150,11 +9267,19 @@ fn rewritten_line(line: &str) -> bool {
 /// This is the reading a walk that carries state from one segment to the
 /// next — the directory a `cd` moves to — walks on its own, from the same
 /// start as the rewrite's reading ([`split_segment_readings`]).
-fn strip_comments_reading_whole(command: &str, whole: bool) -> (String, Vec<&str>, Vec<String>) {
+fn strip_comments_reading_whole(command: &str, whole: bool) -> CommentReadings<'_> {
     let spans = comment_spans_with_kind(command);
     if spans.is_empty() {
-        return (command.to_string(), Vec::new(), Vec::new());
+        return CommentReadings {
+            stripped: command.to_string(),
+            originals: Vec::new(),
+            pieces: Vec::new(),
+            kept_span: false,
+        };
     }
+    let kept_span = spans
+        .iter()
+        .any(|&(_, _, kind)| kind != CommentKind::Comment);
     let mut out = String::with_capacity(command.len());
     let mut originals = Vec::new();
     let mut pieces: Vec<String> = Vec::new();
@@ -9209,7 +9334,12 @@ fn strip_comments_reading_whole(command: &str, whole: bool) -> (String, Vec<&str
     } else {
         pieces.clear();
     }
-    (out, originals, pieces)
+    CommentReadings {
+        stripped: out,
+        originals,
+        pieces,
+        kept_span,
+    }
 }
 
 /// Push `current` (trimmed) onto `segments` paired with the operator that
@@ -13440,22 +13570,61 @@ pub use crate::push::{OutboundRange, PushInvocation, Refspec, outbound_commits, 
 pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
     split_segments(command)
         .iter()
-        .filter_map(|segment| {
-            let tokens = executable_tokens(segment);
-            let argv = peel_command_runners(&tokens);
-            if command_word(argv.first()?) != "git" {
-                return None;
-            }
-            let (subcommand, rest) = skip_git_global_options(&argv[1..]).split_first()?;
-            // `push` stays case-sensitive: only the executable word folds
-            // ([`command_word`]), because a subcommand is case-sensitive to git
-            // and inventing `PUSH` would judge a command the shell never runs.
-            if subcommand != "push" {
-                return None;
-            }
-            Some(rest.to_vec())
-        })
+        .filter_map(|segment| push_arguments(segment))
         .collect()
+}
+
+/// The arguments after `push` when `segment` is a `git push`
+/// ([`git_push_segments`]).
+fn push_arguments(segment: &str) -> Option<Vec<String>> {
+    let tokens = executable_tokens(segment);
+    let argv = peel_command_runners(&tokens);
+    if command_word(argv.first()?) != "git" {
+        return None;
+    }
+    let (subcommand, rest) = skip_git_global_options(&argv[1..]).split_first()?;
+    // `push` stays case-sensitive: only the executable word folds
+    // ([`command_word`]), because a subcommand is case-sensitive to git
+    // and inventing `PUSH` would judge a command the shell never runs.
+    if subcommand != "push" {
+        return None;
+    }
+    Some(rest.to_vec())
+}
+
+/// How many `git push` segments [`git_push_segments`] lists, less the copies
+/// the [`strip_comments_as_written`] reading adds: the larger of the count
+/// in the other two readings, listed together as before, and the count in
+/// that reading alone.
+///
+/// [`git_push_segments`] reads every reading of a span bash and zsh read
+/// apart in one list, and that reading repeats the whole command, so every
+/// push in such a command is listed in it a second time. A caller that
+/// counts pushes, rather than judging each one, counts that reading on its
+/// own: a push it shares with the others is not a second push
+/// (cameronsjo/cadence-hooks#1393 review).
+pub fn git_push_count(command: &str) -> usize {
+    let pushes = |segments: &[(String, Option<&'static str>)]| {
+        segments
+            .iter()
+            .filter(|(segment, _)| push_arguments(segment).is_some())
+            .count()
+    };
+    let original = command;
+    let command = strip_heredoc_bodies(command);
+    let readings = strip_comments_reading_whole(&command, false);
+    let mut listed = Vec::new();
+    for text in
+        std::iter::once(readings.stripped.as_str()).chain(readings.originals.iter().copied())
+    {
+        split_piece_into(text, false, &mut listed);
+    }
+    let written = as_written_reading(original, &readings).map_or(0, |text| {
+        let mut segments = Vec::new();
+        split_text_into(&text, false, &mut segments);
+        pushes(&segments)
+    });
+    pushes(&listed).max(written)
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
@@ -19024,6 +19193,80 @@ mod tests {
     }
 
     #[test]
+    fn a_quote_opened_in_a_kept_span_closes_where_bash_closes_it() {
+        // cameronsjo/cadence-hooks#1393 review: a quote that opens in a span
+        // bash and zsh read apart and closes on a later line. The rewrite
+        // turns the quote into `;` and the original lines are split one at a
+        // time, so in both the closer opens a new quote that hides the next
+        // line. bash reads the glued `#` as a word character, pairs the
+        // quotes across the lines, and runs that line; the third reading
+        // keeps the span as written and splits the whole command at once.
+        let push = "git push --force origin main";
+        for command in [
+            "a=(x)#; echo \"a\nb\"\ngit push --force origin main",
+            "a=(x)#; echo 'a\nb'\ngit push --force origin main",
+            "a=(x)#; echo $'a\nb'\ngit push --force origin main",
+            "( a=(x)#; echo \"a\nb\"\ngit push --force origin main )",
+            "a=(x)#; echo \"a\nb\" # it's\ngit push --force origin main",
+            "a=(x)#; echo \"a\\\nb\"\ngit push --force origin main",
+            "a=(x)#; echo \"a\nb\"; c=(y)#; echo 'c\nd'\ngit push --force origin main",
+            // A `<<` inside that quote opens no heredoc in bash, so the line
+            // after the closer is code, not a heredoc body.
+            "a=(x)#; echo \"a\ncat <<EOF\nb\"\ngit push --force origin main\nEOF",
+            // An `Unresolved` span is code to the end of the input.
+            "(( x <<= 1 ))\necho \"a\nb\"\ngit push --force origin main",
+            "(( x <<= 1 ))\necho 'a\nb'\ngit push --force origin main",
+        ] {
+            let segments = split_segments(command);
+            assert!(
+                segments.iter().any(|s| s.trim_end_matches(" )") == push),
+                "{command:?}: {segments:?}"
+            );
+            assert!(
+                split_segment_readings(command, false)
+                    .iter()
+                    .any(|reading| reading
+                        .iter()
+                        .any(|(s, _)| s.trim_end_matches(" )") == push)),
+                "{command:?}"
+            );
+        }
+        // The third reading is the command with its comments removed and each
+        // kept span as written; a `#` inside the quote is quoted text.
+        let readings = split_segment_readings("a=(x)#; echo \"a\n# b\"\nls # c", false);
+        assert_eq!(
+            readings.last().expect("readings"),
+            &[
+                ("a=(x)#".to_string(), Some(";")),
+                ("echo \"a\n# b\"".to_string(), Some("\n")),
+                ("ls".to_string(), None),
+            ]
+        );
+        assert_eq!(readings.len(), 3);
+        // No kept span, or one the rewrite already reads as written: no third
+        // reading.
+        for command in [
+            "git status # it's",
+            "cd x; echo 'a'",
+            "(( y = 1 << 2 ))",
+            "(( 1 # x ))\nls",
+        ] {
+            let readings = strip_comments_reading_whole(command, false);
+            assert_eq!(as_written_reading(command, &readings), None, "{command:?}");
+        }
+        // A push read three ways is still one push.
+        assert_eq!(
+            git_push_count("a=(x)#; echo \"a\nb\"\ngit push origin main"),
+            1
+        );
+        assert_eq!(
+            git_push_count("(( 1 #'\n))'\n))\ngit push origin a; git push origin b"),
+            2
+        );
+        assert_eq!(git_push_count("git status"), 0);
+    }
+
+    #[test]
     fn rewritten_span_is_also_read_as_written() {
         // cameronsjo/cadence-hooks#1393 review C1 and C2: removing the quotes
         // in an `Unresolved` span read `$'.env'` as `$.env`, and turning them
@@ -19067,14 +19310,17 @@ mod tests {
                 "{command:?}"
             );
         }
-        // The appended block follows a `"\n"`, and the last segment still
-        // carries no operator.
+        // Each appended block follows a `"\n"`, and the last segment still
+        // carries no operator. The last block is the whole command as
+        // written ([`strip_comments_as_written`]).
         assert_eq!(
             split_segments_with_ops("(( x = 1 << 2 )); cat $'.env'"),
             [
                 ("(( x = 1 << 2 ))".to_string(), Some(";")),
                 ("cat $.env".to_string(), Some("\n")),
                 ("<< 2 ))".to_string(), Some(";")),
+                ("cat $'.env'".to_string(), Some("\n")),
+                ("(( x = 1 << 2 ))".to_string(), Some(";")),
                 ("cat $'.env'".to_string(), None),
             ]
         );
@@ -21676,7 +21922,7 @@ mod tests {
         // nested heredoc still reaches the splitter.
         let input = "cat <<EOF\n$(cat <<'X'\nit's\nX\ncat .env)\nEOF";
         let mut spent = WorkBudget { left: 0 };
-        let out = strip_heredoc_bodies_bounded(input, MAX_HEREDOC_SPAN_DEPTH, &mut spent);
+        let out = strip_heredoc_bodies_bounded(input, MAX_HEREDOC_SPAN_DEPTH, &mut spent, false);
         assert!(out.contains("cat .env"), "{out:?}");
         // With room to work, the same input resolves the inner heredoc and
         // the read becomes its own segment.

@@ -2863,6 +2863,13 @@ mod tests {
             "(( x <<= 1 ))\ncd sec_\necho 'a\ncd ../cln_\nb'\ngit push origin main",
             "a=(x)#; cd sec_; echo 'x; cd ../cln_ '; git push origin main",
             "a=(x)#; cd sec_; git push 'origin' main",
+            // A quote that opens in the span and closes on a later line: the
+            // earlier readings cut it at the span's newline, and its closer
+            // opened a quote over the push. bash pairs the quotes, so the
+            // `cd ../cln_` is quoted text and the push runs in `sec_`.
+            "a=(x)#; cd sec_; echo \"a\ncd ../cln_\nb\"\ngit push origin main",
+            "a=(x)#; cd sec_; echo 'a\ncd ../cln_\nb'\ngit push origin main",
+            "cd sec_\na=(x)#; echo \"a\nb\"\ngit push --force origin main",
         ] {
             assert_eq!(run(command).outcome, Outcome::Block, "{command:?}");
         }
