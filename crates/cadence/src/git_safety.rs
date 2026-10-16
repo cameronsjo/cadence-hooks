@@ -1151,6 +1151,194 @@ mod tests {
     }
 
     #[test]
+    fn force_push_behind_a_hash_glued_to_a_paren_blocked() {
+        // cameronsjo/cadence-hooks#1391: bash, zsh or both run the push in
+        // each of these. The guard read the glued `#` as word text, so the
+        // `'` opened a quote the shells never open and hid the push.
+        let push = "git push --force origin main";
+        for shape in [
+            "(#'\nPUSH\n#'\n)",
+            "(true)#'\nPUSH\n#'",
+            "if (#'\nPUSH\n#'\n) then :; fi",
+            "true|(#'\nPUSH\n#'\n)",
+            "case a in a)#'\nPUSH\n#'\n;; esac",
+            "a=(1)#'\nPUSH\n#'",
+            "echo $( (true)#'\nPUSH\n#'\n)",
+            "(( 1 ))#'\nPUSH\n#'",
+            "(( 1 # $(PUSH) ))",
+            "(#'\ncat <<E\n'\nE\nPUSH\n)",
+            "a=(1)#; PUSH",
+            "echo (#i)a; PUSH",
+        ] {
+            let command = shape.replace("PUSH", push);
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: a real comment is inert, and after `$(…)` the `'` is a
+        // real quote that holds the push as text.
+        for command in [
+            "git status # note",
+            "(cd /tmp && ls) # git push --force origin main",
+            "echo $(true)#'\ngit push --force origin main\n'",
+            "echo $((16#ff)) ${#v} $# https://example.com/a#b",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_push_behind_a_double_paren_subshell_blocked() {
+        // cameronsjo/cadence-hooks#1391 review: bash and zsh read `((` as
+        // arithmetic only when its matching `)` is followed by `)`. Otherwise
+        // it is two subshells, the `#` starts a comment, and the push runs
+        // (measured on bash 5.3 and zsh 5.9). Reading `((` as arithmetic let
+        // the `'` hide the push.
+        let push = "git push --force origin main";
+        for shape in [
+            "((echo a #'\nPUSH\n#'\n) )",
+            "((echo a #'\nPUSH\n#'\n);true)",
+            "true; ((echo a #'\nPUSH\n#'\n) )",
+            "true | ((echo a #'\nPUSH\n#'\n) )",
+            "if ((echo a #'\nPUSH\n#'\n) ) then :; fi",
+            "echo $( ((echo a #'\nPUSH\n#'\n) ) )",
+            "((echo '))' #'\nPUSH\n#'\n) )",
+            "(( (echo a #'\nPUSH\n#'\n) ) )",
+            // zsh runs this one: `<<E` is a heredoc in the subshell reading.
+            "((cat <<E\n'\nE\n) )\nPUSH\n#'",
+            // Arithmetic in both shells, and bash runs the push: the `'`
+            // after `#` is a quote there, and `<<` a shift.
+            "(( 1 #'\n))'\n))\nPUSH\n'",
+            "(( x = 1 <<E ))\nPUSH\nE",
+        ] {
+            let command = shape.replace("PUSH", push);
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: genuine arithmetic stays allowed.
+        for command in [
+            "(( x = 1 + 2 ))",
+            "((i++))",
+            "for ((i=0; i<3; i++)); do echo $i; done",
+            "(( y = 1 << 2 )) && git status",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_force_push_word_after_a_rewritten_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review C1 and C2: the span after a
+        // `<<` in `((`, or after a `#` glued to a paren, is kept with its
+        // quotes rewritten. Removing them read `$'--force'` as `$--force`;
+        // turning them into `;` split the word. bash and zsh run each push
+        // as `--force`; the guard now also reads the span as written.
+        for command in [
+            "(( x <<= 1 )); git push $'--force' origin main",
+            "if (( n << 1 > 4 )); then :; fi; git push $'--force' origin main",
+            "(( x = 1 << 2 )); git push --force origin $'main'",
+            "(( 1 # x ))\ngit push $'--force' origin main",
+            "a=(x)#; git push $'--force' origin main",
+            "(true)#; git push '--force' origin main",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Control: a quoted non-force push behind the same spans.
+        for command in [
+            "(( x <<= 1 )); git push origin $'feature'",
+            "a=(x)#; git status '--short'",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_push_after_a_quote_opened_in_a_kept_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review: a quote that opens after a
+        // `#` glued to a paren and closes on a later line. The rewrite and
+        // the line-by-line reading both cut the quote at the span's newline,
+        // so its closer opened a quote over the push. bash pairs the quotes
+        // and runs the push; the guard now reads the span as written too.
+        for command in [
+            "a=(x)#; echo \"a\nb\"\ngit push --force origin main",
+            "a=(x)#; echo 'a\nb'\ngit push --force origin main",
+            "a=(x)#; echo $'a\nb'\ngit push --force origin main",
+            "( a=(x)#; echo \"a\nb\"\ngit push --force origin main )",
+            "a=(x)#; echo \"a\ncat <<EOF\nb\"\ngit push --force origin main\nEOF",
+            "(( x <<= 1 ))\necho 'a\nb'\ngit push --force origin main",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: a non-force push and a status behind the same quote.
+        for command in [
+            "a=(x)#; echo \"a\nb\"\ngit push origin feature",
+            "a=(x)#; echo 'a\nb'\ngit status",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_push_after_a_heredoc_with_a_non_blank_in_its_delimiter_blocked() {
+        // cameronsjo/cadence-hooks#1391: bash and zsh keep NBSP and VT in
+        // the delimiter, so the body ends at `E<C>x` and the push runs.
+        for c in ['\u{a0}', '\u{b}'] {
+            let command = format!("cat <<E{c}x\nE\n'\nE{c}x\ngit push --force origin main\n#'");
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Control: an ordinary heredoc body stays data.
+        let command = "cat <<EOF\ngit push --force origin main\nEOF\necho done";
+        let result = GitSafetyGuard.run(&make_bash_input(command));
+        assert_eq!(
+            result.outcome,
+            cadence_hooks_core::Outcome::Allow,
+            "{command:?}"
+        );
+    }
+
+    #[test]
     fn force_push_through_a_wrapper_utility_blocked() {
         // cadence-hooks#1144: each wrapper runs the push (measured with
         // canaries); `su -c` was read by prevent-secret-leaks' own scan but

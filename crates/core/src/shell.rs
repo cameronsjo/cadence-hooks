@@ -7296,7 +7296,11 @@ fn group_depth_change(raw: &str) -> isize {
 ///   pipeline stage or backgrounded, when it runs in its own process;
 /// - a `cd` in a pipeline stage or a backgrounded segment moves nothing.
 ///   The `&` of a redirection (`cd a 2>&1 && …`) is not a background `&`
-///   ([`split_segments_with_ops_joining_redirects`]).
+///   ([`split_segments_with_ops_joining_redirects`]);
+/// - a command with a span bash and zsh read apart has two readings
+///   ([`split_segment_readings`]). Each is walked from `cwd`, and every `cd`
+///   in either is a maybe-move, so a segment is listed in every directory
+///   either reading may put it in.
 ///
 /// A segment that may run in several directories is listed once for each,
 /// at most [`MAX_POSSIBLE_DIRS`]; past that it is [`UNRESOLVABLE_DIR`]. Like
@@ -7322,15 +7326,46 @@ fn segment_work_dirs_with_cdpath(
     cwd: &str,
     env_cdpath: bool,
 ) -> Vec<LocatedSegment> {
-    let segments = split_segments_with_ops_joining_redirects(command);
-    let mut walk = DirWalk {
-        command: command.to_string(),
-        env_cdpath,
-        ..DirWalk::default()
+    // Each reading from the same start ([`split_segment_readings`]). Where
+    // there are two, neither is what the shell surely runs, and each can
+    // take quoted text for a `cd` (`echo "a⏎cd ../x "`) or lose a real one,
+    // so every directory change in them is a maybe-move: the segments after
+    // it are judged where the shell was before it as well.
+    let readings = split_segment_readings(command, true);
+    let context = DirContext {
+        conditional: readings.len() > 1,
+        looped: false,
     };
-    let mut dirs = DirSet::new(cwd);
-    walk.walk(&segments, &mut dirs, 0, DirContext::default());
-    walk.located
+    let mut located = Vec::new();
+    let mut seen: std::collections::HashSet<(String, std::rc::Rc<str>)> =
+        std::collections::HashSet::new();
+    for (index, segments) in readings.iter().enumerate() {
+        let mut walk = DirWalk {
+            command: command.to_string(),
+            env_cdpath,
+            ..DirWalk::default()
+        };
+        let mut dirs = DirSet::new(cwd);
+        walk.walk(segments, &mut dirs, 0, context);
+        if index == 0 {
+            if readings.len() > 1 {
+                seen.extend(
+                    walk.located
+                        .iter()
+                        .map(|segment| (segment.raw.clone(), segment.dir.clone())),
+                );
+            }
+            located = walk.located;
+        } else {
+            // A segment both readings place alike is listed once.
+            located.extend(
+                walk.located
+                    .into_iter()
+                    .filter(|segment| seen.insert((segment.raw.clone(), segment.dir.clone()))),
+            );
+        }
+    }
+    located
 }
 
 /// The group structure of one top-level segment.
@@ -7522,8 +7557,21 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
 pub fn strip_heredoc_bodies(command: &str) -> String {
+    strip_heredoc_bodies_reading(command, false)
+}
+
+/// [`strip_heredoc_bodies`], or with `ambiguous_as_code` set, read the way
+/// [`strip_comments_as_written`] reads a `#` glued to a paren: as a word
+/// character, so a quote opened after it stays open across lines and a `<<`
+/// inside that quote opens no heredoc.
+fn strip_heredoc_bodies_reading(command: &str, ambiguous_as_code: bool) -> String {
     let mut work = WorkBudget::for_input(command.len());
-    strip_heredoc_bodies_bounded(command, MAX_HEREDOC_SPAN_DEPTH, &mut work)
+    strip_heredoc_bodies_bounded(
+        command,
+        MAX_HEREDOC_SPAN_DEPTH,
+        &mut work,
+        ambiguous_as_code,
+    )
 }
 
 /// How many levels of heredoc-inside-a-carried-span [`strip_heredoc_bodies`]
@@ -7576,10 +7624,15 @@ impl WorkBudget {
 /// runs. Resolving the span's own heredocs first reads it the way bash does.
 /// Past the depth cap, or once the shared work budget is spent, the span is
 /// spliced raw (the prior behavior): unstripped, never dropped.
-fn carried_span(span: &str, depth: usize, work: &mut WorkBudget) -> String {
+fn carried_span(
+    span: &str,
+    depth: usize,
+    work: &mut WorkBudget,
+    ambiguous_as_code: bool,
+) -> String {
     match depth.checked_sub(1) {
         Some(rest) if span.contains("<<") && work.charge(span.len()) => {
-            strip_heredoc_bodies_bounded(span, rest, work)
+            strip_heredoc_bodies_bounded(span, rest, work, ambiguous_as_code)
         }
         _ => span.to_string(),
     }
@@ -7598,14 +7651,22 @@ fn budgeted_spans(body: &str, work: &mut WorkBudget) -> Vec<String> {
     }
 }
 
-fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudget) -> String {
+fn strip_heredoc_bodies_bounded(
+    command: &str,
+    depth: usize,
+    work: &mut WorkBudget,
+    ambiguous_as_code: bool,
+) -> String {
     let chars: Vec<char> = command.chars().collect();
     let byte_of: Vec<usize> = command
         .char_indices()
         .map(|(b, _)| b)
         .chain(std::iter::once(command.len()))
         .collect();
-    let mut lex = HeredocLex::default();
+    let mut lex = HeredocLex {
+        ambiguous_as_code,
+        ..HeredocLex::default()
+    };
     let mut out: Vec<String> = Vec::new();
     let mut pos = 0;
     loop {
@@ -7724,7 +7785,7 @@ fn strip_heredoc_bodies_bounded(command: &str, depth: usize, work: &mut WorkBudg
                 let body = body.strip_suffix('\n').unwrap_or(&body);
                 for span in budgeted_spans(body, work) {
                     line.push('\n');
-                    line.push_str(&carried_span(&span, depth, work));
+                    line.push_str(&carried_span(&span, depth, work, ambiguous_as_code));
                 }
             }
             next = end.resume;
@@ -8079,10 +8140,19 @@ pub fn heredoc_introducers(line: &str) -> Vec<HeredocIntroducer> {
 #[derive(Default)]
 struct HeredocLex {
     open: Vec<Opener>,
+    /// How many [`Opener::Subst`] entries `open` holds, so a heredoc can ask
+    /// whether it sits inside `$( … )` without walking a stack a `(` flood
+    /// made deep.
+    substs: usize,
+    /// How many [`Opener::Arith`] entries `open` holds ([`paren_step`]).
+    arith: usize,
     backticks: bool,
     /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
     /// be bounded, stop trying, so an opener flood stays linear.
     exhausted: SpanLatch,
+    /// Read a `#` glued to a paren as a word character
+    /// ([`strip_heredoc_bodies_reading`]).
+    ambiguous_as_code: bool,
 }
 
 /// A heredoc operator [`scan_command_line`] found, by char index.
@@ -8141,9 +8211,15 @@ fn scan_command_line(
     let mut introducers = Vec::new();
     let mut skipped_heredoc = false;
     let mut joins = Vec::new();
+    // As in [`comment_spans`]: a `#` right after this is ambiguous, and the
+    // unquoted, unescaped character before this one.
+    let mut ambiguous = false;
+    let mut before: Option<char> = None;
     let mut j = start;
     while j < chars.len() {
         let c = chars[j];
+        let was_ambiguous = std::mem::take(&mut ambiguous);
+        let prev = before.take();
         if quote == Some(Quote::Double) {
             // bash removes a backslash-newline inside `"…"` as well.
             if c == '\\' && chars.get(j + 1) == Some(&'\n') {
@@ -8201,20 +8277,57 @@ fn scan_command_line(
                     _ => Opener::Subst,
                 });
                 boundary = lex.open.last() == Some(&Opener::Subst);
+                lex.substs += usize::from(boundary);
                 j += 2;
                 continue;
             }
             '`' => lex.backticks = !lex.backticks,
-            '(' if !lex.open.is_empty() => lex.open.push(Opener::Paren),
-            '{' if !lex.open.is_empty() => lex.open.push(Opener::Brace),
-            ')' if matches!(innermost, Some(Opener::Paren | Opener::Subst)) => {
-                lex.open.pop();
+            '(' | ')' => {
+                let next = chars.get(j + 1).copied();
+                if c == ')' && innermost == Some(Opener::Subst) {
+                    lex.substs -= 1;
+                }
+                let (glued, consumed) =
+                    paren_step(&mut lex.open, &mut lex.arith, c, boundary, prev, next);
+                if consumed {
+                    j += 1;
+                }
+                ambiguous = glued;
+            }
+            // The [`comment_spans`] stop inside `((…))`
+            // ([`CommentKind::Unresolved`]): everything from here on is code,
+            // so no heredoc after it hides a line.
+            '#' | '<'
+                if lex.arith > 0
+                    && !comment_context(innermost)
+                    && unresolved_in_arith(
+                        c,
+                        boundary || was_ambiguous,
+                        chars.get(j + 1).copied(),
+                    ) =>
+            {
+                return CommandLine {
+                    end: chars.len(),
+                    introducers,
+                    skipped_heredoc,
+                    joins,
+                };
+            }
+            '{' if matches!(
+                innermost,
+                Some(Opener::Subst | Opener::Paren | Opener::Brace | Opener::Arith)
+            ) =>
+            {
+                lex.open.push(Opener::Brace);
             }
             '}' if innermost == Some(Opener::Brace) => {
                 lex.open.pop();
             }
-            '#' if boundary
-                && matches!(innermost, None | Some(Opener::Subst))
+            // A comment, or an ambiguous `#` glued to a paren, which
+            // [`comment_spans`] reports and [`strip_comments`] keeps as code:
+            // either way no quote, heredoc or continuation in it is read here.
+            '#' if (boundary || (was_ambiguous && !lex.ambiguous_as_code))
+                && comment_context(innermost)
                 && !lex.backticks =>
             {
                 j = chars[j..]
@@ -8223,27 +8336,25 @@ fn scan_command_line(
                     .map_or(chars.len(), |off| j + off);
                 continue;
             }
-            '<' if matches!(innermost, None | Some(Opener::Subst)) => {
-                match heredoc_operator(chars, j) {
-                    HeredocOperator::HereString(end) => {
-                        j = end;
-                        boundary = false;
-                        continue;
-                    }
-                    HeredocOperator::Heredoc(delimiter) => {
-                        introducers.push(FoundIntroducer {
-                            start: j,
-                            in_subst: lex.open.contains(&Opener::Subst),
-                            in_backticks: lex.backticks,
-                            delimiter,
-                        });
-                        j = introducers.last().expect("just pushed").delimiter.end;
-                        boundary = false;
-                        continue;
-                    }
-                    HeredocOperator::None => {}
+            '<' if comment_context(innermost) => match heredoc_operator(chars, j) {
+                HeredocOperator::HereString(end) => {
+                    j = end;
+                    boundary = false;
+                    continue;
                 }
-            }
+                HeredocOperator::Heredoc(delimiter) => {
+                    introducers.push(FoundIntroducer {
+                        start: j,
+                        in_subst: lex.substs > 0,
+                        in_backticks: lex.backticks,
+                        delimiter,
+                    });
+                    j = introducers.last().expect("just pushed").delimiter.end;
+                    boundary = false;
+                    continue;
+                }
+                HeredocOperator::None => {}
+            },
             '\n' if stop_at_newline => {
                 return CommandLine {
                     end: j,
@@ -8257,6 +8368,7 @@ fn scan_command_line(
         // The [`comment_spans`] boundary set, bash's blanks only
         // (cameronsjo/cadence-hooks#1389).
         boundary = matches!(c, ';' | '&' | '|') || is_bash_blank(c);
+        before = Some(c);
         j += 1;
     }
     CommandLine {
@@ -8341,6 +8453,7 @@ fn split_segments_impl(
     // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
     // with the body scan, because the shell reads one logical line and only
     // then begins a heredoc body on the line after it (#475).
+    let original = command;
     let command = strip_heredoc_bodies(command);
     // Comments are removed as a pass, not as an arm in the loop below. The
     // condition is not "the previous character was a space" — it also depends
@@ -8349,9 +8462,99 @@ fn split_segments_impl(
     // [`strip_heredoc_bodies`] gave two scanners that could disagree, and the
     // permissive one discards commands bash executes. [`comment_spans`] is the
     // single implementation both callers share.
-    let command = strip_comments(&command);
-    let command = command.as_str();
+    //
+    // A span one shell reads as a comment and another as code is rewritten
+    // so its quotes cannot hide later lines, and that rewrite changes what a
+    // quoted word means. Its original lines are split as well, one line at a
+    // time, and their segments appended, so a guard sees both readings
+    // ([`strip_comments_with_readings`]). Each block's last segment gets a
+    // `"\n"` operator, as if the lines followed one another.
+    //
+    // A walk that carries state from one segment to the next (the directory
+    // a `cd` moves to) must not read these as one script: the appended lines
+    // would start where the rewrite's reading ended. Such a walk uses
+    // [`split_segment_readings`] instead.
+    //
+    // A third reading keeps each such span exactly as written and splits the
+    // whole command at once, so a quote that opens in the span pairs with its
+    // closer on a later line as bash pairs it. It starts from the command
+    // before its heredoc bodies were stripped, because a `<<` inside that
+    // quote opens no heredoc in bash ([`as_written_reading`]).
+    let readings = strip_comments_reading_whole(&command, false);
+    let as_written = as_written_reading(original, &readings);
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
+    for text in std::iter::once(readings.stripped.as_str())
+        .chain(readings.originals)
+        .chain(as_written.as_deref())
+    {
+        split_piece_into(text, join_redirect_amp, &mut segments);
+    }
+    segments
+}
+
+/// Split one piece of text after the segments already in `segments`, as if
+/// a newline came between them.
+fn split_piece_into(
+    text: &str,
+    join_redirect_amp: bool,
+    segments: &mut Vec<(String, Option<&'static str>)>,
+) {
+    if let Some(last) = segments.last_mut() {
+        last.1.get_or_insert("\n");
+    }
+    split_text_into(text, join_redirect_amp, segments);
+}
+
+/// One command's segments ([`split_segments_with_ops`], or
+/// [`split_segments_with_ops_joining_redirects`] with `join_redirect_amp`),
+/// one list per reading, for a walk that carries state from one segment to
+/// the next.
+///
+/// The first reading is the rewrite [`strip_comments`] makes of a span that
+/// bash and zsh read apart. When that rewrite changed a line, a second
+/// reading follows: the whole command as written, each rewritten line split
+/// on its own ([`strip_comments_reading_whole`]). When the command holds such
+/// a span, a third reading keeps every span as written and splits the whole
+/// command at once, so a quote opened in a span closes where bash closes it
+/// ([`strip_comments_as_written`]). None is what the shell surely runs, so a
+/// walk reads each from the same start and judges every place any one puts a
+/// command; chaining one into the next would start it where the previous one
+/// ended, and apply a relative `cd` twice (cameronsjo/cadence-hooks#1393
+/// review). [`split_segments_with_ops`] keeps the old shape, every reading in
+/// one list, for guards that judge each segment on its own.
+pub(crate) fn split_segment_readings(
+    command: &str,
+    join_redirect_amp: bool,
+) -> Vec<Vec<(String, Option<&'static str>)>> {
+    let original = command;
+    let command = strip_heredoc_bodies(command);
+    let comment_readings = strip_comments_reading_whole(&command, true);
+    let as_written = as_written_reading(original, &comment_readings);
+    let mut rewrite = Vec::new();
+    split_text_into(&comment_readings.stripped, join_redirect_amp, &mut rewrite);
+    let mut readings = vec![rewrite];
+    if !comment_readings.pieces.is_empty() {
+        let mut written = Vec::new();
+        for piece in &comment_readings.pieces {
+            split_piece_into(piece, join_redirect_amp, &mut written);
+        }
+        readings.push(written);
+    }
+    if let Some(text) = &as_written {
+        let mut whole = Vec::new();
+        split_text_into(text, join_redirect_amp, &mut whole);
+        readings.push(whole);
+    }
+    readings
+}
+
+/// The [`split_segments_impl`] loop over text whose heredoc bodies and
+/// comments are already gone. Appends to `segments`.
+fn split_text_into(
+    command: &str,
+    join_redirect_amp: bool,
+    segments: &mut Vec<(String, Option<&'static str>)>,
+) {
     let mut current = String::new();
     let mut quote: Option<Quote> = None;
     let all: Vec<char> = command.chars().collect();
@@ -8480,7 +8683,7 @@ fn split_segments_impl(
                 } else {
                     "&"
                 };
-                flush_segment_with_op(&mut segments, &mut current, op);
+                flush_segment_with_op(segments, &mut current, op);
             }
             '|' => {
                 // `>|` is the force-clobber redirect operator, not a pipe —
@@ -8495,11 +8698,11 @@ fn split_segments_impl(
                     } else {
                         "|"
                     };
-                    flush_segment_with_op(&mut segments, &mut current, op);
+                    flush_segment_with_op(segments, &mut current, op);
                 }
             }
-            ';' => flush_segment_with_op(&mut segments, &mut current, ";"),
-            '\n' => flush_segment_with_op(&mut segments, &mut current, "\n"),
+            ';' => flush_segment_with_op(segments, &mut current, ";"),
+            '\n' => flush_segment_with_op(segments, &mut current, "\n"),
             _ => current.push(c),
         }
     }
@@ -8507,7 +8710,6 @@ fn split_segments_impl(
     if !trimmed.is_empty() {
         segments.push((trimmed.to_string(), None));
     }
-    segments
 }
 
 /// Whether `text` ends, with no space before the next character, in an
@@ -8558,6 +8760,138 @@ enum Opener {
     /// because bash starts `#` comments inside a command substitution — its
     /// body is ordinary shell code — but not inside arithmetic.
     Subst,
+    /// A `(` where a word could begin (a subshell, a case pattern's optional
+    /// `(`, a zsh glob group in argument position) or after `=` (an array
+    /// `a=(…)`, zsh's `=(…)`). Its body is shell code, so comments start
+    /// there as they do at top level.
+    Group,
+    /// `<(…)` or `>(…)` process substitution. Its body is shell code, and the
+    /// word goes on after its `)`: `<(true)#x` is one word to bash and zsh.
+    ProcSub,
+    /// A `(` inside a word (`f()`, a zsh glob `x(a)`, a bash extglob `@(a)`).
+    WordParen,
+    /// `((…))` arithmetic command where a word could begin. No comment starts
+    /// inside it: `(( 1 # $(cmd) ))` runs `cmd` in bash and zsh. But bash and
+    /// zsh commit to arithmetic only when the matching `)` is followed by `)`;
+    /// otherwise `((` is two nested subshells, where a `#` after a blank IS a
+    /// comment and `<<` IS a heredoc. Neither reading is safe for the other,
+    /// so a `#` or `<<` there ends the scan ([`CommentKind::Unresolved`]).
+    Arith,
+}
+
+/// Can a `#` start a comment directly inside `innermost`? Shell code can
+/// hold one; `${…}`, arithmetic and a `(` nested in those cannot.
+fn comment_context(innermost: Option<Opener>) -> bool {
+    matches!(
+        innermost,
+        None | Some(Opener::Subst | Opener::Group | Opener::ProcSub | Opener::WordParen)
+    )
+}
+
+/// Inside `((…))`, does unquoted `c` start a [`CommentKind::Unresolved`]
+/// span? A `#` where a comment could begin (`at_word`: a word boundary or
+/// glued to a paren), or the `<` of a `<<`. `next` is the character after `c`.
+fn unresolved_in_arith(c: char, at_word: bool, next: Option<char>) -> bool {
+    match c {
+        '#' => at_word,
+        '<' => next == Some('<'),
+        _ => false,
+    }
+}
+
+/// Track an unquoted `(` or `)` for the comment scanners ([`comment_spans`],
+/// [`scan_command_line`]). `boundary` says whether a word could begin at `c`,
+/// `before` is the unquoted, unescaped character just before it (if any),
+/// and `next` the one after.
+///
+/// Returns `(ambiguous, consumed_next)`. `ambiguous` means a `#` right after
+/// `c` is a comment in some shell readings and a word character in others,
+/// so the scanners keep its text visible as code ([`CommentKind::Ambiguous`]).
+/// Measured on bash 5.3 and zsh 5.9 (cameronsjo/cadence-hooks#1391):
+///
+/// - After `(`: `(#'`, `if (#'`, `true|(#'`, `a=(#'`, `cat <(#'`, `!(#'` and
+///   zsh's `=(#'` all start a comment, but zsh with `extendedglob` reads
+///   `(#i)a; cmd` as a glob followed by `cmd`. Stripping there would hide
+///   `cmd`; not stripping lets the `'` open a quote that hides the next line.
+/// - After `)` that closes a subshell, a case pattern, `((…))`, `f()` or an
+///   array: `(true)#'`, `case a in a)#'`, `(( 1 ))#'` start a comment in both
+///   shells, but bash keeps `a=(1)#` and zsh keeps `(a)#` and `x(a)#` as one
+///   word, and runs a `; cmd` after them.
+/// - After `)` that closes `$(…)`, `$((…))` or `<(…)`, the word goes on in
+///   both shells (`$(true)#'`, `<(true)#; cmd`), so `#` is plain text there.
+///
+/// `arith` counts the [`Opener::Arith`] entries on `open`, so a scanner can
+/// ask whether it is anywhere inside `((…))` without walking the stack.
+fn paren_step(
+    open: &mut Vec<Opener>,
+    arith: &mut usize,
+    c: char,
+    boundary: bool,
+    before: Option<char>,
+    next: Option<char>,
+) -> (bool, bool) {
+    let innermost = open.last().copied();
+    if c == '(' {
+        if matches!(
+            innermost,
+            Some(Opener::Paren | Opener::Brace | Opener::Arith)
+        ) {
+            open.push(Opener::Paren);
+            return (false, false);
+        }
+        if boundary && next == Some('(') {
+            open.push(Opener::Arith);
+            *arith += 1;
+            return (false, true);
+        }
+        open.push(if boundary || before == Some('=') {
+            Opener::Group
+        } else if matches!(before, Some('<' | '>')) {
+            Opener::ProcSub
+        } else {
+            Opener::WordParen
+        });
+        return (true, false);
+    }
+    match innermost {
+        // A `)` inside `${…}` is data; see [`comment_spans`].
+        Some(Opener::Brace) => (false, false),
+        Some(Opener::Paren | Opener::Subst | Opener::ProcSub) => {
+            open.pop();
+            (false, false)
+        }
+        Some(Opener::Arith) => {
+            open.pop();
+            *arith -= 1;
+            (true, next == Some(')'))
+        }
+        Some(Opener::Group | Opener::WordParen) => {
+            open.pop();
+            (true, false)
+        }
+        // Unmatched: a case pattern's `)`, or a syntax error.
+        None => (true, false),
+    }
+}
+
+/// How [`strip_comments`] treats a span [`comment_spans`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommentKind {
+    /// A comment in bash and zsh alike: removed.
+    Comment,
+    /// A `#` glued to a `(` or `)`, which one reading takes as a comment and
+    /// another as code ([`paren_step`]). Kept, with every quote, backtick and
+    /// backslash in it replaced by `;`, so its text is read as code and no
+    /// quote it holds can swallow the lines after it.
+    Ambiguous,
+    /// A `#` after a blank, or a `<<`, inside a word-start `((`. If bash and
+    /// zsh read `((` as arithmetic, a `'` after it opens a quote and `<<` is
+    /// a shift; if they read nested subshells, the `#` starts a comment and
+    /// `<<` a heredoc. Each reading has a payload the other hides
+    /// (cameronsjo/cadence-hooks#1391), so the span runs to the end of the
+    /// input and is kept, with every quote and backslash removed and every
+    /// backtick turned into `;`: all of it is read as code.
+    Unresolved,
 }
 
 /// Byte ranges of `#` comments in `text` — from the `#` up to (not including)
@@ -8576,33 +8910,61 @@ enum Opener {
 ///   `#` at a word boundary there IS a comment and runs to the newline
 ///   (measured: `echo $(echo hi # it's⏎)⏎cat .env` runs the read). Refusing
 ///   it left the apostrophe to open a phantom quote downstream that swallowed
-///   the next line. Only the innermost opener counts, and a `(` nested
-///   inside the substitution pushes [`Opener::Paren`], so `$( (#c` is not
-///   recognised — narrower than bash, which keeps more text under inspection.
-///   Without the stack, `echo ${x:- # } ; rm -rf ~`
-///   collapsed to `["echo ${x:-"]` — the `;` and the deletion behind it
-///   vanished from every guard, while bash ran them (#490 follow-up). The
+///   the next line. Only the innermost opener counts. A `(` that opens shell
+///   code — a subshell, `<(…)`, `a=(…)` — is shell code too
+///   ([`Opener::Group`], [`Opener::ProcSub`]). Without the stack,
+///   `echo ${x:- # } ; rm -rf ~` collapsed to `["echo ${x:-"]` — the `;`
+///   and the deletion behind it vanished from every guard, while bash ran
+///   them (#490 follow-up). The
 ///   stack rather than a counter, because a `)` inside `${…}` is data: sharing
 ///   one counter let it close the brace early and reopen the same bypass one
-///   character over. A bare `(…)` subshell pushes nothing: `(` is not
-///   whitespace, so no boundary opens after it and the comment never fires
-///   there anyway.
+///   character over.
 /// - **After UNESCAPED whitespace, or at the very start.** `\ ` is an escaped
 ///   space: it joins two halves of one word, so `echo a\ #x && rm -rf ~` is a
 ///   single argument `a #x` and the `&&` still runs. Testing the raw preceding
 ///   character saw an ordinary space and ate the rest of the line.
 ///
-/// Separators (`\n ; & |`) also open a boundary, matching bash. Where this is
-/// narrower than bash — after `(` and `)` — the effect is that a comment is
-/// *not* recognized, so more text stays under inspection. That direction is
-/// safe; the reverse is the bug this function exists to prevent.
+/// Separators (`\n ; & |`) also open a boundary, matching bash.
+///
+/// **A `#` glued to a `(` or `)` is neither comment nor code.** bash and zsh
+/// disagree there, and each reading has a payload the other hides
+/// ([`paren_step`]). Treating it as code let a `'` in it open a quote bash
+/// never opens, and that quote hid the next line from every guard:
+/// `(#'` ⏎ `git push --force origin main` ⏎ `#'` ran the push
+/// (cameronsjo/cadence-hooks#1391). Such a span is returned as
+/// [`CommentKind::Ambiguous`]: the scan skips it like a comment, and
+/// [`strip_comments`] keeps its text as code.
 ///
 /// State carries across newlines, so a quote opened on one line still suppresses
 /// a `#` on the next.
 fn comment_spans(text: &str) -> Vec<(usize, usize)> {
+    comment_spans_with_kind(text)
+        .into_iter()
+        .map(|(start, end, _)| (start, end))
+        .collect()
+}
+
+/// [`comment_spans`] with each span's [`CommentKind`].
+fn comment_spans_with_kind(text: &str) -> Vec<(usize, usize, CommentKind)> {
+    comment_spans_scan(text, false)
+}
+
+/// [`comment_spans_with_kind`], or with `ambiguous_as_code` set, the spans of
+/// the reading in which every `#` glued to a paren is a word character: no
+/// [`CommentKind::Ambiguous`] span is returned, and the scan goes on through
+/// that text with its quotes, so a quote opened there pairs with its closer
+/// on a later line as bash pairs it ([`strip_comments_as_written`]).
+fn comment_spans_scan(text: &str, ambiguous_as_code: bool) -> Vec<(usize, usize, CommentKind)> {
     let mut spans = Vec::new();
+    // Set by an unquoted `(` or `)` after which a `#` is ambiguous
+    // ([`paren_step`]); cleared by every other character.
+    let mut ambiguous = false;
+    // The unquoted, unescaped character just before this one, if any.
+    let mut before: Option<char> = None;
     let mut quote: Option<Quote> = None;
     let mut open: Vec<Opener> = Vec::new();
+    // How many [`Opener::Arith`] entries `open` holds ([`paren_step`]).
+    let mut arith = 0usize;
     let mut backticks = false;
     let mut boundary = true;
     let mut chars = text.char_indices().peekable();
@@ -8614,6 +8976,8 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
     let mut scan_exhausted = SpanLatch::default();
 
     while let Some((i, c)) = chars.next() {
+        let was_ambiguous = std::mem::take(&mut ambiguous);
+        let prev = before.take();
         // A substitution inside `"…"` is skipped whole, the same way
         // [`split_segments_with_ops`] copies it: an inner `"` belongs to the
         // nested parse and must not close this run. Reading it as data closed
@@ -8710,16 +9074,6 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 backticks = !backticks;
                 boundary = false;
             }
-            // Only nested once an expansion is already open, so a bare
-            // `(subshell)` never pushes.
-            '(' if !open.is_empty() => {
-                open.push(Opener::Paren);
-                boundary = false;
-            }
-            '{' if !open.is_empty() => {
-                open.push(Opener::Brace);
-                boundary = false;
-            }
             // A closer pops ONLY its own opener. A `)` sitting inside `${…}` is
             // DATA — bash never ends a parameter expansion on it — so treating
             // the two kinds as one counter let `echo ${x:-a)b # c} ; rm -rf ~`
@@ -8732,17 +9086,56 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
             // the stack keeps the scan inside an expansion, which DISABLES
             // comment stripping and over-inspects. Every unbalanced-opener
             // shape already fails that way and is measured to do so.
-            ')' if matches!(open.last(), Some(Opener::Paren | Opener::Subst)) => {
-                open.pop();
+            '(' | ')' => {
+                let next = chars.peek().map(|&(_, n)| n);
+                let (glued, consumed) = paren_step(&mut open, &mut arith, c, boundary, prev, next);
+                if consumed {
+                    chars.next();
+                }
+                ambiguous = glued;
+                boundary = false;
+            }
+            // Inside `((…))` the shells read `#` and `<<` one way if `((` is
+            // arithmetic and another if it is two subshells; see
+            // [`CommentKind::Unresolved`]. [`scan_command_line`] stops at the
+            // same characters.
+            '#' | '<'
+                if arith > 0
+                    && !comment_context(open.last().copied())
+                    && unresolved_in_arith(
+                        c,
+                        boundary || was_ambiguous,
+                        chars.peek().map(|&(_, n)| n),
+                    ) =>
+            {
+                spans.push((i, text.len(), CommentKind::Unresolved));
+                break;
+            }
+            // Only nested once an expansion is already open, so a bare
+            // `{ group; }` never pushes.
+            '{' if matches!(
+                open.last(),
+                Some(Opener::Subst | Opener::Paren | Opener::Brace | Opener::Arith)
+            ) =>
+            {
+                open.push(Opener::Brace);
                 boundary = false;
             }
             '}' if open.last() == Some(&Opener::Brace) => {
                 open.pop();
                 boundary = false;
             }
-            '#' if boundary && matches!(open.last(), None | Some(Opener::Subst)) && !backticks => {
+            '#' if (boundary || (was_ambiguous && !ambiguous_as_code))
+                && comment_context(open.last().copied())
+                && !backticks =>
+            {
                 let end = text[i..].find('\n').map_or(text.len(), |off| i + off);
-                spans.push((i, end));
+                let kind = if boundary {
+                    CommentKind::Comment
+                } else {
+                    CommentKind::Ambiguous
+                };
+                spans.push((i, end, kind));
                 while chars.peek().is_some_and(|&(j, _)| j < end) {
                     chars.next();
                 }
@@ -8753,7 +9146,10 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
             // `x<NBSP>#` and runs `cmd`; reading them as blanks opened a
             // comment there and hid `cmd` from every guard
             // (cameronsjo/cadence-hooks#1389).
-            other => boundary = is_bash_blank(other),
+            other => {
+                boundary = is_bash_blank(other);
+                before = Some(other);
+            }
         }
     }
     spans
@@ -8761,19 +9157,189 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
 
 /// `command` with every [`comment_spans`] range removed. The newline that ends
 /// each comment is preserved, so the segment the comment trailed still flushes.
+///
+/// An [`CommentKind::Ambiguous`] span is kept instead, with `'`, `"`, `` ` ``
+/// and `\` turned into `;`: its text stays visible as commands, and none of
+/// its quotes, backticks or escapes reaches past its own line.
+///
+/// An [`CommentKind::Unresolved`] span is kept to the end of the input, with
+/// `'`, `"` and `\` removed and `` ` `` turned into `;`. Removing the quotes
+/// rather than splitting on them keeps a quoted word whole: `cat '.env'`
+/// reads as `cat .env`, not as `cat` and a separate `.env`.
+///
+/// Neither rewrite keeps every reading: removing quotes turns `$'.env'` into
+/// `$.env`, and turning them into `;` splits `cat '.env'` in two. Callers that
+/// hand segments to guards use [`strip_comments_with_readings`], which also
+/// returns the spans' original text.
 pub fn strip_comments(command: &str) -> String {
-    let spans = comment_spans(command);
-    if spans.is_empty() {
-        return command.to_string();
-    }
+    strip_comments_with_readings(command).0
+}
+
+/// [`strip_comments`], plus the original text of every
+/// [`CommentKind::Ambiguous`] and [`CommentKind::Unresolved`] span, cut at
+/// each newline.
+///
+/// The rewrite in the first value stops a quote in the span from hiding the
+/// lines after it, but it changes what a quoted word means
+/// (cameronsjo/cadence-hooks#1393 review). The original lines keep each word
+/// as the shell reads it — `$'--force'`, `'.env'`, `$'\x2eenv'` — and, read
+/// one line at a time, no quote in them reaches the next line. A guard that
+/// reads both sees every reading, and blocks if any one of them trips a rule.
+///
+/// Spans never overlap and an `Unresolved` span ends the scan, so the lines
+/// add at most the input's length again. A line with no `'`, `"`, `` ` `` or
+/// `\` is left out: the rewrite changes only those characters, so it already
+/// reads that line as written.
+pub(crate) fn strip_comments_with_readings(command: &str) -> (String, Vec<&str>) {
+    let readings = strip_comments_reading_whole(command, false);
+    (readings.stripped, readings.originals)
+}
+
+/// `command` with its comments removed and every [`CommentKind::Ambiguous`]
+/// and [`CommentKind::Unresolved`] span kept exactly as written, or `None`
+/// when this text equals `rewrite` (the [`strip_comments`] text). Called
+/// only for a command that holds such a span ([`as_written_reading`]).
+///
+/// The other two readings cut a span's quotes off at its newline: the
+/// rewrite changes them, and the original lines are split one at a time. A
+/// quote that opens in the span and closes on a later line then ends early,
+/// and the line after the closer reads as quoted text. bash takes the `#` as
+/// a word character there and pairs the quotes across the lines, so it runs
+/// that line: `a=(x)#; echo "a` ⏎ `b"` ⏎ `git push --force origin main`
+/// (cameronsjo/cadence-hooks#1393 review). Here an `Ambiguous` `#` is code
+/// ([`comment_spans_scan`]) and the scan keeps the quote open across lines;
+/// an `Unresolved` span is already code to the end of the input, so it is
+/// kept as is.
+fn strip_comments_as_written(command: &str, rewrite: &str) -> Option<String> {
     let mut out = String::with_capacity(command.len());
     let mut cursor = 0;
-    for (start, end) in spans {
+    for (start, end, kind) in comment_spans_scan(command, true) {
+        if kind == CommentKind::Comment {
+            out.push_str(&command[cursor..start]);
+            cursor = end;
+        }
+    }
+    out.push_str(&command[cursor..]);
+    (out != rewrite).then_some(out)
+}
+
+/// What [`strip_comments_reading_whole`] returns.
+struct CommentReadings<'a> {
+    /// The [`strip_comments`] text.
+    stripped: String,
+    /// Each rewritten span line as written ([`strip_comments_with_readings`]).
+    originals: Vec<&'a str>,
+    /// The whole command as written, in pieces to split one at a time.
+    pieces: Vec<String>,
+    /// Whether some span was kept as code rather than removed: the command
+    /// has a reading [`as_written_reading`] adds.
+    kept_span: bool,
+}
+
+/// The third reading of `original` (before its heredoc bodies were stripped)
+/// when `readings` kept a span: heredoc bodies and comments removed with
+/// every `#` glued to a paren read as code ([`strip_heredoc_bodies_reading`],
+/// [`strip_comments_as_written`]). A `<<` inside a quote that opened in such
+/// a span opens no heredoc in that reading, so its "body" is still code:
+/// `a=(x)#; echo "a` ⏎ `cat <<EOF` ⏎ `b"` ⏎ `git push --force origin main`
+/// ⏎ `EOF` runs the push in bash.
+fn as_written_reading(original: &str, readings: &CommentReadings<'_>) -> Option<String> {
+    if !readings.kept_span {
+        return None;
+    }
+    let text = strip_heredoc_bodies_reading(original, true);
+    strip_comments_as_written(&text, &readings.stripped)
+}
+
+/// Whether a line of a rewritten span holds a character the rewrite changes.
+fn rewritten_line(line: &str) -> bool {
+    line.contains(['\'', '"', '`', '\\'])
+}
+
+/// [`strip_comments_with_readings`], plus, when `whole` is set and some span
+/// line was rewritten, the whole command as written in pieces to split one
+/// at a time: the text outside the spans (comments removed) and every span
+/// line the rewrite leaves alone, cut at each rewritten span line, which is
+/// a piece of its own. Splitting the pieces one after another reads every
+/// command in order, each word as written, and no quote in a span line
+/// reaches the next line. Empty when nothing was rewritten.
+///
+/// This is the reading a walk that carries state from one segment to the
+/// next — the directory a `cd` moves to — walks on its own, from the same
+/// start as the rewrite's reading ([`split_segment_readings`]).
+fn strip_comments_reading_whole(command: &str, whole: bool) -> CommentReadings<'_> {
+    let spans = comment_spans_with_kind(command);
+    if spans.is_empty() {
+        return CommentReadings {
+            stripped: command.to_string(),
+            originals: Vec::new(),
+            pieces: Vec::new(),
+            kept_span: false,
+        };
+    }
+    let kept_span = spans
+        .iter()
+        .any(|&(_, _, kind)| kind != CommentKind::Comment);
+    let mut out = String::with_capacity(command.len());
+    let mut originals = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut plain = String::new();
+    let mut cursor = 0;
+    for (start, end, kind) in spans {
         out.push_str(&command[cursor..start]);
+        if whole {
+            plain.push_str(&command[cursor..start]);
+        }
+        match kind {
+            CommentKind::Comment => {}
+            CommentKind::Ambiguous => {
+                out.extend(command[start..end].chars().map(|c| match c {
+                    '\'' | '"' | '`' | '\\' => ';',
+                    other => other,
+                }));
+            }
+            CommentKind::Unresolved => {
+                out.extend(command[start..end].chars().filter_map(|c| match c {
+                    '\'' | '"' | '\\' => None,
+                    '`' => Some(';'),
+                    other => Some(other),
+                }));
+            }
+        }
+        if kind != CommentKind::Comment {
+            for (index, line) in command[start..end].split('\n').enumerate() {
+                if whole && index > 0 {
+                    plain.push('\n');
+                }
+                if !rewritten_line(line) {
+                    if whole {
+                        plain.push_str(line);
+                    }
+                    continue;
+                }
+                originals.push(line);
+                if whole {
+                    pieces.push(std::mem::take(&mut plain));
+                    pieces.push(line.to_string());
+                }
+            }
+        }
         cursor = end;
     }
     out.push_str(&command[cursor..]);
-    out
+    if whole && !originals.is_empty() {
+        plain.push_str(&command[cursor..]);
+        pieces.push(plain);
+        pieces.retain(|piece| !piece.trim().is_empty());
+    } else {
+        pieces.clear();
+    }
+    CommentReadings {
+        stripped: out,
+        originals,
+        pieces,
+        kept_span,
+    }
 }
 
 /// Push `current` (trimmed) onto `segments` paired with the operator that
@@ -8878,7 +9444,7 @@ fn redirect_targets_impl(segment: &str, with_append: bool) -> Vec<String> {
 /// The filename after a redirect operator ending just before `i`, quotes
 /// removed, and the index just past it.
 ///
-/// Blanks before it are skipped. It ends at unquoted whitespace (a
+/// Blanks before it are skipped. It ends at an unquoted bash blank (a
 /// backslash-escaped one is part of the name: `Daily\ Note.md`), at an
 /// operator character, or at an unquoted `)` — a metacharacter bash never
 /// keeps inside a word, so `(: > note.md)` and `{ (echo hi > .env)}` write
@@ -8934,7 +9500,9 @@ fn read_redirect_target(chars: &[char], mut i: usize, scan_floor: &mut usize) ->
                 Err(read) => *scan_floor = i + 1 + read,
             }
         }
-        if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&' | ')') {
+        // Only bash's blanks end the name: `> d<NBSP>x/.env` writes `.env`
+        // inside the directory `d<NBSP>x` (cameronsjo/cadence-hooks#1391).
+        if is_bash_blank(tc) || matches!(tc, '>' | '<' | '|' | ';' | '&' | ')') {
             break;
         }
         target.push(tc);
@@ -11011,7 +11579,9 @@ fn heredoc_delimiter(chars: &[char], k: usize) -> Option<HeredocDelimiter> {
     while let Some(&c) = chars.get(k) {
         match c {
             '\\' if chars.get(k + 1) == Some(&'\n') => k += 2,
-            c if c.is_whitespace() || ";&|()<>".contains(c) => break,
+            // A bash blank or metacharacter ends the word; NBSP, VT and the
+            // rest of Unicode whitespace do not (cameronsjo/cadence-hooks#1391).
+            c if is_word_break(c) => break,
             // `$$` is the PID parameter, kept as text: the `'` or `"` after it
             // opens a plain string (`<<$$'E'` ends at `$$E`, as in bash). An
             // escaped `\$` is taken by the backslash arm below.
@@ -11892,12 +12462,10 @@ fn segment_assignments(segment: &str) -> Vec<Assignment> {
 fn unquoted_substitution_value(segment: &str, token: &str) -> Option<String> {
     // The raw word begins where its `NAME=$(` fragment does, at a word start.
     let head = &token[..token.find("$(")? + 2];
-    let start = segment.match_indices(head).map(|(at, _)| at).find(|&at| {
-        segment[..at]
-            .chars()
-            .next_back()
-            .is_none_or(char::is_whitespace)
-    })?;
+    let start = segment
+        .match_indices(head)
+        .map(|(at, _)| at)
+        .find(|&at| segment[..at].chars().next_back().is_none_or(is_bash_blank))?;
     let value = &segment[start + token.find('=')? + 1..];
     let mut depth = 0usize;
     let mut end = value.len();
@@ -11915,7 +12483,7 @@ fn unquoted_substitution_value(segment: &str, token: &str) -> Option<String> {
             '(' => return None,
             ')' if depth == 1 => depth = 0,
             ')' => return None,
-            c if c.is_whitespace() && depth == 0 => {
+            c if is_bash_blank(c) && depth == 0 => {
                 end = at;
                 break;
             }
@@ -13002,22 +13570,61 @@ pub use crate::push::{OutboundRange, PushInvocation, Refspec, outbound_commits, 
 pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
     split_segments(command)
         .iter()
-        .filter_map(|segment| {
-            let tokens = executable_tokens(segment);
-            let argv = peel_command_runners(&tokens);
-            if command_word(argv.first()?) != "git" {
-                return None;
-            }
-            let (subcommand, rest) = skip_git_global_options(&argv[1..]).split_first()?;
-            // `push` stays case-sensitive: only the executable word folds
-            // ([`command_word`]), because a subcommand is case-sensitive to git
-            // and inventing `PUSH` would judge a command the shell never runs.
-            if subcommand != "push" {
-                return None;
-            }
-            Some(rest.to_vec())
-        })
+        .filter_map(|segment| push_arguments(segment))
         .collect()
+}
+
+/// The arguments after `push` when `segment` is a `git push`
+/// ([`git_push_segments`]).
+fn push_arguments(segment: &str) -> Option<Vec<String>> {
+    let tokens = executable_tokens(segment);
+    let argv = peel_command_runners(&tokens);
+    if command_word(argv.first()?) != "git" {
+        return None;
+    }
+    let (subcommand, rest) = skip_git_global_options(&argv[1..]).split_first()?;
+    // `push` stays case-sensitive: only the executable word folds
+    // ([`command_word`]), because a subcommand is case-sensitive to git
+    // and inventing `PUSH` would judge a command the shell never runs.
+    if subcommand != "push" {
+        return None;
+    }
+    Some(rest.to_vec())
+}
+
+/// How many `git push` segments [`git_push_segments`] lists, less the copies
+/// the [`strip_comments_as_written`] reading adds: the larger of the count
+/// in the other two readings, listed together as before, and the count in
+/// that reading alone.
+///
+/// [`git_push_segments`] reads every reading of a span bash and zsh read
+/// apart in one list, and that reading repeats the whole command, so every
+/// push in such a command is listed in it a second time. A caller that
+/// counts pushes, rather than judging each one, counts that reading on its
+/// own: a push it shares with the others is not a second push
+/// (cameronsjo/cadence-hooks#1393 review).
+pub fn git_push_count(command: &str) -> usize {
+    let pushes = |segments: &[(String, Option<&'static str>)]| {
+        segments
+            .iter()
+            .filter(|(segment, _)| push_arguments(segment).is_some())
+            .count()
+    };
+    let original = command;
+    let command = strip_heredoc_bodies(command);
+    let readings = strip_comments_reading_whole(&command, false);
+    let mut listed = Vec::new();
+    for text in
+        std::iter::once(readings.stripped.as_str()).chain(readings.originals.iter().copied())
+    {
+        split_piece_into(text, false, &mut listed);
+    }
+    let written = as_written_reading(original, &readings).map_or(0, |text| {
+        let mut segments = Vec::new();
+        split_text_into(&text, false, &mut segments);
+        pushes(&segments)
+    });
+    pushes(&listed).max(written)
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
@@ -18390,6 +18997,436 @@ mod tests {
         assert_eq!(strip_heredoc_bodies(command), command);
     }
 
+    /// Shapes where a `#` glued to `(` or `)` is followed by `'`, a newline
+    /// and `cat .env`. bash 5.3, zsh 5.9 or both run the `cat`
+    /// (cameronsjo/cadence-hooks#1391); the first five are the issue's.
+    const PAREN_HASH_SHAPES: &[&str] = &[
+        "(#'\ncat .env\n#'\n)",
+        "(true)#'\ncat .env\n#'",
+        "if (#'\ncat .env\n#'\n) then :; fi",
+        "true|(#'\ncat .env\n#'\n)",
+        "case a in a)#'\ncat .env\n#'\n;; esac",
+        "case a in (a)#'\ncat .env\n#'\n;; esac",
+        "f()#'\n{\ncat .env\n}\nf",
+        "a=(1)#'\ncat .env\n#'",
+        "a=(#'\n)\ncat .env\n#'",
+        "cat =(#'\ncat .env\n#'\n)",
+        "echo $( (#'\ncat .env\n#'\n) )",
+        "echo $( (true)#'\ncat .env\n#'\n)",
+        "echo $(case a in a)#'\ncat .env\n#'\n;; esac)",
+        "(( 1 ))#'\ncat .env\n#'",
+        "((true))#'\ncat .env\n#'",
+        "!(#'\ncat .env\n#'\n)",
+        "{ (true)#'\ncat .env\n#'\n}",
+    ];
+
+    #[test]
+    fn hash_glued_to_a_paren_hides_no_line() {
+        // cameronsjo/cadence-hooks#1391: reading these `#`s as word text let
+        // the `'` open a quote bash and zsh never open, and that quote hid
+        // `cat .env`. Each is now kept as code without its quotes.
+        // Inside `$(…)` a case pattern's `)` reads as the closer here, and
+        // the read is found when [`command_segments`] re-splits the body.
+        for &command in PAREN_HASH_SHAPES {
+            let segments = if command.contains("$(case") {
+                command_segments(command)
+            } else {
+                split_segments(command)
+            };
+            assert!(
+                segments.iter().any(|s| s.trim() == "cat .env"),
+                "{command:?} hid the read: {segments:?}"
+            );
+        }
+        // Inline, a `; cmd` after such a `#` stays visible too: bash keeps
+        // `a=(1)#` one word, zsh keeps `(a)#`, `x(a)#` and, with
+        // `extendedglob`, `(#i)a`, and both run what follows the `;`.
+        for command in [
+            "a=(1)#; cat .env",
+            "echo (a)#; cat .env",
+            "echo x(a)#; cat .env",
+            "echo (#i)a; cat .env",
+            "(true)#; cat .env",
+        ] {
+            let segments = split_segments(command);
+            assert!(
+                segments.iter().any(|s| s.trim() == "cat .env"),
+                "{command:?}: {segments:?}"
+            );
+        }
+        // The span is reported as ambiguous, not as a comment.
+        assert_eq!(
+            comment_spans_with_kind("(true)#'x"),
+            vec![(6, 9, CommentKind::Ambiguous)]
+        );
+        assert_eq!(strip_comments("(true)#'x\"`\\"), "(true)#;x;;;");
+    }
+
+    #[test]
+    fn hash_glued_to_a_paren_leaves_everyday_commands_alone() {
+        // Real comments still go, the `;` and what follows included.
+        for (command, kept) in [
+            ("git status # note", "git status "),
+            ("(cd /tmp && ls) # cat .env", "(cd /tmp && ls) "),
+            ("ls # it's fine\necho ok", "ls \necho ok"),
+            ("echo $(echo hi # it's\n)", "echo $(echo hi \n)"),
+            ("x=(1 2 # it's\n3)", "x=(1 2 \n3)"),
+        ] {
+            assert_eq!(strip_comments(command), kept, "{command:?}");
+        }
+        // No comment and nothing glued: the text is unchanged.
+        for command in [
+            "echo \"a#b\"",
+            "v=abc; echo ${#v} $#",
+            "curl -s https://example.com/page#frag",
+            "echo hi > out.txt",
+            "(cd /tmp && ls)",
+            "diff <(ls a) <(ls b)",
+            "a=(1 2 3); echo ${a[@]}",
+            "echo $((16#ff))",
+            "case $x in a) echo a;; *) echo b;; esac",
+        ] {
+            assert_eq!(strip_comments(command), command, "{command:?}");
+        }
+        // After `$(…)`, `$((…))` or `<(…)` the word goes on in both shells,
+        // so the `#` is plain text and its `'` is a real quote.
+        for command in [
+            "echo $(date)#x",
+            "echo $((1))#x",
+            "cat <(true)#x",
+            "echo $(true)#'\ncat .env\n'",
+        ] {
+            assert_eq!(strip_comments(command), command, "{command:?}");
+        }
+        assert!(
+            !split_segments("echo $(true)#'\ncat .env\n'")
+                .iter()
+                .any(|s| s.trim() == "cat .env")
+        );
+        assert!(
+            split_segments("cat <(true)#; cat .env")
+                .iter()
+                .any(|s| s.trim() == "cat .env")
+        );
+        // A heredoc body stays data.
+        assert!(
+            !split_segments("cat <<EOF\ncat .env\nEOF\necho done")
+                .iter()
+                .any(|s| s.contains("cat .env"))
+        );
+    }
+
+    #[test]
+    fn arithmetic_command_starts_no_comment() {
+        // cameronsjo/cadence-hooks#1391: bash and zsh run the substitution
+        // in `(( 1 # $(cmd) ))`; reading `#` as a comment there hid it.
+        let segments = command_segments("(( 1 # $(cat .env) ))");
+        assert!(
+            segments.iter().any(|s| s.trim() == "cat .env"),
+            "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn double_paren_hash_or_heredoc_keeps_every_later_line_as_code() {
+        // cameronsjo/cadence-hooks#1391 review: bash and zsh read `((` as
+        // arithmetic only when its matching `)` is followed by `)`; otherwise
+        // it is two subshells, where `#` starts a comment and `<<` a heredoc.
+        // In arithmetic a `'` after `#` is a quote and `<<` a shift. Each
+        // reading hides a line the other runs, so from the `#` or `<<` on the
+        // text is kept as code with no quote in it.
+        for command in [
+            // Subshells (bash and zsh run `cat .env`).
+            "((echo a #'\ncat .env\n#'\n) )",
+            "((echo a #'\ncat .env\n#'\n);true)",
+            "true; ((echo a #'\ncat .env\n#'\n) )",
+            "true | ((echo a #'\ncat .env\n#'\n) )",
+            "if ((echo a #'\ncat .env\n#'\n) ) then :; fi",
+            "echo $( ((echo a #'\ncat .env\n#'\n) ) )",
+            "((echo '))' #'\ncat .env\n#'\n) )",
+            "(( (echo a #'\ncat .env\n#'\n) ) )",
+            // A heredoc in the subshell reading (zsh runs `cat .env`).
+            "((cat <<E\n'\nE\n) )\ncat .env\n#'",
+            // Arithmetic (bash runs `cat .env`).
+            "(( 1 #'\n))'\n))\ncat .env\n'",
+            "(( x = 1 <<E ))\ncat .env\nE",
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|s| s.trim() == "cat .env"),
+                "{command:?}: {segments:?}"
+            );
+        }
+        // The span runs to the end of the input; its quotes and backslashes
+        // go, and a backtick becomes `;`.
+        assert_eq!(
+            comment_spans_with_kind("((a #'\nb\n) )"),
+            vec![(4, 12, CommentKind::Unresolved)]
+        );
+        assert_eq!(
+            strip_comments("(( 1 # '.e'nv \\x `y` ))\nz"),
+            "(( 1 # .env x ;y; ))\nz"
+        );
+        // The heredoc scanner stops at the same place, so it cuts no body
+        // after it either: past that point its quote state is a guess.
+        for command in [
+            "((cat <<E\n'\nE\n) )\ncat .env",
+            "(( 1 # x ))\ncat <<E\ncat .env\nE",
+        ] {
+            assert_eq!(strip_heredoc_bodies(command), command, "{command:?}");
+        }
+        // Controls: arithmetic with no `#` or `<<` is unchanged, `16#ff` and
+        // `${#a}` are not at a word start, and `$((…))` keeps its old reading.
+        for command in [
+            "(( x = 1 + 2 ))",
+            "((i++))",
+            "(( x = 16#ff ))",
+            "if (( ${#a[@]} > 0 )); then echo '#'; fi",
+            "echo $(( 1 << 2 ))",
+        ] {
+            assert_eq!(strip_comments(command), command, "{command:?}");
+        }
+        assert_eq!(
+            strip_heredoc_bodies("echo $(( 1 << 2 ))\ncat .env\n2"),
+            "echo $(( 1 << 2 ))\ncat .env\n2"
+        );
+    }
+
+    #[test]
+    fn a_quote_opened_in_a_kept_span_closes_where_bash_closes_it() {
+        // cameronsjo/cadence-hooks#1393 review: a quote that opens in a span
+        // bash and zsh read apart and closes on a later line. The rewrite
+        // turns the quote into `;` and the original lines are split one at a
+        // time, so in both the closer opens a new quote that hides the next
+        // line. bash reads the glued `#` as a word character, pairs the
+        // quotes across the lines, and runs that line; the third reading
+        // keeps the span as written and splits the whole command at once.
+        let push = "git push --force origin main";
+        for command in [
+            "a=(x)#; echo \"a\nb\"\ngit push --force origin main",
+            "a=(x)#; echo 'a\nb'\ngit push --force origin main",
+            "a=(x)#; echo $'a\nb'\ngit push --force origin main",
+            "( a=(x)#; echo \"a\nb\"\ngit push --force origin main )",
+            "a=(x)#; echo \"a\nb\" # it's\ngit push --force origin main",
+            "a=(x)#; echo \"a\\\nb\"\ngit push --force origin main",
+            "a=(x)#; echo \"a\nb\"; c=(y)#; echo 'c\nd'\ngit push --force origin main",
+            // A `<<` inside that quote opens no heredoc in bash, so the line
+            // after the closer is code, not a heredoc body.
+            "a=(x)#; echo \"a\ncat <<EOF\nb\"\ngit push --force origin main\nEOF",
+            // An `Unresolved` span is code to the end of the input.
+            "(( x <<= 1 ))\necho \"a\nb\"\ngit push --force origin main",
+            "(( x <<= 1 ))\necho 'a\nb'\ngit push --force origin main",
+        ] {
+            let segments = split_segments(command);
+            assert!(
+                segments.iter().any(|s| s.trim_end_matches(" )") == push),
+                "{command:?}: {segments:?}"
+            );
+            assert!(
+                split_segment_readings(command, false)
+                    .iter()
+                    .any(|reading| reading
+                        .iter()
+                        .any(|(s, _)| s.trim_end_matches(" )") == push)),
+                "{command:?}"
+            );
+        }
+        // The third reading is the command with its comments removed and each
+        // kept span as written; a `#` inside the quote is quoted text.
+        let readings = split_segment_readings("a=(x)#; echo \"a\n# b\"\nls # c", false);
+        assert_eq!(
+            readings.last().expect("readings"),
+            &[
+                ("a=(x)#".to_string(), Some(";")),
+                ("echo \"a\n# b\"".to_string(), Some("\n")),
+                ("ls".to_string(), None),
+            ]
+        );
+        assert_eq!(readings.len(), 3);
+        // No kept span, or one the rewrite already reads as written: no third
+        // reading.
+        for command in [
+            "git status # it's",
+            "cd x; echo 'a'",
+            "(( y = 1 << 2 ))",
+            "(( 1 # x ))\nls",
+        ] {
+            let readings = strip_comments_reading_whole(command, false);
+            assert_eq!(as_written_reading(command, &readings), None, "{command:?}");
+        }
+        // A push read three ways is still one push.
+        assert_eq!(
+            git_push_count("a=(x)#; echo \"a\nb\"\ngit push origin main"),
+            1
+        );
+        assert_eq!(
+            git_push_count("(( 1 #'\n))'\n))\ngit push origin a; git push origin b"),
+            2
+        );
+        assert_eq!(git_push_count("git status"), 0);
+    }
+
+    #[test]
+    fn rewritten_span_is_also_read_as_written() {
+        // cameronsjo/cadence-hooks#1393 review C1 and C2: removing the quotes
+        // in an `Unresolved` span read `$'.env'` as `$.env`, and turning them
+        // into `;` in an `Ambiguous` span split `cat '.env'` in two. bash and
+        // zsh read each word below whole, so the segments must hold it whole.
+        for (command, want) in [
+            ("(( x = 1 << 2 )); cat $'.env'", "cat $'.env'"),
+            (
+                "(( x <<= 1 )); git push $'--force' origin main",
+                "git push $'--force' origin main",
+            ),
+            ("(( 1 # x ))\ncat $\".env\"", "cat $\".env\""),
+            ("(( x = 1 << 2 )); f=$'.env'; cat \"$f\"", "cat \"$f\""),
+            ("a=(x)#; cat '.env'", "cat '.env'"),
+            (
+                "a=(x)#; git push $'--force' origin main",
+                "git push $'--force' origin main",
+            ),
+            ("a=(x)#; echo k > '.env'", "echo k > '.env'"),
+        ] {
+            let segments = split_segments(command);
+            assert!(
+                segments.iter().any(|s| s == want),
+                "{command:?}: {segments:?}"
+            );
+        }
+        // The original text is cut at each newline, so its quotes still hide
+        // nothing: the line after a stray `'` is its own segment.
+        let (stripped, originals) = strip_comments_with_readings("((echo a #'\ncat .env\n#'\n) )");
+        assert_eq!(stripped, "((echo a #\ncat .env\n#\n) )");
+        assert_eq!(originals, ["#'", "#'"]);
+        assert!(split_segments("((echo a #'\ncat .env\n#'\n) )").contains(&"cat .env".to_string()));
+        // An ambiguous span stops at its newline.
+        let (_, originals) = strip_comments_with_readings("(true)#'x\ncat '.env'");
+        assert_eq!(originals, ["#'x"]);
+        // A span line with nothing the rewrite changes is not repeated, and a
+        // real comment adds nothing.
+        for command in ["(( y = 1 << 2 ))", "(( 1 # x ))\nls", "git status # it's"] {
+            assert!(
+                strip_comments_with_readings(command).1.is_empty(),
+                "{command:?}"
+            );
+        }
+        // Each appended block follows a `"\n"`, and the last segment still
+        // carries no operator. The last block is the whole command as
+        // written ([`strip_comments_as_written`]).
+        assert_eq!(
+            split_segments_with_ops("(( x = 1 << 2 )); cat $'.env'"),
+            [
+                ("(( x = 1 << 2 ))".to_string(), Some(";")),
+                ("cat $.env".to_string(), Some("\n")),
+                ("<< 2 ))".to_string(), Some(";")),
+                ("cat $'.env'".to_string(), Some("\n")),
+                ("(( x = 1 << 2 ))".to_string(), Some(";")),
+                ("cat $'.env'".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn heredoc_scanner_skips_a_hash_glued_to_a_paren() {
+        // cameronsjo/cadence-hooks#1391: [`scan_command_line`] reads the
+        // glued `#` the way [`comment_spans`] does. Following its `'` as a
+        // quote put `cat <<E` inside a string, so the body's `'` line stayed
+        // code and its quote hid the push bash and zsh run.
+        let command = "(#'\ncat <<E\n'\nE\ngit push --force origin main\n)";
+        let stripped = strip_heredoc_bodies(command);
+        assert!(
+            stripped.lines().all(|l| l != "'"),
+            "kept the heredoc body: {stripped:?}"
+        );
+        assert!(
+            split_segments(command)
+                .iter()
+                .any(|s| s.trim() == "git push --force origin main"),
+            "{stripped:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_delimiter_ends_only_at_a_bash_blank_or_metacharacter() {
+        // cameronsjo/cadence-hooks#1391: bash and zsh keep NBSP and VT in the
+        // delimiter word, so the body below runs to `E<C>x` and the push
+        // after it runs. Ending the word at `<C>` closed the body at `E` and
+        // left the `'` line to quote the push out of sight.
+        for c in ['\u{a0}', '\u{b}', '\u{3000}'] {
+            let line = format!("cat <<E{c}x");
+            let found = heredoc_introducers(&line);
+            assert_eq!(found.len(), 1, "{line:?}");
+            assert_eq!(found[0].word, format!("E{c}x"), "{line:?}");
+            let command = format!("{line}\nE\n'\nE{c}x\ngit push --force origin main\n#'");
+            assert!(
+                split_segments(&command)
+                    .iter()
+                    .any(|s| s.trim() == "git push --force origin main"),
+                "{command:?}"
+            );
+        }
+        // Controls: a blank or a metacharacter still ends it.
+        for (line, word) in [
+            ("cat <<E x", "E"),
+            ("cat <<E\tx", "E"),
+            ("cat <<E;x", "E"),
+            ("cat <<E)x", "E"),
+            ("cat <<EOF", "EOF"),
+        ] {
+            let found = heredoc_introducers(line);
+            assert_eq!(found.len(), 1, "{line:?}");
+            assert_eq!(found[0].word, word, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn redirect_target_ends_only_at_a_bash_blank() {
+        // cameronsjo/cadence-hooks#1391: bash and zsh write `.env` inside the
+        // directory `d<C>x`; ending the name at `<C>` judged the target `d`.
+        for c in ['\u{a0}', '\u{b}', '\u{3000}'] {
+            let target = format!("d{c}x/.env");
+            assert_eq!(
+                redirect_targets(&format!("echo A=1 > {target}")),
+                vec![target.clone()]
+            );
+            assert_eq!(
+                redirect_targets(&format!("echo A=1 >> {target}")),
+                vec![target.clone()]
+            );
+            assert_eq!(
+                clobber_redirect_targets(&format!("echo A=1 >{target} x")),
+                vec![target.clone()]
+            );
+        }
+        // Controls: a blank still ends the name.
+        assert_eq!(redirect_targets("echo A=1 > d x/.env"), vec!["d"]);
+        assert_eq!(redirect_targets("echo A=1 > out.txt"), vec!["out.txt"]);
+        assert_eq!(redirect_targets("echo A=1 >\tout.txt"), vec!["out.txt"]);
+    }
+
+    #[test]
+    fn unquoted_substitution_value_splits_only_at_bash_blanks() {
+        // cameronsjo/cadence-hooks#1391, the same class: NBSP neither starts
+        // the assignment word nor ends its value.
+        assert_eq!(
+            unquoted_substitution_value("D=$(pwd #x)\u{a0}y", "D=$(pwd"),
+            Some("$(pwd #x)\u{a0}y".to_string())
+        );
+        assert_eq!(
+            unquoted_substitution_value("export x\u{a0}D=$(a #) D=$(b #)", "D=$(b"),
+            Some("$(b #)".to_string())
+        );
+        // Controls: a space ends the value and starts the word.
+        assert_eq!(
+            unquoted_substitution_value("D=$(pwd #x) y", "D=$(pwd"),
+            Some("$(pwd #x)".to_string())
+        );
+        assert_eq!(
+            unquoted_substitution_value("export D=$(a #) E=1", "D=$(a"),
+            Some("$(a #)".to_string())
+        );
+    }
+
     #[test]
     fn tokenize_keeps_double_quoted_content_in_one_token() {
         assert_eq!(
@@ -20885,7 +21922,7 @@ mod tests {
         // nested heredoc still reaches the splitter.
         let input = "cat <<EOF\n$(cat <<'X'\nit's\nX\ncat .env)\nEOF";
         let mut spent = WorkBudget { left: 0 };
-        let out = strip_heredoc_bodies_bounded(input, MAX_HEREDOC_SPAN_DEPTH, &mut spent);
+        let out = strip_heredoc_bodies_bounded(input, MAX_HEREDOC_SPAN_DEPTH, &mut spent, false);
         assert!(out.contains("cat .env"), "{out:?}");
         // With room to work, the same input resolves the inner heredoc and
         // the read becomes its own segment.
@@ -22898,6 +23935,75 @@ mod tests {
                 "{command:?}: {located:?}"
             );
         }
+    }
+
+    #[test]
+    fn segment_work_dirs_walks_each_reading_from_the_start() {
+        // cameronsjo/cadence-hooks#1393 review round 3: a span bash and zsh
+        // read apart is read rewritten and as written, and the walk read
+        // both as one script, so the second began where the first's `cd`s
+        // ended. Each reading now starts in the cwd, and every `cd` in such
+        // a command is a maybe-move.
+        let dirs_of = |command: &str, segment: &str| -> Vec<String> {
+            let mut dirs: Vec<String> = segment_work_dirs_with_cdpath(command, "/cwd", false)
+                .into_iter()
+                .filter(|located| located.raw == segment)
+                .map(|located| located.dir.to_string())
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs
+        };
+        // A relative `cd` is applied once per reading, never twice.
+        let command = "a=(x)#; cd x; git push 'u' main";
+        assert_eq!(dirs_of(command, "git push 'u' main"), ["/cwd", "/cwd/x"]);
+        assert!(
+            segment_work_dirs_with_cdpath(command, "/cwd", false)
+                .iter()
+                .all(|located| !located.dir.contains("x/x")),
+            "{command:?}"
+        );
+        // The rewrite cannot read `$'x'`; the written reading can.
+        assert!(
+            dirs_of(
+                "(( y <<= 1 ))\ncd $'x'\ngit push origin main",
+                "git push origin main"
+            )
+            .contains(&"/cwd/x".to_string())
+        );
+        // Quoted text read as a `cd` does not take the push out of `x`.
+        for command in [
+            "(( y <<= 1 ))\ncd x\necho \"a\ncd ../y \"\ngit push origin main",
+            "(( y <<= 1 ))\ncd x\necho \"a\ncd ../y\nb\"\ngit push origin main",
+            "a=(x)#; cd x; echo 'a; cd ../y '; git push origin main",
+        ] {
+            assert!(
+                dirs_of(command, "git push origin main").contains(&"/cwd/x".to_string()),
+                "{command:?}"
+            );
+        }
+        // A command with no such span keeps one reading and plain moves.
+        assert_eq!(
+            dirs_of(
+                "cd x; echo 'a'; git push origin main",
+                "git push origin main"
+            ),
+            ["/cwd/x"]
+        );
+        assert_eq!(split_segment_readings("cd x; echo 'a'", false).len(), 1);
+        // The written reading reads every line, each rewritten line on its
+        // own, with every word as written.
+        assert_eq!(
+            split_segment_readings("(( y <<= 1 ))\ncd $'x'\necho \"a\ncd ../y\nb\"\nls", false)[1],
+            [
+                ("(( y <<= 1 ))".to_string(), Some("\n")),
+                ("cd $'x'".to_string(), Some("\n")),
+                ("echo \"a".to_string(), Some("\n")),
+                ("cd ../y".to_string(), Some("\n")),
+                ("b\"".to_string(), Some("\n")),
+                ("ls".to_string(), None),
+            ]
+        );
     }
 
     /// Every directory the LAST segment may run in, per [`segment_work_dirs`].

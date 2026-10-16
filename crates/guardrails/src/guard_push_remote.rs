@@ -8,8 +8,9 @@ use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, LocatedSegment, git_push_segments, host_and_repo_from_url, looks_like_push_url,
-    parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers, strip_quotes,
+    LOOP_PATTERN, LocatedSegment, git_push_count, git_push_segments, host_and_repo_from_url,
+    looks_like_push_url, parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers,
+    strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -1163,7 +1164,12 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
     // a script: its pushes are segments too. A heredoc fed to anything else
     // is data. Accepted gap: script text piped from a producer that is not a
     // heredoc (`echo 'git push …' | bash`, `source <(…)`) is not read.
+    // The fallback count below takes each body's pushes from
+    // [`git_push_count`], which drops the as-written reading's copies; the
+    // segment list keeps every reading so each push is still owner-checked.
+    let mut heredoc_push_count = 0;
     for body in cadence_hooks_core::shell::shell_fed_heredoc_bodies(command) {
+        heredoc_push_count += git_push_count(&body);
         push_segments.extend(git_push_segments(&body));
     }
     if push_segments.is_empty() && walk.of(command, &input_cwd(input)).is_empty() {
@@ -1212,10 +1218,16 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
             // push carrying a git global (`git -C . push …`), which is
             // exactly the shape #554 was about — so take the larger of the
             // two counts rather than trusting either on its own.
+            //
+            // The segment count leaves out the copies the as-written reading
+            // of a span bash and zsh read apart adds ([`git_push_count`]):
+            // that reading repeats the whole command, and one push read twice
+            // there is not two (cameronsjo/cadence-hooks#1393 review). The
+            // shell-fed heredoc pushes are added on top.
             let push_count = strip_quotes(command)
                 .matches("git push")
                 .count()
-                .max(push_segments.len());
+                .max(git_push_count(command) + heredoc_push_count);
             if push_count > 1 {
                 return CheckResult::block(
                     "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
@@ -3102,6 +3114,117 @@ mod tests {
                 let command = command.replace("{other}", &other);
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
                 assert_eq!(result.outcome, Block, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1393 review round 3: a span bash and zsh read
+    /// apart (`(( x <<= 1 ))`, `a=(x)#`) is read twice, rewritten and as
+    /// written. The push walk read both as one script, so the second started
+    /// in the directory the first ended in: a relative `cd` applied twice, a
+    /// `cd $'…'` the rewrite left unreadable decided where the later push
+    /// ran, and quoted text read as a `cd` moved the push to an owned
+    /// checkout. Every row runs from a directory holding `rm_` (unowned) and
+    /// `rf_` (owned), and each blocks as it does on main.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_after_a_span_read_two_ways_is_judged_in_every_directory() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let root = tempfile::tempdir().expect("create fixture root");
+        for (name, url) in [
+            ("rm_", "https://github.com/evil/x.git"),
+            ("rf_", "https://github.com/cameronsjo/x.git"),
+        ] {
+            let repo = root.path().join(name);
+            std::fs::create_dir(&repo).expect("create checkout");
+            cadence_hooks_core::git_fixtures::init_repo(&repo);
+            cadence_hooks_core::git_fixtures::git_in(&repo, &["remote", "add", "origin", url]);
+        }
+        let cwd = root.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // An unreadable rewrite of the `cd` (`$'rm_'` → `$rm_`).
+                ("(( x <<= 1 ))\ncd $'rm_'\ngit push origin main", Block),
+                (
+                    "(( x <<= 1 ))\ncd $'rm_'\ngit push origin --delete main",
+                    Block,
+                ),
+                // Quoted text that reads as a `cd` once the rewrite drops
+                // or cuts its quotes.
+                (
+                    "(( x <<= 1 ))\ncd rm_\necho \"a\ncd ../rf_ \"\ngit push origin main",
+                    Block,
+                ),
+                (
+                    "(( x <<= 1 ))\ncd rm_\necho \"a\ncd ../rf_\nb\"\ngit push origin main",
+                    Block,
+                ),
+                (
+                    "a=(x)#; cd rm_; echo 'x; cd ../rf_ '; git push origin main",
+                    Block,
+                ),
+                // A relative `cd` applied twice (`rf_/rf_`, no repository)
+                // lost the quoted unowned URL.
+                (
+                    "a=(x)#; cd rf_; git push 'https://github.com/evil/x.git' main",
+                    Block,
+                ),
+                // A quote that opens in the span and closes on a later line:
+                // the earlier readings cut it at the span's newline, so its
+                // closer opened a quote over the push, and the quoted `cd
+                // ../rf_` moved it. bash pairs the quotes; the push runs in
+                // `rm_`.
+                (
+                    "a=(x)#; cd rm_; echo \"a\ncd ../rf_\nb\"\ngit push origin main",
+                    Block,
+                ),
+                (
+                    "a=(x)#; cd rm_; echo 'a\ncd ../rf_\nb'\ngit push origin main",
+                    Block,
+                ),
+                // One push read three ways is one push, so the fallback for a
+                // command the chain parser rejects does not count it three
+                // times.
+                ("(( 1 #'\n))'\n))\ncd rf_; git push origin main", Allow),
+                // Controls, as on main.
+                ("cd rf_; git push origin main", Allow),
+                ("cd rf_; git push origin feat", Allow),
+                ("cd rm_; git push origin main", Block),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command:?}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// cameronsjo/cadence-hooks#1393 review round 4: a push in a shell-fed
+    /// heredoc whose body holds a kept span (`a=(x)#` before a quote) is read
+    /// twice, rewritten and as written. When the chain parser rejects the
+    /// command, the fallback count took both copies and blocked one push as
+    /// "multiple git push commands"; main allows it. Two pushes still block.
+    #[cfg(unix)]
+    #[test]
+    fn one_heredoc_push_read_two_ways_is_counted_once() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                (
+                    "bash <<'Z'\na=(x)#; echo 'hi'\ngit push origin main\nZ\necho $((",
+                    Allow,
+                ),
+                (
+                    "bash <<'Z'\na=(x)#; echo 'hi'\ngit push origin main\nZ\n(((",
+                    Allow,
+                ),
+                (
+                    "bash <<'Z'\na=(x)#; echo 'hi'\ngit push origin main\ngit push origin feat\nZ\necho $((",
+                    Block,
+                ),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command:?}: {:?}", result.message);
             }
         });
     }

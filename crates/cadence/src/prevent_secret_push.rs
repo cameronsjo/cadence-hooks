@@ -164,9 +164,10 @@ use crate::secret_patterns::{
 use cadence_hooks_core::deadline::{self, BudgetState};
 use cadence_hooks_core::push::{PushInvocation, is_safe_ref, push_invocations};
 use cadence_hooks_core::shell::{
-    GitSpawn, UNRESOLVABLE_DIR, command_segments_with_dirs, command_word,
+    GitSpawn, LocatedSegment, UNRESOLVABLE_DIR, command_segments_with_dirs, command_word,
     contains_ignoring_ascii_case, executable_tokens, peel_command_runners, resolve_cd_target,
-    run_bounded_capped_input, skip_git_global_options, unescape_word,
+    run_bounded_capped_input, segment_work_dirs, skip_git_global_options, strip_group_wrappers,
+    unescape_word,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
@@ -2370,7 +2371,7 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
             "{why}, so what it publishes could not be resolved"
         )));
     }
-    for inv in push_invocations(command, cwd) {
+    for inv in push_invocations_every_dir(command, cwd) {
         if inv.dry_run {
             continue;
         }
@@ -2407,6 +2408,49 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
         })?;
     }
     Ok(())
+}
+
+/// Every push [`push_invocations`] finds, plus every push it places nowhere
+/// the per-segment reading does ([`segment_work_dirs`]): each top-level
+/// segment that mentions a push, walked on its own in each directory that
+/// segment may run in — the reading guard-push-remote judges beside the push
+/// walk.
+///
+/// The push walk keeps one directory and takes every `cd` it reads as run.
+/// Where a command has a span bash and zsh read apart, quoted text can read
+/// as a `cd` (`echo "a⏎cd ../clean⏎b"`), and the per-segment walk judges
+/// the segments after such a `cd` where the shell was before it as well
+/// (cameronsjo/cadence-hooks#1393 review). A push both readings place alike
+/// is judged once; one they place apart is judged in each, and any finding
+/// blocks — this can add a verdict, never remove one. A directory the walk
+/// cannot say is [`UNRESOLVABLE_DIR`], where every probe fails and the push
+/// is refused.
+fn push_invocations_every_dir(command: &str, cwd: &str) -> Vec<PushInvocation> {
+    let mut pushes = push_invocations(command, cwd);
+    if !contains_ignoring_ascii_case(command, "push") {
+        return pushes;
+    }
+    let mut placed: std::collections::HashSet<(String, Option<String>)> = pushes
+        .iter()
+        .map(|push| (push.work_dir.clone(), push.repository.clone()))
+        .collect();
+    // A flood repeats one segment: each (text, directory) pair is walked once.
+    let mut walked: std::collections::HashSet<(String, std::rc::Rc<str>)> =
+        std::collections::HashSet::new();
+    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+        if !contains_ignoring_ascii_case(&raw, "push") {
+            continue;
+        }
+        if !walked.insert((raw.clone(), dir.clone())) {
+            continue;
+        }
+        for push in push_invocations(strip_group_wrappers(&raw), &dir) {
+            if placed.insert((push.work_dir.clone(), push.repository.clone())) {
+                pushes.push(push);
+            }
+        }
+    }
+    pushes
 }
 
 /// Why a push or git call in `dir` cannot be judged when `dir` does not
@@ -2776,6 +2820,63 @@ mod tests {
             &PreventSecretPushGuard.run_with(&input, None, |_| false),
             &["s.txt"],
         );
+    }
+
+    /// cameronsjo/cadence-hooks#1393 review round 3: a span bash and zsh read
+    /// apart (`(( x <<= 1 ))`, `a=(x)#`) is read twice, rewritten and as
+    /// written, and the push walk read both as one script: the second started
+    /// where the first's `cd`s left it, and quoted text read as a `cd` moved
+    /// the push out of the checkout holding the secret. Every row runs from
+    /// the scratch root, beside `sec_` (an outbound `.env`) and `cln_` (clean).
+    #[cfg(unix)]
+    #[test]
+    fn a_push_after_a_span_read_two_ways_is_scanned_in_every_directory() {
+        let fx = Fx::new_in("spanreadings", "sec_");
+        fx.commit(".env", "FOO=bar\n", "add env");
+        let root = fx._scratch.path();
+        let clean = root.join("cln_");
+        std::fs::create_dir_all(&clean).unwrap();
+        git_in(&clean, &["init", "-q", "-b", "main"]);
+        for (key, value) in [
+            ("user.email", "t@t"),
+            ("user.name", "t"),
+            ("commit.gpgSign", "false"),
+            ("push.followTags", "false"),
+        ] {
+            git_in(&clean, &["config", key, value]);
+        }
+        std::fs::write(clean.join("notes.txt"), "clean\n").unwrap();
+        git_in(&clean, &["add", "notes.txt"]);
+        git_in(&clean, &["commit", "-q", "-m", "clean"]);
+        git_in(
+            &clean,
+            &["remote", "add", "origin", fx.remote.to_str().unwrap()],
+        );
+        let run = |command: &str| {
+            let input = make_bash_with_cwd(command, root.to_str().unwrap());
+            PreventSecretPushGuard.run_with(&input, None, |_| false)
+        };
+        for command in [
+            "(( x <<= 1 ))\ncd $'sec_'\ngit push origin main",
+            "(( x <<= 1 ))\ncd sec_\necho \"a\ncd ../cln_ \"\ngit push origin main",
+            "(( x <<= 1 ))\ncd sec_\necho \"a\ncd ../cln_\nb\"\ngit push origin main",
+            "(( x <<= 1 ))\ncd sec_\necho 'a\ncd ../cln_\nb'\ngit push origin main",
+            "a=(x)#; cd sec_; echo 'x; cd ../cln_ '; git push origin main",
+            "a=(x)#; cd sec_; git push 'origin' main",
+            // A quote that opens in the span and closes on a later line: the
+            // earlier readings cut it at the span's newline, and its closer
+            // opened a quote over the push. bash pairs the quotes, so the
+            // `cd ../cln_` is quoted text and the push runs in `sec_`.
+            "a=(x)#; cd sec_; echo \"a\ncd ../cln_\nb\"\ngit push origin main",
+            "a=(x)#; cd sec_; echo 'a\ncd ../cln_\nb'\ngit push origin main",
+            "cd sec_\na=(x)#; echo \"a\nb\"\ngit push --force origin main",
+        ] {
+            assert_eq!(run(command).outcome, Outcome::Block, "{command:?}");
+        }
+        // Controls, as on main.
+        assert_blocks(&run("cd sec_; git push origin main"), &[".env"]);
+        assert_allows(&run("cd cln_; git push origin main"));
+        assert_allows(&run("cd cln_; git push origin main:feat"));
     }
 
     #[test]

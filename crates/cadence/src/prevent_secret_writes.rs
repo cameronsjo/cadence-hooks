@@ -1049,6 +1049,67 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1391: bash and zsh write `.env` inside the
+    /// directory `d<C>x` (measured), but the redirect target ended at `<C>`
+    /// and the guard judged `d`.
+    #[test]
+    fn redirect_into_a_directory_named_with_a_non_blank_is_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for c in ['\u{a0}', '\u{b}', '\u{3000}'] {
+            for (command, outcome) in [
+                (format!("echo A=1 > d{c}x/.env"), Block),
+                (format!("echo A=1 >> d{c}x/.env"), Block),
+                (format!("echo A=1 > d{c}x/out.txt"), Allow),
+            ] {
+                let result = SecretWritesGuard::default().run(&make_bash(&command));
+                assert_eq!(result.outcome, outcome, "{command:?}");
+            }
+        }
+        for (command, outcome) in [("echo A=1 > .env", Block), ("echo A=1 > out.txt", Allow)] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1391 review: bash and zsh read `((` as two
+    /// subshells when its matching `)` is not followed by `)`, so the `#`
+    /// starts a comment (or `<<` a heredoc) and the write on the next line
+    /// runs. Reading `((` as arithmetic let the `'` hide that line.
+    #[test]
+    fn redirect_after_a_double_paren_subshell_is_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("((echo a #'\necho A=1 > .env\n#'\n) )", Block),
+            ("true | ((echo a #'\necho A=1 > .env\n#'\n) )", Block),
+            ("((cat <<E\n'\nE\n) )\necho A=1 > .env\n#'", Block),
+            ("(( x = 1 <<E ))\necho A=1 > .env\nE", Block),
+            ("(( x = 1 + 2 )); echo A=1 > out.txt", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1393 review C2: a `#` glued to a paren
+    /// starts a span bash runs as code. Its quotes were turned into `;`, so
+    /// `> '.env'` became `> ;.env;` and the target was lost. The guard now
+    /// also reads the span as written.
+    #[test]
+    fn quoted_redirect_target_after_a_rewritten_span_is_seen() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        for (command, outcome) in [
+            ("a=(x)#; echo A=1 > '.env'", Block),
+            ("a=(x)#; echo A=1 > \".env\"", Block),
+            ("a=(x)#; echo A=1 > $'.env'", Block),
+            ("(true)#; echo A=1 >> '.env'", Block),
+            ("(( x = 1 << 2 )); echo A=1 > $'.env'", Block),
+            ("a=(x)#; echo A=1 > 'out.txt'", Allow),
+        ] {
+            let result = SecretWritesGuard::default().run(&make_bash(command));
+            assert_eq!(result.outcome, outcome, "{command:?}");
+        }
+    }
+
     #[test]
     fn service_account_json_blocked() {
         assert!(is_blocked(

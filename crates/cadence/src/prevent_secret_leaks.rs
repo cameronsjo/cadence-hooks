@@ -6967,6 +6967,120 @@ mod tests {
     }
 
     #[test]
+    fn secret_read_behind_a_hash_glued_to_a_paren_blocked() {
+        // cameronsjo/cadence-hooks#1391: bash, zsh or both run the read in
+        // each of these; the glued `#` let a `'` hide it from this guard.
+        assert_bash(
+            &[
+                "(#'\ncat ~/.ssh/id_ed25519\n#'\n)",
+                "(true)#'\ncat ~/.ssh/id_ed25519\n#'",
+                "if (#'\ncat ~/.ssh/id_ed25519\n#'\n) then :; fi",
+                "true|(#'\ncat ~/.ssh/id_ed25519\n#'\n)",
+                "case a in a)#'\ncat ~/.ssh/id_ed25519\n#'\n;; esac",
+                "cat =(#'\ncat ~/.ssh/id_ed25519\n#'\n)",
+                "(( 1 # $(cat ~/.ssh/id_ed25519) ))",
+                "cat <<E\u{a0}x\nE\n'\nE\u{a0}x\ncat ~/.ssh/id_ed25519\n#'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a `#` glued to a paren hides no line",
+        );
+        assert_bash(
+            &[
+                "ls # it's fine",
+                "(cd /tmp && ls) # cat ~/.ssh/id_ed25519",
+                "echo \"a#b\" ${#v} $#",
+                "cat <<EOF\ncat ~/.ssh/id_ed25519\nEOF",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "controls",
+        );
+    }
+
+    #[test]
+    fn secret_read_behind_a_double_paren_subshell_blocked() {
+        // cameronsjo/cadence-hooks#1391 review: `((` whose matching `)` is
+        // not followed by `)` is two subshells in bash and zsh, so `#` starts
+        // a comment and the read on the next line runs.
+        assert_bash(
+            &[
+                "((echo a #'\ncat .env\n#'\n) )",
+                "((echo a #'\ncat .env\n#'\n);true)",
+                "true; ((echo a #'\ncat .env\n#'\n) )",
+                "true | ((echo a #'\ncat .env\n#'\n) )",
+                "if ((echo a #'\ncat .env\n#'\n) ) then :; fi",
+                "echo $( ((echo a #'\ncat .env\n#'\n) ) )",
+                "((cat <<E\n'\nE\n) )\ncat .env\n#'",
+                "(( 1 #'\n))'\n))\ncat .env\n'",
+                "(( 1 # x )); cat '.env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a `#` or `<<` inside `((` hides no line",
+        );
+        assert_bash(
+            &["(( x = 1 + 2 ))", "((i++))", "(( y = 1 << 2 )); ls"],
+            cadence_hooks_core::Outcome::Allow,
+            "arithmetic controls",
+        );
+    }
+
+    #[test]
+    fn quoted_secret_read_after_a_rewritten_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review C1 and C2: the span after a
+        // `<<` in `((`, or after a `#` glued to a paren, is kept with its
+        // quotes rewritten. Removing them read `$'.env'` as `$.env`; turning
+        // them into `;` split `'.env'` off `cat`. bash and zsh read `.env`
+        // in each; the guard now also reads the span as written.
+        assert_bash(
+            &[
+                "(( x = 1 << 2 )); cat $'.env'",
+                "(( x = 1 << 2 )); cat $'\\x2eenv'",
+                "(( x = 1 << 2 )); cat .e$'nv'",
+                "(( x = 1 << 2 )); cat $\".env\"",
+                "(( 1 # x ))\ncat $'.env'",
+                "(( x = 1 << 2 )); f=$'.env'; cat \"$f\"",
+                "a=(x)#; cat '.env'",
+                "a=(x)#; cat $'.env'",
+                "(true)#; cat \".env\"",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a rewritten span keeps its quoted words",
+        );
+        assert_bash(
+            &[
+                "(( x = 1 << 2 )); cat $'notes.txt'",
+                "a=(x)#; cat 'notes.txt'",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "controls",
+        );
+    }
+
+    #[test]
+    fn secret_read_after_a_quote_opened_in_a_kept_span_blocked() {
+        // cameronsjo/cadence-hooks#1393 review: a quote that opens after a
+        // `#` glued to a paren and closes on a later line hid the `cat .env`
+        // after it from both earlier readings; bash runs it.
+        assert_bash(
+            &[
+                "a=(x)#; echo \"a\nb\"\ncat .env",
+                "a=(x)#; echo 'a\nb'\ncat .env",
+                "a=(x)#; echo 'a\ncat <<'EOF'\nb'\ncat .env\nEOF",
+                "(( x <<= 1 ))\necho 'a\nb'\ncat .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "quote across lines",
+        );
+        assert_bash(
+            &[
+                "a=(x)#; echo \"a\nb\"\ncat notes.txt",
+                "a=(x)#; echo 'a\nb'\nls",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "controls",
+        );
+    }
+
+    #[test]
     fn globs_sharing_letters_with_no_stem_allowed() {
         // cadence-hooks#1285: the issue's table. `hooks` shares `ks` with
         // `jks` and `cadence` shares `den` with `credentials`, but only a
