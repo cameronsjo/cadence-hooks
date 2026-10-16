@@ -520,15 +520,6 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: true,
     },
     HookEntry {
-        name: "guard-body-budget",
-        description: "Measure gh pr/issue bodies against a per-surface word budget",
-        namespace: "guardrails",
-        events: &[HookEvent::PreToolUse],
-        // Remote: read-only guard or nudge over the command or repo.
-        remote: RemotePolicy::Run,
-        suppressible: false,
-    },
-    HookEntry {
         name: "warn-issue-tracker",
         description: "Nudge when gh issue create targets a repo other than the canonical tracker",
         namespace: "guardrails",
@@ -1097,12 +1088,6 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // the generic sample would allow without judging anything.
         ("guardrails", "guard-critical-grade") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh issue edit 12 --add-label impact:critical"}}"#,
-        ),
-        // guard-body-budget only engages on a gh posting subcommand carrying a
-        // body flag; the generic PreToolUse sample (`git status`) would allow
-        // without measuring anything.
-        ("guardrails", "guard-body-budget") => Some(
-            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr create --title test --body \"a short sample body\""}}"#,
         ),
         // warn-inline-body only engages on `gh pr|issue create` with an inline
         // body past the threshold; the generic sample (`git status`) would allow.

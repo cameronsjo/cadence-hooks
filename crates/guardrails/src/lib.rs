@@ -91,6 +91,8 @@ pub(crate) fn github_origin_repo() -> tempfile::TempDir {
     repo
 }
 
+/// Where a `gh` posting command's body comes from (shared body-flag helpers).
+pub mod body_args;
 /// Bounded runner for the external tools (`gh`, `chezmoi`) advisory nudges query.
 pub mod bounded_tool;
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
@@ -103,8 +105,6 @@ pub mod enforce_worktree;
 pub mod enforcement_status;
 /// Shared renderer for the gh-write allowlist + `-R` rule context line.
 pub mod gh_context;
-/// Measure `gh` pr/issue bodies against a per-surface word budget.
-pub mod guard_body_budget;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
 /// Block applying the human-only `impact:critical` / `likelihood:critical` labels.

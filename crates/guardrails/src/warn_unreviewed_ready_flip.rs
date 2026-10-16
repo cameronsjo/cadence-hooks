@@ -42,9 +42,7 @@
 //! otherwise contact a host the user has not approved, and send it
 //! `GH_ENTERPRISE_TOKEN` when that is set.
 
-use crate::guard_body_budget::{
-    BodyArg, body_written_earlier, last_body_flag, same_command_heredoc_body,
-};
+use crate::body_args::{BodyArg, body_written_earlier, last_body_flag, same_command_heredoc_body};
 use cadence_hooks_core::gh_bodies::read_body_file;
 use cadence_hooks_core::shell::{
     PrSelector, command_segments, command_word, executable_tokens, git_command,
@@ -946,7 +944,7 @@ static BODY_IMP_RE: LazyLock<Regex> =
 /// The body a `gh pr review` segment posts, when this hook can read it
 /// without guessing: an inline `--body`, or a `--body-file` that is on disk
 /// and not rewritten by the same command (a same-command heredoc whose text
-/// is readable exactly is read instead, as `guard-body-budget` reads it).
+/// is readable exactly is read instead).
 /// `None` for anything else, which keeps the hook silent.
 fn review_body(command: &str, base_dir: &str) -> Option<String> {
     let segments = command_segments(command);

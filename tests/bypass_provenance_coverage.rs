@@ -65,18 +65,6 @@ const RECORDING: &[(&str, &[&str])] = &[
         "CADENCE_ALLOW_CRITICAL_GRADE",
         &["crates/guardrails/src/guard_critical_grade.rs"],
     ),
-    (
-        "CADENCE_BODY_BUDGET_PR",
-        &["crates/guardrails/src/guard_body_budget.rs"],
-    ),
-    (
-        "CADENCE_BODY_BUDGET_COMMENT",
-        &["crates/guardrails/src/guard_body_budget.rs"],
-    ),
-    (
-        "CADENCE_BODY_BUDGET_ISSUE",
-        &["crates/guardrails/src/guard_body_budget.rs"],
-    ),
 ];
 
 /// Switches that look like escape hatches but are not bypasses, with why.
@@ -92,10 +80,6 @@ const NOT_A_BYPASS: &[(&str, &str)] = &[
     (
         "CADENCE_NO_FEEDBACK_FOOTER",
         "hides a cosmetic footer line; no verdict changes",
-    ),
-    (
-        "CADENCE_BODY_BUDGET_MODE",
-        "flips the guard between nudge and block; not an exemption",
     ),
 ];
 
@@ -124,7 +108,6 @@ fn is_escape_hatch(name: &str) -> bool {
     name.starts_with("CADENCE_ALLOW_")
         || name.starts_with("CADENCE_NO_")
         || name.starts_with("CADENCE_SKIP_")
-        || name.starts_with("CADENCE_BODY_BUDGET_")
         || (name.starts_with("CADENCE_") && name.ends_with("_IGNORE"))
 }
 
