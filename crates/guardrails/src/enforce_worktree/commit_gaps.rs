@@ -721,10 +721,12 @@ mod tests {
                     "(mkdir d && cd d && git init && git commit -m x)",
                     Outcome::Allow,
                 ),
+                // From the primary the walk can only guess, so it warns
+                // (cadence-hooks#1383).
                 (
                     true,
                     "(mkdir d && cd d && git init && git commit -m x)",
-                    Outcome::Block,
+                    Outcome::Nudge,
                 ),
             ],
         );
@@ -759,13 +761,15 @@ mod tests {
         let scratch = scratch("brace-overflow");
         let (_p, w) = repos(&scratch);
         for (cmd, want) in [
-            (format!("git commit -m x {big}"), Outcome::Block),
-            (format!("{{g,}}it co{{m,}}mit {big}"), Outcome::Block),
-            (format!("{{g,}}it {big}"), Outcome::Block),
+            // From a worktree the guard cannot tell where such a commit
+            // lands, so it warns instead of blocking (cadence-hooks#1383).
+            (format!("git commit -m x {big}"), Outcome::Nudge),
+            (format!("{{g,}}it co{{m,}}mit {big}"), Outcome::Nudge),
+            (format!("{{g,}}it {big}"), Outcome::Nudge),
             (format!("echo {big}"), Outcome::Allow),
             (format!("for i in {big}; do :; done"), Outcome::Allow),
-            // Any mention of `git` in such a command is refused.
-            (format!("git status {big}"), Outcome::Block),
+            // Any mention of `git` in such a command is warned on.
+            (format!("git status {big}"), Outcome::Nudge),
         ] {
             let r = run_enforce(&input(&cmd, &w), &cfg());
             assert_eq!(r.outcome, want, "{cmd}\n{:?}", r.message);
@@ -788,7 +792,7 @@ mod tests {
             "cd $X; echo hi; git commit -m x".to_string(),
         ] {
             let r = run_enforce(&input(&cmd, &w), &cfg());
-            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+            assert_ne!(r.outcome, Outcome::Allow, "{cmd}");
             assert!(
                 r.message
                     .as_deref()
