@@ -5460,6 +5460,7 @@ mod tests {
     /// The verdict for a commit the walk reads as landing in `dir` itself (a
     /// scratch root, not a fixture repo): it follows the checkout the test
     /// tree sits in, a primary on CI and often a linked worktree locally.
+    #[cfg(unix)]
     fn enclosing_verdict(dir: &Path) -> Outcome {
         let out = std::process::Command::new("git")
             .arg("-C")
