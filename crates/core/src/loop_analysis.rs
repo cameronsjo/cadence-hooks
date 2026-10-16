@@ -593,15 +593,69 @@ pub fn group_nesting_depth(command: &str) -> usize {
     max
 }
 
+/// Wall-clock time [`parse_command`] gives the parser. The parser backtracks
+/// exponentially on some inputs it then rejects: about 3x per line of
+/// unclosed `((` or `( (` (cameronsjo/cadence-hooks#1401). A parse that runs
+/// that long would eat the shared probe budget ([`crate::deadline`]) or hit the
+/// hook's 5 s timeout, and either one lets the push through unjudged. Past
+/// this the parse counts as failed, and every caller already has a fallback
+/// for that. A 200 KB ordinary command parses in well under it in a release
+/// build.
+const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Stack for the parse thread. The parser recurses once per nesting level,
+/// and [`MAX_PARSE_NESTING`] was sized against the main thread's 8 MB stack;
+/// a spawned thread gets 2 MB by default.
+const PARSE_STACK: usize = 16 * 1024 * 1024;
+
+/// Hashes of commands whose parse ran past [`PARSE_BUDGET`] in this process.
+/// Each guard parses the same command again; without this, every one of them
+/// would start another runaway parse and wait out the budget again.
+static PARSE_TIMED_OUT: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+fn command_hash(command: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    command.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
     if group_nesting_depth(command) > MAX_PARSE_NESTING {
         return None;
     }
-    let reader = std::io::Cursor::new(command);
-    let options = ParserOptions::default();
-    let source_info = SourceInfo::default();
-    let mut parser = Parser::new(reader, &options, &source_info);
-    parser.parse_program().ok()
+    let key = command_hash(command);
+    let timed_out = || PARSE_TIMED_OUT.lock().unwrap_or_else(|e| e.into_inner());
+    if timed_out().contains(&key) {
+        return None;
+    }
+    // The parser has no step limit, so it runs on its own thread and is
+    // abandoned at the budget. An abandoned thread keeps running until the
+    // process exits, which for a hook is moments later.
+    let owned = command.to_string();
+    let (send, receive) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("parse-command".into())
+        .stack_size(PARSE_STACK)
+        .spawn(move || {
+            let reader = std::io::Cursor::new(owned.as_str());
+            let options = ParserOptions::default();
+            let source_info = SourceInfo::default();
+            let mut parser = Parser::new(reader, &options, &source_info);
+            // The receiver is gone once the budget ran out; nothing to do.
+            let _ = send.send(parser.parse_program().ok());
+        });
+    // No thread to run it on: report a parse failure, never a parse.
+    let Ok(_handle) = spawned else {
+        return None;
+    };
+    match receive.recv_timeout(PARSE_BUDGET) {
+        Ok(program) => program,
+        Err(_) => {
+            timed_out().push(key);
+            None
+        }
+    }
 }
 
 // --- gh loop analysis ---
@@ -1740,5 +1794,45 @@ mod tests {
         }
         let deep = format!("{}x{}", "{ ( ".repeat(1000), " ) }".repeat(1000));
         assert!(matches!(analyze_gh_loops(&deep), LoopAnalysis::ParseFailed));
+    }
+
+    /// cameronsjo/cadence-hooks#1401: the parser backtracks exponentially on
+    /// unclosed `((` or `( (` lines it then fails to parse, about 3x per
+    /// line. Twenty lines took over 120 s, the hook timed out, and the push
+    /// behind them went through unchecked. Every flood here must come back
+    /// as a parse failure, in well under the hook's 5 s timeout, so the
+    /// guard's fallback judges the push.
+    #[test]
+    fn parser_backtracking_flood_fails_within_the_budget() {
+        for line in ["(( 1 # x ))\n", "(( 1\n", "( ( 1\n"] {
+            let command = format!("{}git push origin main", line.repeat(30));
+            let started = std::time::Instant::now();
+            let (chain, loops) = analyze_push_chain_and_loops(&command);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(4),
+                "{line:?} flood took {took:?}"
+            );
+            assert!(matches!(chain, ChainAnalysis::ParseFailed), "{chain:?}");
+            assert!(matches!(loops, LoopAnalysis::ParseFailed), "{loops:?}");
+            // A second analysis of the same command fails at once rather
+            // than starting another runaway parse.
+            let again = std::time::Instant::now();
+            assert!(matches!(
+                analyze_gh_loops(&command),
+                LoopAnalysis::ParseFailed
+            ));
+            assert!(again.elapsed() < std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// The bound must not cost an ordinary command its parse.
+    #[test]
+    fn ordinary_commands_still_parse_under_the_budget() {
+        let command = "(( 1 + 2 ))\n".repeat(200) + "for r in a b; do git push $r main; done";
+        assert!(matches!(
+            analyze_push_loops(&command),
+            LoopAnalysis::MissingTargets(_) | LoopAnalysis::AllTargetsExplicit(_)
+        ));
     }
 }

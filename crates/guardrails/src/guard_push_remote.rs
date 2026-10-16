@@ -3229,6 +3229,36 @@ mod tests {
         });
     }
 
+    /// cameronsjo/cadence-hooks#1401: twenty `(( 1 # x ))` lines sent the
+    /// loop parser into exponential backtracking. The hook timed out and the
+    /// push behind them went through unchecked. The guard must still decide,
+    /// in time, and refuse an unowned target and a second push.
+    #[cfg(unix)]
+    #[test]
+    fn parser_backtracking_flood_still_judges_the_push() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let flood = "(( 1 # x ))\n".repeat(20);
+        with_env(&owners_only(), || {
+            for (tail, outcome) in [
+                ("git push https://github.com/other/repo.git main", Block),
+                ("git push origin main\ngit push origin feat", Block),
+                ("git push origin main", Allow),
+            ] {
+                let command = format!("{flood}{tail}");
+                let started = std::time::Instant::now();
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(4),
+                    "{tail:?}: took {:?}",
+                    started.elapsed()
+                );
+                assert_eq!(result.outcome, outcome, "{tail:?}: {:?}", result.message);
+            }
+        });
+    }
+
     /// cadence-hooks#1144 review round 2: the substitution a child script runs
     /// after its own `cd`/`export` is judged there, even when the parent
     /// expands a textually identical one in another argument. A text-keyed
