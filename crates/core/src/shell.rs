@@ -7296,7 +7296,11 @@ fn group_depth_change(raw: &str) -> isize {
 ///   pipeline stage or backgrounded, when it runs in its own process;
 /// - a `cd` in a pipeline stage or a backgrounded segment moves nothing.
 ///   The `&` of a redirection (`cd a 2>&1 && …`) is not a background `&`
-///   ([`split_segments_with_ops_joining_redirects`]).
+///   ([`split_segments_with_ops_joining_redirects`]);
+/// - a command with a span bash and zsh read apart has two readings
+///   ([`split_segment_readings`]). Each is walked from `cwd`, and every `cd`
+///   in either is a maybe-move, so a segment is listed in every directory
+///   either reading may put it in.
 ///
 /// A segment that may run in several directories is listed once for each,
 /// at most [`MAX_POSSIBLE_DIRS`]; past that it is [`UNRESOLVABLE_DIR`]. Like
@@ -7322,15 +7326,46 @@ fn segment_work_dirs_with_cdpath(
     cwd: &str,
     env_cdpath: bool,
 ) -> Vec<LocatedSegment> {
-    let segments = split_segments_with_ops_joining_redirects(command);
-    let mut walk = DirWalk {
-        command: command.to_string(),
-        env_cdpath,
-        ..DirWalk::default()
+    // Each reading from the same start ([`split_segment_readings`]). Where
+    // there are two, neither is what the shell surely runs, and each can
+    // take quoted text for a `cd` (`echo "a⏎cd ../x "`) or lose a real one,
+    // so every directory change in them is a maybe-move: the segments after
+    // it are judged where the shell was before it as well.
+    let readings = split_segment_readings(command, true);
+    let context = DirContext {
+        conditional: readings.len() > 1,
+        looped: false,
     };
-    let mut dirs = DirSet::new(cwd);
-    walk.walk(&segments, &mut dirs, 0, DirContext::default());
-    walk.located
+    let mut located = Vec::new();
+    let mut seen: std::collections::HashSet<(String, std::rc::Rc<str>)> =
+        std::collections::HashSet::new();
+    for (index, segments) in readings.iter().enumerate() {
+        let mut walk = DirWalk {
+            command: command.to_string(),
+            env_cdpath,
+            ..DirWalk::default()
+        };
+        let mut dirs = DirSet::new(cwd);
+        walk.walk(segments, &mut dirs, 0, context);
+        if index == 0 {
+            if readings.len() > 1 {
+                seen.extend(
+                    walk.located
+                        .iter()
+                        .map(|segment| (segment.raw.clone(), segment.dir.clone())),
+                );
+            }
+            located = walk.located;
+        } else {
+            // A segment both readings place alike is listed once.
+            located.extend(
+                walk.located
+                    .into_iter()
+                    .filter(|segment| seen.insert((segment.raw.clone(), segment.dir.clone()))),
+            );
+        }
+    }
+    located
 }
 
 /// The group structure of one top-level segment.
@@ -8401,15 +8436,64 @@ fn split_segments_impl(
     // time, and their segments appended, so a guard sees both readings
     // ([`strip_comments_with_readings`]). Each block's last segment gets a
     // `"\n"` operator, as if the lines followed one another.
+    //
+    // A walk that carries state from one segment to the next (the directory
+    // a `cd` moves to) must not read these as one script: the appended lines
+    // would start where the rewrite's reading ended. Such a walk uses
+    // [`split_segment_readings`] instead.
     let (stripped, originals) = strip_comments_with_readings(&command);
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     for text in std::iter::once(stripped.as_str()).chain(originals) {
-        if let Some(last) = segments.last_mut() {
-            last.1.get_or_insert("\n");
-        }
-        split_text_into(text, join_redirect_amp, &mut segments);
+        split_piece_into(text, join_redirect_amp, &mut segments);
     }
     segments
+}
+
+/// Split one piece of text after the segments already in `segments`, as if
+/// a newline came between them.
+fn split_piece_into(
+    text: &str,
+    join_redirect_amp: bool,
+    segments: &mut Vec<(String, Option<&'static str>)>,
+) {
+    if let Some(last) = segments.last_mut() {
+        last.1.get_or_insert("\n");
+    }
+    split_text_into(text, join_redirect_amp, segments);
+}
+
+/// One command's segments ([`split_segments_with_ops`], or
+/// [`split_segments_with_ops_joining_redirects`] with `join_redirect_amp`),
+/// one list per reading, for a walk that carries state from one segment to
+/// the next.
+///
+/// The first reading is the rewrite [`strip_comments`] makes of a span that
+/// bash and zsh read apart. When that rewrite changed a line, a second
+/// reading follows: the whole command as written, each rewritten line split
+/// on its own ([`strip_comments_reading_whole`]). Neither is what the shell
+/// surely runs, so a walk reads each from the same start and judges every
+/// place either one puts a command; chaining one into the other would start
+/// the second where the first ended, and apply a relative `cd` twice
+/// (cameronsjo/cadence-hooks#1393 review). [`split_segments_with_ops`] keeps
+/// the old shape, the rewrite plus the rewritten lines in one list, for
+/// guards that judge each segment on its own.
+pub(crate) fn split_segment_readings(
+    command: &str,
+    join_redirect_amp: bool,
+) -> Vec<Vec<(String, Option<&'static str>)>> {
+    let command = strip_heredoc_bodies(command);
+    let (stripped, _, pieces) = strip_comments_reading_whole(&command, true);
+    let mut rewrite = Vec::new();
+    split_text_into(&stripped, join_redirect_amp, &mut rewrite);
+    let mut readings = vec![rewrite];
+    if !pieces.is_empty() {
+        let mut written = Vec::new();
+        for piece in &pieces {
+            split_piece_into(piece, join_redirect_amp, &mut written);
+        }
+        readings.push(written);
+    }
+    readings
 }
 
 /// The [`split_segments_impl`] loop over text whose heredoc bodies and
@@ -9046,16 +9130,41 @@ pub fn strip_comments(command: &str) -> String {
 /// `\` is left out: the rewrite changes only those characters, so it already
 /// reads that line as written.
 pub(crate) fn strip_comments_with_readings(command: &str) -> (String, Vec<&str>) {
-    let rewritten = |line: &&str| line.contains(['\'', '"', '`', '\\']);
+    let (stripped, originals, _) = strip_comments_reading_whole(command, false);
+    (stripped, originals)
+}
+
+/// Whether a line of a rewritten span holds a character the rewrite changes.
+fn rewritten_line(line: &str) -> bool {
+    line.contains(['\'', '"', '`', '\\'])
+}
+
+/// [`strip_comments_with_readings`], plus, when `whole` is set and some span
+/// line was rewritten, the whole command as written in pieces to split one
+/// at a time: the text outside the spans (comments removed) and every span
+/// line the rewrite leaves alone, cut at each rewritten span line, which is
+/// a piece of its own. Splitting the pieces one after another reads every
+/// command in order, each word as written, and no quote in a span line
+/// reaches the next line. Empty when nothing was rewritten.
+///
+/// This is the reading a walk that carries state from one segment to the
+/// next — the directory a `cd` moves to — walks on its own, from the same
+/// start as the rewrite's reading ([`split_segment_readings`]).
+fn strip_comments_reading_whole(command: &str, whole: bool) -> (String, Vec<&str>, Vec<String>) {
     let spans = comment_spans_with_kind(command);
     if spans.is_empty() {
-        return (command.to_string(), Vec::new());
+        return (command.to_string(), Vec::new(), Vec::new());
     }
     let mut out = String::with_capacity(command.len());
     let mut originals = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut plain = String::new();
     let mut cursor = 0;
     for (start, end, kind) in spans {
         out.push_str(&command[cursor..start]);
+        if whole {
+            plain.push_str(&command[cursor..start]);
+        }
         match kind {
             CommentKind::Comment => {}
             CommentKind::Ambiguous => {
@@ -9063,7 +9172,6 @@ pub(crate) fn strip_comments_with_readings(command: &str) -> (String, Vec<&str>)
                     '\'' | '"' | '`' | '\\' => ';',
                     other => other,
                 }));
-                originals.extend(command[start..end].split('\n').filter(rewritten));
             }
             CommentKind::Unresolved => {
                 out.extend(command[start..end].chars().filter_map(|c| match c {
@@ -9071,13 +9179,37 @@ pub(crate) fn strip_comments_with_readings(command: &str) -> (String, Vec<&str>)
                     '`' => Some(';'),
                     other => Some(other),
                 }));
-                originals.extend(command[start..end].split('\n').filter(rewritten));
+            }
+        }
+        if kind != CommentKind::Comment {
+            for (index, line) in command[start..end].split('\n').enumerate() {
+                if whole && index > 0 {
+                    plain.push('\n');
+                }
+                if !rewritten_line(line) {
+                    if whole {
+                        plain.push_str(line);
+                    }
+                    continue;
+                }
+                originals.push(line);
+                if whole {
+                    pieces.push(std::mem::take(&mut plain));
+                    pieces.push(line.to_string());
+                }
             }
         }
         cursor = end;
     }
     out.push_str(&command[cursor..]);
-    (out, originals)
+    if whole && !originals.is_empty() {
+        plain.push_str(&command[cursor..]);
+        pieces.push(plain);
+        pieces.retain(|piece| !piece.trim().is_empty());
+    } else {
+        pieces.clear();
+    }
+    (out, originals, pieces)
 }
 
 /// Push `current` (trimmed) onto `segments` paired with the operator that
@@ -23557,6 +23689,75 @@ mod tests {
                 "{command:?}: {located:?}"
             );
         }
+    }
+
+    #[test]
+    fn segment_work_dirs_walks_each_reading_from_the_start() {
+        // cameronsjo/cadence-hooks#1393 review round 3: a span bash and zsh
+        // read apart is read rewritten and as written, and the walk read
+        // both as one script, so the second began where the first's `cd`s
+        // ended. Each reading now starts in the cwd, and every `cd` in such
+        // a command is a maybe-move.
+        let dirs_of = |command: &str, segment: &str| -> Vec<String> {
+            let mut dirs: Vec<String> = segment_work_dirs_with_cdpath(command, "/cwd", false)
+                .into_iter()
+                .filter(|located| located.raw == segment)
+                .map(|located| located.dir.to_string())
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs
+        };
+        // A relative `cd` is applied once per reading, never twice.
+        let command = "a=(x)#; cd x; git push 'u' main";
+        assert_eq!(dirs_of(command, "git push 'u' main"), ["/cwd", "/cwd/x"]);
+        assert!(
+            segment_work_dirs_with_cdpath(command, "/cwd", false)
+                .iter()
+                .all(|located| !located.dir.contains("x/x")),
+            "{command:?}"
+        );
+        // The rewrite cannot read `$'x'`; the written reading can.
+        assert!(
+            dirs_of(
+                "(( y <<= 1 ))\ncd $'x'\ngit push origin main",
+                "git push origin main"
+            )
+            .contains(&"/cwd/x".to_string())
+        );
+        // Quoted text read as a `cd` does not take the push out of `x`.
+        for command in [
+            "(( y <<= 1 ))\ncd x\necho \"a\ncd ../y \"\ngit push origin main",
+            "(( y <<= 1 ))\ncd x\necho \"a\ncd ../y\nb\"\ngit push origin main",
+            "a=(x)#; cd x; echo 'a; cd ../y '; git push origin main",
+        ] {
+            assert!(
+                dirs_of(command, "git push origin main").contains(&"/cwd/x".to_string()),
+                "{command:?}"
+            );
+        }
+        // A command with no such span keeps one reading and plain moves.
+        assert_eq!(
+            dirs_of(
+                "cd x; echo 'a'; git push origin main",
+                "git push origin main"
+            ),
+            ["/cwd/x"]
+        );
+        assert_eq!(split_segment_readings("cd x; echo 'a'", false).len(), 1);
+        // The written reading reads every line, each rewritten line on its
+        // own, with every word as written.
+        assert_eq!(
+            split_segment_readings("(( y <<= 1 ))\ncd $'x'\necho \"a\ncd ../y\nb\"\nls", false)[1],
+            [
+                ("(( y <<= 1 ))".to_string(), Some("\n")),
+                ("cd $'x'".to_string(), Some("\n")),
+                ("echo \"a".to_string(), Some("\n")),
+                ("cd ../y".to_string(), Some("\n")),
+                ("b\"".to_string(), Some("\n")),
+                ("ls".to_string(), None),
+            ]
+        );
     }
 
     /// Every directory the LAST segment may run in, per [`segment_work_dirs`].

@@ -37,8 +37,8 @@ use crate::shell::{
     COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, Readings, TRANSPARENT, apply_cd_target,
     child_scripts_but_git_exec, command_word, executable_tokens_marked, git_command_line_aliases,
     git_exec, git_output_detailed, installs_trap_action, is_assignment_word, peel_command_runners,
-    resolve_cd_target, runs_an_unreadable_command, runs_in_found_directories,
-    split_segments_with_ops, strip_group_wrappers, unescape_word,
+    resolve_cd_target, runs_an_unreadable_command, runs_in_found_directories, strip_group_wrappers,
+    unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -753,6 +753,29 @@ fn collect_push_invocations(
     writes: &mut Vec<ConfigRedirect>,
     out: &mut Vec<PushInvocation>,
 ) {
+    // Each reading of the script from the same start: chaining them would
+    // walk the second from wherever the first's `cd`s left it, so a relative
+    // `cd` applied twice and a `cd` the first reading could not read decided
+    // where the second one's pushes ran (cameronsjo/cadence-hooks#1393
+    // review). A push both readings place alike is reported twice, which
+    // every caller judges the same way twice.
+    for segments in crate::shell::split_segment_readings(script, false) {
+        collect_push_reading(segments, script, cwd, depth, inherited, walk, writes, out);
+    }
+}
+
+/// [`collect_push_invocations`] for one reading of `script`.
+#[allow(clippy::too_many_arguments)]
+fn collect_push_reading(
+    segments: Vec<(String, Option<&'static str>)>,
+    script: &str,
+    cwd: &str,
+    depth: usize,
+    inherited: Doubt,
+    walk: Walk<'_>,
+    writes: &mut Vec<ConfigRedirect>,
+    out: &mut Vec<PushInvocation>,
+) {
     let mut effective_dir = cwd.to_string();
     // Set by an EARLIER segment of this scope, and outliving it: a persistent
     // env redirect, or a directory change this walk could not follow. Either
@@ -769,7 +792,7 @@ fn collect_push_invocations(
     let mut scopes_subshells = !crate::shell::mentions_case_keyword(script);
     let mut subshells: Vec<(String, bool)> = Vec::new();
     let mut pending_closes = 0;
-    for (segment, _next_op) in split_segments_with_ops(script) {
+    for (segment, _next_op) in segments {
         for _ in 0..std::mem::take(&mut pending_closes) {
             if let Some((dir, directory)) = subshells.pop() {
                 effective_dir = dir;
@@ -3791,6 +3814,32 @@ mod tests {
         );
         assert_eq!(pushes.len(), 1);
         assert_eq!(pushes[0].work_dir.len(), "/repo".len() + 2 * 40_000);
+    }
+
+    /// cameronsjo/cadence-hooks#1393 review round 3: the two readings of a
+    /// span bash and zsh read apart are walked from the same start. Walked as
+    /// one script, the written reading began in the directory the rewrite's
+    /// ended in, so `cd x` applied twice (`/repo/x/x`) and `cd $'x'`, which
+    /// the rewrite cannot read, decided where the next push ran.
+    #[test]
+    fn each_reading_of_a_span_is_walked_from_the_start() {
+        let places = |command: &str| -> Vec<(String, Option<String>)> {
+            push_locations(command, "/repo")
+                .into_iter()
+                .map(|push| (push.work_dir, push.repository))
+                .collect()
+        };
+        let found = places("a=(x)#; cd x; git push 'u' main");
+        assert!(
+            found.contains(&("/repo/x".to_string(), Some("u".to_string()))),
+            "{found:?}"
+        );
+        assert!(found.iter().all(|(dir, _)| dir == "/repo/x"), "{found:?}");
+        let found = places("(( y <<= 1 ))\ncd $'x'\ngit push origin main");
+        assert!(
+            found.contains(&("/repo/x".to_string(), Some("origin".to_string()))),
+            "{found:?}"
+        );
     }
 
     fn only(command: &str, cwd: &str) -> PushInvocation {

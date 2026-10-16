@@ -3106,6 +3106,68 @@ mod tests {
         });
     }
 
+    /// cameronsjo/cadence-hooks#1393 review round 3: a span bash and zsh read
+    /// apart (`(( x <<= 1 ))`, `a=(x)#`) is read twice, rewritten and as
+    /// written. The push walk read both as one script, so the second started
+    /// in the directory the first ended in: a relative `cd` applied twice, a
+    /// `cd $'…'` the rewrite left unreadable decided where the later push
+    /// ran, and quoted text read as a `cd` moved the push to an owned
+    /// checkout. Every row runs from a directory holding `rm_` (unowned) and
+    /// `rf_` (owned), and each blocks as it does on main.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_after_a_span_read_two_ways_is_judged_in_every_directory() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let root = tempfile::tempdir().expect("create fixture root");
+        for (name, url) in [
+            ("rm_", "https://github.com/evil/x.git"),
+            ("rf_", "https://github.com/cameronsjo/x.git"),
+        ] {
+            let repo = root.path().join(name);
+            std::fs::create_dir(&repo).expect("create checkout");
+            cadence_hooks_core::git_fixtures::init_repo(&repo);
+            cadence_hooks_core::git_fixtures::git_in(&repo, &["remote", "add", "origin", url]);
+        }
+        let cwd = root.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, outcome) in [
+                // An unreadable rewrite of the `cd` (`$'rm_'` → `$rm_`).
+                ("(( x <<= 1 ))\ncd $'rm_'\ngit push origin main", Block),
+                (
+                    "(( x <<= 1 ))\ncd $'rm_'\ngit push origin --delete main",
+                    Block,
+                ),
+                // Quoted text that reads as a `cd` once the rewrite drops
+                // or cuts its quotes.
+                (
+                    "(( x <<= 1 ))\ncd rm_\necho \"a\ncd ../rf_ \"\ngit push origin main",
+                    Block,
+                ),
+                (
+                    "(( x <<= 1 ))\ncd rm_\necho \"a\ncd ../rf_\nb\"\ngit push origin main",
+                    Block,
+                ),
+                (
+                    "a=(x)#; cd rm_; echo 'x; cd ../rf_ '; git push origin main",
+                    Block,
+                ),
+                // A relative `cd` applied twice (`rf_/rf_`, no repository)
+                // lost the quoted unowned URL.
+                (
+                    "a=(x)#; cd rf_; git push 'https://github.com/evil/x.git' main",
+                    Block,
+                ),
+                // Controls, as on main.
+                ("cd rf_; git push origin main", Allow),
+                ("cd rf_; git push origin feat", Allow),
+                ("cd rm_; git push origin main", Block),
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                assert_eq!(result.outcome, outcome, "{command:?}: {:?}", result.message);
+            }
+        });
+    }
+
     /// cadence-hooks#1144 review round 2: the substitution a child script runs
     /// after its own `cd`/`export` is judged there, even when the parent
     /// expands a textually identical one in another argument. A text-keyed
