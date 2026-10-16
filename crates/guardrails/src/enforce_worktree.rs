@@ -10286,9 +10286,8 @@ mod tests {
         }
         // The guard can only guess where these land, so it warns instead
         // (cadence-hooks#1383).
-        for cmd in [format!(
-            "cd {w}/..; OLDPWD={p}; cd {w}; OLDPWD={p}; cd -; git commit -m x"
-        )] {
+        {
+            let cmd = format!("cd {w}/..; OLDPWD={p}; cd {w}; OLDPWD={p}; cd -; git commit -m x");
             let mut input = make_bash(&cmd);
             input.cwd = Some(w.clone());
             assert_eq!(
@@ -11307,9 +11306,10 @@ mod tests {
         }
         // The guard can only guess where these land, so it warns instead
         // (cadence-hooks#1383).
-        for cmd in ["cd }; git commit -m x".to_string()] {
-            assert_eq!(outcome_from(&primary, &cmd), Outcome::Nudge, "{cmd:?}");
-        }
+        assert_eq!(
+            outcome_from(&primary, "cd }; git commit -m x"),
+            Outcome::Nudge
+        );
         // Behind `&&` the commit never runs, but a directory the command may
         // create is judged by its nearest existing ancestor (#1083), so the
         // primary it would sit in blocks.
