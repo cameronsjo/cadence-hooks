@@ -759,13 +759,15 @@ mod tests {
         let scratch = scratch("brace-overflow");
         let (_p, w) = repos(&scratch);
         for (cmd, want) in [
-            (format!("git commit -m x {big}"), Outcome::Block),
-            (format!("{{g,}}it co{{m,}}mit {big}"), Outcome::Block),
-            (format!("{{g,}}it {big}"), Outcome::Block),
+            // From a worktree the guard cannot tell where such a commit
+            // lands, so it warns instead of blocking (cadence-hooks#1383).
+            (format!("git commit -m x {big}"), Outcome::Nudge),
+            (format!("{{g,}}it co{{m,}}mit {big}"), Outcome::Nudge),
+            (format!("{{g,}}it {big}"), Outcome::Nudge),
             (format!("echo {big}"), Outcome::Allow),
             (format!("for i in {big}; do :; done"), Outcome::Allow),
-            // Any mention of `git` in such a command is refused.
-            (format!("git status {big}"), Outcome::Block),
+            // Any mention of `git` in such a command is warned on.
+            (format!("git status {big}"), Outcome::Nudge),
         ] {
             let r = run_enforce(&input(&cmd, &w), &cfg());
             assert_eq!(r.outcome, want, "{cmd}\n{:?}", r.message);
@@ -773,9 +775,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unresolved_cd_blocks_a_commit_from_a_linked_worktree() {
-        // cadence-hooks#346 option (b): already the behaviour (the union path
-        // reports the cd and `run_enforce` blocks it from a worktree); pinned.
+    fn an_unresolved_cd_warns_on_a_commit_from_a_linked_worktree() {
+        // cadence-hooks#346 option (b): the union path reports the cd, and
+        // `run_enforce` warns from a worktree because it can only guess where the
+        // commit lands (cadence-hooks#1383); pinned.
         let scratch = scratch("unresolved-cd");
         let (p, w) = repos(&scratch);
         std::fs::create_dir(w.join("sub")).unwrap();
@@ -788,7 +791,7 @@ mod tests {
             "cd $X; echo hi; git commit -m x".to_string(),
         ] {
             let r = run_enforce(&input(&cmd, &w), &cfg());
-            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+            assert_eq!(r.outcome, Outcome::Nudge, "{cmd}");
             assert!(
                 r.message
                     .as_deref()
