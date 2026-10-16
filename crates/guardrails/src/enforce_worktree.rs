@@ -4621,9 +4621,9 @@ fn shell_single_quote(s: &str) -> String {
 /// Append a hint to a Bash-arm block when the command carried a `cd` whose
 /// target the union path could not read — so the block, judged
 /// from the directory before that cd, says why instead of looking like it
-/// ignored the cd (cadence-hooks#1018). Message-only: the verdict is untouched,
-/// and from a primary checkout an unreadable cd keeps blocking — letting it
-/// through would be a bypass.
+/// ignored the cd (cadence-hooks#1018). Message-only: the verdict is untouched
+/// here; `as_guess` later turns a block that rests only on that guess into a
+/// warning (cadence-hooks#1383).
 fn with_unresolved_cd_hint(mut result: CheckResult, unresolved: Option<&str>) -> CheckResult {
     if let (Some(target), Some(message)) = (
         unresolved.filter(|t| !t.is_empty()),
@@ -4649,12 +4649,39 @@ fn as_guess(result: CheckResult) -> CheckResult {
         return result;
     }
     let message = result.message.unwrap_or_default();
-    let message = message.strip_prefix("Blocked: ").unwrap_or(&message);
-    CheckResult::nudge(format!(
-        "enforce-worktree could not follow this command's `cd`, so it is guessing \
-         where the commit lands and lets it run. If the commit lands in a primary \
-         checkout, undo it. The guess: {message}"
-    ))
+    // Keep the verdict line and the notes on why it is a guess; drop the
+    // remedies for a block (a new worktree, a dismissal), which do not fit a
+    // command that already ran.
+    let mut lines = message.lines();
+    let first = lines.next().unwrap_or_default();
+    let first = first.strip_prefix("Blocked: ").unwrap_or(first);
+    let mut out = format!(
+        "enforce-worktree cannot tell where this commit lands, so it lets it run \
+         with a warning. If it landed in a primary checkout, undo it. The guess: {first}"
+    );
+    // "Name the path literally" says how to write a command the guard can read.
+    let keep = |l: &&str| {
+        l.starts_with("Note:")
+            || l.starts_with("This command's shape")
+            || l.starts_with("Name the path literally")
+    };
+    for line in lines.filter(keep) {
+        out.push('\n');
+        out.push_str(line);
+    }
+    CheckResult::nudge(out)
+}
+
+/// Do `a` and `b` name the same directory, ignoring a trailing slash?
+fn same_dir(a: &str, b: &str) -> bool {
+    let trim = |p: &str| {
+        if p.len() > 1 {
+            p.trim_end_matches('/').to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    trim(a) == trim(b)
 }
 
 /// On a union-path block, name a linked worktree one of the command's `cd`s
@@ -5119,6 +5146,10 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // stall the hook — each distinct target is assessed once (#239 F11).
             let mut seen: HashSet<String> = HashSet::new();
             let has_commit = !commit_targets.is_empty();
+            // A block that rests only on the session cwd standing in for a
+            // `cd` the walk could not follow, held until every other target
+            // is judged (cameronsjo/cadence-hooks#1383).
+            let mut guess: Option<CheckResult> = None;
             for target in commit_targets {
                 if !seen.insert(target.clone()) {
                     continue;
@@ -5164,14 +5195,23 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     // could not follow a `cd` in a non-plain command: that is a
                     // guess, so it warns instead of blocking
                     // (cameronsjo/cadence-hooks#1383).
+                    // Every other target is still judged first: one the walk
+                    // reads as a primary blocks whatever the guess says.
                     let guessed = plain.is_none()
-                        && target == cwd
+                        && same_dir(&target, cwd)
                         && (!union_cd_dirs.is_empty() || unresolved_cd.is_some());
-                    return if guessed { as_guess(result) } else { result };
+                    if !guessed {
+                        return result;
+                    }
+                    guess.get_or_insert(result);
+                    continue;
                 }
                 if result.bypass.is_some() && bypassed.is_none() {
                     bypassed = Some(result);
                 }
+            }
+            if let Some(result) = guess {
+                return as_guess(result);
             }
             // A non-plain command whose `cd` the guard cannot read may commit
             // anywhere. From a primary the session cwd is already a target and
@@ -7045,9 +7085,23 @@ mod tests {
         let target = via_dollar_home(&wt);
 
         for cmd in [
+            format!(r#"HOME=/elsewhere cd "{target}" && git commit -m x"#),
+            format!(r#"env -i bash -c 'cd "{target}" && git commit -m x'"#),
+            format!(r#"sudo bash -c 'cd "{target}" && git commit -m x'"#),
+            format!(r#"test -v 'a[HOME=7]'; cd "{target}" && git commit -m x"#),
+            format!(r#"test -v a[HOME=7]; cd "{target}" && git commit -m x"#),
+            format!(r#"[ -v 'a[HOME=7]' ]; cd "{target}" && git commit -m x"#),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
             format!(r#"HOME=/elsewhere; cd "{target}" && git commit -m x"#),
             format!(r#"export HOME=/elsewhere && cd "{target}" && git commit -m x"#),
-            format!(r#"HOME=/elsewhere cd "{target}" && git commit -m x"#),
             format!(r#"export {{HO,}}ME=/elsewhere && cd "{target}" && git commit -m x"#),
             format!(r#"declare -x {{HO,}}ME=/elsewhere; cd "{target}" && git commit -m x"#),
             format!(r#"read {{HO,}}ME <<< /elsewhere; cd "{target}" && git commit -m x"#),
@@ -7055,17 +7109,15 @@ mod tests {
             format!(
                 r#"f(){{ export {{HO,}}ME=/elsewhere; }}; f && cd "{target}" && git commit -m x"#
             ),
-            format!(r#"env -i bash -c 'cd "{target}" && git commit -m x'"#),
-            format!(r#"sudo bash -c 'cd "{target}" && git commit -m x'"#),
-            format!(r#"test -v 'a[HOME=7]'; cd "{target}" && git commit -m x"#),
-            format!(r#"test -v a[HOME=7]; cd "{target}" && git commit -m x"#),
-            format!(r#"[ -v 'a[HOME=7]' ]; cd "{target}" && git commit -m x"#),
             format!(r#"test -v 'a[HOME=7]' || cd "{target}" && git commit -m x"#),
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(primary.to_string_lossy().into_owned());
-            let r = run_enforce(&input, &cfg(false, false));
-            assert_ne!(r.outcome, Outcome::Allow, "{cmd}");
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
+            );
         }
     }
 
@@ -7141,8 +7193,8 @@ mod tests {
         assert!(msg.contains("is a primary checkout"), "{msg}");
         assert!(!msg.contains("could not be resolved"), "{msg}");
 
-        // Anything that may not hold the literal when the commit runs keeps
-        // refusing.
+        // Anything that may not hold the literal when the commit runs is a
+        // guess, so it warns (cadence-hooks#1383).
         for cmd in [
             format!(r#"M=$(echo {other}); git -C "$M" commit -m x"#),
             format!(r#"true || M={other}; git -C "$M" commit -m x"#),
@@ -7153,7 +7205,7 @@ mod tests {
             format!(r#"M={other}; read "$n" </dev/null; git -C "$M" commit -m x"#),
             format!(r#"M={other}; if x; then M={primary}; fi; git -C "$M" commit -m x"#),
         ] {
-            assert_ne!(run(&cmd).outcome, Outcome::Allow, "{cmd}");
+            assert_eq!(run(&cmd).outcome, Outcome::Nudge, "{cmd}");
         }
     }
 
@@ -7183,12 +7235,12 @@ mod tests {
         let mut input = make_bash("cd ./does-not-exist-xyz || exit; git commit -m 'x'");
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
-        assert_ne!(r.outcome, Outcome::Allow);
+        assert_eq!(r.outcome, Outcome::Block);
         let mut input = make_bash("cd ./does-not-exist-xyz || true; git commit -m 'x'");
         input.cwd = Some(primary.to_string_lossy().into_owned());
-        assert_ne!(
+        assert_eq!(
             run_enforce(&input, &cfg(false, false)).outcome,
-            Outcome::Allow
+            Outcome::Block
         );
     }
 
@@ -9609,17 +9661,29 @@ mod tests {
             .into_owned();
         let parent = scratch.path().to_string_lossy().into_owned();
         for cmd in [
-            format!("(cd {wt}); git commit -m x"),
             format!("cd {wt} && cd - && git commit -m x"),
             format!("cd {parent}/[r]epo && git commit -m x"),
             format!("cd {missing}; git commit -m x"),
-            format!("cd {wt} | true; git commit -m x"),
             format!("cd {wt} extra; git commit -m x"),
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(primary.to_string_lossy().into_owned());
             let r = run_enforce(&input, &cfg(false, false));
-            assert_ne!(r.outcome, Outcome::Allow, "{cmd}");
+            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
+            format!("(cd {wt}); git commit -m x"),
+            format!("cd {wt} | true; git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
+            );
         }
         // The cd that does take effect still reaches the worktree.
         let mut input = make_bash(&format!("cd {wt} && git commit -m x"));
@@ -9990,7 +10054,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn review_repros_from_the_primary_block() {
+    fn review_repros_from_the_primary_warn() {
         let scratch = scratch("cd-review-primary-e2e");
         let (primary, wt) = primary_and_worktree(&scratch);
         let w = wt.to_string_lossy().into_owned();
@@ -10006,9 +10070,9 @@ mod tests {
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(primary.to_string_lossy().into_owned());
-            assert_ne!(
+            assert_eq!(
                 run_enforce(&input, &cfg(false, false)).outcome,
-                Outcome::Allow,
+                Outcome::Nudge,
                 "{cmd}"
             );
         }
@@ -10211,14 +10275,26 @@ mod tests {
             format!("cd {p}; cd {w} 2>&3; git commit -m x"),
             format!("cd {p} || cd {w}; git commit -m x"),
             format!("cd {p} && false && cd {w}; git commit -m x"),
-            format!("cd {w}/..; OLDPWD={p}; cd {w}; OLDPWD={p}; cd -; git commit -m x"),
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(w.clone());
-            assert_ne!(
+            assert_eq!(
                 run_enforce(&input, &cfg(false, false)).outcome,
-                Outcome::Allow,
+                Outcome::Block,
                 "{cmd}"
+            );
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [format!(
+            "cd {w}/..; OLDPWD={p}; cd {w}; OLDPWD={p}; cd -; git commit -m x"
+        )] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(w.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
             );
         }
     }
@@ -10230,25 +10306,37 @@ mod tests {
         let (primary, wt) = primary_and_worktree(&scratch);
         let w = wt.to_string_lossy().into_owned();
         for cmd in [
-            format!("(cd {w}; echo {{case,in}}); git commit -m x"),
             format!("cd {w} && make -v >/dev/null && cd - && git commit -m x"),
             format!("cd {w}; cat /dev/null; cd -; git commit -m x"),
             "! >/dev/null git commit -m x".to_string(),
             format!("false && cd {w}; git commit -m x"),
-            format!("true || cd {w} && git commit -m x"),
-            format!("cd {w} && true & git commit -m x"),
-            format!("cd {w} && true | cat & git commit -m x"),
             "{fd}>/dev/null git commit -m x".to_string(),
             "git >/dev/null commit -m x".to_string(),
             format!("enable -n c{{d,x}}; cd {w} && git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Block,
+                "{cmd}"
+            );
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
+            format!("(cd {w}; echo {{case,in}}); git commit -m x"),
+            format!("true || cd {w} && git commit -m x"),
+            format!("cd {w} && true & git commit -m x"),
+            format!("cd {w} && true | cat & git commit -m x"),
             format!(r#"source /dev/stdin <<<"cd(){{ :; }}"; cd {w} && git commit -m x"#),
         ] {
             let mut input = make_bash(&cmd);
             input.cwd = Some(primary.to_string_lossy().into_owned());
-            assert_ne!(
+            assert_eq!(
                 run_enforce(&input, &cfg(false, false)).outcome,
-                Outcome::Allow,
-                "{cmd}"
+                Outcome::Nudge,
+                "{cmd:?}"
             );
         }
         // The worktree recipe with a piped test step still passes.
@@ -10417,8 +10505,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_unreadable_cd_in_a_non_plain_command_blocks_from_a_worktree() {
-        // The #346/N2 decision, taken fail-closed for non-plain commands.
+    fn an_unreadable_cd_in_a_non_plain_command_warns_from_a_worktree() {
+        // The #346/N2 decision: a cd the guard cannot read leaves it guessing,
+        // so it warns (cadence-hooks#1383).
         let scratch = scratch("union-unresolved-e2e");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy().into_owned();
@@ -10431,7 +10520,7 @@ mod tests {
             let mut input = make_bash(&cmd);
             input.cwd = Some(wt.to_string_lossy().into_owned());
             let r = run_enforce(&input, &cfg(false, false));
-            assert_ne!(r.outcome, Outcome::Allow, "{cmd}");
+            assert_eq!(r.outcome, Outcome::Nudge, "{cmd}");
             assert!(
                 r.message.unwrap().contains("could not be resolved"),
                 "{cmd}"
@@ -10461,23 +10550,33 @@ mod tests {
             format!("if true; then git -C {p} commit -m x; fi"),
             format!("for f in a; do cd {p}; git commit -m x; done"),
         ];
-        let from_p = [
-            format!("cd {w}/nx || (exit); git commit -m x"),
-            format!("cd {w}/nx || return; git commit -m x"),
-            format!("echo then case x in; (cd {w}); git commit -m x"),
-            format!("cd {w} && {{ true & }}; git commit -m x"),
-            "if true; then git commit -m x; fi".to_string(),
-        ];
+        let from_p = ["if true; then git commit -m x; fi".to_string()];
         for (cmds, cwd) in [(&from_w[..], &w), (&from_p[..], &p)] {
             for cmd in cmds {
                 let mut input = make_bash(cmd);
                 input.cwd = Some(cwd.clone());
-                assert_ne!(
+                assert_eq!(
                     run_enforce(&input, &cfg(false, false)).outcome,
-                    Outcome::Allow,
+                    Outcome::Block,
                     "{cmd}"
                 );
             }
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
+            format!("cd {w}/nx || (exit); git commit -m x"),
+            format!("cd {w}/nx || return; git commit -m x"),
+            format!("echo then case x in; (cd {w}); git commit -m x"),
+            format!("cd {w} && {{ true & }}; git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(p.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
+            );
         }
     }
 
@@ -10563,12 +10662,7 @@ mod tests {
         // let-through list).
         std::fs::create_dir(primary.join("2>x")).unwrap();
         std::os::unix::fs::symlink(&primary, wt.join("2>p")).unwrap();
-        let from_p = [
-            format!("(! case a in a) true;; esac; cd {w}); git commit -m x"),
-            format!("(time -p case a in a) true;; esac; cd {w}); git commit -m x"),
-            format!("(cd {w}; echo ${{x:-(}}); git commit -m x"),
-            "mkdir -p 2'>'x; git -C 2'>'x commit -m x".to_string(),
-        ];
+        let from_p = ["mkdir -p 2'>'x; git -C 2'>'x commit -m x".to_string()];
         let from_w = [
             format!("ln -sfn {p} 2'>'p; git -C 2'>'p commit -m x"),
             format!("ln -sfn {p} 2'>'p && (git -C 2'>'p commit -m x)"),
@@ -10577,12 +10671,27 @@ mod tests {
             for cmd in cmds {
                 let mut input = make_bash(cmd);
                 input.cwd = Some(cwd.clone());
-                assert_ne!(
+                assert_eq!(
                     run_enforce(&input, &cfg(false, false)).outcome,
-                    Outcome::Allow,
+                    Outcome::Block,
                     "{cmd}"
                 );
             }
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
+            format!("(! case a in a) true;; esac; cd {w}); git commit -m x"),
+            format!("(time -p case a in a) true;; esac; cd {w}); git commit -m x"),
+            format!("(cd {w}; echo ${{x:-(}}); git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(p.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
+            );
         }
     }
 
@@ -10641,6 +10750,7 @@ mod tests {
         // as landing in the primary still blocks, whatever the command's shape.
         let scratch = scratch("union-guess-e2e");
         let (primary, wt) = primary_and_worktree(&scratch);
+        std::fs::create_dir(primary.join("sub")).unwrap();
         let w = wt.to_string_lossy().into_owned();
         let p = primary.to_string_lossy().into_owned();
         let run = |cmd: &str, cwd: &str| {
@@ -10659,6 +10769,10 @@ mod tests {
             "git commit -m x || echo failed".to_string(),
             format!("cd {p} && git commit -m x 2>&1 | tail -1"),
             format!("(cd {p} && git commit -m x)"),
+            // A cd into a directory of the primary is read, not guessed.
+            "(cd sub && git commit -m x)".to_string(),
+            "cd sub && git commit -m x || echo failed".to_string(),
+            "cd sub || exit 1; git commit -am x".to_string(),
         ] {
             assert_eq!(run(&cmd, &p), Outcome::Block, "from P: {cmd}");
         }
@@ -10889,16 +11003,9 @@ mod tests {
         let w = wt.to_string_lossy().into_owned();
         let c = format!("$(cat <<'EOF'\n{p}\nEOF\n)");
         let from_w = [
-            format!("cd \"{c}\" && git commit -m x"),
-            format!("git -C \"{c}\" commit -m x"),
-            format!("GIT_DIR=\"{c}/.git\" git commit -m x"),
             format!("command -p eval 'cd {p}'; git commit -m x"),
-            "command -p source ./s.sh; git commit -m x".to_string(),
-            "command -p . ./s.sh; git commit -m x".to_string(),
             format!("command -p pushd {p}; git commit -m x"),
             format!("builtin -- eval 'cd {p}'; git commit -m x"),
-            "cd -P link/.. && git commit -m x".to_string(),
-            "set -P; cd link/..; git commit -m x".to_string(),
         ];
         let from_p = [
             "echo \\<<EOF\ngit commit -m x\nEOF".to_string(),
@@ -10909,12 +11016,31 @@ mod tests {
             for cmd in cmds {
                 let mut input = make_bash(cmd);
                 input.cwd = Some(cwd.clone());
-                assert_ne!(
+                assert_eq!(
                     run_enforce(&input, &cfg(false, false)).outcome,
-                    Outcome::Allow,
+                    Outcome::Block,
                     "{cmd:?}"
                 );
             }
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
+            format!("cd \"{c}\" && git commit -m x"),
+            format!("git -C \"{c}\" commit -m x"),
+            format!("GIT_DIR=\"{c}/.git\" git commit -m x"),
+            "command -p source ./s.sh; git commit -m x".to_string(),
+            "command -p . ./s.sh; git commit -m x".to_string(),
+            "cd -P link/.. && git commit -m x".to_string(),
+            "set -P; cd link/..; git commit -m x".to_string(),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(w.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
+            );
         }
         // Still allowed from the worktree.
         for cmd in [
@@ -11096,9 +11222,6 @@ mod tests {
             format!("git commit -m \"$(cat <<'EOF'\nEOFcd {p} && git commit -m y)\nEOF\n)\""),
             // B2: `link/..` is logically W, but W/sub2 and W/.git (a file in a
             // worktree) are not directories, so bash's cd goes physical.
-            "cd link/../sub2 && git commit -m x".to_string(),
-            "cd link/../sub2; git commit -m x".to_string(),
-            "cd link/../.git && cd .. && git commit -m x".to_string(),
             // B3
             format!("cat <<\"E\\\"F\"\nE\"F\ncd {p}\nEF\ngit commit -m x"),
             format!("cat <<\"E\\\"F\"\nE\"F\necho \"abc\n\" ; cd {p} ; git commit -m x"),
@@ -11111,12 +11234,27 @@ mod tests {
             for cmd in cmds {
                 let mut input = make_bash(cmd);
                 input.cwd = Some(cwd.clone());
-                assert_ne!(
+                assert_eq!(
                     run_enforce(&input, &cfg(false, false)).outcome,
-                    Outcome::Allow,
+                    Outcome::Block,
                     "{cmd:?}"
                 );
             }
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in [
+            "cd link/../sub2 && git commit -m x".to_string(),
+            "cd link/../sub2; git commit -m x".to_string(),
+            "cd link/../.git && cd .. && git commit -m x".to_string(),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(w.clone());
+            assert_eq!(
+                run_enforce(&input, &cfg(false, false)).outcome,
+                Outcome::Nudge,
+                "{cmd:?}"
+            );
         }
         let allowed = [
             (
@@ -11160,13 +11298,17 @@ mod tests {
             "cd nonexist; git commit -m x".to_string(),
             "cd \"}\"; git commit -m x".to_string(),
             "cd \\}; git commit -m x".to_string(),
-            "cd }; git commit -m x".to_string(),
             "cd nonexist\ngit commit -m x".to_string(),
             "cd nonexist || true; git commit -m x".to_string(),
             "cd nonexist || git commit -m x".to_string(),
             format!("cd {p}/nonexist; git commit -m x"),
         ] {
-            assert_ne!(outcome_from(&primary, &cmd), Outcome::Allow, "{cmd:?}");
+            assert_eq!(outcome_from(&primary, &cmd), Outcome::Block, "{cmd:?}");
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        for cmd in ["cd }; git commit -m x".to_string()] {
+            assert_eq!(outcome_from(&primary, &cmd), Outcome::Nudge, "{cmd:?}");
         }
         // Behind `&&` the commit never runs, but a directory the command may
         // create is judged by its nearest existing ancestor (#1083), so the
@@ -11571,11 +11713,6 @@ mod tests {
         let p = primary.to_string_lossy().into_owned();
         let from_w = [
             // #1100 (a): git's chdir is physical.
-            "git -C link/../sub2 commit -m x".to_string(),
-            "git -C link/.. commit -m x".to_string(),
-            "git -C link/../sub commit -m x".to_string(),
-            "GIT_DIR=link/../.git git commit -m x".to_string(),
-            "git --git-dir=link/../.git commit -m x".to_string(),
             // #1100 (b)
             format!("env -C {p} git commit -m x"),
             format!("env --chdir={p} git commit -m x"),
@@ -11585,19 +11722,31 @@ mod tests {
             "env -C .. git -C repo commit -m x".to_string(),
             format!("GIT_DIR={p}/.git env -u FOO git commit -m x"),
             // #1091
-            "trap 'cd repo && git commit -m x' EXIT; cd ..".to_string(),
             format!("trap 'git commit -m x' EXIT; cd {p}"),
             format!("eval 'cd {p}'; git commit -m x"),
             "eval 'cd ..'; git -C repo commit -m x".to_string(),
             // #1056
-            "git -C \"$V\" commit -m x".to_string(),
-            "git --work-tree=\"$V\" commit -m x".to_string(),
-            "GIT_DIR=$V git commit -m x".to_string(),
             // #1101: the B3 repro still blocks.
             format!("cat <<\"E\\\"F\"\nE\"F\ncd {p}\nEF\ngit commit -m x"),
         ];
         for cmd in &from_w {
-            assert_ne!(outcome_from(&wt, cmd), Outcome::Allow, "{cmd:?}");
+            assert_eq!(outcome_from(&wt, cmd), Outcome::Block, "{cmd:?}");
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        let guessed_from_w = [
+            "git -C link/../sub2 commit -m x".to_string(),
+            "git -C link/.. commit -m x".to_string(),
+            "git -C link/../sub commit -m x".to_string(),
+            "GIT_DIR=link/../.git git commit -m x".to_string(),
+            "git --git-dir=link/../.git commit -m x".to_string(),
+            "trap 'cd repo && git commit -m x' EXIT; cd ..".to_string(),
+            "git -C \"$V\" commit -m x".to_string(),
+            "git --work-tree=\"$V\" commit -m x".to_string(),
+            "GIT_DIR=$V git commit -m x".to_string(),
+        ];
+        for cmd in &guessed_from_w {
+            assert_eq!(outcome_from(&wt, cmd), Outcome::Nudge, "{cmd:?}");
         }
         for cmd in ["git -C \"$V\" commit -m x", "env -i git commit -m x"] {
             assert_eq!(outcome_from(&primary, cmd), Outcome::Block, "{cmd:?}");
@@ -11673,9 +11822,6 @@ mod tests {
             format!("timeout 5 git -C {p} commit -m x"),
             format!("sudo GIT_DIR={p}/.git git commit -m x"),
             // A runner option the peel cannot read is unreadable.
-            format!("sudo -D {p} git commit -m x"),
-            "timeout --weird 5 git commit -m x".to_string(),
-            format!("echo {p} | xargs -I{{}} git -C {{}} commit -m x"),
             // #1113 item 1: a heredoc a shell runs.
             format!("cat <<'EOF' | sh\n{body}\nEOF"),
             format!("cat <<'EOF' | tee /dev/null | sh\n{body}\nEOF"),
@@ -11696,25 +11842,13 @@ mod tests {
             format!("bash <<A\ncat <<B | sh\n{body}\nB\nA"),
             // #1113 item 2: `..` through a symlink into a directory the
             // command creates.
-            "mkdir link/../nd && git -C link/../nd commit -m x".to_string(),
-            "mkdir -p link/../nd/deep && git -C link/../nd/deep commit -m x".to_string(),
-            "mkdir link/../nd && env -C link/../nd git commit -m x".to_string(),
-            "mkdir link/../nd && GIT_WORK_TREE=link/../nd git commit -m x".to_string(),
-            "mkdir -p link/../nd && cd link/../nd && git commit -m x".to_string(),
             // #1113 item 3: `~` after HOME is rebound.
-            format!("HOME={p}; git -C ~ commit -m x"),
-            format!("HOME={p}; cd ~ && git commit -m x"),
-            format!("HOME={p} && cd ~/sub && git commit -m x"),
-            format!("export HOME={p}; cd ~ && git commit -m x"),
-            format!("h=HO; export ${{h}}ME={p}; cd ~ && git commit -m x"),
             // #1113 item 4: an exported git variable.
             format!("export GIT_DIR={p}/.git; git commit -m x"),
             format!("GIT_DIR={p}/.git; export GIT_DIR; git commit -m x"),
             format!("export GIT_WORK_TREE={p} GIT_DIR={p}/.git && git commit -m x"),
             format!("declare -x GIT_DIR={p}/.git; git commit -m x"),
             format!("set -a; GIT_DIR={p}/.git; git commit -m x"),
-            "read GIT_DIR; git commit -m x".to_string(),
-            "export ${v}_DIR=x; git commit -m x".to_string(),
             // #1113 item 5: a backslash-newline splits the delimiter.
             format!("cat <<EOF >/dev/null\nEO\\\nF\n{body}\nEOF"),
             format!("cat <<EOF\nEO\\\nF\n{body}\nEOF"),
@@ -11725,7 +11859,29 @@ mod tests {
             format!("cat <<EOF\nx\\\nEOF\ncat <<'EOG'\nEOF\n{body}\nEOG"),
         ];
         for cmd in &from_w {
-            assert_ne!(outcome_from(&wt, cmd), Outcome::Allow, "{cmd:?}");
+            assert_eq!(outcome_from(&wt, cmd), Outcome::Block, "{cmd:?}");
+        }
+        // The guard can only guess where these land, so it warns instead
+        // (cadence-hooks#1383).
+        let guessed_from_w = [
+            format!("sudo -D {p} git commit -m x"),
+            "timeout --weird 5 git commit -m x".to_string(),
+            format!("echo {p} | xargs -I{{}} git -C {{}} commit -m x"),
+            "mkdir link/../nd && git -C link/../nd commit -m x".to_string(),
+            "mkdir -p link/../nd/deep && git -C link/../nd/deep commit -m x".to_string(),
+            "mkdir link/../nd && env -C link/../nd git commit -m x".to_string(),
+            "mkdir link/../nd && GIT_WORK_TREE=link/../nd git commit -m x".to_string(),
+            "mkdir -p link/../nd && cd link/../nd && git commit -m x".to_string(),
+            format!("HOME={p}; git -C ~ commit -m x"),
+            format!("HOME={p}; cd ~ && git commit -m x"),
+            format!("HOME={p} && cd ~/sub && git commit -m x"),
+            format!("export HOME={p}; cd ~ && git commit -m x"),
+            format!("h=HO; export ${{h}}ME={p}; cd ~ && git commit -m x"),
+            "read GIT_DIR; git commit -m x".to_string(),
+            "export ${v}_DIR=x; git commit -m x".to_string(),
+        ];
+        for cmd in &guessed_from_w {
+            assert_eq!(outcome_from(&wt, cmd), Outcome::Nudge, "{cmd:?}");
         }
         let w = wt.to_string_lossy().into_owned();
         let allowed_from_w = [
