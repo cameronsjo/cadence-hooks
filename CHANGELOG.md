@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.127.0] - 2026-10-16
+
 ### Changed
 
 - **`enforce-worktree` warns instead of blocking when it is only guessing where a commit lands.** In a command the guard cannot follow step by step (a subshell, `||`, `&`, a redirection, a substitution), it judges the commit from the session cwd as well as every `cd` target, and from a worktree it also judged any `cd` it could not read. A block that rested only on that guess now reaches the model as a warning that names the guess and the `git -C <path> commit` spelling, so `(cd <worktree> && git commit …)` from a primary checkout runs. A commit the guard reads as landing in a primary checkout still blocks in any shape, and so does a plain `git commit` there. A commit target the guard cannot read from a worktree (`git -C "$V" commit`, a path through a symlink it will not follow) warns the same way. The cost: an unusual spelling whose `cd` never takes effect (`(cd wt); git commit`, `cd wt | true; git commit`) now commits to the primary with a warning. (cameronsjo/cadence-hooks#1383, under #1373)
