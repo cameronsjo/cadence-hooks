@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.129.0] - 2026-10-17
+
 ### Security
 
 - **`redact-external-content`'s outside-a-work-tree exemption now proves the file is local.** Since 0.127.0 it skipped the identity scan for code or config outside every git work tree (cameronsjo/cadence#1708), but several paths let a file that can leave the machine pass as local:
