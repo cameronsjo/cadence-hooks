@@ -32,6 +32,10 @@ use std::cell::Cell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// The tightest external hooks.json `timeout` a guard runs under. Past it
+/// Claude Code kills the hook, which lets the tool call through.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Default shared budget. Bounds only in-process git time — the wrapper /
 /// fork-exec slice before `main` runs is outside our control, so this must
 /// leave real headroom under the 5s external hooks.json timeout.

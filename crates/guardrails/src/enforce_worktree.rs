@@ -3564,7 +3564,14 @@ fn substituted_commit(argv: &[String], heads: &[String], found: bool) -> bool {
 fn strip_group_punctuation(raw: &str) -> &str {
     let mut rest = raw.trim();
     loop {
-        let trimmed = rest.trim_start_matches(['(', ' ', '\t']);
+        // A function header (`g(){`, `g()(git`, zsh's anonymous `() {`) is
+        // not a command word (cameronsjo/cadence-hooks#1402). It is read
+        // before each `(` is peeled, one per pass: a bulk trim took the `(`
+        // of `()` in `( () { … } )`.
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        let trimmed = cadence_hooks_core::shell::read_function_header(trimmed)
+            .map_or(trimmed, |len| &trimmed[len..]);
+        let trimmed = trimmed.strip_prefix('(').unwrap_or(trimmed);
         let trimmed = match trimmed.strip_prefix('{') {
             Some(after) if after.starts_with([' ', '\t']) || after.is_empty() => after,
             _ => trimmed,
@@ -6051,6 +6058,63 @@ mod tests {
             git_commit_targets("{ git commit -m x; }", "/cwd"),
             vec!["/cwd".to_string()]
         );
+    }
+
+    #[test]
+    fn function_body_commit_detected() {
+        // cameronsjo/cadence-hooks#1402: a function header glued to its
+        // body's `{` or `(` left that punctuation on the commit's head word,
+        // so `g(){ git commit -m x; }; g` committed with no warning. bash
+        // accepts every spelling here.
+        for command in [
+            "g(){ git commit -m x; }; g",
+            "g()(git commit -m x); g",
+            "g() (git commit -m x); g",
+            "g ( ) { git commit -m x; }; g",
+            "function g(){ git commit -m x; }; g",
+            "function g (){ git commit -m x; }; g",
+            "function g { git commit -m x; }; g",
+            "f() { git commit -m x; }; f",
+            // zsh runs an anonymous function as soon as it is defined, and
+            // defines every name in a list.
+            "() { git commit -m x; }",
+            "(){ git commit -m x; }",
+            "() git commit -m x",
+            "function { git commit -m x; }",
+            "g h(){ git commit -m x; }; g",
+            "function g h { git commit -m x; }; g",
+            // A definition inside a subshell.
+            "(g(){ git commit -m x; }; g)",
+            "( g(){ git commit -m x; }; g )",
+            "( () { git commit -m x; } )",
+            // Names outside `[A-Za-z0-9_.-]`, or a `!` in front: the header
+            // is read loosely (cameronsjo/cadence-hooks#1405 review, I1).
+            "g:x(){ git commit -m x; }; g:x",
+            "@(){ git commit -m x; }; @",
+            "a+b(){ git commit -m x; }; a+b",
+            "fé(){ git commit -m x; }; fé",
+            "\\g(){ git commit -m x; }; g",
+            "'g'(){ git commit -m x; }; g",
+            "! g(){ git commit -m x; }; g",
+            "function g:x { git commit -m x; }; g:x",
+        ] {
+            assert_eq!(
+                git_commit_targets(command, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{command:?}"
+            );
+        }
+        // Controls: words that only look like a header run no commit.
+        for command in [
+            "echo g(){ git status; }",
+            "a=(git commit) && echo ${a[0]}",
+            "echo (git commit)",
+        ] {
+            assert!(
+                git_commit_targets(command, "/cwd").is_empty(),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]

@@ -5336,6 +5336,13 @@ mod tests {
             format!("for i in 1; do {s}; done"),
             format!("if true; then {s}; fi"),
             format!("case x in x) {s};; esac"),
+            // A function body runs when the function is called. Its header
+            // glued to the `{` hid the body's head word until
+            // cameronsjo/cadence-hooks#1402.
+            format!("f(){{ {s}; }}; f"),
+            format!("(f(){{ {s}; }}; f)"),
+            // zsh runs an anonymous function at once.
+            format!("( () {{ {s}; }} )"),
             format!("while false; do :; done; ! {s}"),
             format!("eval \"{s}\""),
             "eval `echo cat .env`".to_string(),
@@ -5360,12 +5367,11 @@ mod tests {
             "eval \"$(printf 'cat .env')\"".to_string(),
         ];
         let allows = [
-            // #1303: an unknown head (`x`, `touch`, a function) is not
-            // judged, and neither is a word core's expansion does not split.
+            // #1303: an unknown head (`x`, `touch`) is not judged, and
+            // neither is a word core's expansion does not split.
             format!("x {s}"),
             "sudo -u root $(echo touch .env)".to_string(),
             "if $(echo touch .env); then :; fi".to_string(),
-            format!("f(){{ {s}; }}; f"),
             "$(echo cat\\ .env)".to_string(),
             // A metadata-safe head keeps its exemption, as before #1106.
             format!("echo {s}"),

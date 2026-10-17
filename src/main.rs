@@ -1422,6 +1422,20 @@ fn main() {
     // exiting, so the waiting `catch_unwind` can finish the dispatch tail and
     // fail open at exit 0 (see the flag's doc, cameronsjo/cadence-hooks#349).
     std::panic::set_hook(Box::new(|info| {
+        // The loop parser's thread is contained: its panic drops the channel
+        // the check waits on, the check reads that as a parse failure and
+        // judges the command through its fallback. Nothing failed open, so
+        // no fail-open row, and no exit: exiting would end every `group`
+        // member, and drop their blocks, over one parse.
+        if std::thread::current().name()
+            == Some(cadence_hooks_core::loop_analysis::PARSE_THREAD_NAME)
+        {
+            eprintln!(
+                "cadence-hooks: the loop parser panicked; judging the command without it.\n{}",
+                panic_stderr_text(info.payload(), info.location())
+            );
+            return;
+        }
         eprintln!(
             "cadence-hooks: internal error (panic). This hook will not block your operation.\n\
              {}",

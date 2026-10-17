@@ -593,15 +593,128 @@ pub fn group_nesting_depth(command: &str) -> usize {
     max
 }
 
+/// Largest command, in bytes, [`parse_command`] hands to the parser. The
+/// parser recurses once per nesting level of many constructs, and a stack
+/// overflow aborts the process, which no panic hook or `catch_unwind` can
+/// stop: the hook then exits with a non-blocking status and the command goes
+/// through (cameronsjo/cadence-hooks#1405 security reviews, I2 and r2 I1).
+/// Listing the constructs that recurse never finished (`[[ ! ! … ]]` was
+/// missing), so the bound is on size. The cheapest known construct, `! `
+/// inside `[[ … ]]`, costs 2 bytes per level. On [`PARSE_STACK`] a debug
+/// build, whose frames are the largest, aborts at 13 000 to 13 500 such
+/// levels (measured), and a release build at about 140 000; this cap allows
+/// 6144. A larger command takes each guard's parse-failure fallback.
+pub const MAX_PARSE_BYTES: usize = 12 * 1024;
+
+/// Wall-clock time [`parse_command`] gives the parser. The parser backtracks
+/// exponentially on some inputs it then rejects: about 3x per line of
+/// unclosed `((` or `( (` (cameronsjo/cadence-hooks#1401). A parse that runs
+/// that long would eat the shared probe budget ([`crate::deadline`]) or hit the
+/// hook's 5 s timeout, and either one lets the push through unjudged. Past
+/// this the parse counts as failed, and every caller already has a fallback
+/// for that. On a saturated host a command under [`MAX_PARSE_BYTES`] can
+/// still run past it, and then takes that fallback: `guard-push-remote` counts pushes, so a
+/// legitimate two-push chain blocks. Wall clock, not CPU time, because the
+/// hook timeout it protects is wall clock.
+const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+
+// A budget at or past the hook timeout lets the runaway parse outlive the
+// hook, and the kill lets the command through.
+const _: () = assert!(PARSE_BUDGET.as_millis() < crate::deadline::HOOK_TIMEOUT.as_millis());
+
+/// Stack for the parse thread. The parser recurses once per nesting level,
+/// and [`MAX_PARSE_BYTES`] is sized against this stack. Only the pages the parse touches are committed;
+/// a spawned thread gets 2 MB by default. A failed spawn counts as a parse
+/// failure, so a larger stack is not free on a host that refuses it.
+const PARSE_STACK: usize = 128 * 1024 * 1024;
+
+/// Hashes of commands whose parse ran past [`PARSE_BUDGET`] or panicked, in
+/// this process.
+/// Each guard parses the same command again; without this, every one of them
+/// would start another runaway parse and wait out the budget again.
+static PARSE_ABANDONED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+fn command_hash(command: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    command.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
-    if group_nesting_depth(command) > MAX_PARSE_NESTING {
+    if command.len() > MAX_PARSE_BYTES || group_nesting_depth(command) > MAX_PARSE_NESTING {
         return None;
     }
-    let reader = std::io::Cursor::new(command);
-    let options = ParserOptions::default();
-    let source_info = SourceInfo::default();
-    let mut parser = Parser::new(reader, &options, &source_info);
-    parser.parse_program().ok()
+    within_budget(command, PARSE_BUDGET, |text| {
+        // Debug builds only: a synthetic parser panic or hang, so the
+        // binary's tests can show the panic hook lets this thread unwind and
+        // the budget abandons a parse that never returns. Neither bypasses
+        // anything: the check reads both as a parse failure and judges the
+        // command through its fallback.
+        #[cfg(debug_assertions)]
+        match std::env::var("CADENCE_TEST_PANIC").as_deref() {
+            Ok("parse") => {
+                eprintln!(
+                    "⚠️  cadence-hooks: CADENCE_TEST_PANIC=parse is forcing a parser panic; \
+                     the command is judged without the loop parser. Unset it outside tests."
+                );
+                panic!("CADENCE_TEST_PANIC: synthetic panic on the parse thread");
+            }
+            Ok("hang") => {
+                eprintln!(
+                    "⚠️  cadence-hooks: CADENCE_TEST_PANIC=hang is forcing a parser hang; \
+                     the command is judged without the loop parser. Unset it outside tests."
+                );
+                std::thread::sleep(PARSE_BUDGET * 30);
+            }
+            _ => {}
+        }
+        let reader = std::io::Cursor::new(text.as_str());
+        let options = ParserOptions::default();
+        let source_info = SourceInfo::default();
+        let mut parser = Parser::new(reader, &options, &source_info);
+        parser.parse_program().ok()
+    })
+}
+
+/// Name of the thread [`within_budget`] runs the parser on. The binary's
+/// panic hook lets a panic on it unwind instead of exiting the process: the
+/// unwind drops the channel, and the check reads that as a parse failure.
+pub const PARSE_THREAD_NAME: &str = "parse-command";
+
+/// `work(command)` on its own thread, or `None` once it runs past `budget`,
+/// panics, or has done either for this command before in this process
+/// ([`PARSE_ABANDONED`]). The parser has no step limit, so it is abandoned
+/// rather than stopped: the thread keeps running until the process exits,
+/// which for a hook is moments later.
+fn within_budget<T: Send + 'static>(
+    command: &str,
+    budget: std::time::Duration,
+    work: fn(String) -> Option<T>,
+) -> Option<T> {
+    let key = command_hash(command);
+    let abandoned = || PARSE_ABANDONED.lock().unwrap_or_else(|e| e.into_inner());
+    if abandoned().contains(&key) {
+        return None;
+    }
+    let owned = command.to_string();
+    let (send, receive) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(PARSE_THREAD_NAME.into())
+        .stack_size(PARSE_STACK)
+        // The receiver is gone once the budget ran out; nothing to do.
+        .spawn(move || drop(send.send(work(owned))));
+    // No thread to run it on: report a parse failure, never a parse.
+    if spawned.is_err() {
+        return None;
+    }
+    match receive.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(_) => {
+            abandoned().push(key);
+            None
+        }
+    }
 }
 
 // --- gh loop analysis ---
@@ -1740,5 +1853,103 @@ mod tests {
         }
         let deep = format!("{}x{}", "{ ( ".repeat(1000), " ) }".repeat(1000));
         assert!(matches!(analyze_gh_loops(&deep), LoopAnalysis::ParseFailed));
+    }
+
+    /// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): a command
+    /// past [`MAX_PARSE_BYTES`] is not parsed, whatever it holds; one at the
+    /// cap still is.
+    #[test]
+    fn a_command_past_the_byte_cap_is_not_parsed() {
+        let unit = "for i in a; do git push origin main; done; ";
+        let at_cap = unit.repeat(MAX_PARSE_BYTES / unit.len());
+        assert!(at_cap.len() <= MAX_PARSE_BYTES);
+        assert!(!matches!(
+            analyze_push_loops(&at_cap),
+            LoopAnalysis::ParseFailed
+        ));
+        let past_cap = format!("{at_cap}{}", " ".repeat(MAX_PARSE_BYTES + 1 - at_cap.len()));
+        assert!(matches!(
+            analyze_push_loops(&past_cap),
+            LoopAnalysis::ParseFailed
+        ));
+        let bangs = format!(
+            "[[ {}x ]] && git push origin main",
+            "! ".repeat(MAX_PARSE_BYTES / 2)
+        );
+        assert!(matches!(
+            analyze_push_loops(&bangs),
+            LoopAnalysis::ParseFailed
+        ));
+    }
+
+    /// cameronsjo/cadence-hooks#1401: the parser backtracks exponentially on
+    /// unclosed `((` or `( (` lines it then fails to parse, about 3x per
+    /// line. Twenty lines took over 120 s, the hook timed out, and the push
+    /// behind them went through unchecked. Work past the budget must come
+    /// back as a failure at the budget, and the same command must then fail
+    /// at once instead of starting another runaway parse. The work sleeps
+    /// rather than parses, so the timing does not depend on the runner's
+    /// speed and the abandoned thread uses no CPU.
+    #[test]
+    fn work_past_the_budget_fails_at_the_budget() {
+        use std::time::{Duration, Instant};
+        fn slow(_: String) -> Option<()> {
+            std::thread::sleep(Duration::from_secs(5));
+            Some(())
+        }
+        fn quick(_: String) -> Option<()> {
+            Some(())
+        }
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        assert_eq!(within_budget("#1401 slow", budget, slow), None);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "took {took:?}");
+        let again = Instant::now();
+        assert_eq!(
+            within_budget("#1401 slow", Duration::from_secs(60), quick),
+            None
+        );
+        assert!(again.elapsed() < Duration::from_secs(1));
+        assert_eq!(within_budget("#1401 quick", budget, quick), Some(()));
+        // A panic in the work is a failure at once, not a wait for the budget.
+        fn panics(_: String) -> Option<()> {
+            panic!("parser bug");
+        }
+        let started = Instant::now();
+        assert_eq!(
+            within_budget("#1401 panic", Duration::from_secs(60), panics),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The floods themselves: each still comes back as a parse failure the
+    /// guard's fallback judges, and on a runner slow enough to backtrack
+    /// past the budget, within it.
+    #[test]
+    fn parser_backtracking_flood_fails_within_the_budget() {
+        for line in ["(( 1 # x ))\n", "(( 1\n", "( ( 1\n"] {
+            let command = format!("{}git push origin main", line.repeat(7));
+            let started = std::time::Instant::now();
+            let (chain, loops) = analyze_push_chain_and_loops(&command);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(4),
+                "{line:?} flood took {took:?}"
+            );
+            assert!(matches!(chain, ChainAnalysis::ParseFailed), "{chain:?}");
+            assert!(matches!(loops, LoopAnalysis::ParseFailed), "{loops:?}");
+        }
+    }
+
+    /// The bound must not cost an ordinary command its parse.
+    #[test]
+    fn ordinary_commands_still_parse_under_the_budget() {
+        let command = "(( 1 + 2 ))\n".repeat(200) + "for r in a b; do git push $r main; done";
+        assert!(matches!(
+            analyze_push_loops(&command),
+            LoopAnalysis::MissingTargets(_) | LoopAnalysis::AllTargetsExplicit(_)
+        ));
     }
 }
