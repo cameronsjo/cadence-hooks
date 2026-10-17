@@ -52,3 +52,16 @@ jobs:
         env:
           CADENCE_TIMING_TESTS: '1'
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
+
+      # TEMP measurement for cadence-hooks#1416: three Windows samples, never red.
+      - name: Measure Windows release timing budgets
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        env:
+          CADENCE_TIMING_TESTS: '1'
+        run: |
+          for i in 1 2 3; do
+            echo "=== sample $i ==="
+            cargo test --release --workspace --no-fail-fast -- --test-threads=1 || true
+          done
