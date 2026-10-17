@@ -14,6 +14,7 @@
 
 mod support;
 
+use cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES;
 use std::io::Write;
 use std::process::{Command, Output};
 
@@ -363,7 +364,7 @@ fn non_object_tool_response_writes_no_failopen_row() {
 )]
 fn a_parser_panic_is_judged_through_the_fallback() {
     let tmp = tempfile::tempdir().unwrap();
-    let (out, _) = run_push_remote(tmp.path(), TWO_PUSHES, Some("parse"));
+    let (out, _) = run_guardrail("guard-push-remote", tmp.path(), TWO_PUSHES, Some("parse"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("the loop parser panicked"),
@@ -380,9 +381,11 @@ fn a_parser_panic_is_judged_through_the_fallback() {
 /// Two pushes: the parse-failure fallback counts them and blocks.
 const TWO_PUSHES: &str = "git push origin main && git push upstream main";
 
-/// `guard-push-remote` on `command`, with `CADENCE_TEST_PANIC` set to
-/// `test_panic` when given. Returns the output and the wall-clock run time.
-fn run_push_remote(
+/// `guardrails <guard>` on `command`, owners set to `cameronsjo`, with
+/// `CADENCE_TEST_PANIC` set to `test_panic` when given. Returns the output and
+/// the wall-clock run time.
+fn run_guardrail(
+    guard: &str,
     metrics: &std::path::Path,
     command: &str,
     test_panic: Option<&str>,
@@ -396,8 +399,9 @@ fn run_push_remote(
     })
     .to_string();
     let mut cmd = cadence_hooks();
-    cmd.args(["guardrails", "guard-push-remote"]);
+    cmd.args(["guardrails", guard]);
     cmd.env("CADENCE_METRICS_DIR", metrics);
+    cmd.env("CADENCE_ALLOWED_OWNERS", "cameronsjo");
     cmd.env_remove("CADENCE_TEST_PANIC");
     if let Some(mode) = test_panic {
         cmd.env("CADENCE_TEST_PANIC", mode);
@@ -429,7 +433,7 @@ fn run_push_remote(
 )]
 fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
     let tmp = tempfile::tempdir().unwrap();
-    let (out, elapsed) = run_push_remote(tmp.path(), TWO_PUSHES, Some("hang"));
+    let (out, elapsed) = run_guardrail("guard-push-remote", tmp.path(), TWO_PUSHES, Some("hang"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("CADENCE_TEST_PANIC=hang"),
@@ -447,15 +451,21 @@ fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
     assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
 }
 
-/// cameronsjo/cadence-hooks#1405 security review, I2: compound-keyword
-/// nesting deep enough to overflow the parse thread's stack. An overflow
-/// aborts the process (exit 134), which drops the block; past the opener
-/// bound the parse counts as failed and the fallback judges the pushes.
+/// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): nesting deep
+/// enough to overflow the parse thread's stack. An overflow aborts the
+/// process (signal 6), which drops the block. Past [`MAX_PARSE_BYTES`] the
+/// command is not parsed, and the fallback judges the pushes. The `[[ ! …`
+/// shape costs 2 bytes per level, the cheapest known; at 16 000 levels it
+/// aborts a debug build when the cap is lifted.
 #[test]
-fn deep_keyword_nesting_is_judged_through_the_fallback() {
+fn nesting_past_the_byte_cap_is_judged_through_the_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let depth = 16_000;
+    let just_over = MAX_PARSE_BYTES / 2 + 1;
     let shapes = [
+        format!("[[ {}x ]] && {TWO_PUSHES}", "! ".repeat(just_over)),
+        format!("[[ {}x ]] && {TWO_PUSHES}", "! ".repeat(depth)),
+        format!("{}{TWO_PUSHES}", "true && ".repeat(MAX_PARSE_BYTES / 8 + 1)),
         format!(
             "{}{TWO_PUSHES}{}",
             "if true; then ".repeat(depth),
@@ -471,14 +481,10 @@ fn deep_keyword_nesting_is_judged_through_the_fallback() {
             "case x in x) ".repeat(depth),
             " ;; esac".repeat(depth)
         ),
-        format!(
-            "{}{TWO_PUSHES}{}",
-            "for i in a; do ".repeat(depth),
-            "; done".repeat(depth)
-        ),
     ];
     for command in &shapes {
-        let (out, _) = run_push_remote(tmp.path(), command, None);
+        assert!(command.len() > MAX_PARSE_BYTES);
+        let (out, _) = run_guardrail("guard-push-remote", tmp.path(), command, None);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let head = &command[..40];
         assert_eq!(out.status.code(), Some(2), "{head}…: {stderr}");
@@ -486,5 +492,48 @@ fn deep_keyword_nesting_is_judged_through_the_fallback() {
             stderr.contains("multiple git push commands"),
             "{head}…: blocked by the parse-failure fallback: {stderr}"
         );
+    }
+}
+
+/// A command past [`MAX_PARSE_BYTES`] gets only each guard's parse-failure
+/// fallback. Padding a dangerous loop or chain with a trailing comment must
+/// not turn its block into an allow (cameronsjo/cadence-hooks#1405 security
+/// review r2, Q2).
+#[test]
+fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pad = format!("\n# {}", "x".repeat(MAX_PARSE_BYTES));
+    for (guard, command, cause) in [
+        (
+            "guard-push-remote",
+            "for r in a b; do git push $r main; done",
+            "git push in loop",
+        ),
+        (
+            "guard-push-remote",
+            "while read r; do git push $r main; done < remotes",
+            "git push in loop",
+        ),
+        (
+            "guard-push-remote",
+            TWO_PUSHES,
+            "multiple git push commands",
+        ),
+        (
+            "guard-gh-write",
+            "for i in 1 2; do gh issue close $i -R other/r; done",
+            "gh command in loop",
+        ),
+        (
+            "guard-gh-write",
+            "while read i; do gh pr merge $i -R other/r; done < prs",
+            "gh command in loop",
+        ),
+    ] {
+        let padded = format!("{command}{pad}");
+        let (out, _) = run_guardrail(guard, tmp.path(), &padded, None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{guard} {command:?}: {stderr}");
+        assert!(stderr.contains(cause), "{guard} {command:?}: {stderr}");
     }
 }

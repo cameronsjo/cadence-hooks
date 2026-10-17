@@ -3698,8 +3698,12 @@ mod tests {
         with_env(&owners_only(), || {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
-            let command = "git -C d push origin main; ".repeat(7000);
-            // The #1131 regression is one `git remote` spawn per push (~7000
+            // Sized under the loop parser's byte cap: a larger command is not
+            // parsed and its push count blocks it (cameronsjo/cadence-hooks#1405).
+            let unit = "git -C d push origin main; ";
+            let command =
+                unit.repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES / unit.len());
+            // The #1131 regression is one `git remote` spawn per push (~450
             // here). Pin that by counting spawns: deterministic on any
             // runner. A raw `elapsed() < 2s` bound failed on a loaded
             // windows-latest runner at 2.16 s with the guard behaving
@@ -3732,9 +3736,12 @@ mod tests {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
             let unit = "for i in 1; do git push origin main; git config user.name x; done;";
-            let flood = unit.repeat(200_000 / unit.len());
+            // Sized under the loop parser's byte cap: a larger command is not
+            // parsed and its push count blocks it (cameronsjo/cadence-hooks#1405).
+            let flood =
+                unit.repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES / unit.len());
             // Pin the #1161 regression by counting spawns, not by timing
-            // the run: one probe per looped push is ~2300 spawns here, one
+            // the run: one probe per looped push is ~180 spawns here, one
             // per distinct remote is a handful. A wall-clock bound fails on
             // a loaded runner with the guard behaving correctly (#1314).
             let spawns_before = cadence_hooks_core::shell::git_spawn_count();

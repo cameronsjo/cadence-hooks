@@ -593,47 +593,18 @@ pub fn group_nesting_depth(command: &str) -> usize {
     max
 }
 
-/// Most nesting openers [`parse_command`] hands to the parser, counted by
-/// [`nesting_opener_count`]. The parser also recurses once per `if`, `while`,
-/// `until`, `for`, `select` and `case` level, which [`group_nesting_depth`]
-/// does not see. A stack overflow aborts the process, which no panic hook or
-/// `catch_unwind` can stop, and the hook then exits with a non-blocking
-/// status (cameronsjo/cadence-hooks#1405 security review, I2). Measured
-/// nested `if` levels that abort: about 4000 for a release build on a 16 MB
-/// stack, and 6000 to 8000 for a debug build on [`PARSE_STACK`]. Sequential
-/// keywords count too, so the bound stays above ordinary large scripts: a
-/// 200 KB flood of one-line `for` loops holds about 2900.
-pub const MAX_PARSE_OPENERS: usize = 4096;
-
-/// Upper bound on how deep the parser can recurse on `command`: every `(`,
-/// `{` and backtick, and every `if`, `while`, `until`, `for`, `select` and
-/// `case` word. Quoting is ignored on purpose. A count, unlike a depth, only
-/// grows when a quote is misread, so no quoting can make it read low.
-pub fn nesting_opener_count(command: &str) -> usize {
-    const KEYWORDS: [&[u8]; 6] = [b"if", b"while", b"until", b"for", b"select", b"case"];
-    let bytes = command.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut count = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if matches!(b, b'(' | b'{' | b'`') {
-            count += 1;
-            i += 1;
-        } else if is_word(b) {
-            let start = i;
-            while i < bytes.len() && is_word(bytes[i]) {
-                i += 1;
-            }
-            if KEYWORDS.contains(&&bytes[start..i]) {
-                count += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    count
-}
+/// Largest command, in bytes, [`parse_command`] hands to the parser. The
+/// parser recurses once per nesting level of many constructs, and a stack
+/// overflow aborts the process, which no panic hook or `catch_unwind` can
+/// stop: the hook then exits with a non-blocking status and the command goes
+/// through (cameronsjo/cadence-hooks#1405 security reviews, I2 and r2 I1).
+/// Listing the constructs that recurse never finished (`[[ ! ! … ]]` was
+/// missing), so the bound is on size. The cheapest known construct, `! `
+/// inside `[[ … ]]`, costs 2 bytes per level. On [`PARSE_STACK`] a debug
+/// build, whose frames are the largest, aborts at 13 000 to 13 500 such
+/// levels (measured), and a release build at about 140 000; this cap allows
+/// 6144. A larger command takes each guard's parse-failure fallback.
+pub const MAX_PARSE_BYTES: usize = 12 * 1024;
 
 /// Wall-clock time [`parse_command`] gives the parser. The parser backtracks
 /// exponentially on some inputs it then rejects: about 3x per line of
@@ -641,9 +612,8 @@ pub fn nesting_opener_count(command: &str) -> usize {
 /// that long would eat the shared probe budget ([`crate::deadline`]) or hit the
 /// hook's 5 s timeout, and either one lets the push through unjudged. Past
 /// this the parse counts as failed, and every caller already has a fallback
-/// for that. A 166 KB ordinary command parses in about 250 ms in a release
-/// build. On a saturated host a large ordinary command can still run past
-/// it, and then takes that fallback: `guard-push-remote` counts pushes, so a
+/// for that. On a saturated host a command under [`MAX_PARSE_BYTES`] can
+/// still run past it, and then takes that fallback: `guard-push-remote` counts pushes, so a
 /// legitimate two-push chain blocks. Wall clock, not CPU time, because the
 /// hook timeout it protects is wall clock.
 const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -653,9 +623,7 @@ const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000)
 const _: () = assert!(PARSE_BUDGET.as_millis() < crate::deadline::HOOK_TIMEOUT.as_millis());
 
 /// Stack for the parse thread. The parser recurses once per nesting level,
-/// and [`MAX_PARSE_OPENERS`] is sized against this stack: a debug build, whose
-/// frames are the largest, aborts at about 1.5 to 2 times the bound, and a
-/// release build far deeper. Only the pages the parse touches are committed;
+/// and [`MAX_PARSE_BYTES`] is sized against this stack. Only the pages the parse touches are committed;
 /// a spawned thread gets 2 MB by default. A failed spawn counts as a parse
 /// failure, so a larger stack is not free on a host that refuses it.
 const PARSE_STACK: usize = 128 * 1024 * 1024;
@@ -674,9 +642,7 @@ fn command_hash(command: &str) -> u64 {
 }
 
 fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
-    if group_nesting_depth(command) > MAX_PARSE_NESTING
-        || nesting_opener_count(command) > MAX_PARSE_OPENERS
-    {
+    if command.len() > MAX_PARSE_BYTES || group_nesting_depth(command) > MAX_PARSE_NESTING {
         return None;
     }
     within_budget(command, PARSE_BUDGET, |text| {
@@ -1889,33 +1855,29 @@ mod tests {
         assert!(matches!(analyze_gh_loops(&deep), LoopAnalysis::ParseFailed));
     }
 
-    /// cameronsjo/cadence-hooks#1405 security review, I2: the count sees
-    /// compound keywords and ignores quoting, so a quoted closer or a quoted
-    /// opener can only raise it.
+    /// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): a command
+    /// past [`MAX_PARSE_BYTES`] is not parsed, whatever it holds; one at the
+    /// cap still is.
     #[test]
-    fn nesting_opener_count_counts_every_opener_regardless_of_quoting() {
-        let cases = [
-            ("echo hi", 0),
-            ("if true; then echo; fi", 1),
-            (
-                "while x; do for i in a; do case $i in a) ;; esac; done; done",
-                3,
-            ),
-            ("until x; do select y in a; do :; done; done", 2),
-            ("diff iffy forty casey whiles", 0),
-            ("echo '(((' \"{\" `x`", 6),
-            ("( \")\" ( \")\" x ) )", 2),
-        ];
-        for (command, want) in cases {
-            assert_eq!(nesting_opener_count(command), want, "{command}");
-        }
-        let deep = format!(
-            "{}git push origin main && git push upstream main{}",
-            "if true; then ".repeat(MAX_PARSE_OPENERS + 1),
-            "; fi".repeat(MAX_PARSE_OPENERS + 1)
+    fn a_command_past_the_byte_cap_is_not_parsed() {
+        let unit = "for i in a; do git push origin main; done; ";
+        let at_cap = unit.repeat(MAX_PARSE_BYTES / unit.len());
+        assert!(at_cap.len() <= MAX_PARSE_BYTES);
+        assert!(!matches!(
+            analyze_push_loops(&at_cap),
+            LoopAnalysis::ParseFailed
+        ));
+        let past_cap = format!("{at_cap}{}", " ".repeat(MAX_PARSE_BYTES + 1 - at_cap.len()));
+        assert!(matches!(
+            analyze_push_loops(&past_cap),
+            LoopAnalysis::ParseFailed
+        ));
+        let bangs = format!(
+            "[[ {}x ]] && git push origin main",
+            "! ".repeat(MAX_PARSE_BYTES / 2)
         );
         assert!(matches!(
-            analyze_push_loops(&deep),
+            analyze_push_loops(&bangs),
             LoopAnalysis::ParseFailed
         ));
     }
