@@ -7141,6 +7141,10 @@ mod tests {
                 "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
                 "function jq { cat $1; }; jq .env.local",
                 "eval 'jq(){ cat $1;}'; jq .env.local",
+                // The accepted cost: the body only prints, but the rule does not
+                // read what it does.
+                r#"f(){ echo "$1"; }; f .env"#,
+                r#"die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env""#,
             ],
             cadence_hooks_core::Outcome::Block,
             "a positional function and a secret name",
