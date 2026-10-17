@@ -656,8 +656,8 @@ const _: () = assert!(PARSE_BUDGET.as_millis() < crate::deadline::HOOK_TIMEOUT.a
 /// and [`MAX_PARSE_OPENERS`] is sized against this stack: a debug build, whose
 /// frames are the largest, aborts at about 1.5 to 2 times the bound, and a
 /// release build far deeper. Only the pages the parse touches are committed;
-/// a spawned thread gets 2 MB by default. A 256 MB stack failed to spawn on
-/// the ubuntu CI runner, which turns every parse into a parse failure.
+/// a spawned thread gets 2 MB by default. A failed spawn counts as a parse
+/// failure, so a larger stack is not free on a host that refuses it.
 const PARSE_STACK: usize = 128 * 1024 * 1024;
 
 /// Hashes of commands whose parse ran past [`PARSE_BUDGET`] or panicked, in
