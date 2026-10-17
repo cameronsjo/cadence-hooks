@@ -598,11 +598,12 @@ pub fn group_nesting_depth(command: &str) -> usize {
 /// `until`, `for`, `select` and `case` level, which [`group_nesting_depth`]
 /// does not see. A stack overflow aborts the process, which no panic hook or
 /// `catch_unwind` can stop, and the hook then exits with a non-blocking
-/// status (cameronsjo/cadence-hooks#1405 security review, I2). Measured on a
-/// 16 MB stack: about 4000 nested `if` levels abort a release build and 1000
-/// abort a debug build. On [`PARSE_STACK`] the bound leaves a debug build
-/// four times that margin.
-pub const MAX_PARSE_OPENERS: usize = 1024;
+/// status (cameronsjo/cadence-hooks#1405 security review, I2). Measured
+/// nested `if` levels that abort: about 4000 for a release build on a 16 MB
+/// stack, and 8000 to 12000 for a debug build on [`PARSE_STACK`]. Sequential
+/// keywords count too, so the bound stays above ordinary large scripts: a
+/// 200 KB flood of one-line `for` loops holds about 2900.
+pub const MAX_PARSE_OPENERS: usize = 4096;
 
 /// Upper bound on how deep the parser can recurse on `command`: every `(`,
 /// `{` and backtick, and every `if`, `while`, `until`, `for`, `select` and
@@ -652,10 +653,11 @@ const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000)
 const _: () = assert!(PARSE_BUDGET.as_millis() < crate::deadline::HOOK_TIMEOUT.as_millis());
 
 /// Stack for the parse thread. The parser recurses once per nesting level,
-/// and [`MAX_PARSE_OPENERS`] is sized against this stack in a debug build,
-/// whose frames are the largest. Only the pages the parse touches are
-/// committed; a spawned thread gets 2 MB by default.
-const PARSE_STACK: usize = 128 * 1024 * 1024;
+/// and [`MAX_PARSE_OPENERS`] is sized against this stack: a debug build, whose
+/// frames are the largest, aborts at about twice the bound, and a release
+/// build far deeper. Only the pages the parse touches are committed; a
+/// spawned thread gets 2 MB by default.
+const PARSE_STACK: usize = 256 * 1024 * 1024;
 
 /// Hashes of commands whose parse ran past [`PARSE_BUDGET`] or panicked, in
 /// this process.
