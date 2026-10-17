@@ -935,7 +935,9 @@ impl MarkerDir {
     /// `/var/folders/…` is `/private/var/folders/…`). The spellings come from
     /// [`temp_root_spellings`], which never resolves `$TMPDIR`: a `$TMPDIR`
     /// that is a symlink, holds `.` or `..`, or sits in or over home counts
-    /// as no temp dir, so a swapped temp dir cannot exempt this parent.
+    /// as no temp dir, so a swapped temp dir cannot exempt this parent. The
+    /// parent is exempt only when every one of its spellings is temp, so a
+    /// link placed above the marker dir cannot exempt it either.
     fn new(spellings: Vec<Vec<String>>, tmpdirs: &[String], home: Option<&str>) -> Self {
         let mut tmpdirs: Vec<&str> = tmpdirs.iter().map(String::as_str).collect();
         tmpdirs.dedup();
@@ -948,12 +950,20 @@ impl MarkerDir {
                     .to_ascii_lowercase()
             })
             .collect();
-        let parents = spellings
+        let parents: Vec<Vec<String>> = spellings
             .iter()
             .filter(|s| s.len() > 1)
             .map(|s| s[..s.len() - 1].to_vec())
-            .filter(|p| !temp_dirs.contains(&format!("/{}", p.join("/")).to_ascii_lowercase()))
             .collect();
+        // All or nothing: the parent is exempt only when every spelling of it
+        // is a temp spelling. The physical spelling is read through links
+        // the session can place (`~/.claude/cadence-hooks -> $TMPDIR`), so a
+        // temp physical spelling alone proves nothing; dropping just that
+        // one would let `cp -r forged/markers $TMPDIR` through.
+        let all_temp = parents
+            .iter()
+            .all(|p| temp_dirs.contains(&format!("/{}", p.join("/")).to_ascii_lowercase()));
+        let parents = if all_temp { Vec::new() } else { parents };
         Self { spellings, parents }
     }
 }
@@ -2853,6 +2863,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // cadence-hooks#1408 review: a link placed above the marker dir that
+    // points its parent at the temp dir (`~/.claude/cadence-hooks -> $TMPDIR`)
+    // gives the parent a temp physical spelling. Its lexical spelling is not
+    // temp, so the parent stays refused under every spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_parent_linked_into_temp_is_still_refused() {
+        let f = fixture("a-marker-parent-linked-into-temp-is-stil");
+        let temp = format!("{}/fake-tmp", f.root);
+        let cfg = format!("{}/cfg", f.root);
+        std::fs::create_dir_all(format!("{temp}/markers")).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::os::unix::fs::symlink(&temp, format!("{cfg}/cadence-hooks")).unwrap();
+        let marker_dir = format!("{cfg}/cadence-hooks/markers");
+        let tmpdirs = [temp.clone()];
+        for parent in [temp.clone(), format!("{cfg}/cadence-hooks")] {
+            let command = format!("cp -r forged/markers {parent}");
+            let input = make_bash_with_cwd(&command, &f.work);
+            let got = run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    marker_dir: Some(&marker_dir),
+                    tmpdirs: &tmpdirs,
+                    ..Env::default()
+                },
+                &[],
+            );
+            assert_eq!(got.outcome, Outcome::Block, "{command}");
         }
     }
 

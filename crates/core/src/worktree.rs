@@ -267,10 +267,12 @@ pub(crate) fn path_under_temp_root_with_canonical(
 ///
 /// Only the last component is `lstat`ed. A symlink earlier in the value is
 /// harmless to an equality caller: the returned spellings are text, never
-/// resolved, so they can only equal a marker parent spelled the same way,
-/// and a physical (resolved) spelling of that parent has no symlink in it.
-/// A caller that compared these against resolved paths of its own would
-/// need to re-check this.
+/// resolved, so they can only equal a path spelled the same way. The other
+/// direction is the caller's to close: a path the caller resolves itself
+/// can be pointed into temp by a link the session placed above it, so a
+/// caller should treat a path as temp only when every spelling it holds of
+/// that path is a temp spelling (as `guard-runbook-scrub`'s `MarkerDir`
+/// does).
 pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<PathBuf> {
     let mut out = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
     let Some(t) = usable_tmpdir(tmpdir, home) else {
