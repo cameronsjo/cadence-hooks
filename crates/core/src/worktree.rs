@@ -254,13 +254,18 @@ pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<Path
     let path = Path::new(t.trim_end_matches('/'));
     // Split the text: `Path::components` drops an interior `.` silently.
     let dotted = t.split(['/', '\\']).any(|s| s == "." || s == "..");
-    let inside_home = home
-        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-        .is_some_and(|h| {
-            let t = t.trim_end_matches('/').to_ascii_lowercase();
-            t == h || t.starts_with(&format!("{h}/"))
-        });
+    // Compared with `/` for either separator, so a Windows `C:\Users\dev\…`
+    // value is read the same as `C:/Users/dev/…`.
+    let fold = |s: &str| {
+        s.trim()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    let inside_home = home.map(fold).filter(|h| !h.is_empty()).is_some_and(|h| {
+        let t = fold(t);
+        t == h || t.starts_with(&format!("{h}/"))
+    });
     let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
     let twin = firmlink_twin(path);
     if path.as_os_str().is_empty()
@@ -279,14 +284,29 @@ pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<Path
     out
 }
 
-/// True when `path` exists and resolves to something other than itself or
-/// `twin`: some component of it is a link the session could have placed.
+/// True when `path` resolves to something other than itself or `twin`: some
+/// component of it is a link the session could have placed. A `path` that
+/// does not exist yet is read through its nearest existing ancestor, so a
+/// swapped parent counts even while the last components are missing.
 /// Unix only; Windows `canonicalize` returns a `\\?\` verbatim path that
 /// never equals the input, and a symlinked `TMPDIR` there is already caught
 /// by the `lstat` of the last component.
 #[cfg(unix)]
 fn resolves_elsewhere(path: &Path, twin: Option<&Path>) -> bool {
-    std::fs::canonicalize(path).is_ok_and(|real| real != path && Some(real.as_path()) != twin)
+    let mut existing = path;
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let real = loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            break real;
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return false;
+        };
+        missing.push(name);
+        existing = parent;
+    };
+    let real = missing.iter().rev().fold(real, |acc, name| acc.join(name));
+    real != path && Some(real.as_path()) != twin
 }
 
 #[cfg(not(unix))]
@@ -693,7 +713,6 @@ mod tests {
             ("/tmp/scratch", Some("/private/tmp/scratch")),
             ("/private/tmp/scratch", Some("/tmp/scratch")),
             ("/srv/tmp", None),
-            ("/var/foldersx/T", None),
         ] {
             let got = temp_root_spellings(Some(tmpdir), None);
             let raw = PathBuf::from(tmpdir.trim_end_matches('/'));
@@ -713,6 +732,7 @@ mod tests {
         // `/var/folders` itself is not a temp dir. Checked on the twin alone:
         // the path exists on macOS, where the resolve check refuses it anyway.
         assert_eq!(firmlink_twin(Path::new("/var/folders")), None);
+        assert_eq!(firmlink_twin(Path::new("/var/foldersx/T")), None);
         assert_eq!(firmlink_twin(Path::new("/private")), None);
         // No duplicates of the fixed roots.
         assert_eq!(temp_root_spellings(Some("/tmp"), None), fixed.to_vec());
@@ -724,6 +744,14 @@ mod tests {
                 "{tmpdir}"
             );
         }
+        // Either separator: a native Windows value inside the profile.
+        assert_eq!(
+            temp_root_spellings(
+                Some(r"C:\Users\Dev\AppData\Local\Temp"),
+                Some(r"C:\Users\Dev")
+            ),
+            fixed.to_vec()
+        );
         // A sibling that only shares the prefix text is not inside home.
         assert!(
             temp_root_spellings(Some("/Users/Devon/tmp"), Some("/Users/Dev"))
@@ -835,11 +863,12 @@ mod tests {
             Some("/home/dev/tmp"),
             Some("/home/dev")
         ));
-        // Control: the same value with home elsewhere is honored.
+        // Control: a value with home elsewhere is honored. A made-up root, since
+        // `/home` is itself a link on macOS and resolves elsewhere.
         assert!(is_temp_root(
-            Path::new("/home/dev/tmp/repo"),
-            Some("/home/dev/tmp"),
-            Some("/home/other")
+            Path::new("/no-such-root/dev/tmp/repo"),
+            Some("/no-such-root/dev/tmp"),
+            Some("/no-such-root/other")
         ));
     }
 
@@ -877,6 +906,14 @@ mod tests {
         assert!(!path_under_temp_root(
             &real.join("T/x"),
             Some(via_parent_str),
+            None
+        ));
+        // The last components do not exist yet: the swapped parent still counts.
+        let missing = parent_link.join("T/not-yet");
+        let missing_str = missing.to_str().unwrap();
+        assert!(!path_under_temp_root(
+            &missing.join("x"),
+            Some(missing_str),
             None
         ));
         // A dot segment.

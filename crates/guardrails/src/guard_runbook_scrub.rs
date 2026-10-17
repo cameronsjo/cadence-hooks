@@ -126,9 +126,9 @@
 //!   directory, the marker directory, or its parent, and also writes, blocks
 //!   (`link_then_write`, cadence-hooks#1412), whatever the write. So does one
 //!   whose link target the hook cannot read: `ln -s "$(brew --prefix)/x" y`,
-//!   operands fed by `xargs`, a `mv`/`cp -r`/`rsync` source that is missing or
-//!   sits behind an unreadable `cd`, or a source tree past `LINK_WALK_BUDGET`
-//!   entries. Run the link, move, or copy as its own command first.
+//!   operands fed by `xargs`, a `mv`/`cp -r`/`rsync` source that is missing,
+//!   remote, or behind an unreadable `cd`, or a source tree past
+//!   `LINK_WALK_BUDGET` entries (a large `node_modules`). Run the link, move, or copy as its own command first.
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -139,7 +139,8 @@
 //! environment), which allows *and* records a bypass row.
 
 use cadence_hooks_cadence::prevent_secret_writes::{
-    program_commands, segment_command_argv, segment_write_targets,
+    RSYNC_VALUE_FLAGS, RSYNC_WRITE_FLAGS, program_commands, segment_command_argv,
+    segment_write_targets,
 };
 use cadence_hooks_core::markers;
 use cadence_hooks_core::shell::{
@@ -1031,59 +1032,41 @@ const NO_LINK_WRITERS: &[&str] = &[
 ];
 
 /// How a segment may create links, by its program ([`link_kind`]).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 enum LinkKind {
     /// Creates no link.
     None,
-    /// Creates links to these words (`ln`, `cp -s`, `install -l`): every
-    /// operand, the destination included, since a clustered `-st DIR` or a
-    /// one-operand `ln -s TARGET` puts the link somewhere a last-operand
-    /// parse misses.
-    Targets(Vec<String>),
-    /// Copies or moves these source trees, recreating any link inside them
-    /// (`cp -r`/`-a`/`-P`/`-d`, `mv`, `rsync`).
-    Trees(Vec<String>),
+    /// Creates links to these words (`ln`, `cp -s`, `install -l`) in the
+    /// destination word, or in the work dir when there is none.
+    Targets(Vec<String>, Option<String>),
+    /// Copies or moves these source trees to the destination word (when the
+    /// hook can find it), recreating any link inside them (`cp -r`/`-a`/`-P`/
+    /// `-d`, `mv`, `rsync`).
+    Trees(Vec<String>, Option<String>),
     /// Creates links the hook cannot read (operands from stdin via `xargs`,
     /// or an unlisted writer).
     Unreadable,
 }
 
-/// `rsync` options whose value is the next word.
-const RSYNC_VALUE_OPTIONS: &[&str] = &[
-    "-e",
-    "--rsh",
-    "-f",
-    "--filter",
-    "--exclude",
-    "--include",
-    "--exclude-from",
-    "--include-from",
-    "--files-from",
-    "-T",
-    "--temp-dir",
-    "--partial-dir",
-    "--backup-dir",
-    "--suffix",
-    "--link-dest",
-    "--compare-dest",
-    "--copy-dest",
-    "--chmod",
-    "--chown",
-    "--log-file",
-    "--password-file",
-    "-B",
-    "--block-size",
-    "--bwlimit",
-    "--max-size",
-    "--min-size",
-    "--timeout",
-    "--port",
-];
+/// The short options of `word` that take a value: the rest of the word, or
+/// the next word.
+fn value_letters(word: &str) -> &'static [char] {
+    if word == "rsync" {
+        &['e', 'f', 'B', 'M', 'T']
+    } else {
+        &['t', 'S']
+    }
+}
 
-/// The source operands of a `cp`/`mv`/`rsync`: every operand but the
-/// destination (the last one, or a `-t`/`--target-directory` value).
-fn source_operands(word: &str, args: &[String]) -> Vec<String> {
+/// The operands of a `cp`/`mv`/`rsync`/`ln`, split into sources and the
+/// destination: the last operand, or a `-t`/`--target-directory` value
+/// (separate, `=`-joined, or attached as `-tDIR` or `-stDIR`). `ln` and
+/// `cp -s` with one operand and no `-t` link to it from the work dir, so
+/// that operand is the one source and there is no destination word.
+fn source_operands(word: &str, args: &[String]) -> (Vec<String>, Option<String>) {
+    let rsync = word == "rsync";
     let mut operands = Vec::new();
+    let mut dest: Option<String> = None;
     let mut target_dir = false;
     let mut i = 0;
     while i < args.len() {
@@ -1093,30 +1076,48 @@ fn source_operands(word: &str, args: &[String]) -> Vec<String> {
             operands.extend(args[i..].iter().cloned());
             break;
         }
-        if a == "-t" || a == "--target-directory" {
+        if a == "--target-directory" && !rsync {
             target_dir = true;
+            dest = args.get(i).cloned();
             i += 1;
-        } else if a.starts_with("--target-directory=") {
+        } else if let Some(v) = a.strip_prefix("--target-directory=").filter(|_| !rsync) {
             target_dir = true;
-        } else if a == "-S"
-            || a == "--suffix"
-            || (word == "rsync" && RSYNC_VALUE_OPTIONS.contains(&a))
-        {
-            i += 1;
-        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) {
-            // A clustered `-rt DIR`: the value is the next word.
-            if word != "rsync" && cluster.ends_with('t') {
-                target_dir = true;
+            dest = Some(v.to_string());
+        } else if a.starts_with("--") {
+            let takes_value = if rsync {
+                RSYNC_VALUE_FLAGS.contains(&a) || RSYNC_WRITE_FLAGS.contains(&a)
+            } else {
+                a == "--suffix"
+            };
+            if takes_value {
                 i += 1;
             }
-        } else if !a.starts_with('-') {
+        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            // A short-option cluster: the first letter that takes a value
+            // takes the rest of the word, or the next word.
+            let value_letters = value_letters(word);
+            if let Some(at) = cluster.find(value_letters) {
+                let rest = &cluster[at + 1..];
+                let value = if rest.is_empty() {
+                    i += 1;
+                    args.get(i - 1).cloned()
+                } else {
+                    Some(rest.to_string())
+                };
+                if cluster[at..].starts_with('t') {
+                    target_dir = true;
+                    dest = value;
+                }
+            }
+        } else {
             operands.push(a.to_string());
         }
     }
-    if !target_dir {
-        operands.pop();
+    let one_operand_link = matches!(word, "ln" | "cp" | "install") && operands.len() == 1;
+    if !target_dir && !one_operand_link {
+        dest = operands.pop();
     }
-    operands
+    (operands, dest)
 }
 
 /// How the segment with peeled argv `argv` and raw `segment` text may create
@@ -1126,36 +1127,75 @@ fn link_kind(segment: &str, argv: &[String]) -> LinkKind {
     let Some(first) = argv.first() else {
         return LinkKind::None;
     };
-    let word = command_word(first);
-    let args = &argv[1..];
-    let any = |long: &[&str], shorts: &[char]| args.iter().any(|a| has_option(a, long, shorts));
-    let words: Vec<String> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .cloned()
-        .collect();
-    let fed = tokenize(segment)
+    // The runner words the peel dropped come before the program's own.
+    let tokens = tokenize(segment);
+    let runners = tokens.len().saturating_sub(argv.len());
+    let fed = tokens[..runners]
         .iter()
         .any(|t| matches!(command_word(t).as_ref(), "xargs" | "parallel"));
-    let kind = match word.as_ref() {
-        "ln" => LinkKind::Targets(words),
-        "cp" if any(&["symbolic-link", "link"], &['s', 'l']) => LinkKind::Targets(words),
+    // `busybox ln …` runs the applet; Homebrew's GNU coreutils carry a `g`.
+    let (word, args) = match (command_word(first).as_ref(), argv.get(1)) {
+        ("busybox", Some(applet)) => (command_word(applet).into_owned(), &argv[2..]),
+        (w, _) => (w.to_string(), &argv[1..]),
+    };
+    let word = match word.as_str() {
+        "gln" => "ln".to_string(),
+        "gcp" => "cp".to_string(),
+        "gmv" => "mv".to_string(),
+        "ginstall" => "install".to_string(),
+        _ => word,
+    };
+    // Option words with any attached value cut off (`-t/a/b` is `-t`, not the
+    // letters of a path), so a value never reads as a flag.
+    let value_letters = value_letters(&word);
+    let flags: Vec<String> = args
+        .iter()
+        .map(
+            |a| match a.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+                Some(cluster) => match cluster.find(value_letters) {
+                    Some(at) => format!("-{}", &cluster[..=at]),
+                    None => a.clone(),
+                },
+                None => a.clone(),
+            },
+        )
+        .collect();
+    let any = |long: &[&str], shorts: &[char]| flags.iter().any(|a| has_option(a, long, shorts));
+    let split = || source_operands(&word, args);
+    let kind = match word.as_str() {
+        "ln" => {
+            let (targets, dest) = split();
+            LinkKind::Targets(targets, dest)
+        }
+        "cp" if any(&["symbolic-link", "link"], &['s', 'l']) => {
+            let (targets, dest) = split();
+            LinkKind::Targets(targets, dest)
+        }
+        "install" if any(&[], &['l']) => {
+            let (targets, dest) = split();
+            LinkKind::Targets(targets, dest)
+        }
         "cp" if any(
             &["recursive", "archive", "no-dereference"],
             &['r', 'R', 'a', 'P', 'd'],
         ) =>
         {
-            LinkKind::Trees(source_operands(&word, args))
+            let (sources, dest) = split();
+            LinkKind::Trees(sources, dest)
         }
-        "mv" | "rsync" => LinkKind::Trees(source_operands(&word, args)),
-        "install" if any(&[], &['l']) => LinkKind::Targets(words),
+        "mv" | "rsync" => {
+            let (sources, dest) = split();
+            LinkKind::Trees(sources, dest)
+        }
         "cp" | "install" => LinkKind::None,
         w if NO_LINK_WRITERS.contains(&w) => LinkKind::None,
         _ if operand_targets(segment).is_empty() => LinkKind::None,
         _ => LinkKind::Unreadable,
     };
     match kind {
-        LinkKind::Targets(w) | LinkKind::Trees(w) if fed || w.is_empty() => LinkKind::Unreadable,
+        LinkKind::Targets(w, _) | LinkKind::Trees(w, _) if fed || w.is_empty() => {
+            LinkKind::Unreadable
+        }
         other => other,
     }
 }
@@ -1247,10 +1287,14 @@ fn reading_path(reading: &[Comp]) -> Option<PathBuf> {
 /// Walk the source tree at `path` for a link a copy or move would recreate
 /// pointing at, above, or below a protected directory. True (dangerous) for
 /// such a link, for a source that is missing (an earlier step may create it),
-/// for a relative link with a `..` (it resolves from wherever the copy lands),
-/// and past `budget` entries.
+/// and past `budget` entries. A relative link resolves from where the copy
+/// puts it: under each reading in `dests` of the destination, directly or
+/// under the source's own name. It is dangerous with no readable
+/// destination, or when its `..` climbs out of another link in the same tree,
+/// which the copy recreates and no pre-command reading can follow.
 fn tree_links_relate(
     path: &Path,
+    dests: &[PathBuf],
     protected: &[Vec<String>],
     resolver: &Resolver,
     budget: &mut usize,
@@ -1275,8 +1319,32 @@ fn tree_links_relate(
                 if readings.into_iter().any(|r| relates(&r, protected)) {
                     return true;
                 }
-            } else if text.split(['/', '\\']).any(|c| c == "..") {
+            } else if dests.is_empty() || climbs_through_a_link(path, &p, &target) {
                 return true;
+            } else {
+                let rel = p.strip_prefix(path).unwrap_or(Path::new(""));
+                let rel_parent = rel.parent().unwrap_or(Path::new(""));
+                let name = path.file_name().unwrap_or_default();
+                let homes: Vec<PathBuf> = dests
+                    .iter()
+                    .flat_map(|d| {
+                        if rel.as_os_str().is_empty() {
+                            vec![d.parent().unwrap_or(d).to_path_buf(), d.clone()]
+                        } else {
+                            vec![d.join(rel_parent), d.join(name).join(rel_parent)]
+                        }
+                    })
+                    .collect();
+                let lands = homes.iter().any(|home| {
+                    let joined = home.join(&target);
+                    let shape = PathShape(PathShape::parse(&joined.to_string_lossy(), false));
+                    std::iter::once(shape.lexical())
+                        .chain(shape.physical(resolver))
+                        .any(|r| relates(&r, protected))
+                });
+                if lands {
+                    return true;
+                }
             }
         } else if meta.is_dir() {
             let Ok(entries) = std::fs::read_dir(&p) else {
@@ -1288,9 +1356,59 @@ fn tree_links_relate(
     false
 }
 
+/// True when the relative link `target`, found at `link` inside the tree
+/// rooted at `root`, takes a `..` out of a directory in that tree that is
+/// itself a link: after the copy, that `..` climbs from the link's target.
+fn climbs_through_a_link(root: &Path, link: &Path, target: &Path) -> bool {
+    let mut cursor = link.parent().unwrap_or(link).to_path_buf();
+    for comp in target.components() {
+        match comp {
+            Component::ParentDir => {
+                if cursor.starts_with(root)
+                    && std::fs::symlink_metadata(&cursor).is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return true;
+                }
+                cursor.pop();
+            }
+            Component::Normal(name) => cursor.push(name),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True when `name` matches the shell glob `pattern` (`*` and `?`; any
+/// other glob syntax matches everything, the over-inclusive side).
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    if pattern.contains(['[', '{']) {
+        return true;
+    }
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    // Classic two-pointer match with one backtrack point per `*`.
+    let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
 /// Entries the source trees of one command's copies and moves may visit
 /// ([`tree_links_relate`]); past it the command is judged dangerous.
-const LINK_WALK_BUDGET: usize = 4096;
+const LINK_WALK_BUDGET: usize = 16_384;
 
 /// A word with each `$(…)` or `` `…` `` replaced by `*`: the reading
 /// [`command_segments_with_dirs`] also lists a command under.
@@ -1376,9 +1494,18 @@ fn link_then_write(
     spent: &mut usize,
 ) -> Option<BashFinding> {
     let mut walk = LINK_WALK_BUDGET;
-    let mut judged: HashSet<(&str, &str)> = HashSet::new();
+    let mut judged: HashSet<(&str, &str, &LinkKind)> = HashSet::new();
     for (i, seg) in segments.iter().enumerate() {
-        if seg.kind == LinkKind::None || !judged.insert((&seg.text.0, &seg.seg_dir)) {
+        if seg.kind == LinkKind::None || !judged.insert((&seg.text.0, &seg.seg_dir, &seg.kind)) {
+            continue;
+        }
+        // Cheap first: a link that nothing writes through costs no walk.
+        let several_sources = matches!(&seg.kind, LinkKind::Trees(w, _) if w.len() > 1);
+        let other_write = segments
+            .iter()
+            .enumerate()
+            .any(|(j, other)| j != i && other.writes && !same_command(&seg.text, &other.text));
+        if !several_sources && !other_write {
             continue;
         }
         let mut bases: Vec<&str> = vec![&seg.seg_dir, cwd, whole];
@@ -1390,52 +1517,80 @@ fn link_then_write(
         let dangerous = match &seg.kind {
             LinkKind::None => false,
             LinkKind::Unreadable => true,
-            LinkKind::Targets(words) => {
-                // A relative link target resolves from the link's directory,
-                // which is one of the other words or its parent.
+            LinkKind::Targets(words, dest) => {
+                // A relative link target resolves from the link's directory: the
+                // destination, or its parent when it names the link itself.
                 let mut link_dirs: Vec<String> = Vec::new();
-                for w in words {
-                    for r in readings(w, spent).into_iter().flatten() {
-                        if let Some(p) = reading_path(&r) {
-                            link_dirs.extend(p.parent().map(|d| d.to_string_lossy().into_owned()));
-                            link_dirs.push(p.to_string_lossy().into_owned());
+                let mut dest_unread = false;
+                if let Some(d) = dest {
+                    match readings(d, spent) {
+                        None => dest_unread = true,
+                        Some(rs) => {
+                            for p in rs.iter().filter_map(|r| reading_path(r)) {
+                                link_dirs
+                                    .extend(p.parent().map(|d| d.to_string_lossy().into_owned()));
+                                link_dirs.push(p.to_string_lossy().into_owned());
+                            }
                         }
                     }
                 }
                 let mut all: Vec<&str> = bases.clone();
                 all.extend(link_dirs.iter().map(String::as_str));
                 words.iter().any(|w| {
+                    let text = dir.expand(&pwd_as_var(w));
+                    let relative = !text.starts_with('/') && !text.starts_with('~');
+                    if relative && dest_unread {
+                        return true;
+                    }
                     *spent = spent.saturating_add(w.len().saturating_mul(all.len()));
                     target_readings(w, &all, dir, resolver)
                         .is_none_or(|rs| rs.iter().any(|r| relates(r, protected)))
                 })
             }
-            LinkKind::Trees(words) => words.iter().any(|w| match readings(w, spent) {
-                None => true,
-                Some(rs) => rs.iter().any(|r| {
-                    // A glob source: walk the literal directory above it.
-                    let literal: Vec<Comp> = r
-                        .iter()
-                        .take_while(|c| matches!(c, Comp::Lit(_)))
-                        .cloned()
-                        .collect();
-                    reading_path(&literal)
-                        .is_none_or(|p| tree_links_relate(&p, protected, resolver, &mut walk))
-                }),
-            }),
+            LinkKind::Trees(words, dest) => {
+                let dests: Vec<PathBuf> = dest
+                    .iter()
+                    .flat_map(|d| readings(d, spent).unwrap_or_default())
+                    .filter_map(|r| reading_path(&r))
+                    .collect();
+                words.iter().any(|w| match readings(w, spent) {
+                    None => true,
+                    Some(rs) => rs.iter().any(|r| {
+                        let literal: Vec<Comp> = r
+                            .iter()
+                            .take_while(|c| matches!(c, Comp::Lit(_)))
+                            .cloned()
+                            .collect();
+                        let Some(base) = reading_path(&literal) else {
+                            return true;
+                        };
+                        // A glob in the last component: walk each match. A glob
+                        // higher up: walk the literal directory above it.
+                        if literal.len() + 1 == r.len() && r.last() == Some(&Comp::Wild) {
+                            let pattern = w.trim_end_matches('/').rsplit('/').next().unwrap_or("*");
+                            let Ok(entries) = std::fs::read_dir(&base) else {
+                                return true;
+                            };
+                            return entries.filter_map(Result::ok).any(|e| {
+                                glob_matches(pattern, &e.file_name().to_string_lossy())
+                                    && tree_links_relate(
+                                        &e.path(),
+                                        &dests,
+                                        protected,
+                                        resolver,
+                                        &mut walk,
+                                    )
+                            });
+                        }
+                        tree_links_relate(&base, &dests, protected, resolver, &mut walk)
+                    }),
+                })
+            }
         };
         if *spent > JUDGE_BUDGET {
             return Some(BashFinding::TooLarge);
         }
-        if !dangerous {
-            continue;
-        }
-        let several_sources = matches!(&seg.kind, LinkKind::Trees(w) if w.len() > 1);
-        let other_write = segments
-            .iter()
-            .enumerate()
-            .any(|(j, other)| j != i && other.writes && !same_command(&seg.text, &other.text));
-        if several_sources || other_write {
+        if dangerous {
             return Some(BashFinding::LinkThenWrite(echo(&seg.text.0)));
         }
     }
@@ -3417,6 +3572,21 @@ mod tests {
         symlink(&marker_dir, &format!("{s}/tree/l"));
         symlink("../../cfg", &format!("{s}/reltree/l"));
         symlink("sub", &format!("{s}/relok/l"));
+        // A relative link that is harmless where it sits and dangerous where the
+        // copy puts it: `d/l -> pre`, and `d/pre` leads to the marker parent.
+        symlink(&parent, &format!("{s}/d/pre"));
+        symlink("pre", &format!("{s}/t2/l"));
+        // `b`'s `..` climbs out of `a`, a link the copy recreates: after the
+        // copy it leaves `{cfg}/x/y`, not the copy's own directory.
+        std::fs::create_dir_all(format!("{cfg}/x/y")).unwrap();
+        std::fs::create_dir_all(format!("{cfg}/proj")).unwrap();
+        symlink(&format!("{cfg}/x/y"), &format!("{s}/t3/a"));
+        symlink("a/../../cadence-hooks", &format!("{s}/t3/b"));
+        // A `node_modules/.bin`-style tree: relative `..` links within the tree.
+        std::fs::create_dir_all(format!("{s}/nm/pkg")).unwrap();
+        std::fs::write(format!("{s}/nm/pkg/x"), "x").unwrap();
+        symlink("../pkg/x", &format!("{s}/nm/.bin/x"));
+        std::fs::write(format!("{s}/b.txt"), "b").unwrap();
         std::fs::create_dir_all(format!("{s}/clean/sub")).unwrap();
         std::fs::write(format!("{s}/clean/sub/a"), "a").unwrap();
         std::fs::write(format!("{s}/a.txt"), "a").unwrap();
@@ -3448,6 +3618,18 @@ mod tests {
             format!("echo {parent} {s}/x | xargs ln -s"),
             format!("ln -s \"$D\" {s}/x"),
             format!("sed -i '1e ln -s {parent} {s}/x' {s}/f"),
+            format!("rsync -a {s}/t2/ {s}/d/"),
+            format!("cp -R {s}/t2 {s}/d"),
+            format!("gln -s {parent} {s}/x"),
+            format!("busybox ln -s {parent} {s}/x"),
+            format!("ln -s --target-directory={cfg}/proj ../cadence-hooks"),
+            format!("ln -s -t{cfg}/proj ../cadence-hooks"),
+            format!("cp -a -t{s}/d2 {s}/clean {s}/tree"),
+            format!("cp -a {s}/t3 {s}/d3"),
+            // A harmless link first in the same program must not hide the second.
+            format!(
+                "awk 'BEGIN{{system(\"ln -s /usr/bin/true {s}/a\"); system(\"ln -s {parent} {s}/x\")}}'"
+            ),
         ];
         let writes = [
             format!("cp -r forged/markers {s}/x/"),
@@ -3463,6 +3645,8 @@ mod tests {
             // `ln` of the marker parent writes that parent, and a link into the
             // runbooks directory names it.
             let blocks_alone = link.starts_with("sed")
+                || link.starts_with("awk")
+                || link.starts_with("cp -a -t")
                 || *link == format!("ln -s {parent}")
                 || link.contains(&f.runbooks);
             if !blocks_alone {
@@ -3508,6 +3692,13 @@ mod tests {
             format!("ln -s \"$(pwd)/bin/tool\" {s}/tool && echo ok > {s}/log"),
             format!("cd {s} && ln -s ../shared/config.toml config.toml && cat config.toml"),
             format!("cat a > {s}/f && cat b >> {s}/f"),
+            format!("rsync -avze ssh {s}/clean/ host:/dst/"),
+            format!("rsync -a --max-delete 10 {s}/clean/ {s}/dst/"),
+            format!("rsync -S {s}/clean/ {s}/dst/ && touch {s}/done"),
+            format!("cp -r {s}/nm {s}/backup && echo ok > {s}/log"),
+            format!("mv {s}/*.txt {s}/dir/ && echo ok > {s}/log"),
+            format!("ln -s /opt/tool/bin/x {} && echo ok > {s}/log", f.root),
+            format!("ln -s /usr/local/bin/xargs {s}/xa && echo ok > {s}/log"),
         ] {
             assert_eq!(judge(&command).outcome, Outcome::Allow, "{command}");
         }
@@ -3517,21 +3708,38 @@ mod tests {
     fn link_kind_reads_link_creators_and_their_operands() {
         let kind = |s: &str| link_kind(s, &segment_command_argv(s));
         let words = |w: &[&str]| w.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        assert_eq!(kind("ln -s a b"), LinkKind::Targets(words(&["a", "b"])));
-        assert_eq!(kind("ln -st d a"), LinkKind::Targets(words(&["d", "a"])));
-        assert_eq!(kind("cp -s a b"), LinkKind::Targets(words(&["a", "b"])));
+        let t = |w: &[&str], d: Option<&str>| LinkKind::Targets(words(w), d.map(String::from));
+        let tr = |w: &[&str], d: Option<&str>| LinkKind::Trees(words(w), d.map(String::from));
+        assert_eq!(kind("ln -s a b"), t(&["a"], Some("b")));
+        assert_eq!(kind("ln -s a"), t(&["a"], None));
+        assert_eq!(kind("ln -st d a"), t(&["a"], Some("d")));
+        assert_eq!(kind("ln -s -td a"), t(&["a"], Some("d")));
         assert_eq!(
-            kind("install -l s a b"),
-            LinkKind::Targets(words(&["s", "a", "b"]))
+            kind("ln -s --target-directory=d ../x"),
+            t(&["../x"], Some("d"))
         );
-        assert_eq!(kind("cp -r a b c"), LinkKind::Trees(words(&["a", "b"])));
-        assert_eq!(kind("cp -rt d a b"), LinkKind::Trees(words(&["a", "b"])));
-        assert_eq!(kind("mv -S .bak a b"), LinkKind::Trees(words(&["a"])));
+        assert_eq!(kind("cp -s a b"), t(&["a"], Some("b")));
+        assert_eq!(kind("install -l s a b"), t(&["s", "a"], Some("b")));
+        assert_eq!(kind("cp -r a b c"), tr(&["a", "b"], Some("c")));
+        assert_eq!(kind("cp -rt d a b"), tr(&["a", "b"], Some("d")));
+        assert_eq!(kind("cp -a -td a b"), tr(&["a", "b"], Some("d")));
+        assert_eq!(kind("mv -S .bak a b"), tr(&["a"], Some("b")));
         assert_eq!(
             kind("rsync -a --exclude x -e ssh a/ b/"),
-            LinkKind::Trees(words(&["a/"]))
+            tr(&["a/"], Some("b/"))
+        );
+        assert_eq!(
+            kind("rsync -avze ssh --max-delete 10 -S a/ h:/b/"),
+            tr(&["a/"], Some("h:/b/"))
         );
         assert_eq!(kind("xargs ln -s"), LinkKind::Unreadable);
+        // A word naming `xargs` is not the runner.
+        assert_eq!(kind("ln -s /bin/xargs x"), t(&["/bin/xargs"], Some("x")));
+        // Homebrew's GNU names and busybox applets are the same programs.
+        assert_eq!(kind("gln -s a b"), t(&["a"], Some("b")));
+        assert_eq!(kind("busybox ln -s a b"), t(&["a"], Some("b")));
+        assert_eq!(kind("gmv a b"), tr(&["a"], Some("b")));
+        assert_eq!(kind("ginstall -l s a b"), t(&["s", "a"], Some("b")));
         assert_eq!(kind("xargs cp -r a b"), LinkKind::Unreadable);
         for plain in [
             "cp a b",

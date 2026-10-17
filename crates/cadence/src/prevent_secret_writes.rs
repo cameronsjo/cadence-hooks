@@ -228,7 +228,7 @@ fn writer_targets(segment: &str) -> Vec<String> {
 
 /// rsync options whose value is a separate token; the value is never the
 /// destination operand.
-const RSYNC_VALUE_FLAGS: &[&str] = &[
+pub const RSYNC_VALUE_FLAGS: &[&str] = &[
     "-e",
     "--rsh",
     "-f",
@@ -280,7 +280,7 @@ const RSYNC_VALUE_FLAGS: &[&str] = &[
 
 /// rsync options that name a path rsync itself writes: a log, a batch file, or
 /// a directory it stages or backs files up into.
-const RSYNC_WRITE_FLAGS: &[&str] = &[
+pub const RSYNC_WRITE_FLAGS: &[&str] = &[
     "--log-file",
     "--write-batch",
     "--only-write-batch",
