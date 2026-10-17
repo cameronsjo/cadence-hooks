@@ -1316,6 +1316,82 @@ mod tests {
     }
 
     #[test]
+    fn force_push_after_a_comment_behind_a_brace_in_a_substitution_blocked() {
+        // cameronsjo/cadence-hooks#1394: inside `$(…)` a bare `{` is a brace
+        // group or a literal, not a `${` opener, so comments and heredocs
+        // still start after it. Reading it as `${` hid the comment, its `'`
+        // opened a quote, and the push behind it reached no guard. bash 5.3
+        // and zsh 5.9 run the push in each shape.
+        let push = "git push --force origin main";
+        for shape in [
+            "echo $( { true #'\n} )\nPUSH\n#'",
+            "echo $({ true #'\n} )\nPUSH\n#'",
+            "echo $(echo {a, #'\n} )\nPUSH\n#'",
+            "echo $( { cat <<E\n'\nE\n} )\nPUSH\n#'",
+        ] {
+            let command = shape.replace("PUSH", push);
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: brace groups in a substitution, and a real comment after
+        // one, stay allowed.
+        for command in [
+            "echo $( { true; } ) && git status",
+            "x=$( { git log -1; } 2>&1 ) # it's fine",
+            "echo $(echo {a,b} # git push --force origin main\n)",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_push_behind_a_heredoc_in_dollar_double_paren_blocked() {
+        // cameronsjo/cadence-hooks#1395: zsh retries a `$((…))` that fails
+        // as arithmetic as a command substitution, where `<<` opens a
+        // heredoc and `#` a comment. bash reads `$((` as arithmetic, where
+        // `'` is a quote. Each reading hides a line from the other, so a
+        // `<<` or blank-led `#` there is read the way a word-start `((`
+        // already is: everything after it is code.
+        let push = "git push --force origin main";
+        for shape in [
+            "echo $((cat <<E\n'\nE\n) )\nPUSH\n#'",
+            "echo $((echo a #'\n) )\nPUSH\n#'",
+            "echo $(( 1 <<E ))\nX\nE\nPUSH",
+            "echo \"$((cat <<E\n'\nE\n) )\"\nPUSH\n#'",
+        ] {
+            let command = shape.replace("PUSH", push);
+            let result = GitSafetyGuard.run(&make_bash_input(&command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command:?}"
+            );
+        }
+        // Controls: arithmetic with no `<<` or blank-led `#` is unchanged.
+        for command in [
+            "echo $(( 1 + 2 )) && git status",
+            "echo $((16#ff)) '#git push --force origin main'",
+            "echo $(( 1 << 2 )) && git status",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn force_push_after_a_heredoc_with_a_non_blank_in_its_delimiter_blocked() {
         // cameronsjo/cadence-hooks#1391: bash and zsh keep NBSP and VT in
         // the delimiter, so the body ends at `E<C>x` and the push runs.

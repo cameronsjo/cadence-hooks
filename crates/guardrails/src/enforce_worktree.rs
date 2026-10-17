@@ -3565,6 +3565,10 @@ fn strip_group_punctuation(raw: &str) -> &str {
     let mut rest = raw.trim();
     loop {
         let trimmed = rest.trim_start_matches(['(', ' ', '\t']);
+        // A function header glued to its body (`g(){`, `g()(git`) is not a
+        // command word (cameronsjo/cadence-hooks#1402).
+        let trimmed = cadence_hooks_core::shell::function_header_len(trimmed)
+            .map_or(trimmed, |len| &trimmed[len..]);
         let trimmed = match trimmed.strip_prefix('{') {
             Some(after) if after.starts_with([' ', '\t']) || after.is_empty() => after,
             _ => trimmed,
@@ -6039,6 +6043,41 @@ mod tests {
             git_commit_targets("{ git commit -m x; }", "/cwd"),
             vec!["/cwd".to_string()]
         );
+    }
+
+    #[test]
+    fn function_body_commit_detected() {
+        // cameronsjo/cadence-hooks#1402: a function header glued to its
+        // body's `{` or `(` left that punctuation on the commit's head word,
+        // so `g(){ git commit -m x; }; g` committed with no warning. bash
+        // accepts every spelling here.
+        for command in [
+            "g(){ git commit -m x; }; g",
+            "g()(git commit -m x); g",
+            "g() (git commit -m x); g",
+            "g ( ) { git commit -m x; }; g",
+            "function g(){ git commit -m x; }; g",
+            "function g (){ git commit -m x; }; g",
+            "function g { git commit -m x; }; g",
+            "f() { git commit -m x; }; f",
+        ] {
+            assert_eq!(
+                git_commit_targets(command, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{command:?}"
+            );
+        }
+        // Controls: words that only look like a header run no commit.
+        for command in [
+            "echo g(){ git status; }",
+            "a=(git commit) && echo ${a[0]}",
+            "echo (git commit)",
+        ] {
+            assert!(
+                git_commit_targets(command, "/cwd").is_empty(),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
