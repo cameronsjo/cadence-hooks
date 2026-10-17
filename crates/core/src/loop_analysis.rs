@@ -600,7 +600,7 @@ pub fn group_nesting_depth(command: &str) -> usize {
 /// `catch_unwind` can stop, and the hook then exits with a non-blocking
 /// status (cameronsjo/cadence-hooks#1405 security review, I2). Measured
 /// nested `if` levels that abort: about 4000 for a release build on a 16 MB
-/// stack, and 8000 to 12000 for a debug build on [`PARSE_STACK`]. Sequential
+/// stack, and 6000 to 8000 for a debug build on [`PARSE_STACK`]. Sequential
 /// keywords count too, so the bound stays above ordinary large scripts: a
 /// 200 KB flood of one-line `for` loops holds about 2900.
 pub const MAX_PARSE_OPENERS: usize = 4096;
@@ -654,10 +654,11 @@ const _: () = assert!(PARSE_BUDGET.as_millis() < crate::deadline::HOOK_TIMEOUT.a
 
 /// Stack for the parse thread. The parser recurses once per nesting level,
 /// and [`MAX_PARSE_OPENERS`] is sized against this stack: a debug build, whose
-/// frames are the largest, aborts at about twice the bound, and a release
-/// build far deeper. Only the pages the parse touches are committed; a
-/// spawned thread gets 2 MB by default.
-const PARSE_STACK: usize = 256 * 1024 * 1024;
+/// frames are the largest, aborts at about 1.5 to 2 times the bound, and a
+/// release build far deeper. Only the pages the parse touches are committed;
+/// a spawned thread gets 2 MB by default. A 256 MB stack failed to spawn on
+/// the ubuntu CI runner, which turns every parse into a parse failure.
+const PARSE_STACK: usize = 128 * 1024 * 1024;
 
 /// Hashes of commands whose parse ran past [`PARSE_BUDGET`] or panicked, in
 /// this process.
