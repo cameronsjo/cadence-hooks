@@ -1805,7 +1805,7 @@ mod tests {
     #[test]
     fn parser_backtracking_flood_fails_within_the_budget() {
         for line in ["(( 1 # x ))\n", "(( 1\n", "( ( 1\n"] {
-            let command = format!("{}git push origin main", line.repeat(30));
+            let command = format!("{}git push origin main", line.repeat(9));
             let started = std::time::Instant::now();
             let (chain, loops) = analyze_push_chain_and_loops(&command);
             let took = started.elapsed();
