@@ -6,6 +6,8 @@
 //! - Bash-matcher hooks missing an `if` filter (process spawn on every command)
 //! - Cross-plugin hooks (plugin X dispatching plugin Y's subcommand)
 //! - User-level settings.json duplicating hooks that plugins already provide
+//!   (read from `tests/fixtures/settings-home`; `CADENCE_AUDIT_LIVE_SETTINGS=1`
+//!   audits the real `~/.claude/settings.json` instead)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -3432,4 +3434,31 @@ fn settings_audit_reads_the_fixture_unless_live_is_opted_in() {
         "settings audit must read tests/fixtures/settings-home, not the real home"
     );
     assert!(binary_dispatches.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "duplicates hooks already provided")]
+fn settings_dispatch_duplicating_a_plugin_hook_panics() {
+    let command = "guardrails warn-untracked";
+    let mut refs = BTreeMap::new();
+    refs.insert(
+        "cadence-guardrails".to_string(),
+        vec![HookRef {
+            command: command.to_string(),
+            plugin: "guardrails".to_string(),
+            expected_plugin: "guardrails".to_string(),
+            is_bash_matcher: false,
+            matcher: String::new(),
+            has_if_filter: false,
+            event_type: "PreToolUse".to_string(),
+            matcher_index: 0,
+        }],
+    );
+    let subject = AuditSubject {
+        label: "synthetic",
+        hint: String::new(),
+        refs,
+        root: PathBuf::new(),
+    };
+    check_no_plugin_hooks_duplicated_in_settings_json(&subject, &[], &[command.to_string()]);
 }
