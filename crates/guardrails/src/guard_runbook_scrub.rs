@@ -1463,6 +1463,9 @@ struct LinkSegment {
     kind: LinkKind,
     /// Whether the segment writes anything but a stream.
     writes: bool,
+    /// Paths the segment writes as regular files: its write targets when it
+    /// creates no link and runs no inner command, else none.
+    plain_writes: Vec<String>,
 }
 
 /// The first segment that creates a link which may lead into a protected
@@ -1553,37 +1556,52 @@ fn link_then_write(
                     .flat_map(|d| readings(d, spent).unwrap_or_default())
                     .filter_map(|r| reading_path(&r))
                     .collect();
-                words.iter().any(|w| match readings(w, spent) {
-                    None => true,
-                    Some(rs) => rs.iter().any(|r| {
-                        let literal: Vec<Comp> = r
-                            .iter()
-                            .take_while(|c| matches!(c, Comp::Lit(_)))
-                            .cloned()
-                            .collect();
-                        let Some(base) = reading_path(&literal) else {
-                            return true;
-                        };
-                        // A glob in the last component: walk each match. A glob
-                        // higher up: walk the literal directory above it.
-                        if literal.len() + 1 == r.len() && r.last() == Some(&Comp::Wild) {
-                            let pattern = w.trim_end_matches('/').rsplit('/').next().unwrap_or("*");
-                            let Ok(entries) = std::fs::read_dir(&base) else {
+                // A missing source another step writes as a regular file (`sed … >
+                // f.tmp && mv f.tmp f`) holds no link. One that exists already may
+                // be a link the write goes through, so it is walked as usual.
+                let plain = |w: &String| {
+                    segments
+                        .iter()
+                        .any(|s| s.seg_dir == seg.seg_dir && s.plain_writes.contains(w))
+                };
+                let missing = |r: &Vec<Comp>| {
+                    reading_path(r).is_some_and(|p| std::fs::symlink_metadata(p).is_err())
+                };
+                words.iter().any(|w| {
+                    match readings(w, spent) {
+                        None => true,
+                        Some(rs) if plain(w) && rs.iter().all(missing) => false,
+                        Some(rs) => rs.iter().any(|r| {
+                            let literal: Vec<Comp> = r
+                                .iter()
+                                .take_while(|c| matches!(c, Comp::Lit(_)))
+                                .cloned()
+                                .collect();
+                            let Some(base) = reading_path(&literal) else {
                                 return true;
                             };
-                            return entries.filter_map(Result::ok).any(|e| {
-                                glob_matches(pattern, &e.file_name().to_string_lossy())
-                                    && tree_links_relate(
-                                        &e.path(),
-                                        &dests,
-                                        protected,
-                                        resolver,
-                                        &mut walk,
-                                    )
-                            });
-                        }
-                        tree_links_relate(&base, &dests, protected, resolver, &mut walk)
-                    }),
+                            // A glob in the last component: walk each match. A glob
+                            // higher up: walk the literal directory above it.
+                            if literal.len() + 1 == r.len() && r.last() == Some(&Comp::Wild) {
+                                let pattern =
+                                    w.trim_end_matches('/').rsplit('/').next().unwrap_or("*");
+                                let Ok(entries) = std::fs::read_dir(&base) else {
+                                    return true;
+                                };
+                                return entries.filter_map(Result::ok).any(|e| {
+                                    glob_matches(pattern, &e.file_name().to_string_lossy())
+                                        && tree_links_relate(
+                                            &e.path(),
+                                            &dests,
+                                            protected,
+                                            resolver,
+                                            &mut walk,
+                                        )
+                                });
+                            }
+                            tree_links_relate(&base, &dests, protected, resolver, &mut walk)
+                        }),
+                    }
                 })
             }
         };
@@ -1649,12 +1667,18 @@ fn bash_write_into(
             let inner_argv = segment_command_argv(inner);
             link_kind(inner, &inner_argv)
         }));
+        let plain = kinds.len() == 1 && kinds[0] == LinkKind::None;
         for kind in kinds {
             link_segments.push(LinkSegment {
                 text: (segment.clone(), argv.clone()),
                 seg_dir: seg_dir.clone(),
                 kind,
                 writes: seg_writes.iter().any(|t| !is_stream_sink(t)),
+                plain_writes: if plain {
+                    seg_writes.clone()
+                } else {
+                    Vec::new()
+                },
             });
         }
         for target in seg_writes {
@@ -3569,6 +3593,7 @@ mod tests {
             std::os::unix::fs::symlink(target, at).unwrap();
         };
         symlink(&parent, &format!("{s}/pre"));
+        symlink(&cfg, &format!("{s}/pre2"));
         symlink(&marker_dir, &format!("{s}/tree/l"));
         symlink("../../cfg", &format!("{s}/reltree/l"));
         symlink("sub", &format!("{s}/relok/l"));
@@ -3672,6 +3697,15 @@ mod tests {
                 }
             }
         }
+        // A source written as a file in the same command is exempt only while
+        // it does not exist: an existing link stays a link under the write.
+        assert_eq!(
+            judge(&format!(
+                "echo x > {s}/pre2 && mv {s}/pre2 {s}/b && cp f {s}/b/cadence-hooks/markers/"
+            ))
+            .outcome,
+            Outcome::Block
+        );
         // One copy of several sources writes through a link it just made.
         assert_eq!(
             judge(&format!("cp -R {s}/tree/ {s}/clean/ {s}/dst/")).outcome,
@@ -3692,6 +3726,7 @@ mod tests {
             format!("ln -s \"$(pwd)/bin/tool\" {s}/tool && echo ok > {s}/log"),
             format!("cd {s} && ln -s ../shared/config.toml config.toml && cat config.toml"),
             format!("cat a > {s}/f && cat b >> {s}/f"),
+            format!("sed s/a/b/ {s}/f > {s}/f.tmp && mv {s}/f.tmp {s}/f"),
             format!("rsync -avze ssh {s}/clean/ host:/dst/"),
             format!("rsync -a --max-delete 10 {s}/clean/ {s}/dst/"),
             format!("rsync -S {s}/clean/ {s}/dst/ && touch {s}/done"),
