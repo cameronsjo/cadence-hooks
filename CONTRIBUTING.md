@@ -12,6 +12,26 @@ make ci    # Run fmt check, clippy, and tests
 
 Requires Rust 2024 edition (1.85+).
 
+### Flood-test timing budgets
+
+The push-walk, bare-hook heredoc, ship-judging, and posted-stdin flood tests run
+their semantic assertions in the normal suite. The shared scaling helper also
+runs both its small and large input sizes. Their wall-clock budget and scaling
+assertions are enabled only by `CADENCE_TIMING_TESTS=1`; an unset variable or any
+other value leaves them off. This setting lives in test helpers and does not
+change production hook deadlines.
+
+Run the opted-in budgets in release mode with one test thread:
+
+```bash
+CADENCE_TIMING_TESTS=1 cargo test --release --workspace --no-fail-fast -- --test-threads=1
+```
+
+In PowerShell, set `$env:CADENCE_TIMING_TESTS = '1'` before running the same
+`cargo test` command. CI runs both the normal suite and this release invocation
+on its existing Linux and Windows runners. Use a machine without competing heavy
+workloads: wall-clock measurements still depend on available CPU time.
+
 ### Windows
 
 The binary builds and tests natively on Windows (`x86_64-pc-windows-msvc`); CI

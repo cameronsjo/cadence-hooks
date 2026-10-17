@@ -100,12 +100,11 @@ fn bare_prevent_secret_leaks_blocks_nested_heredoc_floods() {
                 command.len(),
                 String::from_utf8_lossy(&out.stderr)
             );
-            // Generous for a debug build on a loaded runner; the regression
-            // this pins was tens of seconds at these sizes.
-            assert!(
-                took < Duration::from_secs(10),
-                "{name} ({} B): {took:?}",
-                command.len()
+            // The verdict always runs; the unchanged budget is opt-in.
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{name} ({} B)", command.len()),
+                took,
+                Duration::from_secs(10),
             );
         }
     }

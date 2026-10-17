@@ -5219,10 +5219,10 @@ term = "acmecorp"
         assert_eq!(texts.len(), 1);
         let lines = "echo a\n".repeat(30_000) + "gh pr create --body-file -";
         let _ = gather_posted(&lines, ".");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            start.elapsed()
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "posted stdin flood",
+            start.elapsed(),
+            std::time::Duration::from_secs(5),
         );
     }
 
