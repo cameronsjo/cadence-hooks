@@ -28,11 +28,13 @@ CADENCE_TIMING_TESTS=1 cargo test --release --workspace --no-fail-fast -- --test
 ```
 
 In PowerShell, set `$env:CADENCE_TIMING_TESTS = '1'` before running the same
-`cargo test` command. CI runs the normal suite on its Linux and Windows runners
-and this release invocation on Linux only: the release budgets are enforced on Linux
-CI only: one observed overrun (676 ms against 500 ms); tracked in
-https://github.com/cameronsjo/cadence-hooks/issues/1416. Use a machine without competing heavy
-workloads: wall-clock measurements still depend on available CPU time.
+`cargo test` command. CI runs this release invocation on Linux and Windows. On
+Windows, budgets under one second are multiplied by 3 (`platform_limit` in
+`crates/core/src/test_builders.rs`): three `windows-latest` samples overran the
+500 ms budgets by up to 1.42x (710 ms worst; cadence-hooks#1416). Budgets of a
+second or more guard against a hang or a hook deadline and stay as written. Use
+a machine without competing heavy workloads: wall-clock measurements still
+depend on available CPU time.
 
 Other timing budgets are not gated by this variable. The five `CADENCE_TEST_PANIC`
 tests exist only in debug builds, so `--release` runs report them as ignored.

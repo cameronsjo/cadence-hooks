@@ -262,7 +262,28 @@ fn timing_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
 /// Check an unchanged wall-clock budget only when timing tests are opted in.
 #[track_caller]
 pub fn assert_elapsed_under(what: &str, elapsed: std::time::Duration, limit: std::time::Duration) {
-    assert_elapsed_under_if(timing_tests_enabled(), what, elapsed, limit);
+    assert_elapsed_under_if(
+        timing_tests_enabled(),
+        what,
+        elapsed,
+        platform_limit(cfg!(windows), limit),
+    );
+}
+
+/// Sub-second budgets get this multiple on Windows. Three GitHub-hosted
+/// `windows-latest` release runs (cadence-hooks#1416) overran the 500 ms
+/// budgets by up to 1.42x (710 ms worst; process spawn and filesystem calls
+/// cost more there), so 3x leaves about 2x headroom over the worst sample.
+const WINDOWS_SUBSECOND_FACTOR: u32 = 3;
+
+/// Budgets of a second or more guard against a hang or a hook deadline, which
+/// platform speed does not move, so they stay as written.
+fn platform_limit(windows: bool, limit: std::time::Duration) -> std::time::Duration {
+    if windows && limit < std::time::Duration::from_secs(1) {
+        limit * WINDOWS_SUBSECOND_FACTOR
+    } else {
+        limit
+    }
 }
 
 #[track_caller]
@@ -417,6 +438,21 @@ mod timing_tests {
     #[should_panic(expected = "exceeded budget")]
     fn opted_in_elapsed_budget_rejects_the_boundary() {
         assert_elapsed_under_if(true, "slow", Duration::from_secs(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn windows_widens_only_subsecond_budgets() {
+        let ms = Duration::from_millis;
+        assert_eq!(platform_limit(true, ms(500)), ms(1500));
+        assert_eq!(
+            platform_limit(true, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            platform_limit(true, Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(platform_limit(false, ms(500)), ms(500));
     }
 
     #[test]
