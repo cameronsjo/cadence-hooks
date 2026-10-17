@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **A run of unclosed `((` lines no longer stalls `guard-push-remote` into failing open.** The loop parser (`brush-parser`) backtracks exponentially on unclosed `((` or `( (` lines that it then rejects: twenty `(( 1 # x ))` lines took over 120 s, the hook timed out, and the push behind them went through unchecked. A shorter run still used up the git-probe budget, so a fail-closed probe was skipped. The parse now runs on its own thread with a 1 s budget and counts as failed past it. The guard's existing fallbacks (push counting, the loop pattern) and its owner checks then judge the push. A command that ran out the budget once is not parsed again in the same process. (cameronsjo/cadence-hooks#1401)
+- **A comment after `{` inside `$(…)`, and a heredoc or comment inside `$((…))`, no longer hide the next line.** Inside `$(…)` a bare `{` is a brace group or a literal, but the comment scanners read it as a `${` opener and stopped finding comments and heredocs after it, so the `'` in `echo $( { true #'` opened a quote the shell never opens and hid the next line. zsh retries a `$((…))` that fails as arithmetic as a command substitution, where `<<` opens a heredoc and a `#` after a blank starts a comment; bash reads it as arithmetic. A `<<` or blank-led `#` inside `$((` is now read the way it already was inside a word-start `((`: everything after it is code. `git-safety` and `prevent-secret-leaks` allowed a force push or a key read written either way. (cameronsjo/cadence-hooks#1394, cameronsjo/cadence-hooks#1395)
+- **`enforce-worktree` sees a commit inside a function body.** A header glued to its body (`g(){`, `g()(git`, `function g(){`, `g ( ) {`) stayed on the head word, so `g(){ git commit -m x; }; g` committed from a primary checkout with no warning. The header is now dropped before the head word is read, in the shared group-punctuation strip and in `enforce-worktree`'s own. (cameronsjo/cadence-hooks#1402)
+
 ## [0.127.0] - 2026-10-16
 
 ### Changed
