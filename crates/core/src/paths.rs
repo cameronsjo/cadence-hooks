@@ -157,6 +157,47 @@ pub fn cloud_sync_marker(path: &Path) -> Option<&'static str> {
         })
 }
 
+/// The current user's home directory from the account database, not `HOME`.
+///
+/// For a check that widens what is allowed: a repo's settings `env` block
+/// reaches hook processes and can set `HOME`, but not the passwd entry. `None`
+/// on a lookup failure and on platforms without one.
+pub fn account_home() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pwd` and `buf` are writable and outlive the call; `found`
+        // is set to null or to `pwd`, whose strings point into `buf`.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &raw mut found,
+            )
+        };
+        // SAFETY: `found` is checked before it is read; a non-null `found`
+        // points at `pwd`, which `getpwuid_r` filled.
+        if rc != 0 || found.is_null() || unsafe { (*found).pw_dir.is_null() } {
+            return None;
+        }
+        // SAFETY: `found` is non-null, so `getpwuid_r` filled `pwd`, and
+        // `pw_dir` is a non-null NUL-terminated string inside `buf`, still
+        // alive.
+        let dir = unsafe { std::ffi::CStr::from_ptr((*found).pw_dir) };
+        let dir = std::ffi::OsStr::from_bytes(dir.to_bytes());
+        (!dir.is_empty()).then(|| PathBuf::from(dir))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Does a file at or under `dir` leave the machine with no command at all?
 ///
 /// `Some(true)` when the deepest existing ancestor sits on a file system that
@@ -572,6 +613,14 @@ mod tests {
         assert_eq!(super::cloud_sync_marker(path), None);
         let path = std::path::Path::new("/Users/x/OneDrive - Acmé/repo");
         assert_eq!(super::cloud_sync_marker(path), Some("OneDrive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_home_is_an_existing_absolute_dir() {
+        let home = super::account_home().expect("passwd entry");
+        assert!(home.is_absolute(), "{}", home.display());
+        assert!(home.is_dir(), "{}", home.display());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

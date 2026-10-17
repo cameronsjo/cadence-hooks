@@ -1438,9 +1438,10 @@ fn reconcile_findings(
 ///    edit — including the edit that removes the term. (Its `None`-on-unreadable
 ///    default is also self-locking, and its own docs warn blocking guards off
 ///    it.)
-/// 3. **Code and config proven local are not scanned.** Outside every git
-///    work tree and every cloud-synced tree, they cannot leave the machine
-///    without a post, and the post is scanned (cameronsjo/cadence#1708).
+/// 3. **Code and config proven local are not scanned.** In a fixed local
+///    config or temp location, and outside every work tree, synced tree and
+///    network mount, they cannot leave the machine without a post, and the
+///    post is scanned (cameronsjo/cadence#1708, cameronsjo/cadence-hooks#1429).
 ///    Anything the check cannot resolve is scanned
 ///    ([`context::is_provably_local`]). A prose draft is still scanned there
 ///    ([`context::is_prose_draft`]).
@@ -1469,14 +1470,14 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         return CheckResult::allow();
     }
 
-    // Code or config proven local (outside every work tree, synced tree and
-    // network mount) never leaves the machine on its own
-    // (cameronsjo/cadence#1708). A prose draft keeps the scan even
+    // Code or config proven local (in a fixed local config or temp location,
+    // outside every work tree, synced tree and network mount) never leaves
+    // the machine on its own (cameronsjo/cadence#1708). A prose draft keeps the scan even
     // there: it is the file a later `--body "$(cat F)"` or `cat F |` posts,
     // and the post-time scan does not read through either. A file inside a
     // work tree keeps the scan, because the post-time scan never sees a
     // commit's file content. An MCP write has no path and is scanned.
-    if context::is_provably_local(file_path) && !context::is_prose_draft(file_path) {
+    if !context::is_prose_draft(file_path) && context::is_provably_local(file_path) {
         return CheckResult::allow();
     }
 
@@ -5681,6 +5682,12 @@ destinations = ["me/*", "them/exact"]
         // A real home dir: macOS mounts `/home` by autofs, which is not a
         // local file system, so a literal `/home/u` is scanned there.
         let home = tempfile::tempdir().unwrap();
+        // Under a TMPDIR outside the system temp dirs nothing in it is
+        // exempt, so only the Block rows can be judged there.
+        let temp_ok = context::scratch_counts_as_system_temp(home.path());
+        if !temp_ok {
+            eprintln!("Allow rows skipped: TMPDIR is not a system temp dir");
+        }
         let home = home.path().display();
         let table: Vec<(&str, String, Outcome)> = vec![
             ("Write", "/tmp/scratch/poll.sh".into(), Outcome::Allow),
@@ -5708,6 +5715,9 @@ destinations = ["me/*", "them/exact"]
         ];
         with_env(FIXTURE, &[], || {
             for (tool, path, want) in &table {
+                if *want == Outcome::Allow && !temp_ok {
+                    continue;
+                }
                 let ti = cadence_hooks_core::ToolInput {
                     file_path: Some(path.clone()),
                     content: (*tool == "Write").then(|| "we ship acmecorp tooling".into()),
@@ -5769,11 +5779,21 @@ destinations = ["me/*", "them/exact"]
     fn a_local_config_edit_passes_and_the_same_edit_in_a_repo_blocks() {
         // cadence#1708: the home config file cannot leave the machine; every
         // file in a work tree can, tracked or not (untracked and ignored files
-        // can be added or force-added).
+        // can be added or force-added). The fake home sits in a temp dir, so
+        // its Allow comes through the temp rule; the home allowlist itself is
+        // pinned by `context`'s tests, which can place a home outside temp.
         let (_root, home, repo) = home_and_repo();
+        // Under a TMPDIR outside the system temp dirs nothing in it is
+        // exempt, so only the Block rows can be judged there.
+        let temp_ok = context::scratch_counts_as_system_temp(&home);
+        if !temp_ok {
+            eprintln!("Allow rows skipped: TMPDIR is not a system temp dir");
+        }
         with_env(FIXTURE, &[], || {
-            let local = home.join(".config/tool/config.toml");
-            assert_eq!(term_edit(&local).outcome, Outcome::Allow);
+            if temp_ok {
+                let local = home.join(".config/tool/config.toml");
+                assert_eq!(term_edit(&local).outcome, Outcome::Allow);
+            }
             for name in ["tracked.toml", "untracked.toml", "ignored.toml"] {
                 assert_eq!(
                     term_edit(&repo.join(name)).outcome,
@@ -5843,6 +5863,12 @@ destinations = ["me/*", "them/exact"]
     fn a_config_edit_in_a_cloud_synced_tree_blocks() {
         // A synced tree leaves the machine with no post at all.
         let root = tempfile::tempdir().unwrap();
+        // Under a TMPDIR outside the system temp dirs nothing in it is
+        // exempt, so only the Block rows can be judged there.
+        let temp_ok = context::scratch_counts_as_system_temp(root.path());
+        if !temp_ok {
+            eprintln!("Allow rows skipped: TMPDIR is not a system temp dir");
+        }
         let synced = root.path().join("Library/Mobile Documents/app");
         std::fs::create_dir_all(&synced).unwrap();
         with_env(FIXTURE, &[], || {
@@ -5850,8 +5876,35 @@ destinations = ["me/*", "them/exact"]
                 term_edit(&synced.join("config.toml")).outcome,
                 Outcome::Block
             );
-            let plain = root.path().join("Library/app/config.toml");
-            assert_eq!(term_edit(&plain).outcome, Outcome::Allow);
+            if temp_ok {
+                let plain = root.path().join("Library/app/config.toml");
+                assert_eq!(term_edit(&plain).outcome, Outcome::Allow);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_folders_outside_the_local_config_locations_block() {
+        // cadence-hooks#1429: `~/Documents` (iCloud Desktop & Documents) and a
+        // sync folder no list names are outside the allowlist. The paths need
+        // not exist; nothing is written.
+        let Some(home) = cadence_hooks_core::paths::account_home() else {
+            eprintln!("skipped: no account home directory");
+            return;
+        };
+        if context::scratch_counts_as_system_temp(&home) {
+            eprintln!("skipped: the home directory is under a system temp dir");
+            return;
+        }
+        with_env(FIXTURE, &[], || {
+            for rel in [
+                "Documents/cos-1429-probe/config.toml",
+                "Dropbox (Acme)/cos-1429-probe/config.toml",
+                "Insync/cos-1429-probe/run.sh",
+            ] {
+                assert_eq!(term_edit(&home.join(rel)).outcome, Outcome::Block, "{rel}");
+            }
         });
     }
 
@@ -5861,6 +5914,12 @@ destinations = ["me/*", "them/exact"]
         // iCloud's Desktop & Documents sync marks `~/Documents` with a File
         // Provider domain and leaves its path unmarked.
         let root = tempfile::tempdir().unwrap();
+        // Under a TMPDIR outside the system temp dirs nothing in it is
+        // exempt, so only the Block rows can be judged there.
+        let temp_ok = context::scratch_counts_as_system_temp(root.path());
+        if !temp_ok {
+            eprintln!("Allow rows skipped: TMPDIR is not a system temp dir");
+        }
         let documents = root.path().join("Documents");
         std::fs::create_dir_all(documents.join("tool")).unwrap();
         let ok = std::process::Command::new("xattr")
@@ -5873,8 +5932,10 @@ destinations = ["me/*", "them/exact"]
         with_env(FIXTURE, &[], || {
             let synced = documents.join("tool/config.toml");
             assert_eq!(term_edit(&synced).outcome, Outcome::Block);
-            let beside = root.path().join("tool/config.toml");
-            assert_eq!(term_edit(&beside).outcome, Outcome::Allow);
+            if temp_ok {
+                let beside = root.path().join("tool/config.toml");
+                assert_eq!(term_edit(&beside).outcome, Outcome::Allow);
+            }
         });
     }
 
