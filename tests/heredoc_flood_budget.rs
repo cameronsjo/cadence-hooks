@@ -22,6 +22,9 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
         .path()
 }
 
+/// The wired group's hook deadline; past it the group exits 0.
+const GROUP_DEADLINE: Duration = Duration::from_millis(4000);
+
 fn run(args: &[&str], command: &str) -> (Output, Duration) {
     let payload = serde_json::json!({
         "hook_event_name": "PreToolUse",
@@ -113,8 +116,9 @@ fn bare_prevent_secret_leaks_blocks_nested_heredoc_floods() {
 #[test]
 fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
     // The group fails OPEN at 4000 ms, so an exit 2 here is itself the proof
-    // the scan finished inside the deadline. 200 KB is left to the bare-hook
-    // test above: a debug build of the full group needs ~2 s there, too close
+    // the scan finished inside the deadline. Crossing it on a loaded machine
+    // passes unless `CADENCE_TIMING_TESTS=1` (cadence-hooks#1366). 200 KB is
+    // left to the bare-hook test above: a debug build of the full group needs ~2 s there, too close
     // to the deadline to assert on a shared runner.
     for target in [10_000, 50_000] {
         for (name, command) in shapes(target) {
@@ -128,12 +132,15 @@ fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
                 ],
                 &command,
             );
-            assert_eq!(
+            cadence_hooks_core::test_builders::assert_blocked_before_deadline(
+                &format!(
+                    "{name} ({} B); stderr: {}",
+                    command.len(),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
                 out.status.code(),
-                Some(2),
-                "{name} ({} B) was not blocked in {took:?}; stderr: {}",
-                command.len(),
-                String::from_utf8_lossy(&out.stderr)
+                took,
+                GROUP_DEADLINE,
             );
         }
     }

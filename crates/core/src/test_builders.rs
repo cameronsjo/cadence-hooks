@@ -280,6 +280,37 @@ fn assert_elapsed_under_if(
     }
 }
 
+/// Assert a hook that fails open at `deadline` blocked (exit 2) in time.
+///
+/// Past the deadline the hook exits 0 by design, so an exit-2 assert on such a
+/// run is a wall-clock assert in disguise. Without [`timing_tests_enabled`], a
+/// non-block that took at least `deadline` is load, not a regression, and
+/// passes; any non-block that finished sooner still fails, as does every
+/// non-block when timing is opted in.
+#[track_caller]
+pub fn assert_blocked_before_deadline(
+    what: &str,
+    code: Option<i32>,
+    took: std::time::Duration,
+    deadline: std::time::Duration,
+) {
+    assert_blocked_before_deadline_if(timing_tests_enabled(), what, code, took, deadline);
+}
+
+#[track_caller]
+fn assert_blocked_before_deadline_if(
+    enabled: bool,
+    what: &str,
+    code: Option<i32>,
+    took: std::time::Duration,
+    deadline: std::time::Duration,
+) {
+    if code == Some(2) || (!enabled && took >= deadline) {
+        return;
+    }
+    panic!("{what}: exit {code:?} after {took:?}, expected a block (exit 2) before {deadline:?}");
+}
+
 /// Run flood semantics at `size` and four times `size`, and optionally assert
 /// that `run(n)` costs time linear in `n`.
 ///
@@ -386,6 +417,41 @@ mod timing_tests {
     #[should_panic(expected = "exceeded budget")]
     fn opted_in_elapsed_budget_rejects_the_boundary() {
         assert_elapsed_under_if(true, "slow", Duration::from_secs(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_block_passes_at_any_speed() {
+        for enabled in [false, true] {
+            assert_blocked_before_deadline_if(
+                enabled,
+                "block",
+                Some(2),
+                Duration::MAX,
+                Duration::from_secs(4),
+            );
+        }
+    }
+
+    #[test]
+    fn a_fail_open_past_the_deadline_is_load_unless_timing_is_opted_in() {
+        let (took, deadline) = (Duration::from_secs(5), Duration::from_secs(4));
+        assert_blocked_before_deadline_if(false, "loaded", Some(0), took, deadline);
+        let strict = std::panic::catch_unwind(|| {
+            assert_blocked_before_deadline_if(true, "loaded", Some(0), took, deadline)
+        });
+        assert!(strict.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a block")]
+    fn a_fast_non_block_is_a_real_failure() {
+        assert_blocked_before_deadline_if(
+            false,
+            "fast",
+            Some(0),
+            Duration::from_millis(50),
+            Duration::from_secs(4),
+        );
     }
 
     #[test]

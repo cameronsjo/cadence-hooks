@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The wired-group heredoc flood test no longer fails when a loaded machine pushes one call past the group's 4000 ms hook deadline (where the group fails open and exits 0). Past the deadline it passes unless `CADENCE_TIMING_TESTS=1`; a non-block that finishes sooner still fails. The Linux release timing step keeps the strict check. (cameronsjo/cadence-hooks#1366)
+
 ## [0.128.0] - 2026-10-17
 
 ### Security
