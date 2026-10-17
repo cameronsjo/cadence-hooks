@@ -3564,11 +3564,13 @@ fn substituted_commit(argv: &[String], heads: &[String], found: bool) -> bool {
 fn strip_group_punctuation(raw: &str) -> &str {
     let mut rest = raw.trim();
     loop {
-        let trimmed = rest.trim_start_matches(['(', ' ', '\t']);
-        // A function header glued to its body (`g(){`, `g()(git`) is not a
-        // command word (cameronsjo/cadence-hooks#1402).
+        // A function header (`g(){`, `g()(git`, zsh's anonymous `() {`) is
+        // not a command word (cameronsjo/cadence-hooks#1402). Read it before
+        // the `(` trim, which would take the `(` of `()`.
+        let trimmed = rest.trim_start_matches([' ', '\t']);
         let trimmed = cadence_hooks_core::shell::function_header_len(trimmed)
             .map_or(trimmed, |len| &trimmed[len..]);
+        let trimmed = trimmed.trim_start_matches(['(', ' ', '\t']);
         let trimmed = match trimmed.strip_prefix('{') {
             Some(after) if after.starts_with([' ', '\t']) || after.is_empty() => after,
             _ => trimmed,
@@ -6060,6 +6062,14 @@ mod tests {
             "function g (){ git commit -m x; }; g",
             "function g { git commit -m x; }; g",
             "f() { git commit -m x; }; f",
+            // zsh runs an anonymous function as soon as it is defined, and
+            // defines every name in a list.
+            "() { git commit -m x; }",
+            "(){ git commit -m x; }",
+            "() git commit -m x",
+            "function { git commit -m x; }",
+            "g h(){ git commit -m x; }; g",
+            "function g h { git commit -m x; }; g",
         ] {
             assert_eq!(
                 git_commit_targets(command, "/cwd"),

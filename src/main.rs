@@ -1460,7 +1460,13 @@ fn main() {
         // Exit only when nothing downstream is positioned to catch this unwind.
         // A panic hook runs before unwinding starts, so exiting here would make
         // every `catch_unwind` in the tree unreachable — see `PANIC_GUARDED`.
-        if !PANIC_GUARDED.with(Cell::get) {
+        // The loop parser's thread is contained too: its panic drops the
+        // channel the check waits on, and the check reads that as a parse
+        // failure. Exiting would end every `group` member, and drop their
+        // blocks, over one parse.
+        let contained = std::thread::current().name()
+            == Some(cadence_hooks_core::loop_analysis::PARSE_THREAD_NAME);
+        if !PANIC_GUARDED.with(Cell::get) && !contained {
             process::exit(1);
         }
     }));

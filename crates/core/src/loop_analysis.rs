@@ -624,33 +624,48 @@ fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
     if group_nesting_depth(command) > MAX_PARSE_NESTING {
         return None;
     }
+    within_budget(command, PARSE_BUDGET, |text| {
+        let reader = std::io::Cursor::new(text.as_str());
+        let options = ParserOptions::default();
+        let source_info = SourceInfo::default();
+        let mut parser = Parser::new(reader, &options, &source_info);
+        parser.parse_program().ok()
+    })
+}
+
+/// Name of the thread [`within_budget`] runs the parser on. The binary's
+/// panic hook lets a panic on it unwind instead of exiting the process: the
+/// unwind drops the channel, and the check reads that as a parse failure.
+pub const PARSE_THREAD_NAME: &str = "parse-command";
+
+/// `work(command)` on its own thread, or `None` once it runs past `budget`,
+/// panics, or has done either for this command before in this process
+/// ([`PARSE_TIMED_OUT`]). The parser has no step limit, so it is abandoned
+/// rather than stopped: the thread keeps running until the process exits,
+/// which for a hook is moments later.
+fn within_budget<T: Send + 'static>(
+    command: &str,
+    budget: std::time::Duration,
+    work: fn(String) -> Option<T>,
+) -> Option<T> {
     let key = command_hash(command);
     let timed_out = || PARSE_TIMED_OUT.lock().unwrap_or_else(|e| e.into_inner());
     if timed_out().contains(&key) {
         return None;
     }
-    // The parser has no step limit, so it runs on its own thread and is
-    // abandoned at the budget. An abandoned thread keeps running until the
-    // process exits, which for a hook is moments later.
     let owned = command.to_string();
     let (send, receive) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
-        .name("parse-command".into())
+        .name(PARSE_THREAD_NAME.into())
         .stack_size(PARSE_STACK)
-        .spawn(move || {
-            let reader = std::io::Cursor::new(owned.as_str());
-            let options = ParserOptions::default();
-            let source_info = SourceInfo::default();
-            let mut parser = Parser::new(reader, &options, &source_info);
-            // The receiver is gone once the budget ran out; nothing to do.
-            let _ = send.send(parser.parse_program().ok());
-        });
+        // The receiver is gone once the budget ran out; nothing to do.
+        .spawn(move || drop(send.send(work(owned))));
     // No thread to run it on: report a parse failure, never a parse.
-    let Ok(_handle) = spawned else {
+    if spawned.is_err() {
         return None;
-    };
-    match receive.recv_timeout(PARSE_BUDGET) {
-        Ok(program) => program,
+    }
+    match receive.recv_timeout(budget) {
+        Ok(result) => result,
         Err(_) => {
             timed_out().push(key);
             None
@@ -1799,9 +1814,48 @@ mod tests {
     /// cameronsjo/cadence-hooks#1401: the parser backtracks exponentially on
     /// unclosed `((` or `( (` lines it then fails to parse, about 3x per
     /// line. Twenty lines took over 120 s, the hook timed out, and the push
-    /// behind them went through unchecked. Every flood here must come back
-    /// as a parse failure, in well under the hook's 5 s timeout, so the
-    /// guard's fallback judges the push.
+    /// behind them went through unchecked. Work past the budget must come
+    /// back as a failure at the budget, and the same command must then fail
+    /// at once instead of starting another runaway parse. The work sleeps
+    /// rather than parses, so the timing does not depend on the runner's
+    /// speed and the abandoned thread uses no CPU.
+    #[test]
+    fn work_past_the_budget_fails_at_the_budget() {
+        use std::time::{Duration, Instant};
+        fn slow(_: String) -> Option<()> {
+            std::thread::sleep(Duration::from_secs(5));
+            Some(())
+        }
+        fn quick(_: String) -> Option<()> {
+            Some(())
+        }
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        assert_eq!(within_budget("#1401 slow", budget, slow), None);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "took {took:?}");
+        let again = Instant::now();
+        assert_eq!(
+            within_budget("#1401 slow", Duration::from_secs(60), quick),
+            None
+        );
+        assert!(again.elapsed() < Duration::from_secs(1));
+        assert_eq!(within_budget("#1401 quick", budget, quick), Some(()));
+        // A panic in the work is a failure at once, not a wait for the budget.
+        fn panics(_: String) -> Option<()> {
+            panic!("parser bug");
+        }
+        let started = Instant::now();
+        assert_eq!(
+            within_budget("#1401 panic", Duration::from_secs(60), panics),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The floods themselves: each still comes back as a parse failure the
+    /// guard's fallback judges, and on a runner slow enough to backtrack
+    /// past the budget, within it.
     #[test]
     fn parser_backtracking_flood_fails_within_the_budget() {
         for line in ["(( 1 # x ))\n", "(( 1\n", "( ( 1\n"] {
@@ -1815,14 +1869,6 @@ mod tests {
             );
             assert!(matches!(chain, ChainAnalysis::ParseFailed), "{chain:?}");
             assert!(matches!(loops, LoopAnalysis::ParseFailed), "{loops:?}");
-            // A second analysis of the same command fails at once rather
-            // than starting another runaway parse.
-            let again = std::time::Instant::now();
-            assert!(matches!(
-                analyze_gh_loops(&command),
-                LoopAnalysis::ParseFailed
-            ));
-            assert!(again.elapsed() < std::time::Duration::from_millis(100));
         }
     }
 

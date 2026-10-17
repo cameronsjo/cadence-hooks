@@ -2420,11 +2420,13 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     // 50 KB run of openers linear (PR #1118 review).
     let mut glued_walks = 0usize;
     loop {
-        rest = rest.trim_start_matches(['(', ' ', '\t']);
+        // Before the `(` trim, which would take the `(` of an anonymous `()`.
+        rest = rest.trim_start_matches([' ', '\t']);
         if let Some(len) = function_header_len(rest) {
             rest = &rest[len..];
             continue;
         }
+        rest = rest.trim_start_matches(['(', ' ', '\t']);
         let Some(after) = rest.strip_prefix('{') else {
             break;
         };
@@ -2766,42 +2768,48 @@ fn is_function_name(word: &str) -> bool {
 }
 
 /// Byte length of a function definition's header at the start of `text`,
-/// with the blanks after it, when a `{` or `(` body follows: `g()`,
-/// `g ( )`, `function g`, `function g()`. `None` for anything else.
+/// with the blanks after it, when a body follows: `g()`, `g ( )`,
+/// `function g`, `function g()`, zsh's anonymous `()` and `function`, and
+/// zsh's name lists (`g h()`, `function g h`). `None` for anything else.
+///
+/// After `()` any body counts, since zsh takes a simple command there
+/// (`() cat .env` runs at once). After `function` with no `()`, only a `{`
+/// or `(` body does: otherwise every word after it would read as a name.
 ///
 /// For the string-level strips ([`strip_group_wrappers`]), which are the only
 /// ones that can reach a body opener glued to the header: [`tokenize`] makes
 /// `g(){` and `g()(git` one word each, and the token-level
 /// [`strip_function_header`] cannot split them. Leaving them whole hid the
-/// commit in `g(){ git commit -m x; }; g` (cameronsjo/cadence-hooks#1402).
+/// commit in `g(){ git commit -m x; }; g` (cameronsjo/cadence-hooks#1402),
+/// and zsh runs an anonymous function as soon as it is defined.
 ///
-/// **Detector direction only**: bash runs no word of a header, so dropping it
-/// can only expose a command the body runs.
+/// **Detector direction only**: neither shell runs a word of a header, so
+/// dropping it can only expose a command the body runs.
 pub fn function_header_len(text: &str) -> Option<usize> {
     let blank = [' ', '\t'];
-    let (rest, keyword) = match text.strip_prefix("function") {
+    let (mut rest, keyword) = match text.strip_prefix("function") {
         Some(after) if after.starts_with(blank) => (after.trim_start_matches(blank), true),
         _ => (text, false),
     };
-    let name_len = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
-        .unwrap_or(rest.len());
-    if !is_function_name(&rest[..name_len]) {
-        return None;
+    // Zero or more names; zsh defines each one in a list.
+    loop {
+        let name_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+            .unwrap_or(rest.len());
+        if !is_function_name(&rest[..name_len]) {
+            break;
+        }
+        rest = rest[name_len..].trim_start_matches(blank);
     }
-    let after_name = &rest[name_len..];
-    let parens = after_name
-        .trim_start_matches(blank)
+    let parens = rest
         .strip_prefix('(')
         .and_then(|inner| inner.trim_start_matches(blank).strip_prefix(')'));
-    let after_header = match parens {
-        Some(after) => after,
-        None if keyword => after_name,
+    let body = match parens {
+        Some(after) => after.trim_start_matches(blank),
+        None if keyword && rest.starts_with(['{', '(']) => rest,
         None => return None,
     };
-    let body = after_header.trim_start_matches(blank);
-    body.starts_with(['{', '('])
-        .then(|| text.len() - body.len())
+    (!body.is_empty()).then(|| text.len() - body.len())
 }
 
 /// The header of a function definition, in all three spellings. The body's
