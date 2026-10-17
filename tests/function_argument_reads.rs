@@ -66,6 +66,11 @@ fn a_secret_name_passed_to_a_reading_function_is_blocked() {
             "function { cat $1; } .env",
             "functions[f]='cat $1'; f .env",
             r#"env 'BASH_FUNC_f%%=() { cat "$1"; }' bash -c 'f .env'"#,
+            // #1430 review: an import is found by its name, whatever the
+            // quoting of its value.
+            r"env BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
+            r"env BASH_FUNC_f%%=\(\)\ \{\ cat\ \$1\;\ \} bash -c 'f .env'",
+            r"env BASH_FUNC_f%%='('')'' { cat $1; }' bash -c 'f .env'",
             // The accepted cost: the rule does not read what the body does.
             r#"f(){ echo "$1"; }; f .env"#,
             r#"f(){ git add "$@"; }; f .env"#,

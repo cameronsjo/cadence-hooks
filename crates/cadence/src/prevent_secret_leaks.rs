@@ -2992,7 +2992,37 @@ const STDIN_CONSUMERS: &[&str] = &[
 const MULTICALL: &[&str] = &["busybox", "toybox"];
 
 /// What [`segment_reads`] finds in one segment.
-type SegmentReads = (Vec<(String, String)>, Vec<String>, Option<String>);
+struct SegmentReads {
+    /// `(verb, secret word)` reads.
+    reads: Vec<(String, String)>,
+    /// Command texts the segment runs that were not expanded.
+    children: Vec<String>,
+    /// The first secret-like word in any position, when asked for.
+    secret_word: Option<String>,
+    /// A word assigns a `BASH_FUNC_` environment import.
+    imports_function: bool,
+}
+
+/// The name of bash's environment import of a function, `BASH_FUNC_<name>%%`
+/// or the older `BASH_FUNC_<name>()`.
+static FUNCTION_IMPORT_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^BASH_FUNC_\S*(?:%%|\(\))$").expect("function import pattern compiles")
+});
+
+/// Does a dequoted `word` assign a function import? bash imports the value
+/// after quote removal, which [`command_segments`] does not do for an `env`
+/// operand, so the name decides, whatever the value (#1430). The word keeps
+/// its unquoted backslashes (`BASH_FUNC_f\%\%=`), so they are dropped here.
+fn imports_a_function(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    if name.contains('\\') {
+        FUNCTION_IMPORT_NAME.is_match(&name.replace('\\', ""))
+    } else {
+        FUNCTION_IMPORT_NAME.is_match(name)
+    }
+}
 
 /// One segment's `(verb, secret word)` reads — a literal secret name handed
 /// to an enumerated reader or sender as a file, or redirected into one's
@@ -3003,6 +3033,7 @@ type SegmentReads = (Vec<(String, String)>, Vec<String>, Option<String>);
 fn segment_reads(segment: &str, find_secret: bool) -> SegmentReads {
     let (outer, mut children) = split_process_substitutions(segment);
     let (words, stdin) = words_and_stdin(&outer);
+    let imports_function = words.iter().any(|w| imports_a_function(w));
     // Any secret-like word, for the function rule: read here so the rule
     // reuses this segmentation instead of walking the command again (#1425).
     let secret_word = find_secret
@@ -3026,10 +3057,20 @@ fn segment_reads(segment: &str, find_secret: bool) -> SegmentReads {
             .filter(|w| names_a_secret(w, Filename::Known))
             .map(|w| ("<".to_string(), w))
             .collect();
-        return (reads, children, secret_word);
+        return SegmentReads {
+            reads,
+            children,
+            secret_word,
+            imports_function,
+        };
     };
     if head.starts_with('#') {
-        return (Vec::new(), children, secret_word);
+        return SegmentReads {
+            reads: Vec::new(),
+            children,
+            secret_word,
+            imports_function,
+        };
     }
     let mut verb = command_word(head).into_owned();
     if MULTICALL.contains(&verb.as_str()) && argv.len() > 1 {
@@ -3093,7 +3134,12 @@ fn segment_reads(segment: &str, find_secret: bool) -> SegmentReads {
         );
     }
     let reads = found.into_iter().map(|w| (verb.clone(), w)).collect();
-    (reads, children, secret_word)
+    SegmentReads {
+        reads,
+        children,
+        secret_word,
+        imports_function,
+    }
 }
 
 /// `command` with the bodies of heredocs no shell runs left out, for a
@@ -3260,7 +3306,13 @@ fn bash_leaks_secrets(
                 record_paren_assignments(&segment, &mut paren_vars);
                 defines_function = defines_a_function(&segment, &paren_vars);
             }
-            let (reads, children, secret) = segment_reads(&segment, secret_word.is_none());
+            let SegmentReads {
+                reads,
+                children,
+                secret_word: secret,
+                imports_function,
+            } = segment_reads(&segment, secret_word.is_none());
+            defines_function = defines_function || imports_function;
             for (verb, token) in reads {
                 if envrc_bash_read_allowed(&token, cwd, || *command_has_cd, || *envrc_replaceable) {
                     continue;
@@ -7253,6 +7305,37 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "a spelling with no secret name",
+        );
+    }
+
+    #[test]
+    fn function_import_found_by_its_name_blocked() {
+        // #1430 review: bash imports a function from any `BASH_FUNC_<name>%%`
+        // whose value is `() {` after quote removal, and `command_segments`
+        // does not decode an `env` operand, so the name decides.
+        assert_bash(
+            &[
+                r#"env BASH_FUNC_f%%=$'\x28\x29 { cat "$1"; }' bash -c 'f .env'"#,
+                r"env BASH_FUNC_f%%=$'\50\51 { cat $1; }' bash -c 'f .env'",
+                r"env BASH_FUNC_f%%=\(\)\ \{\ cat\ \$1\;\ \} bash -c 'f .env'",
+                r"env BASH_FUNC_f%%='('')'' { cat $1; }' bash -c 'f .env'",
+                r#"env BASH_FUNC_f%%="("")"' { cat $1; }' bash -c 'f .env'"#,
+                r"env 'BASH_FUNC_f()=() { cat $1; }' bash -c 'f .env'",
+                r"export BASH_FUNC_f%%=$'\x28\x29 { cat $1; }'; bash -c 'f .env'",
+                r"BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
+                r"env BASH_FUNC_f\%\%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
+                r#"env "BASH_FUNC_f%%"=$'\x28\x29 { cat $1; }' bash -c 'f .env'"#,
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a function import named BASH_FUNC_",
+        );
+        assert_bash(
+            &[
+                r"env BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f README.md'",
+                "echo BASH_FUNC_f; echo .env.example",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "an import with no secret name",
         );
     }
 
