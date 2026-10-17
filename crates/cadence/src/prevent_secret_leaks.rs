@@ -4,10 +4,12 @@
 //! On Bash, blocks a literal secret file name handed to an ENUMERATED reader
 //! or sender (`READERS`: `cat`, `grep`, `base64`, `curl -d @`, `gh --input`,
 //! `source`, …), or redirected into one's standard input
-//! (cameronsjo/cadence-hooks#1303). Unknown commands, variables, URL and API
-//! paths, regex patterns, and globs that only share letters with a secret
-//! name are not judged. Safe templates (.env.example, .env.test) are always
-//! allowed. Environment dumps nudge.
+//! (cameronsjo/cadence-hooks#1303). A secret name passed to a function the
+//! command defines is judged as if it stood where the body's positional
+//! parameters are (cameronsjo/cadence-hooks#1409). Unknown commands, other
+//! variables, URL and API paths, regex patterns, and globs that only share
+//! letters with a secret name are not judged. Safe templates (.env.example,
+//! .env.test) are always allowed. Environment dumps nudge.
 
 use crate::forgectl_hint::{HintKind, with_forgectl_hint};
 use crate::secret_patterns::{
@@ -3022,8 +3024,7 @@ fn segment_reads(segment: &str) -> (Vec<(String, String)>, Vec<String>) {
     // (`sudo -D /x cat .env`, `env --chd /usr cat .env`), and the linear
     // peel stops at any option value. The first reader or shell after it is
     // then taken as the command.
-    let runs_a_command =
-        |word: &str| SHELL_HEADS.contains(&word) || READERS.iter().any(|(name, _)| *name == word);
+    let runs_a_command = reads_or_runs;
     let refused = COMMAND_RUNNERS.contains(&verb.as_str()) || TRANSPARENT.contains(&verb.as_str());
     if (refused || (words.len() > PEEL_WORD_LIMIT && !runs_a_command(&verb)))
         && let Some(at) = argv
@@ -3127,68 +3128,249 @@ fn first_secret_read(command: &str, cwd: Option<&str>) -> Option<(String, String
     None
 }
 
-/// Any reference to a positional parameter: `$1`…`$9`, `$@`, `$*`, braced
-/// or not, and every other `${` form that starts with one (`${1:-x}`,
-/// `${#1}`, `${!1}`, `${@:2}`).
+/// Any reference to a positional parameter: `$1`…`$9`, `$@`, `$*`, zsh's
+/// `$argv`, braced or not, and every other `${` form that starts with one,
+/// zsh flags included (`${1:-x}`, `${#1}`, `${!1}`, `${@:2}`, `${=1}`,
+/// `${(q)1}`, `${argv[1]}`).
 static POSITIONAL_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?:[1-9@*]|\{[!#]?[1-9@*])").expect("positional pattern compiles")
+    Regex::new(r"\$(?:[1-9@*]|argv\b|\{[!#=~^]*(?:\([^)]*\))?[!#=~^]*(?:[1-9@*]|argv\b))")
+        .expect("positional pattern compiles")
 });
 
-/// `"$@"`, `"${@}"`, `"$*"`, `"${*}"`, quotes included: each becomes the
-/// call's arguments as separate words.
-static QUOTED_ARGUMENT_LIST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""\$(?:[@*]|\{[@*]\})""#).expect("argument list pattern compiles")
+/// `for NAME` with no `in`, which loops over the positional parameters:
+/// `for x; do`, `for x do`, `for x⏎do`.
+static FOR_OVER_ARGUMENTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"((?:^|[\s;&|(){}])for[ \t]+[A-Za-z_][A-Za-z0-9_]*)[ \t]*(;|\n|do(?:[\s;]|$))")
+        .expect("for pattern compiles")
 });
 
-/// `$@`, `${@}`, `$*`, `${*}` outside the quoted form.
+/// `"$@"` and `"${@}"`, quotes included: each argument as its own word.
+static QUOTED_AT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""\$(?:@|\{@\})""#).expect("argument list pattern compiles"));
+
+/// `"$*"` and `"${*}"`, quotes included: the arguments as one word.
+static QUOTED_STAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""\$(?:\*|\{\*\})""#).expect("argument list pattern compiles"));
+
+/// `$@`, `${@}`, `$*`, `${*}` outside the quoted forms.
 static ARGUMENT_LIST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$(?:[@*]|\{[@*]\})").expect("argument list pattern compiles"));
 
-/// `$1`…`$9` and `${1}`…`${9}`.
-static ONE_ARGUMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$(?:[1-9]|\{[1-9]\})").expect("argument pattern compiles"));
-
-/// A function definition's name: `function NAME` or `NAME ()`. Quotes are
-/// not read, so a header inside a quoted string also counts; that can only
-/// add a block.
-static FUNCTION_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?:^|[\s;&|(){}!])(?:function[ \t]+([^\s(){}<>;&|'"\\$`]+)|([^\s(){}<>;&|'"\\$`=]+)[ \t]*\([ \t]*\))"#,
-    )
-    .expect("function name pattern compiles")
+/// `"$1"` and `"${1}"`, quotes included.
+static QUOTED_ONE_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""\$(?:([1-9])|\{([1-9])\})""#).expect("argument pattern compiles")
 });
 
-/// Most distinct calls [`function_argument_read`] scans; past it the command
-/// is refused as unread.
-const MAX_FUNCTION_CALL_SCANS: usize = 8;
+/// `$1`…`$9` and `${1}`…`${9}`.
+static ONE_ARGUMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$(?:([1-9])|\{([1-9])\})").expect("argument pattern compiles"));
+
+/// A positional parameter glued to other text once double quotes are
+/// dropped (`".env.$1"`, `"$1".env`, `$1$2`): the file read is a name no
+/// single argument spells.
+static GLUED_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[^\s;&|(){}<>'=]\$(?:[1-9]|\{[1-9]\})|\$(?:[1-9]|\{[1-9]\})[^\s;&|(){}<>']")
+        .expect("glued argument pattern compiles")
+});
+
+/// A function definition's header and the names it defines: `function NAME`,
+/// `NAME ()`, and zsh's name lists (`function g h`, `g h ()`). Quotes are not
+/// read, so a header inside a quoted string also counts; that can only add a
+/// block.
+static FUNCTION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    const NAME: &str = r#"[^\s(){}<>;&|'"\\$`=]+"#;
+    Regex::new(&format!(
+        r"(?:^|[\s;&|(){{}}!])(?:function[ \t]+((?:{NAME}[ \t]+)*{NAME})[ \t]*(?:\([ \t]*\))?|((?:{NAME}[ \t]+)*{NAME})[ \t]*\([ \t]*\))"
+    ))
+    .expect("function header pattern compiles")
+});
+
+/// Most distinct substitutions [`function_argument_read`] scans; past it the
+/// command is refused as unread.
+const MAX_FUNCTION_CALL_SCANS: usize = 16;
+
+/// Longest text [`function_argument_read`] scans after a substitution. Every
+/// `$@` becomes the whole argument list, so the text can grow as the product
+/// of the two, and a hook that runs out its deadline lets the command through.
+const MAX_SUBSTITUTED_LEN: usize = 64 * 1024;
 
 /// Commands that turn standard input into another command's arguments, so a
 /// positional value piped into one reaches a reader no substitution shows.
 const ARGUMENT_FEEDERS: &[&str] = &["xargs", "parallel"];
 
-/// Can `word` stand in for `$1` inside double quotes and read the same?
-/// Anything with a quote, blank, `$`, backtick or backslash cannot.
-fn is_plain_argument(word: &str) -> bool {
-    !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._-/~+,:@%=".contains(c))
+/// Does `word`, a command word, name an enumerated reader or a shell?
+fn reads_or_runs(word: &str) -> bool {
+    SHELL_HEADS.contains(&word) || READERS.iter().any(|(name, _)| *name == word)
 }
 
-/// Does a segment of `command` hand an expansion the guard did not resolve
-/// to an enumerated reader or a shell, as an operand or on standard input?
-fn reader_takes_an_expansion(command: &str) -> bool {
-    command_segments(command).iter().any(|segment| {
+/// One function the command defines: the names it binds, folded the way
+/// [`command_word`] folds a call's head, and its body's text.
+struct Function<'c> {
+    names: Vec<String>,
+    body: &'c str,
+}
+
+/// The body that starts after a header: a `{ … }` or `( … )` group through
+/// its matching closer, quote-aware. Any other body (zsh's `f() cmd`), or an
+/// unclosed group, runs to the end of the command, which can only add text
+/// to scan.
+fn body_after(rest: &str) -> &str {
+    let rest = rest.trim_start();
+    let (open, close) = match rest.chars().next() {
+        Some('{') => ('{', '}'),
+        Some('(') => ('(', ')'),
+        _ => return rest,
+    };
+    let mut depth = 0usize;
+    let mut in_double = false;
+    let mut chars = rest.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' if !in_double => {
+                if chars.by_ref().find(|&(_, c)| c == '\'').is_none() {
+                    return rest;
+                }
+            }
+            '"' => in_double = !in_double,
+            c if c == open && !in_double => depth += 1,
+            c if c == close && !in_double => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &rest[..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Every function `command` defines ([`FUNCTION_HEADER`]).
+fn defined_functions(command: &str) -> Vec<Function<'_>> {
+    FUNCTION_HEADER
+        .captures_iter(command)
+        .filter_map(|c| {
+            let names = c.get(1).or_else(|| c.get(2))?;
+            let names: Vec<String> = names
+                .as_str()
+                .split([' ', '\t'])
+                .filter(|n| !n.is_empty() && *n != "function")
+                .map(|n| command_word(n).into_owned())
+                .collect();
+            let end = c.get(0)?.end();
+            (!names.is_empty()).then(|| Function {
+                names,
+                body: body_after(&command[end..]),
+            })
+        })
+        .collect()
+}
+
+/// The head word and arguments of a segment's command, with the group
+/// punctuation a segment can carry stripped.
+fn call_words(segment: &str) -> (Vec<String>, Vec<String>) {
+    let (words, stdin) = words_and_stdin(segment);
+    let words: Vec<String> = words
+        .iter()
+        .skip_while(|w| matches!(w.as_str(), "(" | "{" | "!"))
+        .map(|w| w.trim_end_matches([')', '}']).to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let argv = peel_command_runners(&words).to_vec();
+    (argv, stdin)
+}
+
+/// The bodies a call of `name` runs: its own, and those of the defined
+/// functions they call in turn, joined one per line.
+fn reachable_bodies(functions: &[Function<'_>], name: &str) -> String {
+    let mut reached: Vec<usize> = Vec::new();
+    let mut pending = vec![name.to_string()];
+    while let Some(name) = pending.pop() {
+        for (i, function) in functions.iter().enumerate() {
+            if reached.contains(&i) || !function.names.contains(&name) {
+                continue;
+            }
+            reached.push(i);
+            for segment in command_segments(function.body) {
+                let (argv, _) = call_words(&segment);
+                if let Some(head) = argv.first() {
+                    pending.push(command_word(head).into_owned());
+                }
+            }
+        }
+    }
+    reached
+        .iter()
+        .map(|&i| functions[i].body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `value` as one single-quoted shell word.
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// `text` with the call's arguments in place of its positional references.
+/// `every` puts that one word in place of every `$N`; otherwise each `$N`
+/// becomes the argument at its position.
+fn substitute_arguments(text: &str, args: &[String], every: Option<&str>) -> String {
+    let nth = |caps: &regex::Captures| -> String {
+        let n: usize = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        every
+            .map(str::to_string)
+            .or_else(|| args.get(n.wrapping_sub(1)).cloned())
+            .unwrap_or_default()
+    };
+    let words: Vec<String> = args.iter().map(|a| single_quoted(a)).collect();
+    let list = words.join(" ");
+    // `for x; do` loops over the arguments; spell the list out.
+    let text = FOR_OVER_ARGUMENTS.replace_all(text, |c: &regex::Captures| {
+        let separator = &c[2];
+        let separator = if separator.starts_with("do") {
+            format!("; {separator}")
+        } else {
+            separator.to_string()
+        };
+        format!("{} in {list}{separator}", &c[1])
+    });
+    let text = QUOTED_AT.replace_all(&text, list.as_str());
+    let text = QUOTED_STAR.replace_all(&text, single_quoted(&args.join(" ")).as_str());
+    let text = QUOTED_ONE_ARGUMENT.replace_all(&text, |c: &regex::Captures| single_quoted(&nth(c)));
+    let text = ARGUMENT_LIST.replace_all(&text, args.join(" ").as_str());
+    ONE_ARGUMENT.replace_all(&text, nth).into_owned()
+}
+
+/// Does `bodies`, after a substitution, still read the arguments in a way the
+/// scan cannot show? A positional form left in place, an [`ARGUMENT_FEEDERS`] command, or an enumerated reader or
+/// shell handed an expansion as an operand or on standard input.
+fn reads_beyond_the_scan(bodies: &str) -> bool {
+    if POSITIONAL_REFERENCE.is_match(bodies) {
+        return true;
+    }
+    command_segments(bodies).iter().any(|segment| {
         let (words, stdin) = words_and_stdin(segment);
         let argv = peel_command_runners(&words);
+        // The runners peeled off, and the command they run.
+        let ran = (words.len() - argv.len() + 1).min(words.len());
+        if words[..ran]
+            .iter()
+            .any(|w| ARGUMENT_FEEDERS.contains(&command_word(w).as_ref()))
+        {
+            return true;
+        }
         let Some(head) = argv.first() else {
             return false;
         };
         let verb = command_word(head);
-        let reads = SHELL_HEADS.contains(&verb.as_ref())
-            || matches!(verb.as_ref(), "eval" | "source" | ".")
-            || READERS.iter().any(|(name, _)| *name == verb);
-        reads
+        (reads_or_runs(&verb) || matches!(verb.as_ref(), "eval" | "source" | "."))
             && argv[1..]
                 .iter()
                 .chain(&stdin)
@@ -3221,50 +3403,48 @@ fn function_read_block(
     ))
 }
 
-/// A secret name passed to a function the command defines, where the body
-/// reads a positional parameter: `f(){ cat "$1"; }; f .env` reads `.env`,
-/// yet the name never sits where a reader takes a file
-/// (cameronsjo/cadence-hooks#1409).
+/// A secret file read through a function the command defines:
+/// `f(){ cat "$1"; }; f .env` reads `.env`, yet the name never sits where a
+/// reader takes a file (cameronsjo/cadence-hooks#1409).
 ///
-/// Arguments are not traced into each body. Each call of a defined function
-/// that passes a secret name has its arguments put in place of every
-/// positional reference in the whole command (`$1`…`$9` all become the
-/// secret name, so `shift` cannot hide it), and the result is scanned like
-/// any command. When that cannot show what the body reads (a `${1…}` form,
-/// an argument that does not substitute cleanly, `xargs`, or a reader still
-/// handed an expansion), the command is refused as unread. A secret file
-/// redirected into a call (`f < .env`) is read by the body as well.
+/// Arguments are not traced through each body. For each call of a defined
+/// function, the bodies it runs ([`reachable_bodies`]) are scanned like any
+/// command with the call's arguments in place of the positional references:
+///
+/// - for each argument that names a secret, that name in place of every
+///   `$N`, so `shift` or an argument's position cannot hide it;
+/// - when a `$N` is glued to other text (`".env.$1"`), each argument at its
+///   own position, since the name read is one no argument spells.
+///
+/// A secret-name call whose bodies still read in a way that scan cannot show
+/// ([`reads_beyond_the_scan`]), or with an argument holding a quote, `$`,
+/// backtick or backslash, is refused as unread. So is a command past
+/// [`MAX_FUNCTION_CALL_SCANS`] secret-name substitutions, or one whose
+/// substituted text would pass [`MAX_SUBSTITUTED_LEN`]. By-position passes
+/// stop at the same cap.
+/// A secret file redirected into a call (`f < .env`) is read by the body.
 fn function_argument_read(
     command: &str,
     cwd: Option<&str>,
     detect: fn() -> bool,
 ) -> Option<CheckResult> {
-    let positional = POSITIONAL_REFERENCE.is_match(command);
-    let names: Vec<&str> = FUNCTION_NAME
-        .captures_iter(command)
-        .filter_map(|c| c.get(1).or_else(|| c.get(2)))
-        .map(|m| m.as_str())
-        .filter(|name| *name != "function")
-        .collect();
-    if names.is_empty() {
+    let functions = defined_functions(command);
+    if functions.is_empty() {
         return None;
     }
-    let mut scanned = std::collections::HashSet::new();
+    let cannot_follow = "whose body reads its arguments in a way this guard cannot follow";
+    let mut secret_scans = std::collections::HashSet::new();
+    let mut position_scans = std::collections::HashSet::new();
+    let mut bodies_of: std::collections::HashMap<String, std::rc::Rc<str>> =
+        std::collections::HashMap::new();
     for segment in command_segments(command) {
-        let (words, stdin) = words_and_stdin(&segment);
-        let words: Vec<String> = words
-            .iter()
-            .skip_while(|w| matches!(w.as_str(), "(" | "{" | "!"))
-            .map(|w| w.trim_end_matches([')', '}']).to_string())
-            .filter(|w| !w.is_empty())
-            .collect();
-        let argv = peel_command_runners(&words);
+        let (argv, stdin) = call_words(&segment);
         let Some((head, args)) = argv.split_first() else {
             continue;
         };
         let head = command_word(head);
         let head = head.trim_start_matches(['(', '{']);
-        if !names.contains(&head) {
+        if !functions.iter().any(|f| f.names.iter().any(|n| n == head)) {
             continue;
         }
         // The body is what reads a call's standard input, as it is for a
@@ -3273,41 +3453,66 @@ fn function_argument_read(
             let how = "whose body reads it on standard input";
             return Some(function_read_block(head, secret, how, detect));
         }
-        if !positional {
+        let bodies = std::rc::Rc::clone(
+            bodies_of
+                .entry(head.to_string())
+                .or_insert_with(|| reachable_bodies(&functions, head).into()),
+        );
+        if !(POSITIONAL_REFERENCE.is_match(&bodies) || FOR_OVER_ARGUMENTS.is_match(&bodies)) {
             continue;
         }
-        for secret in args.iter().filter(|a| names_a_secret(a, Filename::Known)) {
-            let cannot_follow = "whose body reads its arguments in a way this guard cannot follow";
-            if !args.iter().all(|a| is_plain_argument(a)) {
-                return Some(function_read_block(head, secret, cannot_follow, detect));
+        let secrets: Vec<&String> = args
+            .iter()
+            .filter(|a| names_a_secret(a, Filename::Known))
+            .collect();
+        let glued = GLUED_ARGUMENT.is_match(&bodies.replace('"', ""));
+        let substitutable = args.iter().all(|a| !a.contains(['"', '$', '`', '\\']));
+        if let Some(secret) = secrets.first()
+            && !substitutable
+        {
+            return Some(function_read_block(head, secret, cannot_follow, detect));
+        }
+        if !substitutable {
+            continue;
+        }
+        let mut passes: Vec<Option<&str>> = secrets.iter().map(|s| Some(s.as_str())).collect();
+        if glued {
+            passes.push(None);
+        }
+        // Each reference grows by at most the whole quoted list; refuse before
+        // building text that large.
+        let list_len: usize = args.iter().map(|a| single_quoted(a).len() + 1).sum();
+        let references = POSITIONAL_REFERENCE.find_iter(&bodies).count();
+        if bodies.len() + references.saturating_mul(list_len) > MAX_SUBSTITUTED_LEN {
+            let shown = secrets
+                .first()
+                .map_or_else(|| args.join(" "), |s| (*s).clone());
+            return Some(function_read_block(head, &shown, cannot_follow, detect));
+        }
+        for every in passes {
+            let shown = every.map_or_else(|| args.join(" "), str::to_string);
+            let key = (head.to_string(), args.join("\0"), every.map(str::to_string));
+            if every.is_some() {
+                if !secret_scans.insert(key) {
+                    continue;
+                }
+                if secret_scans.len() > MAX_FUNCTION_CALL_SCANS {
+                    return Some(function_read_block(head, &shown, cannot_follow, detect));
+                }
+            } else {
+                // debt: a by-position pass past the cap is skipped, not refused,
+                // so 16 padding calls hide a glued read; refuse if one is seen.
+                if position_scans.len() >= MAX_FUNCTION_CALL_SCANS || !position_scans.insert(key) {
+                    continue;
+                }
             }
-            let list = args.join(" ");
-            if !scanned.insert((list.clone(), secret.clone())) {
-                continue;
+            let substituted = substitute_arguments(&bodies, args, every);
+            if let Some((verb, read)) = first_secret_read(&substituted, cwd) {
+                let how = format!("whose body reads `{read}` with `{verb}`");
+                return Some(function_read_block(head, &shown, &how, detect));
             }
-            // Each scan reads the whole command, so many calls with different
-            // arguments would make it quadratic, and a hook that runs out its
-            // deadline lets the command through.
-            if scanned.len() > MAX_FUNCTION_CALL_SCANS {
-                return Some(function_read_block(head, secret, cannot_follow, detect));
-            }
-            let substituted = QUOTED_ARGUMENT_LIST.replace_all(command, list.as_str());
-            let substituted = ARGUMENT_LIST.replace_all(&substituted, list.as_str());
-            let substituted = ONE_ARGUMENT.replace_all(&substituted, secret.as_str());
-            if let Some((verb, _)) = first_secret_read(&substituted, cwd) {
-                let how = format!("whose body reads its arguments with `{verb}`");
-                return Some(function_read_block(head, secret, &how, detect));
-            }
-            let feeds = command_segments(&substituted).iter().any(|s| {
-                executable_tokens(s)
-                    .iter()
-                    .any(|w| ARGUMENT_FEEDERS.contains(&command_word(w).as_ref()))
-            });
-            if POSITIONAL_REFERENCE.is_match(&substituted)
-                || feeds
-                || reader_takes_an_expansion(&substituted)
-            {
-                return Some(function_read_block(head, secret, cannot_follow, detect));
+            if every.is_some() && reads_beyond_the_scan(&substituted) {
+                return Some(function_read_block(head, &shown, cannot_follow, detect));
             }
         }
     }
@@ -7178,6 +7383,18 @@ mod tests {
                 "jq(){ cat \"$1\"; }; jq .env.local",
                 "jq () { cat \"$1\"; }; jq .env.local",
                 "function jq { cat $1; }; jq .env.local",
+                // The call's head is folded as a verb is, so case cannot hide it.
+                r#"F(){ cat "$1"; }; F .env"#,
+                r#"Cat_env(){ cat "$1"; }; Cat_env .env"#,
+                // zsh name lists define every name.
+                r#"g h(){ cat "$1"; }; g .env"#,
+                r#"function g h { cat "$1"; }; h .env"#,
+                // A name glued to text is read by position.
+                r#"f(){ cat "$1".env; }; f prod"#,
+                r#"f(){ cat ".env.$1"; }; f production"#,
+                r#"f(){ cat "$1$2"; }; f .e nv"#,
+                // An argument with a blank is one word in `"$1"`.
+                r#"f(){ cat "$1" "$2"; }; f a 'my .env'"#,
             ],
             cadence_hooks_core::Outcome::Block,
             "the body reads its argument",
@@ -7191,7 +7408,17 @@ mod tests {
                 r#"f(){ local x="$1"; cat "$x"; }; f .env"#,
                 r#"f(){ cat "${1:-x}"; }; f .env"#,
                 r#"f(){ cat "${!1}"; }; f .env"#,
-                r#"f(){ cat "$1" "$2"; }; f a 'my .env'"#,
+                // zsh spells the arguments `$argv` and takes flags in `${…}`.
+                r#"f(){ cat $argv; }; f .env"#,
+                r#"f(){ cat "${argv[1]}"; }; f .env"#,
+                r#"f(){ cat ${=1}; }; f .env"#,
+                r#"f(){ cat "${(q)1}"; }; f .env"#,
+                // `for NAME` with no `in` loops over the arguments.
+                r#"f(){ for x; do cat "$x"; done; }; f .env"#,
+                r#"f(){ for x do cat "$x"; done; }; f .env"#,
+                "f(){ for x\ndo cat \"$x\"\ndone; }; f .env",
+                // An argument that cannot stand in for `$1`.
+                r#"f(){ cat "$1"; }; f "$(pwd)" .env"#,
             ],
             cadence_hooks_core::Outcome::Block,
             "a read the guard cannot follow",
@@ -7213,6 +7440,20 @@ mod tests {
                 // No function defined.
                 r#"cat "$1""#,
                 "for f in a b; do cat \"$f\"; done",
+                // Only the called function's bodies are scanned, so a reader
+                // elsewhere in the command, or an uncalled reading function, does
+                // not count.
+                r#"f(){ echo "$1"; }; f .env; cat "$LOGFILE""#,
+                r#"f(){ test -f "$1"; }; f .env && cat "$HOME/notes.txt""#,
+                r#"f(){ echo "$1"; }; f .env; find . -name "*.rs" | xargs wc -l"#,
+                r#"f(){ echo "$1"; }; f .env; grep xargs notes.txt"#,
+                r#"g(){ for a; do echo "$a"; done; }; f(){ cat "$1"; }; g .env"#,
+                // A message argument naming a secret file is only printed.
+                r#"die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env""#,
+                r#"log(){ printf "%s\n" "$*"; }; log "loading .env"; cargo build"#,
+                // Glued names that read no secret.
+                r#"f(){ echo "item-$1"; }; f a; f b; f c"#,
+                r#"f(){ cat "notes-$1.md"; }; f today"#,
             ],
             cadence_hooks_core::Outcome::Allow,
             "no secret name reaches a reader",
@@ -7238,10 +7479,17 @@ mod tests {
             cadence_hooks_core::Outcome::Allow,
             "repeats and calls under the cap are scanned",
         );
+        // Every `$@` becomes the whole list, so this one call would scan
+        // about 120 KB; it is refused before the text is built.
+        let growing = format!(
+            "f(){{ echo {}; }}; f .env {}",
+            ["$@"; 200].join(" "),
+            ["a"; 200].join(" ")
+        );
         assert_bash(
-            &[distinct.as_str()],
+            &[distinct.as_str(), growing.as_str()],
             cadence_hooks_core::Outcome::Block,
-            "past the cap the command is refused",
+            "past the cap or the size bound the command is refused",
         );
     }
 
