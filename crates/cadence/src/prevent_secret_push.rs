@@ -140,7 +140,11 @@
 //! a `GIT_SSH_COMMAND=`/`GIT_PAGER=` prefix, …) reads as a push core cannot
 //! resolve and is refused whatever its subcommand, `GIT_SSH_COMMAND='ssh -i
 //! key' git push` included; the value is not parsed. An empty value and a
-//! pager of `cat` are not counted (cameronsjo/cadence-hooks#1231).
+//! pager of `cat` are not counted (cameronsjo/cadence-hooks#1231), and neither
+//! is a prefix that sets both an empty `GIT_CONFIG_PARAMETERS` and a
+//! `GIT_CONFIG_COUNT` of `0` or empty, which gives git no config
+//! (cameronsjo/cadence-hooks#1378); one of the two alone still counts. A push under
+//! any `GIT_CONFIG*` prefix is still refused.
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
 //! `git subtree push`, a `git-<name>` executable on `PATH` other than
@@ -301,6 +305,9 @@ fn git_bytes(
 enum Stop {
     /// The range could not be fully scanned.
     Refused(String),
+    /// The same, with a cause-specific fix that replaces the generic "narrow
+    /// the push" advice (cameronsjo/cadence-hooks#1381, #1384, #1386).
+    Advised { why: String, fix: String },
     /// Findings, newest commit first.
     Found(Vec<Hit>),
 }
@@ -1331,7 +1338,7 @@ fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> 
         }
         let cfg = probed.entry(call.dir.clone()).or_insert_with(|| {
             alias_config(&call.dir).map_err(|stop| match stop {
-                Stop::Refused(why) => why,
+                Stop::Refused(why) | Stop::Advised { why, .. } => why,
                 Stop::Found(_) => String::new(),
             })
         });
@@ -1469,11 +1476,24 @@ fn sources_of(inv: &PushInvocation) -> Result<Vec<String>, Stop> {
             source.to_string()
         };
         if !is_safe_ref(&source) {
-            return Err(Stop::Refused(format!(
+            let why = format!(
                 "refspec source `{}` is not a plain ref name (revision expressions and globs \
                  cannot be scanned safely)",
                 sane(&source)
-            )));
+            );
+            // A variable source (`"$SHA:refs/heads/b"`) is usually the pinned
+            // form the git-workflow rules recommend; its literal spelling is
+            // scanned like a branch (cameronsjo/cadence-hooks#1386).
+            if source.contains(['$', '`']) {
+                return Err(Stop::Advised {
+                    why,
+                    fix: "Spell the source literally: for a pinned commit, run `git rev-parse \
+                          HEAD` in one call, then push the literal SHA it prints in the next \
+                          (`git push origin <40-hex sha>:refs/heads/<branch>`)"
+                        .into(),
+                });
+            }
+            return Err(Stop::Refused(why));
         }
         if !sources.contains(&source) {
             sources.push(source);
@@ -1716,7 +1736,7 @@ fn sources_are_commits(work_dir: &str, range: &Range) -> Result<(), Stop> {
             "git was unavailable or timed out resolving the pushed refs".into(),
         )),
         _ => Err(Stop::Refused(format!(
-            "git could not resolve {} to a commit (a missing ref, or a ref or tag naming a \
+            "{UNRESOLVED_RANGE} {} to a commit (a missing ref, or a ref or tag naming a \
              tree or blob, whose content this guard cannot scan)",
             describe(range)
         ))),
@@ -1790,7 +1810,7 @@ fn outbound(work_dir: &str, range: &Range) -> Result<(Vec<String>, bool), Stop> 
             "the range is too large to fully scan (over {MAX_COMMITS} commits)"
         ))),
         Git::Failed(_) => Err(Stop::Refused(format!(
-            "git could not resolve the outbound range for {}",
+            "{UNRESOLVED_RANGE} the outbound range for {}",
             describe(range)
         ))),
         Git::Down => Err(Stop::Refused(
@@ -2366,6 +2386,7 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
 fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
     let calls = git_calls(command, cwd);
     let hints = command_hints(&calls);
+    let writer = ref_writer_before_push(&calls);
     if let Some(why) = hidden_alias_push(command, &calls, &hints) {
         return Err(Stop::Refused(format!(
             "{why}, so what it publishes could not be resolved"
@@ -2379,15 +2400,40 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
             // An unreadable directory change is the cause the message can
             // name: say which token, not "which repository"
             // (cameronsjo/cadence-hooks#1337).
-            if inv.directory_unverified
-                && !inv.repository_unresolved
-                && let Some(token) = unreadable_directory_token(command)
-            {
-                return Err(Stop::Refused(format!(
-                    "the push runs in a directory named by `{}`, which this guard cannot \
-                     resolve, so what it publishes could not be read (use a literal path)",
-                    sane(&token)
-                )));
+            //
+            // The token is named whenever the command has one, even beside a
+            // which-repository doubt: a literal path is the usual fix, and
+            // the generic advice hid it (cameronsjo/cadence-hooks#1384).
+            let token = inv
+                .directory_unverified
+                .then(|| unreadable_directory_token(command))
+                .flatten();
+            if let Some(token) = token {
+                let token = sane(&token);
+                let fix = format!(
+                    "Use a literal path in place of `{token}`, or run the push from the \
+                     repository's own directory"
+                );
+                if !inv.repository_unresolved {
+                    return Err(Stop::Advised {
+                        why: format!(
+                            "the push runs in a directory named by `{token}`, which this guard \
+                             cannot resolve, so what it publishes could not be read"
+                        ),
+                        fix,
+                    });
+                }
+                return Err(Stop::Advised {
+                    why: format!(
+                        "could not resolve which repository or refs this push publishes: it runs \
+                         in a directory named by `{token}`, which this guard cannot resolve, and \
+                         under a config override or environment it cannot follow"
+                    ),
+                    fix: format!(
+                        "{fix}, and drop any `GIT_DIR`, `GIT_CONFIG*` or `-c` override from the \
+                         push"
+                    ),
+                });
             }
             return Err(Stop::Refused(
                 "could not resolve which repository or refs this push publishes (a directory \
@@ -2395,13 +2441,15 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
                     .into(),
             ));
         }
-        judge_invocation(&inv, &hints, exempt).map_err(|stop| match stop {
+        judge_invocation(&inv, &hints, writer.as_deref(), exempt).map_err(|stop| match stop {
             // A directory an earlier command in the same line creates (`git
             // worktree add <p> … && git -C <p> push`) does not exist yet, so
             // every probe there fails: say so rather than blame whatever
             // probe failed first (cameronsjo/cadence-hooks#1336). The verdict
             // is unchanged.
-            Stop::Refused(_) if !std::path::Path::new(&inv.work_dir).exists() => {
+            Stop::Refused(_) | Stop::Advised { .. }
+                if !std::path::Path::new(&inv.work_dir).exists() =>
+            {
                 Stop::Refused(missing_directory(&inv.work_dir))
             }
             stop => stop,
@@ -2464,18 +2512,113 @@ fn missing_directory(dir: &str) -> String {
     )
 }
 
+/// Subcommands that make commits or move refs. One of them earlier in the
+/// same call has not run when the guard reads the repository.
+/// `branch` and `tag` count only when they name a new ref (their list and
+/// query forms open with an option), and `reset`/`stash` not at all: their
+/// everyday forms do not make the ref a push names.
+const REF_WRITERS: &[&str] = &[
+    "am",
+    "checkout",
+    "cherry-pick",
+    "commit",
+    "merge",
+    "pull",
+    "revert",
+    "switch",
+    "symbolic-ref",
+    "update-ref",
+];
+
+/// How a refusal that git could not resolve a source or range starts; only
+/// such a refusal gets [`explain_unresolved_range`]'s advice, never a cap or
+/// a timeout.
+const UNRESOLVED_RANGE: &str = "git could not resolve";
+
+/// The first ref-writing subcommand the command runs before its first push,
+/// for a message only; it never changes a verdict.
+fn ref_writer_before_push(calls: &[GitCall]) -> Option<String> {
+    let writes = |rest: &[String]| match rest {
+        [sub, ..] if REF_WRITERS.contains(&sub.as_str()) => true,
+        [sub, name, ..] if sub == "branch" || sub == "tag" => !name.starts_with('-'),
+        _ => false,
+    };
+    calls
+        .iter()
+        .take_while(|call| !call.renamed && call.rest.first().is_none_or(|sub| sub != "push"))
+        .find(|call| writes(&call.rest))
+        .and_then(|call| call.rest.first().cloned())
+}
+
+/// Name the likely cause of a range that did not resolve, when there is one
+/// the reader can act on (cameronsjo/cadence-hooks#1381): a ref-writing git
+/// command earlier in the same call, which has not run yet when this guard
+/// reads the repository, or an unborn branch. The push still blocks.
+fn explain_unresolved_range(
+    work_dir: &str,
+    range: &Range,
+    writer: Option<&str>,
+    stop: Stop,
+) -> Stop {
+    let Stop::Refused(why) = stop else {
+        return stop;
+    };
+    if !why.starts_with(UNRESOLVED_RANGE) {
+        return Stop::Refused(why);
+    }
+    if let Some(sub) = writer {
+        return Stop::Advised {
+            why: format!(
+                "{why}. This call runs `git {}` before the push, and that has not run yet when \
+                 this guard reads the repository, so the commits or branch it makes cannot be \
+                 read",
+                sane(sub)
+            ),
+            fix: format!(
+                "Run `git {}` in one call and the push in the next call, so the push is scanned \
+                 against what it made",
+                sane(sub)
+            ),
+        };
+    }
+    let names_head = range.sources.iter().any(|s| s == "HEAD")
+        || current_branch(work_dir).is_some_and(|b| range.sources.contains(&b));
+    let unborn = names_head
+        && matches!(
+            git(
+                work_dir,
+                &["rev-parse", "-q", "--verify", "HEAD^{commit}"],
+                4096,
+                Budget::Probe
+            ),
+            Git::Failed(_)
+        );
+    if unborn {
+        return Stop::Advised {
+            why: format!(
+                "{why}: `HEAD` has no commit yet (an unborn branch), so there is nothing to push"
+            ),
+            fix: "Make the commit first, then push in a separate call".into(),
+        };
+    }
+    Stop::Refused(why)
+}
+
 /// [`judge`] for one push that is neither a dry run nor unresolved.
+/// `writer` is [`ref_writer_before_push`] of the whole command.
 fn judge_invocation(
     inv: &PushInvocation,
     hints: &CommandHints,
+    writer: Option<&str>,
     exempt: Exempt,
 ) -> Result<(), Stop> {
     let Some(range) = range_of(inv, hints)? else {
         return Ok(());
     };
-    sources_are_commits(&inv.work_dir, &range)?;
+    let explain = |stop| explain_unresolved_range(&inv.work_dir, &range, writer, stop);
+    sources_are_commits(&inv.work_dir, &range).map_err(explain)?;
     hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
-    let (shas, over) = outbound(&inv.work_dir, &range)?;
+    let (shas, over) = outbound(&inv.work_dir, &range).map_err(explain)?;
     let mut hits = if shas.is_empty() {
         Vec::new()
     } else {
@@ -2510,6 +2653,11 @@ fn render(stop: &Stop) -> String {
             "BLOCKED: git push refused — {why}.\n\
              This guard fails closed: a push it cannot fully scan is not allowed. Narrow the \
              push (push fewer commits or name one branch), or acknowledge it.\n{ACK}"
+        ),
+        Stop::Advised { why, fix } => format!(
+            "BLOCKED: git push refused — {why}.\n\
+             This guard fails closed: a push it cannot fully scan is not allowed.\n\
+             Fix: {fix}.\n{ACK}"
         ),
         Stop::Found(hits) => {
             let mut out =
@@ -4427,7 +4575,7 @@ mod tests {
             ("cd \"$(cat /tmp/dir)\" && git st", "$(cat /tmp/dir)"),
         ] {
             let r = fx.run(command);
-            assert_blocks(&r, &[token, "use a literal"]);
+            assert_blocks(&r, &[token, "literal path"]);
             let msg = r.message.as_deref().unwrap();
             assert!(!msg.contains("may be an alias"), "{command}: {msg}");
             assert!(!msg.contains("which repository"), "{command}: {msg}");
@@ -4451,5 +4599,125 @@ mod tests {
             let r = fx.run(&seen);
             assert_eq!(r.outcome, Outcome::Allow, "{command}: {:?}", r.message);
         }
+    }
+
+    /// The generic "narrow the push" advice, which fits none of the causes
+    /// the tests below pin.
+    const NARROW: &str = "Narrow the push";
+
+    fn assert_not_narrow(r: &CheckResult) {
+        let msg = r.message.as_deref().unwrap_or("");
+        assert!(!msg.contains(NARROW), "generic advice in {msg}");
+    }
+
+    #[test]
+    fn a_clone_with_an_empty_config_environment_is_not_a_push() {
+        // cameronsjo/cadence-hooks#1378: the credential-stripping clone form
+        // sets no config, publishes nothing and is allowed.
+        let fx = Fx::new("emptycfg");
+        for command in [
+            "GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT=0 git clone -q https://github.com/o/r.git /tmp/d",
+            "env -u GIT_DIR -u GIT_COMMON_DIR GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null \
+             GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= GIT_ASKPASS= git \
+             -c credential.helper= -c core.askpass= clone --depth 1 -q \
+             https://github.com/o/r.git /tmp/d",
+        ] {
+            assert_allows(&fx.run(command));
+        }
+        // A value that can set a key still refuses, and so does a push under
+        // the empty form: the `GIT_CONFIG` family redirects a push.
+        for command in [
+            "GIT_CONFIG_PARAMETERS=\"'core.sshcommand'='x'\" git clone u /tmp/d",
+            "GIT_CONFIG_COUNT=1 git clone u /tmp/d",
+            // One channel emptied leaves the other to an earlier export.
+            "GIT_CONFIG_PARAMETERS= git clone u /tmp/d",
+            "GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT=0 git push origin main",
+        ] {
+            assert_blocks(&fx.run(command), &["could not resolve"]);
+        }
+    }
+
+    #[test]
+    fn a_commit_made_in_the_same_call_as_the_push_names_the_split() {
+        // cameronsjo/cadence-hooks#1381: the guard reads the repository
+        // before the command runs, so a commit or branch the command itself
+        // makes is not there yet. The push still blocks; the advice says to
+        // split the call, not to narrow the push.
+        let fx = Fx::new("samecall");
+        fx.git(&["switch", "-q", "--orphan", "orph"]);
+        let r = fx.run(
+            "echo x > f; git add f; git commit -q -m first; git push origin HEAD:refs/heads/main2",
+        );
+        assert_blocks(&r, &["`git commit`", "has not run", "next call"]);
+        assert_not_narrow(&r);
+        // No commit in the command: the branch is unborn, and the message
+        // says so.
+        let r = fx.run("git push origin HEAD:refs/heads/main2");
+        assert_blocks(&r, &["has no commit yet", "commit first"]);
+        assert_not_narrow(&r);
+        // A branch the same call creates.
+        fx.git(&["switch", "-q", "main"]);
+        let r = fx.run("git switch -q -c fresh && git push origin fresh");
+        assert_blocks(&r, &["`git switch`", "has not run", "next call"]);
+        // A read-only form names no writer, so a typo is not blamed on it.
+        let r = fx.run("git branch --show-current && git push origin nosuch");
+        assert_blocks(&r, &["nosuch"]);
+        assert!(
+            !r.message.as_deref().unwrap_or("").contains("next call"),
+            "{:?}",
+            r.message
+        );
+        // Split into two calls, the commit is scanned like any other.
+        // The orphan branch has no ref until its first commit.
+        fx.git(&["switch", "-q", "--orphan", "orph"]);
+        fx.commit("f", "fine\n", "first");
+        assert_allows(&fx.run("git push origin HEAD:refs/heads/main2"));
+        fx.commit("cfg.txt", &format!("key={}\n", aws_key()), "add cfg");
+        assert_blocks(
+            &fx.run("git push origin HEAD:refs/heads/main3"),
+            &["cfg.txt", "AWS access key id"],
+        );
+    }
+
+    #[test]
+    fn a_push_in_a_variable_directory_names_the_literal_path_fix() {
+        // cameronsjo/cadence-hooks#1384: a `-C "$VAR"` the guard cannot
+        // follow is named, with the literal-path fix, even when another
+        // doubt sets the generic refusal too.
+        let fx = Fx::new("vardirmsg");
+        for command in [
+            r#"git -C "$VAR" push --no-follow-tags -u origin main"#,
+            r#"GIT_CONFIG_PARAMETERS= git -C "$VAR" push origin main"#,
+            r#"cd "$VAR" && GIT_DIR=.git git push origin main"#,
+        ] {
+            let r = fx.run(command);
+            assert_blocks(&r, &["`$VAR`", "literal path"]);
+            assert_not_narrow(&r);
+        }
+    }
+
+    #[test]
+    fn a_literal_sha_source_is_scanned_and_a_variable_one_names_the_literal() {
+        // cameronsjo/cadence-hooks#1386: the pinned form the git-workflow
+        // rules recommend is a literal 40-hex source, which is scanned like a
+        // branch. A `$SHA` source cannot be read before the command runs and
+        // stays refused, with the literal SHA as the fix.
+        let fx = Fx::new("pinsha");
+        fx.commit("src/a.txt", "fine\n", "add a");
+        let sha = git_out(&fx.work, &["rev-parse", "HEAD"]);
+        assert_allows(&fx.run(&format!(
+            "git push --no-follow-tags origin {sha}:refs/heads/feat"
+        )));
+        fx.commit("src/cfg.txt", &format!("key={}\n", aws_key()), "add cfg");
+        let sha = git_out(&fx.work, &["rev-parse", "HEAD"]);
+        assert_blocks(
+            &fx.run(&format!("git push origin {sha}:refs/heads/feat")),
+            &["src/cfg.txt", "AWS access key id"],
+        );
+        let r = fx.run(
+            r#"SHA=$(git rev-parse HEAD) && git push --no-follow-tags origin "$SHA:refs/heads/feat""#,
+        );
+        assert_blocks(&r, &["`$SHA`", "literal", "git rev-parse HEAD"]);
+        assert_not_narrow(&r);
     }
 }

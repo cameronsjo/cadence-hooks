@@ -2,7 +2,7 @@
 //!
 //! Three questions the guard asks that the term list cannot answer:
 //!
-//! - **Can this Write leave the machine by itself?** ([`is_outside_git_tree`],
+//! - **Can this Write leave the machine by itself?** ([`is_provably_local`],
 //!   cameronsjo/cadence#1708, after cameronsjo/cadence-hooks#1013, #716, #603.)
 //! - **Which repo does this command post to?** ([`post_targets`] and the two
 //!   verdicts built on it: [`shared_destination`] for `destinations`-scoped
@@ -17,6 +17,7 @@
 use super::is_external_post;
 use cadence_hooks_core::config::{self, AllowEntry};
 use cadence_hooks_core::gh_bodies::parse_gh_api;
+use cadence_hooks_core::paths;
 use cadence_hooks_core::shell::{
     GhRepoFlag, command_segments, command_word, executable_tokens, gh_command_path, gh_repo_flags,
     git_command, host_and_repo_from_url, parse_gh_repo_value, peel_command_runners,
@@ -24,7 +25,8 @@ use cadence_hooks_core::shell::{
 };
 use std::path::{Component, Path, PathBuf};
 
-/// Is `file_path` a local file outside every git work tree?
+/// Is `file_path` provably local: outside every version-controlled work tree,
+/// every synced tree and every network mount?
 ///
 /// Such a file cannot leave the machine by itself. For code and config the
 /// caller skips the identity pass on it (cameronsjo/cadence#1708; this
@@ -36,15 +38,30 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// - the path is non-empty, absolute, and carries no `..` component (an MCP
 ///   write has no path and is always scanned);
-/// - no ancestor of the path, judged after resolving symlinks on the deepest
-///   ancestor that exists, is a git work tree: a file in a checkout can be
-///   committed, and the post-time scan does not see commits' file content.
+/// - every symlink on the way resolves: a dangling link (to the file or to a
+///   directory above it) means the write lands wherever the link points, which
+///   may be a work tree that does not hold the file yet;
+/// - no ancestor of the resolved path holds a `.git` entry of any kind
+///   (directory, linked-worktree file, or link), whether the file is tracked,
+///   untracked or ignored: a file in a checkout can be committed or
+///   force-added, and the post-time scan does not see commits' file content;
+/// - the file, if it exists, has no second hard link, which could sit in a
+///   work tree;
+/// - no ancestor of the resolved path holds another version-control marker
+///   (`.jj`, `.hg`, `.sl`, `.svn`, and the rest of `REPO_MARKERS`): those
+///   push file content too;
+/// - no component of the given or resolved path names a cloud-sync tree
+///   ([`paths::cloud_sync_marker`]), no ancestor is a File Provider root, and
+///   the file system is local ([`paths::syncs_or_mounts_remotely`]): a synced
+///   or remote file leaves with no post;
+/// - every lookup on the way answers. A permission error or any other failure
+///   to read whether a `.git` is there means "cannot tell", which scans.
 ///
 /// The residuals: a later `cp`, `git add` of a copy, or `chezmoi add` can bring
 /// the text into a repo with no Edit call, and a bare-repo dotfiles setup
 /// (`--git-dir=~/.dotfiles --work-tree=~`) has no `.git` above the files it
 /// tracks. The leak-ledger scan is the net for both.
-pub(super) fn is_outside_git_tree(file_path: Option<&str>) -> bool {
+pub(super) fn is_provably_local(file_path: Option<&str>) -> bool {
     let Some(raw) = file_path.filter(|p| !p.is_empty()) else {
         return false;
     };
@@ -52,9 +69,68 @@ pub(super) fn is_outside_git_tree(file_path: Option<&str>) -> bool {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return false;
     }
-    let resolved = resolve_deepest(path);
-    let dir = resolved.parent().and_then(Path::to_str).unwrap_or("/");
-    cadence_hooks_core::paths::find_git_root(dir).is_none()
+    let Some(resolved) = resolve_deepest(path) else {
+        return false;
+    };
+    if paths::cloud_sync_marker(path).is_some() || paths::cloud_sync_marker(&resolved).is_some() {
+        return false;
+    }
+    let Some(dir) = resolved.parent() else {
+        return false;
+    };
+    // Cheapest first: most files are in a repo, and the walk ends there.
+    dir.ancestors().all(|d| holds_no_repo(d) == Some(true))
+        && has_one_name(&resolved)
+        // The file itself when it exists: a file can be mounted on its own.
+        && paths::syncs_or_mounts_remotely(&resolved) == Some(false)
+}
+
+/// Is `path` absent, or a file with no second hard link? A second link may
+/// sit in a work tree, and an in-place write changes both.
+fn has_one_name(path: &Path) -> bool {
+    match path.symlink_metadata() {
+        #[cfg(unix)]
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            meta.nlink() <= 1
+        }
+        #[cfg(not(unix))]
+        Ok(_) => false,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Entries that make their parent a version-controlled work tree: git, and
+/// the tools that push file content much as git does.
+const REPO_MARKERS: &[&str] = &[
+    ".git",
+    ".jj",
+    ".hg",
+    ".sl",
+    ".svn",
+    ".bzr",
+    ".pijul",
+    "_darcs",
+    ".fslckout",
+    "_FOSSIL_",
+    "CVS",
+];
+
+/// `Some(true)` when `dir` provably has no repo marker, `Some(false)` when it
+/// has one, `None` when a lookup fails for any reason but absence.
+///
+/// `symlink_metadata`, not `exists`: `exists` reads a permission error as
+/// "absent" and follows a dangling `.git` link to "absent", and either would
+/// excuse a file that sits in a work tree.
+fn holds_no_repo(dir: &Path) -> Option<bool> {
+    for marker in REPO_MARKERS {
+        match dir.join(marker).symlink_metadata() {
+            Ok(_) => return Some(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(true)
 }
 
 /// Is `file_path` anything but code or config? Prose is what a post reads
@@ -90,20 +166,26 @@ const CODE_OR_CONFIG_EXTENSIONS: &[&str] = &[
 ];
 
 /// Canonicalize the deepest existing ancestor of `path` and re-append the rest.
-fn resolve_deepest(path: &Path) -> PathBuf {
+///
+/// `None` when the answer is unknown: a component that is a symlink but does
+/// not resolve (the write would follow it somewhere this cannot see), or any
+/// lookup that fails for a reason other than the component being absent.
+fn resolve_deepest(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(real) = cur.canonicalize() {
-            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        match cur.canonicalize() {
+            Ok(real) => return Some(tail.iter().rev().fold(real, |acc, part| acc.join(part))),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return None,
+            Err(_) => {}
         }
-        match (cur.parent(), cur.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name);
-                cur = parent;
-            }
-            _ => return path.to_path_buf(),
+        match cur.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return None,
+            _ => {}
         }
+        tail.push(cur.file_name()?);
+        cur = cur.parent()?;
     }
 }
 
@@ -308,15 +390,20 @@ mod tests {
     #[test]
     fn outside_git_tree_needs_a_plain_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
+        // Only macOS and Linux can prove a path local; elsewhere nothing is.
+        let local = cfg!(any(target_os = "macos", target_os = "linux"));
         let plain = dir.path().join("notes.md");
-        assert!(is_outside_git_tree(plain.to_str()));
-        assert!(is_outside_git_tree(dir.path().join("a/b/c.toml").to_str()));
+        assert_eq!(is_provably_local(plain.to_str()), local);
+        assert_eq!(
+            is_provably_local(dir.path().join("a/b/c.toml").to_str()),
+            local
+        );
         for path in ["", "notes.md", "./tmp/notes.md"] {
-            assert!(!is_outside_git_tree(Some(path)), "path: {path:?}");
+            assert!(!is_provably_local(Some(path)), "path: {path:?}");
         }
         let traversal = format!("{}/../notes.md", dir.path().display());
-        assert!(!is_outside_git_tree(Some(&traversal)));
-        assert!(!is_outside_git_tree(None));
+        assert!(!is_provably_local(Some(&traversal)));
+        assert!(!is_provably_local(None));
     }
 
     #[test]
@@ -324,9 +411,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        assert!(!is_outside_git_tree(repo.join("notes.md").to_str()));
-        assert!(!is_outside_git_tree(repo.join("deep/new/x.sh").to_str()));
-        assert!(is_outside_git_tree(root.path().join("notes.md").to_str()));
+        assert!(!is_provably_local(repo.join("notes.md").to_str()));
+        assert!(!is_provably_local(repo.join("deep/new/x.sh").to_str()));
+        assert_eq!(
+            is_provably_local(root.path().join("notes.md").to_str()),
+            cfg!(any(target_os = "macos", target_os = "linux"))
+        );
     }
 
     #[test]
@@ -338,7 +428,18 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let link = elsewhere.path().join("link");
         std::os::unix::fs::symlink(&repo, &link).unwrap();
-        assert!(!is_outside_git_tree(link.join("notes.md").to_str()));
+        assert!(!is_provably_local(link.join("notes.md").to_str()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_git_link_still_marks_a_work_tree() {
+        // `Path::exists` follows the link and reads it as absent.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(root.path().join("gone"), repo.join(".git")).unwrap();
+        assert!(!is_provably_local(repo.join("config.toml").to_str()));
     }
 
     #[test]

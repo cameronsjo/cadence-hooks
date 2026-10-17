@@ -100,6 +100,167 @@ pub fn find_git_root(start: &str) -> Option<PathBuf> {
     }
 }
 
+/// Path fragments that mark a cloud-sync provider's local mirror.
+///
+/// Matched case-insensitively against a path's own components, never as a bare
+/// substring — `~/src/dropbox-client` is a project, not a synced tree, and a
+/// substring test would flag it. Each entry is a directory NAME a provider
+/// creates: macOS iCloud Drive lives under `Library/Mobile Documents`, and
+/// modern macOS third-party providers mount under `Library/CloudStorage`.
+pub const CLOUD_SYNC_MARKERS: &[&str] = &[
+    "OneDrive",
+    "Dropbox",
+    "CloudStorage",
+    "Mobile Documents",
+    "Google Drive",
+    "GoogleDrive",
+    "pCloud Drive",
+    "Sync.com",
+    "iCloudDrive",
+    "Nextcloud",
+    "ownCloud",
+    "Box Sync",
+    "MEGA",
+    "Proton Drive",
+];
+
+/// The provider marker in `path`, if any component names one.
+///
+/// Component-wise and case-insensitive: a provider directory is a real path
+/// segment, so testing components avoids the `dropbox-client` false positive a
+/// substring search produces, while still catching a nested repo far below the
+/// sync root.
+///
+/// A component matches on exact equality **or** on a `"<marker> - "` prefix.
+/// The second form is not a nicety: a Microsoft 365 business or school tenant
+/// syncs to a folder named `OneDrive - <Organization>`, which is the dominant
+/// real-world shape of the very deployment this check exists to catch, and
+/// exact equality alone silently never fires for it. The separator is spelled
+/// with surrounding spaces deliberately — a bare `-` boundary would re-admit
+/// `dropbox-client`, the exact false positive component matching was chosen to
+/// avoid.
+pub fn cloud_sync_marker(path: &Path) -> Option<&'static str> {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .find_map(|segment| {
+            CLOUD_SYNC_MARKERS
+                .iter()
+                .find(|m| {
+                    segment.eq_ignore_ascii_case(m)
+                        || segment.len() > m.len() + 3
+                            && segment
+                                .get(..m.len())
+                                .is_some_and(|h| h.eq_ignore_ascii_case(m))
+                            && segment.get(m.len()..).is_some_and(|t| t.starts_with(" - "))
+                })
+                .copied()
+        })
+}
+
+/// Does a file at or under `dir` leave the machine with no command at all?
+///
+/// `Some(true)` when the deepest existing ancestor sits on a file system that
+/// is not local (macOS: no `MNT_LOCAL`; Linux: any type but a known local
+/// disk or memory file system), or, on macOS, when an ancestor is a File Provider root. iCloud's
+/// Desktop & Documents sync marks `~/Documents` that way while its path names
+/// no provider, so [`cloud_sync_marker`] cannot see it. `None` when a lookup
+/// fails for any reason but absence, and on every other platform: the caller
+/// cannot tell.
+pub fn syncs_or_mounts_remotely(dir: &Path) -> Option<bool> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut checked_mount = false;
+        for d in dir.ancestors() {
+            let c = std::ffi::CString::new(d.as_os_str().as_bytes()).ok()?;
+            if !checked_mount {
+                match is_remote_mount(&c) {
+                    Ok(true) => return Some(true),
+                    Ok(false) => checked_mount = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if is_file_provider_root(&c)? {
+                return Some(true);
+            }
+        }
+        checked_mount.then_some(false)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // No mount check here (a Windows share or mapped drive looks like
+        // any other path), so this cannot tell.
+        let _ = dir;
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_remote_mount(path: &std::ffi::CStr) -> std::io::Result<bool> {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buf` is a writable `statfs`; the
+    // struct is read only after the call reports success.
+    let rc = unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `statfs` returned 0, so it filled `buf`.
+    let st = unsafe { buf.assume_init() };
+    #[cfg(target_os = "macos")]
+    {
+        Ok(st.f_flags & libc::MNT_LOCAL as u32 == 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Local disk and memory file systems (statfs(2)). Anything else,
+        // NFS, SMB, FUSE, a cluster file system or a type added later, counts
+        // as remote: a list of remote types is never complete.
+        const LOCAL: &[u64] = &[
+            0xEF53,      // ext2/3/4
+            0x5846_5342, // XFS
+            0x9123_683E, // Btrfs
+            0x2FC1_2FC1, // ZFS
+            0xF2F5_2010, // F2FS
+            0xCA45_1A4E, // bcachefs
+            0x0102_1994, // tmpfs
+            0x8584_58F6, // ramfs
+            0x794C_7630, // overlayfs
+            0xF15F,      // eCryptfs (an encrypted home over a local disk)
+        ];
+        // `f_type` is signed on some targets and unsigned on others.
+        #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+        let kind = (st.f_type as u64) & 0xFFFF_FFFF;
+        Ok(!LOCAL.contains(&kind))
+    }
+}
+
+/// Does `path` carry a File Provider domain? `None` when the lookup fails for
+/// a reason other than the attribute or the path being absent.
+#[cfg(target_os = "macos")]
+fn is_file_provider_root(path: &std::ffi::CStr) -> Option<bool> {
+    // SAFETY: both strings are NUL-terminated; a null buffer of size 0 asks
+    // only for the attribute's length.
+    let rc = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"com.apple.file-provider-domain-id".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if rc >= 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOATTR | libc::ENOENT | libc::ENOTSUP) => Some(false),
+        _ => None,
+    }
+}
+
 /// True when `path` resolves inside `dir` (string-prefix on normalized paths).
 ///
 /// Existence-independent — a purely lexical containment test, so it holds for a
@@ -404,6 +565,46 @@ pub fn expand_tilde_with(s: &str, home: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloud_sync_marker_survives_a_multibyte_component() {
+        // Byte 8 of "OneDrivé…" falls inside `é`; slicing there used to panic.
+        let path = std::path::Path::new("/Users/x/OneDrivé - Acme/repo");
+        assert_eq!(super::cloud_sync_marker(path), None);
+        let path = std::path::Path::new("/Users/x/OneDrive - Acmé/repo");
+        assert_eq!(super::cloud_sync_marker(path), Some("OneDrive"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_plain_temp_dir_is_local_and_a_missing_tail_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::syncs_or_mounts_remotely(dir.path()), Some(false));
+        let tail = dir.path().join("not/yet/here");
+        assert_eq!(super::syncs_or_mounts_remotely(&tail), Some(false));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn other_platforms_cannot_tell() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::syncs_or_mounts_remotely(dir.path()), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_provider_root_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("xattr")
+            .args(["-w", "com.apple.file-provider-domain-id", "fixture"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let below = dir.path().join("sub/new");
+        assert_eq!(super::syncs_or_mounts_remotely(&below), Some(true));
+    }
+
     #[cfg(unix)]
     #[test]
     fn opened_fifo_is_rejected_by_fstat_without_blocking() {
