@@ -121,9 +121,12 @@ fn enforce_worktree_edit_is_immune_to_a_hanging_git() {
         String::from_utf8_lossy(&out.stderr)
     );
     // Nowhere near the hanging git's 30s sleep — it was never spawned.
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "enforce resolves via the filesystem, never awaiting the hanging git; took {elapsed:?}"
+    cadence_hooks_core::test_builders::assert_elapsed_under(
+        &format!(
+            "enforce resolves via the filesystem, never awaiting the hanging git; took {elapsed:?}"
+        ),
+        elapsed,
+        Duration::from_secs(4),
     );
     let rows = failopen_rows(metrics.path());
     assert!(
@@ -170,9 +173,10 @@ fn hanging_branch_resolution_never_blocks_bare_head_force_push() {
         "a timed-out branch resolution must not block: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "guard must abandon the probe at its ~1s budget, took {elapsed:?}"
+    cadence_hooks_core::test_builders::assert_elapsed_under(
+        &format!("guard must abandon the probe at its ~1s budget, took {elapsed:?}"),
+        elapsed,
+        Duration::from_secs(4),
     );
     let rows = failopen_rows(metrics.path());
     assert_eq!(rows.len(), 1, "exactly one failopen row: {rows:?}");

@@ -676,7 +676,11 @@ mod tests {
         let deep = format!("{}x", "a/".repeat(2000));
         let started = std::time::Instant::now();
         let _ = resolve_effective_repo(&meta, Path::new(&deep), TargetKind::File);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        crate::test_builders::assert_elapsed_under(
+            "a_pathological_target_stays_fast",
+            started.elapsed(),
+            std::time::Duration::from_secs(1),
+        );
     }
 
     #[test]

@@ -3466,10 +3466,10 @@ mod tests {
         let started = std::time::Instant::now();
         let hints = command_hints(&calls);
         assert_eq!(hidden_alias_push(&flood, &calls, &hints), None);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("took {:?}", started.elapsed()),
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
         );
         let padded = format!("if false; then {flood}fi; git push origin main");
         assert_blocks(&fx.run(&padded), &["s.txt"]);

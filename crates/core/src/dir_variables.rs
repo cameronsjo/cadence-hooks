@@ -1265,7 +1265,11 @@ mod tests {
         assert!(out.contains("git -C \"/a/b\" status"));
         // Debug builds are several times slower than the release binary the
         // budget is for.
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        crate::test_builders::assert_elapsed_under(
+            "a_flood_of_assignments_and_reads_stays_linear",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
 
         let mut command = String::from("X=/a; ");
         while command.len() < 200 * 1024 {
@@ -1273,6 +1277,10 @@ mod tests {
         }
         let started = std::time::Instant::now();
         assert!(!resolve_literal_dir_variables(&command).contains("$X"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        crate::test_builders::assert_elapsed_under(
+            "a_flood_of_assignments_and_reads_stays_linear",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
     }
 }

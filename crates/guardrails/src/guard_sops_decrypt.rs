@@ -1011,7 +1011,11 @@ mod tests {
             );
             let started = std::time::Instant::now();
             assert_eq!(outcome(&command), Outcome::Block);
-            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                "a_brace_flood_before_a_decrypt_still_blocks_promptly",
+                started.elapsed(),
+                std::time::Duration::from_secs(4),
+            );
             // A heredoc body of minified JSON is data, not an overflow.
             let json = format!("[{}]", vec![r#"{"a":1,"b":2}"#; 100].join(","));
             assert_eq!(
@@ -1125,10 +1129,10 @@ mod tests {
             for command in deep_nests_1118("sops -d x | grep y") {
                 let start = std::time::Instant::now();
                 assert_eq!(outcome(&command), Outcome::Block);
-                assert!(
-                    start.elapsed() < nest_time_limit_1118(),
-                    "{:?}",
-                    start.elapsed()
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{:?}", start.elapsed()),
+                    start.elapsed(),
+                    nest_time_limit_1118(),
                 );
             }
         });

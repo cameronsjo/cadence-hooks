@@ -1228,10 +1228,10 @@ mod tests {
             let start = std::time::Instant::now();
             let result = GhDangerousGuard.run(&make_bash(&command));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-            assert!(
-                start.elapsed() < nest_time_limit_1118(),
-                "{:?}",
-                start.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                nest_time_limit_1118(),
             );
         }
     }
@@ -1258,10 +1258,10 @@ mod tests {
                 let start = std::time::Instant::now();
                 let result = GhDangerousGuard.run(&make_bash(&command));
                 assert_eq!(result.outcome, want, "{unit:?} {tail}");
-                assert!(
-                    start.elapsed() < nest_time_limit_1118(),
-                    "{unit:?} {tail}: {:?}",
-                    start.elapsed()
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{unit:?} {tail}: {:?}", start.elapsed()),
+                    start.elapsed(),
+                    nest_time_limit_1118(),
                 );
             }
         }
@@ -1361,7 +1361,11 @@ mod tests {
                 let result = GhDangerousGuard.run(&make_bash(&command));
                 let took = start.elapsed();
                 assert_eq!(result.outcome, want, "{} bytes{tail}", command.len());
-                assert!(took < limit, "{} bytes{tail}: {took:?}", command.len());
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{} bytes{tail}: {took:?}", command.len()),
+                    took,
+                    limit,
+                );
             }
         }
     }

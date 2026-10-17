@@ -848,9 +848,10 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(read.is_none(), "a FIFO is not a marker");
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "read_marker must not block on a FIFO (took {elapsed:?})"
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("read_marker must not block on a FIFO (took {elapsed:?})"),
+            elapsed,
+            std::time::Duration::from_secs(2),
         );
         assert_eq!(run_warn(tmp.path()).outcome, Outcome::Allow);
     }

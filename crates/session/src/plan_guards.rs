@@ -930,7 +930,11 @@ mod tests {
         for (path, want) in [(&regular, 2), (&fifo, 0), (&link, 0)] {
             assert_eq!(unticked_boxes(path), want, "{}", path.display());
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "unticked_boxes_refuses_fifo_and_symlink_without_stalling",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     fn write_plan(dir: &Path, name: &str, status: &str, branch: &str, body: &str) {
@@ -1437,7 +1441,11 @@ mod tests {
             assert_eq!(outcome, want, "{head:?}…");
             // Release is the shipped profile; debug builds get headroom.
             let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
-            assert!(elapsed.as_secs_f64() < limit, "{head:?}…: {elapsed:?}");
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{head:?}…"),
+                elapsed,
+                std::time::Duration::from_secs_f64(limit),
+            );
         }
     }
 

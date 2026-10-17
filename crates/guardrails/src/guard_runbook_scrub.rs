@@ -2126,7 +2126,11 @@ mod tests {
             Some(BashFinding::TooLarge)
         );
         assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Block);
-        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_flood_past_the_judge_budget_is_refused_not_waved_through",
+            started.elapsed(),
+            std::time::Duration::from_secs(20),
+        );
         // A short command outside the dir stays well under the budget.
         let small = make_bash_with_cwd("cd d && echo x > f", &f.work);
         assert_eq!(outcome(&small, Some(&f.runbooks), &[]), Outcome::Allow);
@@ -2694,7 +2698,11 @@ mod tests {
         let flood = "${HOME:-".repeat(25_000);
         let started = std::time::Instant::now();
         assert_eq!(substitute_var(&flood, "HOME", "/h"), flood);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "substitute_var_expands_set_forms_only",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
     }
 
     #[test]
@@ -2735,7 +2743,11 @@ mod tests {
         );
         assert_eq!(outcome(&input, Some(&f.runbooks), &[]), Outcome::Block);
         // Debug build; the release bound (< 0.5 s) is probed separately.
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_pwd_amplification_flood_is_refused_quickly",
+            started.elapsed(),
+            std::time::Duration::from_secs(10),
+        );
     }
 
     // L2: a marker dir whose parent is a temp dir or the root (the

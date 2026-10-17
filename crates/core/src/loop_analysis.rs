@@ -1904,13 +1904,21 @@ mod tests {
         let started = Instant::now();
         assert_eq!(within_budget("#1401 slow", budget, slow), None);
         let took = started.elapsed();
-        assert!(took < Duration::from_secs(3), "took {took:?}");
+        crate::test_builders::assert_elapsed_under(
+            &format!("took {took:?}"),
+            took,
+            Duration::from_secs(3),
+        );
         let again = Instant::now();
         assert_eq!(
             within_budget("#1401 slow", Duration::from_secs(60), quick),
             None
         );
-        assert!(again.elapsed() < Duration::from_secs(1));
+        crate::test_builders::assert_elapsed_under(
+            "quick",
+            again.elapsed(),
+            Duration::from_secs(1),
+        );
         assert_eq!(within_budget("#1401 quick", budget, quick), Some(()));
         // A panic in the work is a failure at once, not a wait for the budget.
         fn panics(_: String) -> Option<()> {
@@ -1921,7 +1929,11 @@ mod tests {
             within_budget("#1401 panic", Duration::from_secs(60), panics),
             None
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        crate::test_builders::assert_elapsed_under(
+            "panics",
+            started.elapsed(),
+            Duration::from_secs(5),
+        );
     }
 
     /// The floods themselves: each still comes back as a parse failure the
@@ -1934,9 +1946,10 @@ mod tests {
             let started = std::time::Instant::now();
             let (chain, loops) = analyze_push_chain_and_loops(&command);
             let took = started.elapsed();
-            assert!(
-                took < std::time::Duration::from_secs(4),
-                "{line:?} flood took {took:?}"
+            crate::test_builders::assert_elapsed_under(
+                &format!("{line:?} flood took {took:?}"),
+                took,
+                std::time::Duration::from_secs(4),
             );
             assert!(matches!(chain, ChainAnalysis::ParseFailed), "{chain:?}");
             assert!(matches!(loops, LoopAnalysis::ParseFailed), "{loops:?}");

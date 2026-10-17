@@ -3251,10 +3251,10 @@ mod tests {
                 let command = format!("{flood}{tail}");
                 let started = std::time::Instant::now();
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
-                assert!(
-                    started.elapsed() < std::time::Duration::from_secs(4),
-                    "{tail:?}: took {:?}",
-                    started.elapsed()
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{tail:?}: took {:?}", started.elapsed()),
+                    started.elapsed(),
+                    std::time::Duration::from_secs(4),
                 );
                 assert_eq!(result.outcome, outcome, "{tail:?}: {:?}", result.message);
             }
@@ -3717,9 +3717,10 @@ mod tests {
             assert!(spawns <= 4, "{spawns} git spawns for one directory");
             // Hang guard only, not a performance assertion: far above a
             // healthy run so runner load cannot trip it.
-            assert!(
-                elapsed < std::time::Duration::from_secs(30),
-                "took {elapsed:?}"
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("took {elapsed:?}"),
+                elapsed,
+                std::time::Duration::from_secs(30),
             );
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
@@ -3752,9 +3753,10 @@ mod tests {
             // Measured 4 on a healthy run, independent of the loop count.
             assert!(spawns <= 8, "{spawns} git spawns for one looped remote");
             // Hang guard only, far above a healthy run.
-            assert!(
-                elapsed < std::time::Duration::from_secs(30),
-                "took {elapsed:?}"
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("took {elapsed:?}"),
+                elapsed,
+                std::time::Duration::from_secs(30),
             );
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
             let distinct: String = (0..6)
