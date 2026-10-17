@@ -3569,7 +3569,7 @@ fn strip_group_punctuation(raw: &str) -> &str {
         // before each `(` is peeled, one per pass: a bulk trim took the `(`
         // of `()` in `( () { … } )`.
         let trimmed = rest.trim_start_matches([' ', '\t']);
-        let trimmed = cadence_hooks_core::shell::function_header_len(trimmed)
+        let trimmed = cadence_hooks_core::shell::read_function_header(trimmed)
             .map_or(trimmed, |len| &trimmed[len..]);
         let trimmed = trimmed.strip_prefix('(').unwrap_or(trimmed);
         let trimmed = match trimmed.strip_prefix('{') {
@@ -6075,6 +6075,16 @@ mod tests {
             "(g(){ git commit -m x; }; g)",
             "( g(){ git commit -m x; }; g )",
             "( () { git commit -m x; } )",
+            // Names outside `[A-Za-z0-9_.-]`, or a `!` in front: the header
+            // is read loosely (cameronsjo/cadence-hooks#1405 review, I1).
+            "g:x(){ git commit -m x; }; g:x",
+            "@(){ git commit -m x; }; @",
+            "a+b(){ git commit -m x; }; a+b",
+            "fé(){ git commit -m x; }; fé",
+            "\\g(){ git commit -m x; }; g",
+            "'g'(){ git commit -m x; }; g",
+            "! g(){ git commit -m x; }; g",
+            "function g:x { git commit -m x; }; g:x",
         ] {
             assert_eq!(
                 git_commit_targets(command, "/cwd"),

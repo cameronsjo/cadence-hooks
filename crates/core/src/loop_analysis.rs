@@ -593,6 +593,47 @@ pub fn group_nesting_depth(command: &str) -> usize {
     max
 }
 
+/// Most nesting openers [`parse_command`] hands to the parser, counted by
+/// [`nesting_opener_count`]. The parser also recurses once per `if`, `while`,
+/// `until`, `for`, `select` and `case` level, which [`group_nesting_depth`]
+/// does not see. A stack overflow aborts the process, which no panic hook or
+/// `catch_unwind` can stop, and the hook then exits with a non-blocking
+/// status (cameronsjo/cadence-hooks#1405 security review, I2). Measured on a
+/// 16 MB stack: about 4000 nested `if` levels abort a release build and 1000
+/// abort a debug build. On [`PARSE_STACK`] the bound leaves a debug build
+/// four times that margin.
+pub const MAX_PARSE_OPENERS: usize = 1024;
+
+/// Upper bound on how deep the parser can recurse on `command`: every `(`,
+/// `{` and backtick, and every `if`, `while`, `until`, `for`, `select` and
+/// `case` word. Quoting is ignored on purpose. A count, unlike a depth, only
+/// grows when a quote is misread, so no quoting can make it read low.
+pub fn nesting_opener_count(command: &str) -> usize {
+    const KEYWORDS: [&[u8]; 6] = [b"if", b"while", b"until", b"for", b"select", b"case"];
+    let bytes = command.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'(' | b'{' | b'`') {
+            count += 1;
+            i += 1;
+        } else if is_word(b) {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            if KEYWORDS.contains(&&bytes[start..i]) {
+                count += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 /// Wall-clock time [`parse_command`] gives the parser. The parser backtracks
 /// exponentially on some inputs it then rejects: about 3x per line of
 /// unclosed `((` or `( (` (cameronsjo/cadence-hooks#1401). A parse that runs
@@ -606,10 +647,15 @@ pub fn group_nesting_depth(command: &str) -> usize {
 /// hook timeout it protects is wall clock.
 const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
 
+// A budget at or past the hook timeout lets the runaway parse outlive the
+// hook, and the kill lets the command through.
+const _: () = assert!(PARSE_BUDGET.as_millis() < crate::deadline::HOOK_TIMEOUT.as_millis());
+
 /// Stack for the parse thread. The parser recurses once per nesting level,
-/// and [`MAX_PARSE_NESTING`] was sized against the main thread's 8 MB stack;
-/// a spawned thread gets 2 MB by default.
-const PARSE_STACK: usize = 16 * 1024 * 1024;
+/// and [`MAX_PARSE_OPENERS`] is sized against this stack in a debug build,
+/// whose frames are the largest. Only the pages the parse touches are
+/// committed; a spawned thread gets 2 MB by default.
+const PARSE_STACK: usize = 128 * 1024 * 1024;
 
 /// Hashes of commands whose parse ran past [`PARSE_BUDGET`] or panicked, in
 /// this process.
@@ -625,17 +671,34 @@ fn command_hash(command: &str) -> u64 {
 }
 
 fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
-    if group_nesting_depth(command) > MAX_PARSE_NESTING {
+    if group_nesting_depth(command) > MAX_PARSE_NESTING
+        || nesting_opener_count(command) > MAX_PARSE_OPENERS
+    {
         return None;
     }
     within_budget(command, PARSE_BUDGET, |text| {
-        // Debug builds only: a synthetic parser panic, so the binary's tests
-        // can show the panic hook lets this thread unwind. It bypasses
-        // nothing: the check reads the panic as a parse failure and judges
-        // the command through its fallback.
+        // Debug builds only: a synthetic parser panic or hang, so the
+        // binary's tests can show the panic hook lets this thread unwind and
+        // the budget abandons a parse that never returns. Neither bypasses
+        // anything: the check reads both as a parse failure and judges the
+        // command through its fallback.
         #[cfg(debug_assertions)]
-        if std::env::var("CADENCE_TEST_PANIC").as_deref() == Ok("parse") {
-            panic!("CADENCE_TEST_PANIC: synthetic panic on the parse thread");
+        match std::env::var("CADENCE_TEST_PANIC").as_deref() {
+            Ok("parse") => {
+                eprintln!(
+                    "⚠️  cadence-hooks: CADENCE_TEST_PANIC=parse is forcing a parser panic; \
+                     the command is judged without the loop parser. Unset it outside tests."
+                );
+                panic!("CADENCE_TEST_PANIC: synthetic panic on the parse thread");
+            }
+            Ok("hang") => {
+                eprintln!(
+                    "⚠️  cadence-hooks: CADENCE_TEST_PANIC=hang is forcing a parser hang; \
+                     the command is judged without the loop parser. Unset it outside tests."
+                );
+                std::thread::sleep(PARSE_BUDGET * 30);
+            }
+            _ => {}
         }
         let reader = std::io::Cursor::new(text.as_str());
         let options = ParserOptions::default();
@@ -1821,6 +1884,37 @@ mod tests {
         }
         let deep = format!("{}x{}", "{ ( ".repeat(1000), " ) }".repeat(1000));
         assert!(matches!(analyze_gh_loops(&deep), LoopAnalysis::ParseFailed));
+    }
+
+    /// cameronsjo/cadence-hooks#1405 security review, I2: the count sees
+    /// compound keywords and ignores quoting, so a quoted closer or a quoted
+    /// opener can only raise it.
+    #[test]
+    fn nesting_opener_count_counts_every_opener_regardless_of_quoting() {
+        let cases = [
+            ("echo hi", 0),
+            ("if true; then echo; fi", 1),
+            (
+                "while x; do for i in a; do case $i in a) ;; esac; done; done",
+                3,
+            ),
+            ("until x; do select y in a; do :; done; done", 2),
+            ("diff iffy forty casey whiles", 0),
+            ("echo '(((' \"{\" `x`", 6),
+            ("( \")\" ( \")\" x ) )", 2),
+        ];
+        for (command, want) in cases {
+            assert_eq!(nesting_opener_count(command), want, "{command}");
+        }
+        let deep = format!(
+            "{}git push origin main && git push upstream main{}",
+            "if true; then ".repeat(MAX_PARSE_OPENERS + 1),
+            "; fi".repeat(MAX_PARSE_OPENERS + 1)
+        );
+        assert!(matches!(
+            analyze_push_loops(&deep),
+            LoopAnalysis::ParseFailed
+        ));
     }
 
     /// cameronsjo/cadence-hooks#1401: the parser backtracks exponentially on

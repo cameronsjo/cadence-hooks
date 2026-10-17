@@ -351,31 +351,7 @@ fn non_object_tool_response_writes_no_failopen_row() {
 #[test]
 fn a_parser_panic_is_judged_through_the_fallback() {
     let tmp = tempfile::tempdir().unwrap();
-    let payload = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": {"command": "git push origin main && git push upstream main"},
-        "cwd": tmp.path(),
-        "hook_event_name": "PreToolUse",
-        "session_id": "x",
-    })
-    .to_string();
-    let mut cmd = cadence_hooks();
-    cmd.args(["guardrails", "guard-push-remote"]);
-    cmd.env("CADENCE_METRICS_DIR", tmp.path());
-    cmd.env("CADENCE_TEST_PANIC", "parse");
-    cmd.env_remove("CADENCE_DISABLE");
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().expect("failed to spawn binary");
-    if let Some(ref mut stdin) = child.stdin {
-        match stdin.write_all(payload.as_bytes()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => panic!("failed to write child stdin: {e}"),
-        }
-    }
-    let out = child.wait_with_output().expect("failed to wait on binary");
+    let (out, _) = run_push_remote(tmp.path(), TWO_PUSHES, Some("parse"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("the loop parser panicked"),
@@ -387,4 +363,112 @@ fn a_parser_panic_is_judged_through_the_fallback() {
         "blocked by the parse-failure fallback: {stderr}"
     );
     assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
+}
+
+/// Two pushes: the parse-failure fallback counts them and blocks.
+const TWO_PUSHES: &str = "git push origin main && git push upstream main";
+
+/// `guard-push-remote` on `command`, with `CADENCE_TEST_PANIC` set to
+/// `test_panic` when given. Returns the output and the wall-clock run time.
+fn run_push_remote(
+    metrics: &std::path::Path,
+    command: &str,
+    test_panic: Option<&str>,
+) -> (std::process::Output, std::time::Duration) {
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "cwd": metrics,
+        "hook_event_name": "PreToolUse",
+        "session_id": "x",
+    })
+    .to_string();
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", "guard-push-remote"]);
+    cmd.env("CADENCE_METRICS_DIR", metrics);
+    cmd.env_remove("CADENCE_TEST_PANIC");
+    if let Some(mode) = test_panic {
+        cmd.env("CADENCE_TEST_PANIC", mode);
+    }
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let started = std::time::Instant::now();
+    let mut child = cmd.spawn().expect("failed to spawn binary");
+    if let Some(ref mut stdin) = child.stdin {
+        match stdin.write_all(payload.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("failed to write child stdin: {e}"),
+        }
+    }
+    let out = child.wait_with_output().expect("failed to wait on binary");
+    (out, started.elapsed())
+}
+
+/// cameronsjo/cadence-hooks#1401: `parse_command` gives the parser a budget.
+/// The debug-only `hang` mode makes the parse sleep 30 s. Without the budget
+/// the hook waits it out and the 5 s hook timeout lets the pushes through.
+#[test]
+fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, elapsed) = run_push_remote(tmp.path(), TWO_PUSHES, Some("hang"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("CADENCE_TEST_PANIC=hang"),
+        "the synthetic hang fired: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("multiple git push commands"),
+        "blocked by the parse-failure fallback: {stderr}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"
+    );
+    assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
+}
+
+/// cameronsjo/cadence-hooks#1405 security review, I2: compound-keyword
+/// nesting deep enough to overflow the parse thread's stack. An overflow
+/// aborts the process (exit 134), which drops the block; past the opener
+/// bound the parse counts as failed and the fallback judges the pushes.
+#[test]
+fn deep_keyword_nesting_is_judged_through_the_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let depth = 16_000;
+    let shapes = [
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "if true; then ".repeat(depth),
+            "; fi".repeat(depth)
+        ),
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "while true; do ".repeat(depth),
+            "; done".repeat(depth)
+        ),
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "case x in x) ".repeat(depth),
+            " ;; esac".repeat(depth)
+        ),
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "for i in a; do ".repeat(depth),
+            "; done".repeat(depth)
+        ),
+    ];
+    for command in &shapes {
+        let (out, _) = run_push_remote(tmp.path(), command, None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let head = &command[..40];
+        assert_eq!(out.status.code(), Some(2), "{head}…: {stderr}");
+        assert!(
+            stderr.contains("multiple git push commands"),
+            "{head}…: blocked by the parse-failure fallback: {stderr}"
+        );
+    }
 }

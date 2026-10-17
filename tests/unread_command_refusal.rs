@@ -336,3 +336,100 @@ fn ordinary_quoted_substitutions_still_pass() {
         }
     }
 }
+
+/// cameronsjo/cadence-hooks#1405 security review, I1: zsh (and bash, for most
+/// of these) defines a function under a name outside `[A-Za-z0-9_.-]`, or
+/// behind a `!`, and runs its body. The guards read such a header only
+/// loosely, so every fail-closed guard refuses it, with its own message.
+#[test]
+fn a_function_header_read_only_loosely_is_refused() {
+    for shape in [
+        "g:x(){ BODY; }; g:x",
+        "@(){ BODY; }; @",
+        "a+b(){ BODY; }; a+b",
+        "a/b(){ BODY; }; a/b",
+        "fé(){ BODY; }; fé",
+        "\\g(){ BODY; }; g",
+        "'g'(){ BODY; }; g",
+        "! g(){ BODY; }; g",
+        "function g:x { BODY; }; g:x",
+        "(g:x(){ BODY; }; g:x)",
+    ] {
+        for (args, body) in [
+            (["cadence", "git-safety"], "git push --force origin main"),
+            (["cadence", "prevent-secret-leaks"], "cat .env"),
+            (["cadence", "prevent-secret-writes"], "echo A=1 > .env"),
+        ] {
+            let command = shape.replace("BODY", body);
+            let out = run(&args, &command);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?} {command:?}: {stderr}");
+        }
+    }
+    let out = run(&["cadence", "prevent-secret-leaks"], "@(){ echo hi; }; @");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("read only loosely"), "{stderr}");
+}
+
+/// cameronsjo/cadence-hooks#1405 security review, I3: bash 5.3 runs
+/// `${ cmd; }` and `${| cmd; }` as command substitutions, where a comment's
+/// quote does not open. Every reader here took them for parameter
+/// expansions, so the quote hid the lines after it. Every fail-closed guard
+/// refuses the spelling, with its own message.
+#[test]
+fn a_bash_funsub_is_refused() {
+    for shape in [
+        "bash -c \"echo ${ true #'\n}\nTAIL\n#'\"",
+        "bash -c \"echo ${| true #'\n}\nTAIL\n#'\"",
+        "echo \"${\ttrue; }\"; TAIL",
+        "x=${\ntrue\n}; TAIL",
+    ] {
+        for (args, tail) in [
+            (["cadence", "git-safety"], "git push --force origin main"),
+            (["cadence", "prevent-secret-leaks"], "cat .env"),
+            (["cadence", "prevent-secret-writes"], "echo A=1 > .env"),
+        ] {
+            let command = shape.replace("TAIL", tail);
+            let out = run(&args, &command);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?} {command:?}: {stderr}");
+        }
+    }
+    let out = run(&["cadence", "prevent-secret-leaks"], "echo ${ date; }");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("bash 5.3"), "{stderr}");
+}
+
+/// Everyday function definitions, assignments and parameter expansions near
+/// the I1 and I3 shapes are not refused.
+#[test]
+fn ordinary_functions_and_expansions_still_pass() {
+    for command in [
+        "arr=()",
+        "arr+=(one two)",
+        "f() { echo hi; }; f",
+        "function build { echo hi; }; build",
+        "f.x-y() { echo hi; }; f.x-y",
+        "git commit -m \"fix: call Foo::new() and Bar::default()\"",
+        "echo \"${HOME}/x ${x:-a} ${#arr[@]}\"",
+        "echo \"${{ secrets.TOKEN }}\"",
+        "time cargo test",
+        "! grep -q foo bar.txt",
+    ] {
+        for args in [
+            ["cadence", "git-safety"],
+            ["cadence", "prevent-secret-leaks"],
+            ["cadence", "prevent-secret-writes"],
+        ] {
+            let out = run(&args, command);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{args:?} {command:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}

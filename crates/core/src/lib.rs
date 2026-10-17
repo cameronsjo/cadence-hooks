@@ -1824,7 +1824,7 @@ pub trait Check {
 /// The block a fail-closed guard gives a command it could not read in full
 /// ([`Check::refuses_unread_commands`]).
 ///
-/// **When a command counts as unread** ([`command_is_unread`]):
+/// **When a command counts as unread** ([`unread_block`]):
 ///
 /// - **The brace budget is spent** — the call's or the thread's
 ///   ([`shell::command_unread`]). Every expanding word after that point is left
@@ -1863,13 +1863,41 @@ pub const GLUED_HASH_BLOCK: &str = "a `#` glued to `(` or `)` inside a double-qu
      verified\n   Fix: put a space before the `#` if it starts a comment, or quote it (`'#'`) if it \
      is text";
 
-/// Whether `command`, just read by `check`, counts as unread
-/// ([`UNREAD_COMMAND_BLOCK`] and [`GLUED_HASH_BLOCK`] say when).
-fn command_is_unread(check: &dyn Check, command: &str) -> bool {
-    shell::command_unread()
-        || shell::glued_hash_unread()
-        || (shell::brace_word_left_whole()
-            && shell::unexpanded_word_may_hide_a_command(command, check.unread_inert_commands()))
+/// The block a fail-closed guard gives a command holding bash 5.3's `${ cmd; }`
+/// or `${| cmd; }` ([`shell::has_bash_funsub`]), which every reader here takes
+/// for a parameter expansion (cameronsjo/cadence-hooks#1405 security review).
+pub const FUNSUB_BLOCK: &str = "`${` followed by a space, newline or `|` is bash 5.3's \
+     `${ cmd; }` command substitution, which the guards cannot read, so what it runs cannot be \
+     verified\n   Fix: use `$(cmd)` instead; for a parameter expansion, drop the space after `${`";
+
+/// The block a fail-closed guard gives a command defining a function whose
+/// header the guards read only loosely ([`shell::function_header_unread`]):
+/// a name outside `[A-Za-z0-9_.-]`, or a `!` in front. zsh, and bash for most
+/// of them, runs the body (cameronsjo/cadence-hooks#1405 security review).
+pub const FUNCTION_HEADER_BLOCK: &str = "a function definition with an unusual name (or a `!` \
+     before it) is read only loosely, so what its body runs cannot be verified\n   Fix: name \
+     the function with letters, digits, `_`, `-` or `.` only, starting with a letter or `_`";
+
+/// The block for `command`, just read by `check`, when it counts as unread:
+/// the size message if the reading budget ran out, otherwise the message for
+/// the shape the guards cannot read. `None` when it was read in full
+/// ([`UNREAD_COMMAND_BLOCK`] and the other blocks say when).
+fn unread_block(check: &dyn Check, command: &str) -> Option<&'static str> {
+    if shell::command_unread() {
+        Some(UNREAD_COMMAND_BLOCK)
+    } else if shell::glued_hash_unread() {
+        Some(GLUED_HASH_BLOCK)
+    } else if shell::has_bash_funsub(command) {
+        Some(FUNSUB_BLOCK)
+    } else if shell::function_header_unread() {
+        Some(FUNCTION_HEADER_BLOCK)
+    } else if shell::brace_word_left_whole()
+        && shell::unexpanded_word_may_hide_a_command(command, check.unread_inert_commands())
+    {
+        Some(UNREAD_COMMAND_BLOCK)
+    } else {
+        None
+    }
 }
 
 /// Pure: should `run_check` short-circuit for the given effort level?
@@ -2134,17 +2162,10 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
     if check.refuses_unread_commands()
         && matches!(result.outcome, Outcome::Allow | Outcome::Nudge)
         && result.bypass.is_none()
-        && input
+        && let Some(message) = input
             .command()
-            .is_some_and(|command| command_is_unread(check, command))
+            .and_then(|command| unread_block(check, command))
     {
-        // The size advice does not fit a glued `#`, so it gets its own
-        // message unless the command also ran past the reading budget.
-        let message = if shell::glued_hash_unread() && !shell::command_unread() {
-            GLUED_HASH_BLOCK
-        } else {
-            UNREAD_COMMAND_BLOCK
-        };
         return Some(CheckResult::block(message));
     }
     Some(result)

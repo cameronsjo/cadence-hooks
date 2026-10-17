@@ -1238,6 +1238,7 @@ thread_local! {
     static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BRACE_WORD_LEFT_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GLUED_HASH_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FUNCTION_HEADER_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Record that a double-quoted `"$(…)"` holds a `#` glued to a paren. bash
@@ -1288,12 +1289,13 @@ pub fn brace_word_left_whole() -> bool {
     BRACE_WORD_LEFT_WHOLE.with(std::cell::Cell::get)
 }
 
-/// Clear [`command_unread`], [`brace_word_left_whole`] and
-/// [`glued_hash_unread`] before a check reads a command.
+/// Clear [`command_unread`], [`brace_word_left_whole`], [`glued_hash_unread`]
+/// and [`function_header_unread`] before a check reads a command.
 pub fn reset_command_unread() {
     COMMAND_UNREAD.with(|unread| unread.set(false));
     BRACE_WORD_LEFT_WHOLE.with(|whole| whole.set(false));
     GLUED_HASH_UNREAD.with(|unread| unread.set(false));
+    FUNCTION_HEADER_UNREAD.with(|unread| unread.set(false));
 }
 
 /// `text` as `(char, structural)` pairs when bash would brace-expand it — some
@@ -2426,7 +2428,7 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     let trimmed = segment.trim();
     // A function header in front of the body is not a command word
     // ([`function_header_len`]); the body's `{` decides what the `}` closes.
-    let body = function_header_len(trimmed).map_or(trimmed, |len| &trimmed[len..]);
+    let body = read_function_header(trimmed).map_or(trimmed, |len| &trimmed[len..]);
     let opened_a_brace_group = body.starts_with('{') && !opens_brace_expansion(body);
     // A `{` that opens a brace EXPANSION is part of the command word, not a
     // group: `{cat,.env}` runs `cat .env`, and trimming the brace left
@@ -2443,7 +2445,7 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
         // trim took the `(` of an anonymous `()` and skipped a header behind
         // a subshell's `(` (`(f(){ cat .env; }; f)`).
         rest = rest.trim_start_matches([' ', '\t']);
-        if let Some(len) = function_header_len(rest) {
+        if let Some(len) = read_function_header(rest) {
             rest = &rest[len..];
             continue;
         }
@@ -2843,6 +2845,105 @@ pub fn function_header_len(text: &str) -> Option<usize> {
         None => return None,
     };
     (!body.is_empty()).then(|| text.len() - body.len())
+}
+
+/// Byte length of a function definition's header at the start of `text`,
+/// read by [`function_header_len`] or, failing that, by
+/// [`loose_function_header_len`]. A header only the loose reading finds marks
+/// the command unread ([`function_header_unread`]), so the fail-closed guards
+/// refuse it. Either way the header is dropped and the body read.
+pub fn read_function_header(text: &str) -> Option<usize> {
+    function_header_len(text).or_else(|| {
+        let len = loose_function_header_len(text)?;
+        FUNCTION_HEADER_UNREAD.with(|unread| unread.set(true));
+        Some(len)
+    })
+}
+
+/// Byte length of anything shaped like a function header at the start of
+/// `text`, with the blanks after it, when a body follows: any word with no
+/// unquoted `=` (so `arr=()` stays an assignment), then `()`, or `function`
+/// and a word. A leading `!`, `time` or `coproc` is skipped. zsh takes
+/// names [`function_header_len`] does not (`g:x`, `@`, `a+b`, `fé`, `\g`,
+/// `'g'`), and bash takes most of them too, so the shape alone counts:
+/// enumerating name characters never finishes (cameronsjo/cadence-hooks#1405
+/// security review, I1).
+fn loose_function_header_len(text: &str) -> Option<usize> {
+    let blank = [' ', '\t'];
+    let mut rest = text;
+    while let Some(after) = ["!", "time", "coproc"]
+        .iter()
+        .find_map(|prefix| rest.strip_prefix(prefix).filter(|a| a.starts_with(blank)))
+    {
+        rest = after.trim_start_matches(blank);
+    }
+    let (rest, keyword) = match rest.strip_prefix("function") {
+        Some(after) if after.starts_with(blank) => (after.trim_start_matches(blank), true),
+        _ => (rest, false),
+    };
+    let name_len = unquoted_word_len(rest)?;
+    let after_name = rest[name_len..].trim_start_matches(blank);
+    let parens = after_name
+        .strip_prefix('(')
+        .and_then(|inner| inner.trim_start_matches(blank).strip_prefix(')'));
+    let body = match parens {
+        Some(after) => after.trim_start_matches(blank),
+        None if keyword && name_len > 0 && after_name.starts_with(['{', '(']) => after_name,
+        None => return None,
+    };
+    (!body.is_empty()).then(|| text.len() - body.len())
+}
+
+/// Byte length of the shell word at the start of `text`, through its quotes
+/// and backslash escapes, up to a blank or an operator character. `None` for
+/// an unquoted `=` (an assignment, never a name) or an unclosed quote.
+fn unquoted_word_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => break,
+            b'=' => return None,
+            b'\\' => i += 2,
+            b'\'' => i += 2 + text[i + 1..].find('\'')?,
+            b'"' => {
+                i += 1;
+                loop {
+                    match bytes.get(i)? {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Some(i.min(text.len()))
+}
+
+/// Whether `command` holds `${` followed by a blank, a newline or `|`
+/// anywhere, quoted or not. In bash 5.3 that opens a command substitution
+/// (`${ cmd; }`, `${| cmd; }`), where comments and heredocs start; every
+/// reader here takes `${` for a parameter expansion, where they do not, so a
+/// quote in its comment hid the lines after it from every guard
+/// (cameronsjo/cadence-hooks#1405 security review, I3). No other shell or
+/// expansion accepts that spelling, so it is refused, not read. Quoting is
+/// ignored on purpose: a misread quote must not hide one.
+pub fn has_bash_funsub(command: &str) -> bool {
+    command
+        .as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'$' && w[1] == b'{' && matches!(w[2], b' ' | b'\t' | b'\n' | b'|'))
+}
+
+/// Whether a reading on this thread met a function header only
+/// [`loose_function_header_len`] could read since the last
+/// [`reset_command_unread`]. A fail-closed guard refuses such a command with
+/// its own message.
+pub fn function_header_unread() -> bool {
+    FUNCTION_HEADER_UNREAD.with(std::cell::Cell::get)
 }
 
 /// The header of a function definition, in all three spellings. The body's
