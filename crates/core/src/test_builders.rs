@@ -296,7 +296,7 @@ fn assert_elapsed_under_if(
     if enabled {
         assert!(
             elapsed < limit,
-            "{what}: {elapsed:?} exceeded budget {limit:?}"
+            "{what}: {elapsed:?} exceeded budget {limit:?} (after any platform scaling)"
         );
     }
 }
@@ -305,8 +305,8 @@ fn assert_elapsed_under_if(
 ///
 /// Past the deadline the hook exits 0 by design, so an exit-2 assert on such a
 /// run is a wall-clock assert in disguise. Without [`timing_tests_enabled`], a
-/// non-block that took at least `deadline` is load, not a regression, and
-/// passes; any non-block that finished sooner still fails, as does every
+/// fail-open (exit 0) that took at least `deadline` is load, not a regression,
+/// and passes; a crash or other exit code never does; any non-block that finished sooner still fails, as does every
 /// non-block when timing is opted in.
 #[track_caller]
 pub fn assert_blocked_before_deadline(
@@ -326,7 +326,7 @@ fn assert_blocked_before_deadline_if(
     took: std::time::Duration,
     deadline: std::time::Duration,
 ) {
-    if code == Some(2) || (!enabled && took >= deadline) {
+    if code == Some(2) || (!enabled && code == Some(0) && took >= deadline) {
         return;
     }
     panic!("{what}: exit {code:?} after {took:?}, expected a block (exit 2) before {deadline:?}");

@@ -118,8 +118,8 @@ fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
     // The group fails OPEN at 4000 ms, so an exit 2 here is itself the proof
     // the scan finished inside the deadline. Crossing it on a loaded machine
     // passes unless `CADENCE_TIMING_TESTS=1` (cadence-hooks#1366). 200 KB is
-    // left to the bare-hook test above: a debug build of the full group needs ~2 s there, too close
-    // to the deadline to assert on a shared runner.
+    // left to the bare-hook test above: a debug build of the full group needs
+    // ~2 s there, too close to the deadline to assert on a shared runner.
     for target in [10_000, 50_000] {
         for (name, command) in shapes(target) {
             let (out, took) = run(
