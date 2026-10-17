@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-runbook-scrub` no longer refuses a copy into the temp dir on macOS.** When the scrub-marker directory sits directly under `$TMPDIR`, the guard skips refusing writes to its parent, but it matched only the raw `$TMPDIR` spelling (`/var/folders/…`). The marker directory is also held in its physical spelling (`/private/var/folders/…`), which survived the check, so `cp -r x $TMPDIR` blocked. The check now uses every spelling of each temp root, from the new `worktree::temp_root_spellings` core helper, which also drops a `$TMPDIR` that covers the home directory, as the worktree carve-out already does. A marker parent outside temp is still refused under both spellings. (cameronsjo/cadence-hooks#1403)
+
 ## [0.127.0] - 2026-10-16
 
 ### Changed

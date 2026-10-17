@@ -244,6 +244,29 @@ pub(crate) fn path_under_temp_root_with_canonical(
     fixed || via_env
 }
 
+/// Every spelling of the temp roots [`path_under_temp_root`] honors: `/tmp`,
+/// `/private/tmp`, and a usable `$TMPDIR` both as given and canonicalized.
+///
+/// For a caller that needs equality with a temp root rather than a prefix
+/// test. Matching only the raw `$TMPDIR` misses macOS's physical spelling
+/// (`/var/folders/…` is `/private/var/folders/…`), so a path read through
+/// symlinks never compares equal to it (cadence-hooks#1403). The same
+/// [`usable_tmpdir`] veto applies: a `$TMPDIR` covering `home` yields no
+/// spelling at all, and a canonical form that is the root is dropped, as
+/// [`path_under_temp_root_with_canonical`] drops it.
+pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+    if let Some(t) = usable_tmpdir(tmpdir, home) {
+        out.push(PathBuf::from(t));
+        out.extend(
+            std::fs::canonicalize(t)
+                .ok()
+                .filter(|c| c != Path::new("/")),
+        );
+    }
+    out
+}
+
 /// Pure: is `repo_root` inside a temp tree? Scratch/fixture repos live here;
 /// enforcing worktree discipline on them would only produce noise. Delegates
 /// to [`path_under_temp_root`] — kept as a named alias for the enforce-worktree
@@ -601,6 +624,37 @@ mod tests {
             !is_temp_root(&link.join("Documents"), Some(link_str), Some(home_str)),
             "a $TMPDIR that resolves to home must not earn the temp carve-out"
         );
+    }
+
+    /// A symlinked `$TMPDIR` yields both its spellings, and one covering home
+    /// yields neither (cadence-hooks#1403).
+    #[test]
+    #[cfg(unix)]
+    fn temp_root_spellings_carry_both_readings_of_tmpdir() {
+        let scratch = scratch("tmpdir-spellings");
+        let real = scratch.path().join("real-tmp");
+        let link = scratch.path().join("tmp-link");
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link_str = link.to_str().unwrap();
+
+        let got = temp_root_spellings(Some(link_str), Some(home.to_str().unwrap()));
+        assert!(got.contains(&link), "{got:?}");
+        assert!(got.contains(&real.canonicalize().unwrap()), "{got:?}");
+        assert!(got.contains(&PathBuf::from("/tmp")), "{got:?}");
+
+        let covering = temp_root_spellings(Some(link_str), Some(real.to_str().unwrap()));
+        assert_eq!(
+            covering,
+            vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")]
+        );
+
+        // A `$TMPDIR` that resolves to the root keeps its raw spelling only.
+        let rooted = temp_root_spellings(Some("/tmp/.."), None);
+        assert!(!rooted.contains(&PathBuf::from("/")), "{rooted:?}");
     }
 
     /// A `$TMPDIR` differing from home only in CASE, on a case-insensitive
