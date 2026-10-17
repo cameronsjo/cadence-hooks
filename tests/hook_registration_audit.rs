@@ -986,21 +986,42 @@ fn extract_dispatches_expands_group_members() {
     );
 }
 
-/// Parse user-level settings.json and extract all hook shell script paths and
-/// any cadence-hooks binary dispatches registered there.
+/// Opt-in switch that points the settings audits at the developer's real
+/// home directory instead of the checked-in fixture. Live input is
+/// machine-specific: a personal hook can fail the audit on one machine and
+/// not on CI, so it never runs by default (cameronsjo/cadence-hooks#1406).
+const LIVE_SETTINGS_ENV: &str = "CADENCE_AUDIT_LIVE_SETTINGS";
+
+/// The home directory the settings audits read: the checked-in
+/// `tests/fixtures/settings-home` by default, the real user home only when
+/// [`LIVE_SETTINGS_ENV`] is `1`. `None` means live input was requested and no
+/// home resolves.
+fn audit_settings_home() -> Option<PathBuf> {
+    if std::env::var(LIVE_SETTINGS_ENV).as_deref() == Ok("1") {
+        eprintln!("{LIVE_SETTINGS_ENV}=1: auditing LIVE user settings, not the fixture");
+        return cadence_hooks_core::paths::user_home();
+    }
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/settings-home"))
+}
+
+/// Parse the audited home's `.claude/settings.json` (see
+/// [`audit_settings_home`]) and extract all hook shell script paths and any
+/// cadence-hooks binary dispatches registered there.
 fn settings_json_hooks() -> (Vec<String>, Vec<String>) {
-    // No resolvable home (e.g. a Windows CI runner with no `~/.claude`) means
-    // there is nothing registered to audit — no-op rather than panic.
-    let Some(home) = cadence_hooks_core::paths::user_home() else {
+    // No resolvable home (live mode on a runner with none) means there is
+    // nothing registered to audit — no-op rather than panic.
+    let Some(home) = audit_settings_home() else {
         return (Vec::new(), Vec::new());
     };
-    let settings_path = home.join(".claude/settings.json");
+    settings_json_hooks_at(&home.join(".claude/settings.json"))
+}
 
+fn settings_json_hooks_at(settings_path: &Path) -> (Vec<String>, Vec<String>) {
     if !settings_path.exists() {
         return (Vec::new(), Vec::new());
     }
 
-    let content = std::fs::read_to_string(&settings_path)
+    let content = std::fs::read_to_string(settings_path)
         .unwrap_or_else(|e| panic!("failed to read settings.json: {e}"));
 
     let json: serde_json::Value =
@@ -2944,12 +2965,12 @@ fn shell_script_exists(command: &str, home: &str) -> Option<bool> {
 #[test]
 fn settings_json_shell_scripts_exist() {
     let (shell_scripts, _) = settings_json_hooks();
-    // Empty means no registered hooks to verify (no `~/.claude/settings.json`,
-    // or no resolvable home on this platform) — nothing to assert.
+    // Empty means no registered hooks to verify (live mode with no
+    // `~/.claude/settings.json`, or no resolvable home) — nothing to assert.
     if shell_scripts.is_empty() {
         return;
     }
-    let home = cadence_hooks_core::paths::user_home()
+    let home = audit_settings_home()
         .expect("settings_json_hooks returned scripts, so a home dir resolved")
         .to_string_lossy()
         .into_owned();
@@ -3395,4 +3416,20 @@ fn every_multi_matcher_hook_is_pinned() {
             unpinned.join("\n")
         );
     }
+}
+
+#[test]
+fn settings_audit_reads_the_fixture_unless_live_is_opted_in() {
+    // Guards #1406: with the opt-in unset, the audited settings come from the
+    // checked-in fixture, whatever the developer's real home registers.
+    if std::env::var(LIVE_SETTINGS_ENV).as_deref() == Ok("1") {
+        return;
+    }
+    let (shell_scripts, binary_dispatches) = settings_json_hooks();
+    assert_eq!(
+        shell_scripts,
+        vec!["bash ~/.claude/hooks/fixture-greeter.sh".to_string()],
+        "settings audit must read tests/fixtures/settings-home, not the real home"
+    );
+    assert!(binary_dispatches.is_empty());
 }
