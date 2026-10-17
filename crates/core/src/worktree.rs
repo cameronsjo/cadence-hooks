@@ -244,27 +244,76 @@ pub(crate) fn path_under_temp_root_with_canonical(
     fixed || via_env
 }
 
-/// Every spelling of the temp roots [`path_under_temp_root`] honors: `/tmp`,
-/// `/private/tmp`, and a usable `$TMPDIR` both as given and canonicalized.
+/// Every spelling of the temp roots: `/tmp`, `/private/tmp`, and a usable
+/// `$TMPDIR`, plus that `$TMPDIR`'s other spelling under macOS's fixed
+/// `/var` → `/private/var` and `/tmp` → `/private/tmp` mapping.
 ///
 /// For a caller that needs equality with a temp root rather than a prefix
 /// test. Matching only the raw `$TMPDIR` misses macOS's physical spelling
 /// (`/var/folders/…` is `/private/var/folders/…`), so a path read through
-/// symlinks never compares equal to it (cadence-hooks#1403). The same
-/// [`usable_tmpdir`] veto applies: a `$TMPDIR` covering `home` yields no
-/// spelling at all, and a canonical form that is the root is dropped, as
-/// [`path_under_temp_root_with_canonical`] drops it.
+/// symlinks never compares equal to it (cadence-hooks#1403).
+///
+/// **The other spelling is derived lexically, never by `canonicalize`.** The
+/// session owns the parent of `$TMPDIR`, so it can swap the directory for a
+/// symlink to any directory it wants counted as temp, such as the
+/// scrub-marker directory's parent. Resolving the link would hand it that
+/// exemption. So:
+/// - only a `/var/folders/…` or `/tmp…` value (or its `/private` form) gains
+///   its other spelling; anything else contributes only its raw spelling;
+/// - a value with a `.` or `..` component, or one that is a symlink itself
+///   (`lstat`), contributes nothing;
+/// - a value inside `home` (compared ignoring ASCII case, as the volume may),
+///   or covering it ([`usable_tmpdir`]), contributes nothing.
+///
+/// Only the last component is `lstat`ed. A symlink earlier in the value is
+/// harmless to an equality caller: the returned spellings are text, never
+/// resolved, so they can only equal a marker parent spelled the same way,
+/// and a physical (resolved) spelling of that parent has no symlink in it.
+/// A caller that compared these against resolved paths of its own would
+/// need to re-check this.
 pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<PathBuf> {
     let mut out = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
-    if let Some(t) = usable_tmpdir(tmpdir, home) {
-        out.push(PathBuf::from(t));
-        out.extend(
-            std::fs::canonicalize(t)
-                .ok()
-                .filter(|c| c != Path::new("/")),
-        );
+    let Some(t) = usable_tmpdir(tmpdir, home) else {
+        return out;
+    };
+    let path = Path::new(t.trim_end_matches('/'));
+    // Split the text: `Path::components` drops an interior `.` silently.
+    let dotted = t.split(['/', '\\']).any(|s| s == "." || s == "..");
+    let inside_home = home
+        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .is_some_and(|h| {
+            let t = t.trim_end_matches('/').to_ascii_lowercase();
+            t == h || t.starts_with(&format!("{h}/"))
+        });
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if path.as_os_str().is_empty() || dotted || inside_home || is_link {
+        return out;
+    }
+    for p in std::iter::once(path.to_path_buf()).chain(firmlink_twin(path)) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
     }
     out
+}
+
+/// `path`'s other spelling under macOS's fixed firmlinks, for the two temp
+/// trees only: `/var/folders/…` ↔ `/private/var/folders/…` and `/tmp…` ↔
+/// `/private/tmp…`. Pure; `None` for anything else.
+fn firmlink_twin(path: &Path) -> Option<PathBuf> {
+    let private = Path::new("/private");
+    if let Ok(rest) = path.strip_prefix(private) {
+        let public = Path::new("/").join(rest);
+        return is_firmlinked_temp(&public).then_some(public);
+    }
+    is_firmlinked_temp(path).then(|| private.join(path.strip_prefix("/").unwrap_or(path)))
+}
+
+/// `/tmp` or below it, or strictly below `/var/folders`.
+fn is_firmlinked_temp(path: &Path) -> bool {
+    path.starts_with("/tmp")
+        || (path.starts_with("/var/folders") && path != Path::new("/var/folders"))
 }
 
 /// Pure: is `repo_root` inside a temp tree? Scratch/fixture repos live here;
@@ -626,35 +675,82 @@ mod tests {
         );
     }
 
-    /// A symlinked `$TMPDIR` yields both its spellings, and one covering home
-    /// yields neither (cadence-hooks#1403).
+    /// The macOS temp trees gain their other spelling lexically, in both
+    /// directions; any other value keeps only its raw spelling. Pure: the
+    /// paths need not exist, so this pins #1403 on every platform.
+    #[test]
+    fn temp_root_spellings_map_the_macos_temp_trees_lexically() {
+        let fixed = [PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+        for (tmpdir, want) in [
+            ("/var/folders/zz/T", Some("/private/var/folders/zz/T")),
+            ("/var/folders/zz/T/", Some("/private/var/folders/zz/T")),
+            ("/private/var/folders/zz/T", Some("/var/folders/zz/T")),
+            ("/tmp/scratch", Some("/private/tmp/scratch")),
+            ("/private/tmp/scratch", Some("/tmp/scratch")),
+            ("/srv/tmp", None),
+            ("/var/foldersx/T", None),
+            ("/var/folders", None),
+        ] {
+            let got = temp_root_spellings(Some(tmpdir), None);
+            let raw = PathBuf::from(tmpdir.trim_end_matches('/'));
+            let mut expect = fixed.to_vec();
+            expect.push(raw);
+            expect.extend(want.map(PathBuf::from));
+            assert_eq!(got, expect, "{tmpdir}");
+        }
+        // No duplicates of the fixed roots.
+        assert_eq!(temp_root_spellings(Some("/tmp"), None), fixed.to_vec());
+        // Inside home, in any case spelling, contributes nothing.
+        for tmpdir in ["/Users/Dev/tmp", "/users/dev/tmp", "/Users/Dev/"] {
+            assert_eq!(
+                temp_root_spellings(Some(tmpdir), Some("/Users/Dev")),
+                fixed.to_vec(),
+                "{tmpdir}"
+            );
+        }
+        // A sibling that only shares the prefix text is not inside home.
+        assert!(
+            temp_root_spellings(Some("/Users/Devon/tmp"), Some("/Users/Dev"))
+                .contains(&PathBuf::from("/Users/Devon/tmp"))
+        );
+    }
+
+    /// cadence-hooks#1408 review: `$TMPDIR` never counts as temp through a
+    /// symlink, a `.`/`..` component, or a spot inside home. Each would let
+    /// the session nominate a directory of its choosing as temp.
     #[test]
     #[cfg(unix)]
-    fn temp_root_spellings_carry_both_readings_of_tmpdir() {
-        let scratch = scratch("tmpdir-spellings");
-        let real = scratch.path().join("real-tmp");
+    fn temp_root_spellings_refuse_a_tmpdir_the_session_could_redirect() {
+        let fixed = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+        let scratch = scratch("tmpdir-spellings-refuse");
+        let target = scratch.path().join("marker-parent");
         let link = scratch.path().join("tmp-link");
-        let home = scratch.path().join("home");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(target.join("m-x")).unwrap();
         let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
         let link_str = link.to_str().unwrap();
-
-        let got = temp_root_spellings(Some(link_str), Some(home.to_str().unwrap()));
-        assert!(got.contains(&link), "{got:?}");
-        assert!(got.contains(&real.canonicalize().unwrap()), "{got:?}");
-        assert!(got.contains(&PathBuf::from("/tmp")), "{got:?}");
-
-        let covering = temp_root_spellings(Some(link_str), Some(real.to_str().unwrap()));
+        assert_eq!(temp_root_spellings(Some(link_str), None), fixed);
         assert_eq!(
-            covering,
-            vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")]
+            temp_root_spellings(Some(&format!("{link_str}/")), None),
+            fixed
         );
-
-        // A `$TMPDIR` that resolves to the root keeps its raw spelling only.
-        let rooted = temp_root_spellings(Some("/tmp/.."), None);
-        assert!(!rooted.contains(&PathBuf::from("/")), "{rooted:?}");
+        let dotted = format!("{}/m-x/..", target.to_str().unwrap());
+        assert_eq!(temp_root_spellings(Some(&dotted), None), fixed);
+        assert_eq!(
+            temp_root_spellings(Some("/var/folders/zz/./T"), None),
+            fixed
+        );
+        let home = scratch.path().to_str().unwrap();
+        assert_eq!(
+            temp_root_spellings(Some(target.to_str().unwrap()), Some(home)),
+            fixed
+        );
+        // A `$TMPDIR` covering home is refused too ([`usable_tmpdir`]).
+        assert_eq!(
+            temp_root_spellings(Some(home), Some(target.to_str().unwrap())),
+            fixed
+        );
     }
 
     /// A `$TMPDIR` differing from home only in CASE, on a case-insensitive
