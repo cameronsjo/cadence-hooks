@@ -195,7 +195,11 @@ mod tests {
         let dir = std::env::temp_dir();
         let started = std::time::Instant::now();
         assert_eq!(run_tool("sleep", &["10"], &dir, &[]), None);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_stalled_tool_is_cut_off_at_the_cap",
+            started.elapsed(),
+            Duration::from_secs(5),
+        );
     }
 
     #[cfg(unix)]
@@ -204,9 +208,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let started = std::time::Instant::now();
         assert_eq!(run_tool("yes", &[], &dir, &[]), None);
-        assert!(
-            started.elapsed() < TOOL_CAP,
-            "the byte cap, not the wall-clock cap, must end the run"
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_tool_that_loops_output_is_cut_off_at_the_byte_cap",
+            started.elapsed(),
+            TOOL_CAP,
         );
     }
 

@@ -817,7 +817,11 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let _ = first_exposed_dump(&flood);
-        assert!(started.elapsed() < bound, "took {:?}", started.elapsed());
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("took {:?}", started.elapsed()),
+            started.elapsed(),
+            bound,
+        );
     }
 
     #[test]
@@ -825,6 +829,10 @@ mod tests {
         let long = format!("op read op://v/i/f{}", " | cat".repeat(40_000));
         let started = std::time::Instant::now();
         assert_eq!(first_exposed_dump(&long), Some("op read"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "adversarial_200kb_command_stays_fast",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
     }
 }

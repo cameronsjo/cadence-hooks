@@ -481,6 +481,10 @@ mod tests {
         assert_eq!(rows[0]["markerPresent"], false);
         // Release is the shipped profile; debug builds get headroom.
         let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
-        assert!(elapsed.as_secs_f64() < limit, "{elapsed:?}");
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "run_logs_the_first_anchor_of_a_capped_flood",
+            elapsed,
+            std::time::Duration::from_secs_f64(limit),
+        );
     }
 }

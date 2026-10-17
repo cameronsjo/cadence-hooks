@@ -3190,7 +3190,11 @@ mod tests {
                 path.display()
             );
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "file_matches_body_refuses_fifo_and_symlink_without_stalling",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     #[test]

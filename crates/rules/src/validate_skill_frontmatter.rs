@@ -2647,7 +2647,11 @@ mod tests {
             let r = check_plan(&path.to_string_lossy(), legacy);
             assert_eq!(r.outcome, want, "{}", path.display());
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "check_plan_before_read_refuses_fifo_symlink_and_oversize",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     #[test]

@@ -9754,7 +9754,11 @@ mod tests {
                     result.outcome,
                     cadence_hooks_core::Outcome::Allow
                 ));
-                assert!(started.elapsed() < std::time::Duration::from_secs(4));
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    "adversarial_repo_flag_floods_stay_fast",
+                    started.elapsed(),
+                    std::time::Duration::from_secs(4),
+                );
             }
         });
     }
@@ -9774,7 +9778,11 @@ mod tests {
             let started = std::time::Instant::now();
             let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
             assert!(result.block_metadata.is_some(), "expected a block");
-            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                "a_brace_flood_before_a_gh_write_still_blocks_promptly",
+                started.elapsed(),
+                std::time::Duration::from_secs(4),
+            );
         });
     }
 
@@ -9910,7 +9918,11 @@ mod tests {
                     } else {
                         500
                     });
-                    assert!(took < limit, "{name}: {took:?}");
+                    cadence_hooks_core::test_builders::assert_elapsed_under(
+                        &format!("{name}: {took:?}"),
+                        took,
+                        limit,
+                    );
                 }
             }
         });
@@ -10326,10 +10338,10 @@ mod tests {
                 let start = std::time::Instant::now();
                 let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
                 assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-                assert!(
-                    start.elapsed() < nest_time_limit_1118(),
-                    "{:?}",
-                    start.elapsed()
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{:?}", start.elapsed()),
+                    start.elapsed(),
+                    nest_time_limit_1118(),
                 );
             }
         });
@@ -10810,10 +10822,10 @@ mod tests {
             let result = GhWriteGuard.run(&input_with(&command, o));
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
-            assert!(
-                started.elapsed().as_secs_f64() < limit,
-                "{:?}",
-                started.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                "gh_write_flood",
+                started.elapsed(),
+                std::time::Duration::from_secs_f64(limit),
             );
         });
     }

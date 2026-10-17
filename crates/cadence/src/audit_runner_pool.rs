@@ -323,7 +323,11 @@ mod tests {
         let t = Instant::now();
         let r = audit(Path::new("/r"), cache.path(), Duration::from_millis(300));
         assert!(matches!(r.outcome, Outcome::Allow));
-        assert!(t.elapsed() < Duration::from_secs(5));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "hung_audit_fails_open_within_the_timeout",
+            t.elapsed(),
+            Duration::from_secs(5),
+        );
     }
 
     #[cfg(unix)]

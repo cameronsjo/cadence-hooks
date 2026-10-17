@@ -618,7 +618,11 @@ mod tests {
             let started = std::time::Instant::now();
             let _ = crate::shell::command_segments(&command);
             let _ = crate::shell::resolved_readings(&command);
-            assert!(started.elapsed() < limit, "{:?}", started.elapsed());
+            crate::test_builders::assert_elapsed_under(
+                &format!("{:?}", started.elapsed()),
+                started.elapsed(),
+                limit,
+            );
         }
     }
 }

@@ -11085,19 +11085,19 @@ mod tests {
         let cmd = "git commit -m \"$(cat <<'EOF'\n".repeat(10_000);
         let started = std::time::Instant::now();
         assert_eq!(plain_carve(&cmd), None);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            started.elapsed()
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("{:?}", started.elapsed()),
+            started.elapsed(),
+            std::time::Duration::from_millis(500),
         );
         // And ten thousand GOOD ones are one pass.
         let good = "git commit -m \"$(cat <<'EOF'\nm\nEOF\n)\"\n".repeat(10_000);
         let started = std::time::Instant::now();
         assert!(plain_carve(&good).is_some());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("{:?}", started.elapsed()),
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
         );
     }
 
@@ -11444,7 +11444,11 @@ mod tests {
         });
         assert!(walked.is_some());
         assert!(longest <= "/w/sub".len(), "{longest}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_long_cd_chain_keeps_the_walked_path_bounded",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
         assert_eq!(sorted_targets(&cmd, "/w"), vec!["/w"]);
     }
 
@@ -11955,9 +11959,10 @@ mod tests {
             let cmd = format!("git {}commit -m x", unit.repeat(200 * 1024 / unit.len()));
             let started = std::time::Instant::now();
             let scan = scan_targets(&cmd, "/w", false);
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "{unit}"
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                unit,
+                started.elapsed(),
+                std::time::Duration::from_secs(2),
             );
             assert!(scan.unreadable.is_some(), "{unit}");
             assert!(scan.commits.contains(&"/w".to_string()), "{unit}");
@@ -12438,11 +12443,10 @@ mod tests {
             // 4.36 s on one input with no algorithmic change (PR #1118), so
             // debug gets headroom; a return to quadratic work still trips it.
             let limit = std::time::Duration::from_secs(if cfg!(debug_assertions) { 12 } else { 4 });
-            assert!(
-                started.elapsed() < limit,
-                "{:?}: {:?}",
-                &cmd[..40],
-                started.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{:?}: {:?}", &cmd[..40], started.elapsed()),
+                started.elapsed(),
+                limit,
             );
         }
     }
@@ -12485,7 +12489,11 @@ mod tests {
             } else {
                 500
             });
-            assert!(took < limit, "{name}: {took:?}");
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{name}: {took:?}"),
+                took,
+                limit,
+            );
             // Without a commit anywhere there is nothing to refuse.
             let quiet = scan_targets(&body, "/w", false);
             assert!(quiet.commits.is_empty(), "{name}");
@@ -12518,10 +12526,10 @@ mod tests {
         assert_eq!(nearest_existing_ancestor(&deep), base);
         // Unix only: Windows' extended-length cap still stats ~100 KB paths.
         #[cfg(not(windows))]
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(400),
-            "took {:?}",
-            start.elapsed()
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("took {:?}", start.elapsed()),
+            start.elapsed(),
+            std::time::Duration::from_millis(400),
         );
     }
 

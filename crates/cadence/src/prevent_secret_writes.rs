@@ -2754,10 +2754,10 @@ mod tests {
         for command in &commands {
             let start = std::time::Instant::now();
             let _ = bash_targets_env_file(command);
-            assert!(
-                start.elapsed() < nest_time_limit_1118(),
-                "{:?}",
-                start.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                nest_time_limit_1118(),
             );
         }
     }
@@ -2779,7 +2779,11 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         // Release is the shipped profile; debug builds get headroom.
         let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
-        assert!(elapsed.as_secs_f64() < limit, "{elapsed:?}");
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "padded_assignment_chain_blocks_within_the_hook_deadline",
+            elapsed,
+            std::time::Duration::from_secs_f64(limit),
+        );
     }
 
     /// PR #1118 review: padded prefixes that once turned a size bound into a
@@ -2831,10 +2835,10 @@ mod tests {
             let start = std::time::Instant::now();
             let result = SecretWritesGuard::default().run(&make_bash(&command));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-            assert!(
-                start.elapsed() < nest_time_limit_1118(),
-                "{:?}",
-                start.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                nest_time_limit_1118(),
             );
         }
     }

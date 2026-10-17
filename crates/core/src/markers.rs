@@ -3962,7 +3962,11 @@ mod tests {
         // cwd, each once.
         assert_eq!(ships.len(), 2);
         // Debug build; the release bound is 0.5 s.
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        crate::test_builders::assert_elapsed_under(
+            "a_flood_of_segments_stays_linear",
+            started.elapsed(),
+            std::time::Duration::from_secs(10),
+        );
     }
 
     #[test]

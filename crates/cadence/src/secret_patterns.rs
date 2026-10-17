@@ -3202,7 +3202,11 @@ mod tests {
         ] {
             is_dangerous_secret_token_at(&token, Filename::Known);
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "adversarial_brace_and_glob_tokens_stay_fast",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     #[test]
