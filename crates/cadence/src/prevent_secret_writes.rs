@@ -452,7 +452,7 @@ fn inplace_file_operands(argv: &[String], grammar: InplaceGrammar) -> Vec<String
 /// Shell commands a `sed`/`awk` program in this segment runs (#1130) — `sed
 /// '1e …'`, awk's `system(…)` and pipes — judged as commands in their own
 /// right.
-fn program_commands(segment: &str) -> Vec<String> {
+pub fn program_commands(segment: &str) -> Vec<String> {
     let tokens = executable_tokens(segment);
     let argv = writer_argv(&tokens);
     let Some(first) = argv.first() else {

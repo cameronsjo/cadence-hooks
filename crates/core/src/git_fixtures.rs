@@ -17,7 +17,7 @@
 //! directory removal included — into the shipped binary as dead code. A
 //! resolver downgrade is the one change that silently reopens that.
 
-use crate::worktree::{is_claude_managed_dir, path_under_temp_root};
+use crate::worktree::is_claude_managed_dir;
 use std::path::{Path, PathBuf};
 
 /// Env var overriding [`resolve_scratch_dir`]'s fallback root, for the rare
@@ -187,13 +187,16 @@ fn resolve_scratch_dir_with(
     // fixture under its resolved spelling is still a temp dir, and on Windows
     // `canonicalize` returns a `\\?\` spelling the raw value never matches.
     // Counting it here only relocates more fixtures, which is the safe side.
+    // `$TMPDIR` is fixed for the process: read its spellings once for up to
+    // three candidates (cadence-hooks#403 code review).
+    let temp_roots = crate::worktree::temp_root_spellings(tmpdir, home);
     let tmpdir_resolved = crate::worktree::usable_tmpdir(tmpdir, home)
         .and_then(|t| std::fs::canonicalize(t).ok())
         .filter(|c| c.parent().is_some());
     let escapes_carveout = |dir: &Path| {
         let resolved = canonicalize_nearest_existing(dir);
         !is_claude_managed_dir(&resolved)
-            && !path_under_temp_root(&resolved, tmpdir, home)
+            && !temp_roots.iter().any(|r| resolved.starts_with(r))
             && !tmpdir_resolved
                 .as_deref()
                 .is_some_and(|c| resolved.starts_with(c))
