@@ -228,7 +228,7 @@ fn writer_targets(segment: &str) -> Vec<String> {
 
 /// rsync options whose value is a separate token; the value is never the
 /// destination operand.
-const RSYNC_VALUE_FLAGS: &[&str] = &[
+pub const RSYNC_VALUE_FLAGS: &[&str] = &[
     "-e",
     "--rsh",
     "-f",
@@ -280,7 +280,7 @@ const RSYNC_VALUE_FLAGS: &[&str] = &[
 
 /// rsync options that name a path rsync itself writes: a log, a batch file, or
 /// a directory it stages or backs files up into.
-const RSYNC_WRITE_FLAGS: &[&str] = &[
+pub const RSYNC_WRITE_FLAGS: &[&str] = &[
     "--log-file",
     "--write-batch",
     "--only-write-batch",
@@ -452,7 +452,7 @@ fn inplace_file_operands(argv: &[String], grammar: InplaceGrammar) -> Vec<String
 /// Shell commands a `sed`/`awk` program in this segment runs (#1130) — `sed
 /// '1e …'`, awk's `system(…)` and pipes — judged as commands in their own
 /// right.
-fn program_commands(segment: &str) -> Vec<String> {
+pub fn program_commands(segment: &str) -> Vec<String> {
     let tokens = executable_tokens(segment);
     let argv = writer_argv(&tokens);
     let Some(first) = argv.first() else {

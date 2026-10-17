@@ -131,22 +131,26 @@ pub(crate) fn git_dir_is_common_dir(git_dir: &Path, repo_root: &Path) -> bool {
     }
 }
 
-/// Pure-ish: does `path` live under a temp root? `tmpdir` is the `$TMPDIR`
-/// value, when set, and `home` the user's home directory, when resolvable.
-/// True for `/tmp`, `/private/tmp`, and `$TMPDIR` (with the canonicalized form
-/// too, for macOS's `/var/folders` vs `/private/var` split). The one non-pure
-/// step is a `canonicalize` of the `$TMPDIR` value.
+/// Does `path` live under a temp root? `tmpdir` is the `$TMPDIR` value, when
+/// set, and `home` the user's home directory, when resolvable. True when
+/// `path` starts with any of [`temp_root_spellings`]: `/tmp`, `/private/tmp`,
+/// and a usable `$TMPDIR` with its lexical macOS twin (`/var/folders/…` ↔
+/// `/private/var/folders/…`), which is what a repo root from
+/// `git rev-parse --show-toplevel` comes back as.
 ///
-/// This is the generic predicate behind [`is_temp_root`]; the delete guard
-/// removed in cadence-ecosystem#582 used to reuse it to classify an `rm`
-/// target path (cadence-hooks#261), while `is_temp_root` keeps its
-/// repo-root-focused name for the enforce-worktree
-/// carve-out. Canonicalizes `tmpdir` on every call — fine for a single check,
-/// but see [`path_under_temp_root_with_canonical`] when a caller checks
-/// several candidate paths against the same `$TMPDIR` in one pass.
+/// **`$TMPDIR` is never resolved** (cadence-hooks#1413). The session owns the
+/// parent of `$TMPDIR`, so it can swap the directory for a symlink to any
+/// directory it wants counted as temp; a `canonicalize` here handed that
+/// directory the carve-out for `enforce-worktree`, `session start`'s posture
+/// line, and `guard-git-init`. [`temp_root_spellings`] refuses a symlinked
+/// `$TMPDIR`, a `.`/`..` component, and one inside or covering home.
+///
+/// This is the generic predicate behind [`is_temp_root`], which keeps its
+/// repo-root-focused name for the enforce-worktree carve-out.
 pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>, home: Option<&str>) -> bool {
-    let canonical = canonicalize_tmpdir(tmpdir, home);
-    path_under_temp_root_with_canonical(path, tmpdir, canonical.as_deref(), home)
+    temp_root_spellings(tmpdir, home)
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 /// True when `tmpdir` IS the home directory or an ancestor of it — under
@@ -159,8 +163,8 @@ pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>, home: Option<&str
 /// so it is rejected outright rather than trusted.
 ///
 /// **Both spellings, because the literal one is what the prefix test uses.**
-/// `path_under_temp_root_with_canonical` matches an operand against the RAW
-/// `$TMPDIR` string, so an operand spelled the same way as a symlinked or
+/// [`path_under_temp_root`] matches an operand against the RAW `$TMPDIR`
+/// string, so an operand spelled the same way as a symlinked or
 /// case-differing `$TMPDIR` matches it — and a lexical-only check calls that
 /// value acceptable, because it compares unequal to home while naming the same
 /// directory. Two spellings survived a literal-only check: `TMPDIR=/scratch`
@@ -195,53 +199,15 @@ fn tmpdir_covers_home(tmpdir: &Path, home: Option<&str>) -> bool {
     }
 }
 
-/// `$TMPDIR`, canonicalized once — factored out of [`path_under_temp_root`]
-/// so a caller checking multiple candidate paths against the same `$TMPDIR`
-/// (e.g. [`crate::git_fixtures::resolve_scratch_dir`]'s up-to-three-candidate
-/// fallback chain, cadence-hooks#403 code review) can canonicalize once and
-/// reuse it, instead of re-running a real `realpath` syscall chain per
-/// candidate.
-///
-/// Returns `None` for a `$TMPDIR` that covers `home` — [`usable_tmpdir`] has
-/// already rejected it under both spellings, so no further check is owed here.
-pub(crate) fn canonicalize_tmpdir(tmpdir: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    usable_tmpdir(tmpdir, home).and_then(|t| std::fs::canonicalize(t).ok())
-}
-
 /// `$TMPDIR`, trimmed, when the value is usable as a temp root at all:
 /// non-empty, not the filesystem root, and not covering `home`.
 ///
-/// One definition rather than a repeated filter chain, because both callers
-/// below decide the same security question and a divergence between them would
-/// be a hole in exactly one of the two paths. This is the single veto for the
-/// whole `via_env` branch — gating only the branch's canonical comparand left
-/// its raw one, the one that actually fires, unguarded.
-fn usable_tmpdir<'a>(tmpdir: Option<&'a str>, home: Option<&str>) -> Option<&'a str> {
+/// The first veto [`temp_root_spellings`] applies; every temp-root caller
+/// goes through that function, so none can skip it.
+pub(crate) fn usable_tmpdir<'a>(tmpdir: Option<&'a str>, home: Option<&str>) -> Option<&'a str> {
     tmpdir
         .map(str::trim)
         .filter(|t| !t.is_empty() && *t != "/" && !tmpdir_covers_home(Path::new(t), home))
-}
-
-/// Same check as [`path_under_temp_root`], but takes an already-canonicalized
-/// `$TMPDIR` (from [`canonicalize_tmpdir`]) instead of canonicalizing on
-/// every call.
-pub(crate) fn path_under_temp_root_with_canonical(
-    path: &Path,
-    tmpdir: Option<&str>,
-    tmpdir_canonical: Option<&Path>,
-    home: Option<&str>,
-) -> bool {
-    let fixed = path.starts_with("/tmp") || path.starts_with("/private/tmp");
-    let via_env = usable_tmpdir(tmpdir, home).is_some_and(|t| {
-        // `path` (a repo root from `git rev-parse --show-toplevel`, or a
-        // resolved `rm` target) may be canonicalized (`/private/var/…` on
-        // macOS) while `$TMPDIR` is not (`/var/folders/…`) — compare
-        // against the canonicalized tmpdir too, or the match never fires
-        // on macOS.
-        path.starts_with(t)
-            || tmpdir_canonical.is_some_and(|c| c != Path::new("/") && path.starts_with(c))
-    });
-    fixed || via_env
 }
 
 /// Every spelling of the temp roots: `/tmp`, `/private/tmp`, and a usable
@@ -263,16 +229,23 @@ pub(crate) fn path_under_temp_root_with_canonical(
 /// - a value with a `.` or `..` component, or one that is a symlink itself
 ///   (`lstat`), contributes nothing;
 /// - a value inside `home` (compared ignoring ASCII case, as the volume may),
-///   or covering it ([`usable_tmpdir`]), contributes nothing.
+///   or covering it ([`usable_tmpdir`]), contributes nothing. Windows puts
+///   its per-user temp dir under the profile, so a `TMPDIR` set to it there
+///   earns no carve-out; only `TMPDIR` is read, and native Windows leaves it
+///   unset;
+/// - on Unix, a value that resolves anywhere other than itself or its
+///   firmlink twin contributes nothing. This catches a symlink swapped in
+///   for an earlier component, which the `lstat` of the last one misses.
+///   `canonicalize` only ever removes a spelling here, never adds one, so a
+///   value that does not exist (nothing to resolve) keeps its raw spelling.
 ///
-/// Only the last component is `lstat`ed. A symlink earlier in the value is
-/// harmless to an equality caller: the returned spellings are text, never
-/// resolved, so they can only equal a path spelled the same way. The other
-/// direction is the caller's to close: a path the caller resolves itself
-/// can be pointed into temp by a link the session placed above it, so a
-/// caller should treat a path as temp only when every spelling it holds of
-/// that path is a temp spelling (as `guard-runbook-scrub`'s `MarkerDir`
-/// does).
+/// Prefix callers ([`path_under_temp_root`]) and equality callers
+/// (`guard-runbook-scrub`) both use this list, so it never holds a spelling
+/// the session could have redirected. The other direction is the caller's to
+/// close: a path the caller resolves itself can be pointed into temp by a
+/// link the session placed above it, so a caller should treat a path as temp
+/// only when every spelling it holds of that path is a temp spelling (as
+/// `guard-runbook-scrub`'s `MarkerDir` does).
 pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<PathBuf> {
     let mut out = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
     let Some(t) = usable_tmpdir(tmpdir, home) else {
@@ -281,23 +254,64 @@ pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<Path
     let path = Path::new(t.trim_end_matches('/'));
     // Split the text: `Path::components` drops an interior `.` silently.
     let dotted = t.split(['/', '\\']).any(|s| s == "." || s == "..");
-    let inside_home = home
-        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-        .is_some_and(|h| {
-            let t = t.trim_end_matches('/').to_ascii_lowercase();
-            t == h || t.starts_with(&format!("{h}/"))
-        });
+    // Compared with `/` for either separator, so a Windows `C:\Users\dev\…`
+    // value is read the same as `C:/Users/dev/…`.
+    let fold = |s: &str| {
+        s.trim()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    let inside_home = home.map(fold).filter(|h| !h.is_empty()).is_some_and(|h| {
+        let t = fold(t);
+        t == h || t.starts_with(&format!("{h}/"))
+    });
     let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-    if path.as_os_str().is_empty() || dotted || inside_home || is_link {
+    let twin = firmlink_twin(path);
+    if path.as_os_str().is_empty()
+        || dotted
+        || inside_home
+        || is_link
+        || resolves_elsewhere(path, twin.as_deref())
+    {
         return out;
     }
-    for p in std::iter::once(path.to_path_buf()).chain(firmlink_twin(path)) {
+    for p in std::iter::once(path.to_path_buf()).chain(twin) {
         if !out.contains(&p) {
             out.push(p);
         }
     }
     out
+}
+
+/// True when `path` resolves to something other than itself or `twin`: some
+/// component of it is a link the session could have placed. A `path` that
+/// does not exist yet is read through its nearest existing ancestor, so a
+/// swapped parent counts even while the last components are missing.
+/// Unix only; Windows `canonicalize` returns a `\\?\` verbatim path that
+/// never equals the input, and a symlinked `TMPDIR` there is already caught
+/// by the `lstat` of the last component.
+#[cfg(unix)]
+fn resolves_elsewhere(path: &Path, twin: Option<&Path>) -> bool {
+    let mut existing = path;
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let real = loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            break real;
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return false;
+        };
+        missing.push(name);
+        existing = parent;
+    };
+    let real = missing.iter().rev().fold(real, |acc, name| acc.join(name));
+    real != path && Some(real.as_path()) != twin
+}
+
+#[cfg(not(unix))]
+fn resolves_elsewhere(_path: &Path, _twin: Option<&Path>) -> bool {
+    false
 }
 
 /// `path`'s other spelling under macOS's fixed firmlinks, for the two temp
@@ -699,8 +713,6 @@ mod tests {
             ("/tmp/scratch", Some("/private/tmp/scratch")),
             ("/private/tmp/scratch", Some("/tmp/scratch")),
             ("/srv/tmp", None),
-            ("/var/foldersx/T", None),
-            ("/var/folders", None),
         ] {
             let got = temp_root_spellings(Some(tmpdir), None);
             let raw = PathBuf::from(tmpdir.trim_end_matches('/'));
@@ -717,6 +729,10 @@ mod tests {
             Some("/private/var/folders/zz/T".to_string())
         );
         assert_eq!(firmlink_twin(Path::new("/privatex/tmp")), None);
+        // `/var/folders` itself is not a temp dir. Checked on the twin alone:
+        // the path exists on macOS, where the resolve check refuses it anyway.
+        assert_eq!(firmlink_twin(Path::new("/var/folders")), None);
+        assert_eq!(firmlink_twin(Path::new("/var/foldersx/T")), None);
         assert_eq!(firmlink_twin(Path::new("/private")), None);
         // No duplicates of the fixed roots.
         assert_eq!(temp_root_spellings(Some("/tmp"), None), fixed.to_vec());
@@ -728,6 +744,14 @@ mod tests {
                 "{tmpdir}"
             );
         }
+        // Either separator: a native Windows value inside the profile.
+        assert_eq!(
+            temp_root_spellings(
+                Some(r"C:\Users\Dev\AppData\Local\Temp"),
+                Some(r"C:\Users\Dev")
+            ),
+            fixed.to_vec()
+        );
         // A sibling that only shares the prefix text is not inside home.
         assert!(
             temp_root_spellings(Some("/Users/Devon/tmp"), Some("/Users/Dev"))
@@ -823,17 +847,84 @@ mod tests {
         ));
     }
 
-    /// Windows puts the per-user temp dir UNDER the profile directory, which
-    /// is why the rule rejects only an ancestor-or-equal of home and not
-    /// "anything under home" — the latter would kill the carve-out on Windows
-    /// outright.
+    /// cadence-hooks#1413: a `$TMPDIR` inside home earns no carve-out, since
+    /// the session owns everything there. That includes Windows' per-user
+    /// temp dir under the profile; only `TMPDIR` is read, and native Windows
+    /// leaves it unset.
     #[test]
-    fn windows_appdata_temp_under_home_still_honored() {
-        let tmp = "C:/Users/dev/AppData/Local/Temp";
-        assert!(is_temp_root(
+    fn tmpdir_inside_home_is_not_a_temp_root() {
+        assert!(!is_temp_root(
             Path::new("C:/Users/dev/AppData/Local/Temp/repo"),
-            Some(tmp),
+            Some("C:/Users/dev/AppData/Local/Temp"),
             Some("C:/Users/dev")
+        ));
+        assert!(!is_temp_root(
+            Path::new("/home/dev/tmp/repo"),
+            Some("/home/dev/tmp"),
+            Some("/home/dev")
+        ));
+        // Control: a value with home elsewhere is honored. A made-up root, since
+        // `/home` is itself a link on macOS and resolves elsewhere.
+        assert!(is_temp_root(
+            Path::new("/no-such-root/dev/tmp/repo"),
+            Some("/no-such-root/dev/tmp"),
+            Some("/no-such-root/other")
+        ));
+    }
+
+    /// cadence-hooks#1413: `path_under_temp_root` never resolves `$TMPDIR`.
+    /// The session owns the parent of `$TMPDIR` and can swap it for a link,
+    /// or swap an earlier component; neither the link nor its target, nor a
+    /// dotted value, reads as temp.
+    #[test]
+    #[cfg(unix)]
+    fn path_under_temp_root_refuses_a_redirected_tmpdir() {
+        let scratch = scratch("tmpdir-redirect");
+        let target = scratch.path().join("marker-parent");
+        let link = scratch.path().join("tmp-link");
+        let parent_link = scratch.path().join("parent-link");
+        std::fs::create_dir_all(target.join("T")).unwrap();
+        for l in [&link, &parent_link] {
+            let _ = std::fs::remove_file(l);
+        }
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &parent_link).unwrap();
+        let real = std::fs::canonicalize(&target).unwrap();
+
+        // The last component is the link.
+        let link_str = link.to_str().unwrap();
+        assert!(!path_under_temp_root(&link.join("x"), Some(link_str), None));
+        assert!(!path_under_temp_root(&real.join("x"), Some(link_str), None));
+        // An earlier component is the link; the last one is a real dir.
+        let via_parent = parent_link.join("T");
+        let via_parent_str = via_parent.to_str().unwrap();
+        assert!(!path_under_temp_root(
+            &via_parent.join("x"),
+            Some(via_parent_str),
+            None
+        ));
+        assert!(!path_under_temp_root(
+            &real.join("T/x"),
+            Some(via_parent_str),
+            None
+        ));
+        // The last components do not exist yet: the swapped parent still counts.
+        let missing = parent_link.join("T/not-yet");
+        let missing_str = missing.to_str().unwrap();
+        assert!(!path_under_temp_root(
+            &missing.join("x"),
+            Some(missing_str),
+            None
+        ));
+        // A dot segment.
+        let dotted = format!("{}/T/..", real.display());
+        assert!(!path_under_temp_root(&real.join("x"), Some(&dotted), None));
+        // Control: the real directory, spelled physically, is honored.
+        let real_t = real.join("T");
+        assert!(path_under_temp_root(
+            &real_t.join("x"),
+            Some(real_t.to_str().unwrap()),
+            None
         ));
     }
 
