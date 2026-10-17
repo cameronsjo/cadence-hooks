@@ -4572,6 +4572,61 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_config_environment_sets_nothing_and_reads_as_no_push() {
+        // cameronsjo/cadence-hooks#1378: `GIT_CONFIG_PARAMETERS=` together
+        // with `GIT_CONFIG_COUNT=0` (or empty) gives git no config at all, so
+        // a clone carrying both, the form a credential-stripping clone is
+        // written in, runs no push. Any other value can set any key, and
+        // emptying one channel alone leaves the other to an earlier
+        // `export`, so those still read as a push the walk cannot resolve.
+        let prescribed = "env -u GIT_DIR -u GIT_COMMON_DIR GIT_TERMINAL_PROMPT=0 \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=0 \
+            GIT_CONFIG_PARAMETERS= GIT_ASKPASS= git -c credential.helper= -c core.askpass= \
+            clone --depth 1 -q https://github.com/o/r.git /tmp/d";
+        for command in [
+            "GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT=0 git clone -q u /tmp/d",
+            "GIT_CONFIG_PARAMETERS='' GIT_CONFIG_COUNT= git fetch",
+            "GIT_CONFIG_COUNT=x GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= git fetch",
+            "env GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT=0 git ls-remote u",
+            prescribed,
+        ] {
+            assert!(
+                push_invocations(command, "/repo").is_empty(),
+                "{command}: {:?}",
+                push_invocations(command, "/repo")
+            );
+        }
+        for command in [
+            "GIT_CONFIG_PARAMETERS=x git clone -q u /tmp/d",
+            // One channel emptied leaves the other.
+            "GIT_CONFIG_PARAMETERS= git clone -q u /tmp/d",
+            "GIT_CONFIG_COUNT=0 git clone -q u /tmp/d",
+            "export GIT_CONFIG_PARAMETERS=\"'core.sshcommand'='x'\"; GIT_CONFIG_COUNT=0 git fetch",
+            "GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS=x git fetch",
+            "GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT+=0 git fetch",
+            // An option value is not an assignment (#1378 review 2).
+            "GIT_CONFIG_COUNT=0 xargs -E GIT_CONFIG_PARAMETERS= git fetch",
+            "GIT_CONFIG_PARAMETERS= xargs -E GIT_CONFIG_COUNT=0 git fetch",
+            "GIT_CONFIG_COUNT=0 env -C GIT_CONFIG_PARAMETERS= git fetch",
+            "GIT_CONFIG_PARAMETERS=\"'core.sshcommand'='x'\" git clone u",
+            "GIT_CONFIG_PARAMETERS+= git clone u",
+            "GIT_CONFIG_COUNT=1 git clone u",
+            "GIT_CONFIG_COUNT=00 git clone u",
+            "GIT_CONFIG_COUNT=0 GIT_CONFIG_KEY_0=core.sshCommand git clone u",
+            "GIT_CONFIG_PARAMETERS=\"$P\" git clone u",
+            // A push stays unresolved whatever the value: the `GIT_CONFIG`
+            // family redirects it.
+            "GIT_CONFIG_PARAMETERS= git push origin main",
+        ] {
+            let found = push_invocations(command, "/repo");
+            assert!(
+                !found.is_empty() && found.iter().all(|push| push.unresolved),
+                "{command}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
     fn exec_valued_git_settings_are_read_as_nested_scripts_when_literal() {
         // cameronsjo/cadence-hooks#1231: a value git runs as a command is a
         // script nested in the invocation. A fully literal one is read like

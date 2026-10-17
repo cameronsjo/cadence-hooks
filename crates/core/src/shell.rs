@@ -14715,12 +14715,59 @@ struct ExecSettings {
     opaque: bool,
 }
 
+/// Does this prefix give git no config through the environment at all: an
+/// empty `GIT_CONFIG_PARAMETERS` and a `GIT_CONFIG_COUNT` of `0` or empty,
+/// each the last assignment of its name, neither an append? git reads both as
+/// zero entries, so the credential-stripping clone form carries nothing
+/// (cameronsjo/cadence-hooks#1378). Both are required: emptying one leaves
+/// the other channel to whatever an earlier `export` in the same command put
+/// there, which no reading here follows (#1378 review I1).
+fn empties_config_environment(prefix: &[String]) -> bool {
+    // Only real assignments count: the shell's leading `NAME=value` words, and
+    // the operands of one `env` whose only options are `-u NAME`. Any other
+    // word (a runner, an option value such as `xargs -E NAME=`) may look like
+    // an assignment and set nothing (#1378 review 2), so it voids the
+    // exemption.
+    let mut parameters = None;
+    let mut count = None;
+    let mut in_env = false;
+    let mut words = prefix.iter();
+    while let Some(raw) = words.next() {
+        let word = unescape_word(raw);
+        let assignment = if in_env {
+            is_assignment_word(&word)
+        } else {
+            is_assignment_word(raw)
+        };
+        if assignment {
+            let Some((name, value)) = word.split_once('=') else {
+                return false;
+            };
+            match name {
+                "GIT_CONFIG_PARAMETERS" => parameters = Some(value.is_empty()),
+                "GIT_CONFIG_COUNT" => count = Some(value.is_empty() || value == "0"),
+                // An append keeps what the environment held.
+                "GIT_CONFIG_PARAMETERS+" | "GIT_CONFIG_COUNT+" => return false,
+                _ => {}
+            }
+        } else if !in_env && command_word(raw) == "env" {
+            in_env = true;
+        } else if in_env && word == "-u" && words.next().is_some() {
+            // `env -u NAME` unsets; the name is not an assignment.
+        } else {
+            return false;
+        }
+    }
+    parameters == Some(true) && count == Some(true)
+}
+
 /// [`ExecSettings`] of one git invocation (cameronsjo/cadence-hooks#1231).
 /// An empty value and a pager of exactly `cat` run nothing of the command's
 /// choosing, and are not counted. An editor is read as a script by
 /// [`editor_scripts`], so it is not counted here either.
 fn exec_settings(prefix: &[String], globals: &[String]) -> ExecSettings {
     let mut out = ExecSettings::default();
+    let empties_config = empties_config_environment(prefix);
     let inert_pager = |value: &str| value.is_empty() || value == "cat";
     let take = |value: &str, out: &mut ExecSettings| {
         // `credential.helper=!cmd` runs `cmd` under a shell.
@@ -14742,7 +14789,11 @@ fn exec_settings(prefix: &[String], globals: &[String]) -> ExecSettings {
         };
         // The `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` triple and
         // `GIT_CONFIG_PARAMETERS` are `-c` spelled as the environment: any
-        // key at all, so any value counts.
+        // key at all, so any value counts — except a prefix that empties
+        // both channels (see [`empties_config_environment`]).
+        if empties_config && matches!(name, "GIT_CONFIG_PARAMETERS" | "GIT_CONFIG_COUNT") {
+            continue;
+        }
         if name == "GIT_CONFIG_COUNT"
             || name == "GIT_CONFIG_PARAMETERS"
             || name.starts_with("GIT_CONFIG_KEY_")

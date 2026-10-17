@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A credential-stripping `git clone` is no longer refused as a push.** An empty `GIT_CONFIG_PARAMETERS=` together with a `GIT_CONFIG_COUNT` of `0` (or empty) gives git no config, but any value of either made every git command read as a push that could not be resolved, so `prevent-secret-push` refused the `GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= … git clone …` form a credential-stripping clone is written in. A prefix that empties both now counts as setting nothing. One of the two alone still refuses, because the other can carry config an earlier `export` in the same command set; so do any other value and a `git push` under any `GIT_CONFIG*` prefix. (cameronsjo/cadence-hooks#1378)
+- **`prevent-secret-push` gives a fix that matches the cause of an unscannable push**, in a `Fix:` line, instead of "narrow the push" in every case. A push in the same call as the `git commit`, `git switch -c` or other ref-writing command it depends on is told to split into two calls, because the guard reads the repository before that command runs. A push from an unborn branch is told to commit first. A `-C "$VAR"` or `cd "$VAR"` directory is named with the literal-path fix even when a config override also blocks the push. A `"$SHA:refs/heads/b"` source is told to push the literal SHA, the pinned form, which the guard already scans. Every one of these still blocks. (cameronsjo/cadence-hooks#1381, cameronsjo/cadence-hooks#1384, cameronsjo/cadence-hooks#1386)
+
 ## [0.128.0] - 2026-10-17
 
 ### Security
