@@ -121,3 +121,63 @@ fn a_link_toward_the_marker_dir_blocks_in_whichever_call_makes_it() {
         Some(0)
     );
 }
+
+/// cameronsjo/cadence-hooks#1417 r2: the same split through a link whose
+/// target the guard cannot read. Each form below names the marker parent only
+/// at run time, so the call that makes the link must block on its own. A copy
+/// or move whose source cannot be read stays allowed alone.
+#[test]
+fn an_unreadable_link_blocks_alone_but_an_unreadable_copy_does_not() {
+    let scratch = Scratch::outside_checkout(&scratch_root(), "unreadable-link");
+    let root = scratch.path().canonicalize().unwrap();
+    for d in ["home", "vault/Runbooks", "cfg", "work", "s"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    let work = root.join("work");
+    let parent = root.join("cfg");
+    let x = root.join("s/x");
+    let (p, x) = (parent.display(), x.display());
+
+    let write = format!("(sleep 10; cp -r forged/markers {x}/) &");
+    assert_eq!(
+        judge(&root, &work, &write).status.code(),
+        Some(0),
+        "control: the backgrounded write alone is allowed"
+    );
+    for link in [
+        format!("D={p}; ln -s \"$D\" {x}"),
+        format!("export D={p} && ln -s \"$D\" {x}"),
+        format!("for d in {p}; do ln -s \"$d\" {x}; done"),
+        format!("ln -s \"$(dirname {p}/x)\" {x}"),
+        format!("ln -s \"$(cat f)\" {x}"),
+        format!("ln -s \"$(git rev-parse --show-toplevel)\" {x}"),
+        format!("ln -s \"${{CADENCE_MARKER_DIR}}\" {x}"),
+        format!("ln -s \"$D\" {x}"),
+        format!("echo {p} {x} | xargs ln -s"),
+        format!("printf '%s\\0' {p} | xargs -0 -I{{}} ln -s {{}} {x}"),
+    ] {
+        let got = judge(&root, &work, &link);
+        assert_eq!(
+            got.status.code(),
+            Some(2),
+            "an unreadable link must block alone: `{link}`: {}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&got.stderr).contains("creates a link"),
+            "`{link}`: {}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+    }
+    for copy in [
+        "mv node_modules /tmp/nm".to_string(),
+        format!("cp -r \"$S\" {x}"),
+        format!("rsync -a \"$S\"/ {x}/"),
+    ] {
+        assert_eq!(
+            judge(&root, &work, &copy).status.code(),
+            Some(0),
+            "an unreadable copy or move stays allowed alone: `{copy}`"
+        );
+    }
+}

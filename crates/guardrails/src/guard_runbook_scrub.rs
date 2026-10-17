@@ -128,12 +128,14 @@
 //!   directory, the marker directory, or its parent blocks on its own
 //!   (`link_then_write`, cadence-hooks#1412): `ln -s ~ /tmp/h` and
 //!   `ln -s ~/.claude x` included, since a write backgrounded by an earlier
-//!   command can go through it later. A command that also writes blocks too
-//!   when a link's target cannot be read: `ln -s "$(brew --prefix)/x" y`,
-//!   operands fed by `xargs`, a `mv`/`cp -r`/`rsync` source that is missing,
-//!   remote, or behind an unreadable `cd`, or a source tree past
-//!   `LINK_WALK_BUDGET` entries (a large `node_modules`). Run the link, move,
-//!   or copy as its own command first.
+//!   command can go through it later. So does a link creator whose target
+//!   cannot be read, alone: `ln -s "$D" x`, `ln -s "$(brew --prefix)/x" y`,
+//!   `xargs ln -s`, `rsync -l` of an unreadable source. A copy or move whose
+//!   source cannot be read blocks only when the command also writes: a
+//!   `mv`/`cp -r`/`rsync` source that is missing, remote, or behind an
+//!   unreadable `cd`, or a source tree past `LINK_WALK_BUDGET` entries (a
+//!   large `node_modules`). Run the link, move, or copy as its own command
+//!   first, with a target the hook can read.
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -1048,9 +1050,15 @@ enum LinkKind {
     /// hook can find it), recreating any link inside them (`cp -r`/`-a`/`-P`/
     /// `-d`, `mv`, `rsync`).
     Trees(Vec<String>, Option<String>),
-    /// Creates links the hook cannot read (operands from stdin via `xargs`,
-    /// or an unlisted writer).
-    Unreadable,
+    /// A link creator (`ln`, `cp -s`, `install -l`) whose operands the hook
+    /// cannot read: fed from stdin by `xargs`, or absent.
+    UnreadableLink,
+    /// A copy or move (`cp -r`, `mv`, `rsync`) whose operands the hook cannot
+    /// read: fed from stdin by `xargs`, or absent.
+    UnreadableTrees,
+    /// A writer the parser reads that is on no list, so the links it makes
+    /// cannot be read.
+    UnlistedWriter,
 }
 
 /// The short options of `word` that take a value: the rest of the word, or
@@ -1127,7 +1135,8 @@ fn source_operands(word: &str, args: &[String]) -> (Vec<String>, Option<String>)
 
 /// How the segment with peeled argv `argv` and raw `segment` text may create
 /// links. Operands an `xargs` or `parallel` runner feeds from stdin are not in
-/// the text, so a link creator run through one is [`LinkKind::Unreadable`].
+/// the text, so a link creator run through one is [`LinkKind::UnreadableLink`]
+/// (or [`LinkKind::UnreadableTrees`] for a copy or move).
 fn link_kind(segment: &str, argv: &[String]) -> LinkKind {
     let Some(first) = argv.first() else {
         return LinkKind::None;
@@ -1195,12 +1204,11 @@ fn link_kind(segment: &str, argv: &[String]) -> LinkKind {
         "cp" | "install" => LinkKind::None,
         w if NO_LINK_WRITERS.contains(&w) => LinkKind::None,
         _ if operand_targets(segment).is_empty() => LinkKind::None,
-        _ => LinkKind::Unreadable,
+        _ => LinkKind::UnlistedWriter,
     };
     match kind {
-        LinkKind::Targets(w, _) | LinkKind::Trees(w, _) if fed || w.is_empty() => {
-            LinkKind::Unreadable
-        }
+        LinkKind::Targets(w, _) if fed || w.is_empty() => LinkKind::UnreadableLink,
+        LinkKind::Trees(w, _) if fed || w.is_empty() => LinkKind::UnreadableTrees,
         other => other,
     }
 }
@@ -1472,6 +1480,32 @@ fn same_command(a: &(String, Vec<String>), b: &(String, Vec<String>)) -> bool {
             .all(|(x, y)| subst_as_glob(x) == subst_as_glob(y))
 }
 
+/// True when `argv` runs `rsync` with `-l`/`--links` spelled out: a request to
+/// copy links as links, judged like a link creator. `-a` implies `-l` too, but
+/// reads as an ordinary recursive copy, as `cp -a` does.
+fn rsync_keeps_links(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let args = match (command_word(first).as_ref(), argv.get(1)) {
+        ("busybox", Some(applet)) if command_word(applet) == "rsync" => &argv[2..],
+        ("rsync", _) => &argv[1..],
+        _ => return false,
+    };
+    let value_letters = value_letters("rsync");
+    args.iter().take_while(|a| a.as_str() != "--").any(|a| {
+        a == "--links"
+            || a.strip_prefix('-')
+                .filter(|c| !c.starts_with('-'))
+                .is_some_and(|cluster| {
+                    let flags = cluster
+                        .find(value_letters)
+                        .map_or(cluster, |at| &cluster[..at]);
+                    flags.contains('l')
+                })
+    })
+}
+
 /// A segment of the command, as [`link_then_write`] reads it.
 struct LinkSegment {
     /// The segment text and its peeled argv, to tell readings apart.
@@ -1540,7 +1574,9 @@ fn link_then_write(
         };
         let danger = match &seg.kind {
             LinkKind::None => Danger::Clean,
-            LinkKind::Unreadable => Danger::Unknown,
+            LinkKind::UnreadableLink | LinkKind::UnreadableTrees | LinkKind::UnlistedWriter => {
+                Danger::Unknown
+            }
             LinkKind::Targets(words, dest) => {
                 // A relative link target resolves from the link's directory: the
                 // destination, or its parent when it names the link itself.
@@ -1653,8 +1689,18 @@ fn link_then_write(
         if *spent > JUDGE_BUDGET {
             return Some(BashFinding::TooLarge);
         }
+        // A link creator whose target the hook cannot read is refused alone
+        // too: the same two-call split works through `ln -s "$D" x`. A copy or
+        // move that cannot be read stays allowed alone (`mv node_modules /tmp/nm`);
+        // its tree holds a protected link only if a judged link creator or a
+        // program the parser cannot read put one there.
+        let creates_links = matches!(seg.kind, LinkKind::Targets(..) | LinkKind::UnreadableLink)
+            || rsync_keeps_links(&seg.text.1);
         match danger {
             Danger::Relates if !writes_through => {
+                return Some(BashFinding::LinkToProtected(echo(&seg.text.0)));
+            }
+            Danger::Unknown if !writes_through && creates_links => {
                 return Some(BashFinding::LinkToProtected(echo(&seg.text.0)));
             }
             Danger::Relates | Danger::Unknown if writes_through => {
@@ -2337,7 +2383,9 @@ impl RunbookScrubGuard {
                     ),
                     BashFinding::LinkToProtected(target) => format!(
                         "🚫 BLOCKED: guard-runbook-scrub: this command creates a link that points \
-                         at, above, or below the scrub-marker or runbooks directory. A write \
+                         at, above, or below the scrub-marker or runbooks directory, or one \
+                         whose target the hook cannot read (a variable, a substitution, \
+                         `xargs`). A write \
                          through it, from a later command or one already running in the \
                          background, could land in that directory where the hook cannot see it.\n   \
                          Found:  {}\n   \
@@ -3741,10 +3789,11 @@ mod tests {
                 || link.contains(&f.runbooks);
             // A link the hook cannot read is refused only with a write; alone it
             // is the control that the write is what refuses it.
+            // cadence-hooks#1417 r2: an unreadable link creator (`ln -s "$D"`,
+            // `xargs ln`) is refused alone like a relating one; an unreadable copy
+            // or move is not.
             let unreadable_only = [
                 format!("mv {s}/missing {s}/x"),
-                format!("echo {parent} {s}/x | xargs ln -s"),
-                format!("ln -s \"$D\" {s}/x"),
                 format!("cp -a {s}/t3 {s}/d3"),
             ];
             if unreadable_only.contains(link) {
@@ -3861,6 +3910,11 @@ mod tests {
             "ln -s ~/.claude/skills/x ~/backup-x",
             "ln -s ../shared/config.toml config.toml",
             "cp -a ~/.dotfiles ~/dotfiles-backup",
+            // A copy or move whose source cannot be read stays allowed alone.
+            "mv node_modules /tmp/nm",
+            "cp -r \"$S\" /tmp/c",
+            "rsync -a \"$S\"/ /tmp/c/",
+            "echo a b | xargs mv",
         ] {
             assert_eq!(judge(command), Outcome::Allow, "{command}");
         }
@@ -3870,6 +3924,20 @@ mod tests {
             "ln -s ~/.claude /tmp/c",
             "ln -s ~/.claude/cadence-hooks /tmp/c",
             "ln -s ~/.claude/cadence-hooks/markers/sub /tmp/c",
+            // cadence-hooks#1417 r2: a link creator whose target cannot be read.
+            "D=~/.claude/cadence-hooks; ln -s \"$D\" /tmp/c",
+            "export D=x && ln -s \"$D\" /tmp/c",
+            "for d in ~/.claude; do ln -s \"$d\" /tmp/c; done",
+            "ln -s \"$(dirname ~/.claude/cadence-hooks/x)\" /tmp/c",
+            "ln -s \"$(cat f)\" /tmp/c",
+            "ln -s \"$(git rev-parse --show-toplevel)\" /tmp/c",
+            "ln -s \"${CADENCE_MARKER_DIR}\" /tmp/c",
+            "echo ~/.claude /tmp/c | xargs ln -s",
+            "printf '%s\\0' ~/.claude | xargs -0 -I{} ln -s {} /tmp/c",
+            "cp -s \"$S\" /tmp/c",
+            "rsync -l \"$S\" /tmp/c",
+            "rsync -avl \"$S\"/ /tmp/c/",
+            "ln -s \"$(brew --prefix)/bin/x\" ~/bin/x",
         ] {
             assert_eq!(judge(command), Outcome::Block, "{command}");
         }
@@ -3903,7 +3971,7 @@ mod tests {
             kind("rsync -avze ssh --max-delete 10 -S a/ h:/b/"),
             tr(&["a/"], Some("h:/b/"))
         );
-        assert_eq!(kind("xargs ln -s"), LinkKind::Unreadable);
+        assert_eq!(kind("xargs ln -s"), LinkKind::UnreadableLink);
         // A word naming `xargs` is not the runner.
         assert_eq!(kind("ln -s /bin/xargs x"), t(&["/bin/xargs"], Some("x")));
         // Homebrew's GNU names and busybox applets are the same programs.
@@ -3911,7 +3979,7 @@ mod tests {
         assert_eq!(kind("busybox ln -s a b"), t(&["a"], Some("b")));
         assert_eq!(kind("gmv a b"), tr(&["a"], Some("b")));
         assert_eq!(kind("ginstall -l s a b"), t(&["s", "a"], Some("b")));
-        assert_eq!(kind("xargs cp -r a b"), LinkKind::Unreadable);
+        assert_eq!(kind("xargs cp -r a b"), LinkKind::UnreadableTrees);
         for plain in [
             "cp a b",
             "install -m 644 a b",
