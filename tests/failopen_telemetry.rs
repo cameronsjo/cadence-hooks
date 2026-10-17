@@ -176,6 +176,10 @@ fn malformed_stdin_on_a_logger_writes_parse_row() {
 // --- panic path (cameronsjo/cadence-hooks#349) ---
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn a_panicking_check_fails_open_and_dispatch_survives_it() {
     // The one test that proves #349 fixed. Before the fix the global panic hook
     // called `process::exit(1)` *before* unwinding began, so `catch_unwind` in
@@ -230,6 +234,10 @@ fn a_panicking_check_fails_open_and_dispatch_survives_it() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn a_panicking_logger_still_exits_zero() {
     // `run_logged_logger` documents an always-exit-0 contract. Until #349 that
     // contract was violated by any panic, because the panic hook exited 1

@@ -120,6 +120,10 @@ const FORMATTED_PANIC: &[(&str, &str)] = &[
 ];
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn check_panic_row_omits_formatted_payload() {
     let (out, tmp) = run(&["cadence", "terminology"], b"{}", FORMATTED_PANIC);
     let error = only_row_error(tmp.path(), "panic", &out);
@@ -131,6 +135,10 @@ fn check_panic_row_omits_formatted_payload() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn logger_panic_row_omits_formatted_payload() {
     let (out, tmp) = run(&["metrics", "log-subagent"], b"{}", FORMATTED_PANIC);
     let error = only_row_error(tmp.path(), "panic", &out);

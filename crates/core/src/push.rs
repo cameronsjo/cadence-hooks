@@ -3802,15 +3802,14 @@ mod tests {
     fn a_cd_flood_walks_in_linear_time() {
         // Each `cd a` used to copy the whole path built so far: quadratic in
         // a 200 KB flood (~0.27 s of a release guard's budget). The bound is
-        // loose so a loaded test machine does not fail it; the release
-        // timings are the measurement.
+        // checked only in the opted-in timing run.
         let command = format!("{}git push origin main", "cd a; ".repeat(40_000));
         let started = std::time::Instant::now();
         let pushes = push_locations(&command, "/repo");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
+        crate::test_builders::assert_elapsed_under(
+            "cd flood",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
         );
         assert_eq!(pushes.len(), 1);
         assert_eq!(pushes[0].work_dir.len(), "/repo".len() + 2 * 40_000);
@@ -4523,10 +4522,10 @@ mod tests {
         ] {
             let started = std::time::Instant::now();
             let found = push_locations(&flood, "/repo");
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "took {:?}",
-                started.elapsed()
+            crate::test_builders::assert_elapsed_under(
+                "wrapper flood",
+                started.elapsed(),
+                std::time::Duration::from_secs(5),
             );
             assert!(found.len() <= 16, "{}", found.len());
         }
@@ -4956,7 +4955,11 @@ mod tests {
         let command = format!("{}git push origin main", "(cd a;".repeat(20_000));
         let started = std::time::Instant::now();
         let pushes = push_invocations(&command, "/repo");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        crate::test_builders::assert_elapsed_under(
+            "nested subshell flood",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
         assert_eq!(pushes.len(), 1);
         assert!(pushes[0].work_dir.starts_with("/repo/a/a"));
         let closed = format!("{}git push origin main", "(cd a;".repeat(40));
@@ -5051,10 +5054,10 @@ mod tests {
             );
             let started = std::time::Instant::now();
             let pushes = push_invocations(&command, "/repo");
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "{opener:?}: {:?}",
-                started.elapsed()
+            crate::test_builders::assert_elapsed_under(
+                &format!("cut substitution opener {opener:?}"),
+                started.elapsed(),
+                std::time::Duration::from_secs(5),
             );
             assert!(!pushes.is_empty(), "{opener:?}");
         }

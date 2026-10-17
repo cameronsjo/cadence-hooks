@@ -248,27 +248,69 @@ pub fn make_user_prompt_submit(
 // Git-fixture builders (`Scratch`, `git_in`, `init_repo`) live in the sibling
 // `git_fixtures` module — see there.
 
-/// Assert that `run(n)` costs time linear in `n`, for a flood test whose
-/// property is "this input shape does not blow up".
+/// Whether load-sensitive timing assertions were explicitly requested.
+/// Set `CADENCE_TIMING_TESTS=1` for release tests with one test thread.
+/// Semantic assertions must run regardless of this setting.
+pub fn timing_tests_enabled() -> bool {
+    timing_opt_in(std::env::var_os("CADENCE_TIMING_TESTS").as_deref())
+}
+
+fn timing_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Check an unchanged wall-clock budget only when timing tests are opted in.
+#[track_caller]
+pub fn assert_elapsed_under(what: &str, elapsed: std::time::Duration, limit: std::time::Duration) {
+    assert_elapsed_under_if(timing_tests_enabled(), what, elapsed, limit);
+}
+
+#[track_caller]
+fn assert_elapsed_under_if(
+    enabled: bool,
+    what: &str,
+    elapsed: std::time::Duration,
+    limit: std::time::Duration,
+) {
+    if enabled {
+        assert!(
+            elapsed < limit,
+            "{what}: {elapsed:?} exceeded budget {limit:?}"
+        );
+    }
+}
+
+/// Run flood semantics at `size` and four times `size`, and optionally assert
+/// that `run(n)` costs time linear in `n`.
 ///
-/// An absolute wall-clock bound on a flood fails on a loaded runner with the
-/// code behaving correctly: a 2.3 s run took 9.6 s on a busy CI box. The
-/// ratio between two sizes measured in the same process does not, because
-/// load slows both. `run` is timed at `size` and then at four times `size`,
-/// and the fastest time seen at each size is compared: linear work takes
-/// about 4x as long at the larger size, quadratic work about 16x, so a ratio
-/// under [`LINEAR_RATIO_LIMIT`] passes. A round over it is measured again, up
-/// to [`LINEAR_ROUNDS`] rounds, so a load burst that lands on one measurement
-/// does not decide the verdict; a real quadratic stays over it every round.
+/// Without [`timing_tests_enabled`], both sizes still run once so assertions
+/// inside `run` retain coverage of the original maximum input. With timing
+/// enabled, compare the fastest time seen at each size: linear work takes
+/// about 4x as long, quadratic work about 16x, so a ratio under
+/// [`LINEAR_RATIO_LIMIT`] passes. Retry up to [`LINEAR_ROUNDS`] rounds to reduce
+/// sensitivity to load bursts. Ratios still depend on scheduling; opt in using
+/// release mode and one test thread on a machine without competing heavy work.
 ///
-/// Each larger run is also held to [`FLOOD_HANG_LIMIT`], a hang guard far
-/// above a healthy run so runner load cannot trip it.
+/// When opted in, each larger run also retains [`FLOOD_HANG_LIMIT`].
 pub fn assert_scales_linearly(what: &str, size: usize, mut run: impl FnMut(usize)) {
-    let mut timed = |n: usize| {
+    assert_scales_linearly_with_timing(what, size, timing_tests_enabled(), |n| {
         let started = std::time::Instant::now();
         run(n);
         started.elapsed()
-    };
+    });
+}
+
+fn assert_scales_linearly_with_timing(
+    what: &str,
+    size: usize,
+    enabled: bool,
+    mut timed: impl FnMut(usize) -> std::time::Duration,
+) {
+    if !enabled {
+        timed(size);
+        timed(4 * size);
+        return;
+    }
     let mut small = std::time::Duration::MAX;
     let mut large = std::time::Duration::MAX;
     for _ in 0..LINEAR_ROUNDS {
@@ -296,3 +338,91 @@ pub const LINEAR_ROUNDS: usize = 5;
 
 /// Hang guard for one flood run in [`assert_scales_linearly`].
 pub const FLOOD_HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::time::Duration;
+
+    #[test]
+    fn only_one_explicitly_enables_timing() {
+        assert!(!timing_opt_in(None));
+        for value in ["", "0", "true", "yes", "01", " 1"] {
+            assert!(!timing_opt_in(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert!(timing_opt_in(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn elapsed_budget_is_not_enforced_by_default() {
+        assert_elapsed_under_if(
+            false,
+            "loaded runner",
+            Duration::MAX,
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn public_elapsed_budget_obeys_the_process_opt_in() {
+        let result = std::panic::catch_unwind(|| {
+            assert_elapsed_under("public gate", Duration::MAX, Duration::from_secs(5));
+        });
+        assert_eq!(result.is_err(), timing_tests_enabled());
+    }
+
+    #[test]
+    fn opted_in_elapsed_budget_accepts_time_below_limit() {
+        assert_elapsed_under_if(
+            true,
+            "fast",
+            Duration::from_millis(4999),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeded budget")]
+    fn opted_in_elapsed_budget_rejects_the_boundary() {
+        assert_elapsed_under_if(true, "slow", Duration::from_secs(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn default_scaling_runs_both_sizes_without_judging_time() {
+        let mut sizes = Vec::new();
+        assert_scales_linearly_with_timing("loaded runner", 7, false, |n| {
+            sizes.push(n);
+            Duration::MAX
+        });
+        assert_eq!(sizes, [7, 28]);
+    }
+
+    #[test]
+    #[should_panic(expected = "large input semantic assertion")]
+    fn default_scaling_keeps_large_input_assertions() {
+        assert_scales_linearly_with_timing("semantics", 7, false, |n| {
+            assert_ne!(n, 28, "large input semantic assertion");
+            Duration::ZERO
+        });
+    }
+
+    #[test]
+    fn opted_in_scaling_accepts_linear_work() {
+        assert_scales_linearly_with_timing("linear", 10, true, |n| Duration::from_millis(n as u64));
+    }
+
+    #[test]
+    #[should_panic(expected = "work grows faster than linearly")]
+    fn opted_in_scaling_rejects_quadratic_work() {
+        assert_scales_linearly_with_timing("quadratic", 10, true, |n| {
+            Duration::from_millis((n * n) as u64)
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "hang: 120s at 40")]
+    fn opted_in_scaling_keeps_the_hang_budget() {
+        assert_scales_linearly_with_timing("hang", 10, true, |_| FLOOD_HANG_LIMIT);
+    }
+}
