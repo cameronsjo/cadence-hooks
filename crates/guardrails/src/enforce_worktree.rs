@@ -5641,20 +5641,32 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn tmpdir_env_canonicalization_mismatch_is_temp() {
+    fn tmpdir_env_physical_spelling_is_temp() {
         // macOS: `git rev-parse --show-toplevel` canonicalizes
         // (`/private/var/…`) while `$TMPDIR` stays `/var/folders/…` — the
-        // exemption must fire anyway. Simulated with a symlinked tmpdir under
-        // the non-temp scratch root (`Scratch` is imported from
-        // `cadence_hooks_core::git_fixtures` at the top of this module).
+        // exemption must fire anyway, through the lexical twin.
+        assert!(is_temp_root(
+            Path::new("/private/var/folders/xy/T/repo"),
+            Some("/var/folders/xy/T"),
+            None
+        ));
+    }
+
+    /// cadence-hooks#1413: a symlinked `$TMPDIR` is never resolved, so the
+    /// directory it points at does not earn the carve-out — under either
+    /// spelling of a repo root inside it.
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_tmpdir_is_not_temp() {
         let scratch = scratch("tmpdir-canon");
         let real = scratch.path().join("real");
         let link = scratch.path().join("link");
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link_str = link.to_str().unwrap();
         let repo_root = std::fs::canonicalize(&real).unwrap().join("repo");
-        assert!(is_temp_root(&repo_root, Some(link.to_str().unwrap()), None));
+        assert!(!is_temp_root(&repo_root, Some(link_str), None));
+        assert!(!is_temp_root(&link.join("repo"), Some(link_str), None));
     }
 
     // --- git_commit_targets (pure parsing) ---

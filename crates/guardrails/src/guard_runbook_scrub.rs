@@ -99,7 +99,9 @@
 //! - A write into the marker directory through a location the hook cannot
 //!   read, or by a program whose writes it cannot see, is not caught: the
 //!   marker-dir refusal judges write targets only. (`record-scrub` itself
-//!   trusts its caller, so it is the simpler forgery anyway.)
+//!   trusts its caller, so it is the simpler forgery anyway.) The same
+//!   holds for a link such a program creates: a write through it is not
+//!   refused, since the program could write the marker directly.
 //! - `NotebookEdit` carries its target in `notebook_path`, which no guard
 //!   reads; a notebook is not a runbook.
 //!
@@ -120,6 +122,11 @@
 //!   Windows that is the default temp dir (`%LOCALAPPDATA%\Temp`).
 //! - A mention is read additively (raw, expanded, and normalized text), so a
 //!   spelling that walks back out (`…/Runbooks/../x.md`) still names it.
+//! - A write at or under a path another segment of the same command may
+//!   place a link at blocks (`link_then_write`, cadence-hooks#1412), since
+//!   the pre-command reading cannot see where that link points. That catches
+//!   `mv a dir/ && cp b dir/c` and `cp -r src out && cp f out/` too; run the
+//!   link, move, or recursive copy as its own command first.
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -132,7 +139,8 @@
 use cadence_hooks_cadence::prevent_secret_writes::{segment_command_argv, segment_write_targets};
 use cadence_hooks_core::markers;
 use cadence_hooks_core::shell::{
-    UNRESOLVABLE_DIR, command_segments_with_dirs, command_word, parse_work_dir, tokenize,
+    UNRESOLVABLE_DIR, command_segments_with_dirs, command_word, parse_work_dir, redirect_targets,
+    tokenize,
 };
 use cadence_hooks_core::worktree::{is_truthy, temp_root_spellings};
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
@@ -1008,6 +1016,164 @@ fn bash_target_is_parent(
         })
 }
 
+/// Writers known never to create a symlink at a path they write
+/// (cadence-hooks#1412). Any other program whose operands are write targets
+/// may: `ln`, `mv` of an existing link, `rsync -l`, a recursive `cp`, which
+/// copies the links inside its source as links, and `install -l` (BSD).
+const NO_LINK_WRITERS: &[&str] = &["tee", "rm", "shred", "unlink", "dd", "truncate", "touch"];
+
+/// True when the segment whose peeled argv is `argv` may create a link at
+/// one of its write targets: its program is not in [`NO_LINK_WRITERS`], or
+/// is a `cp` or `install` with an option that makes or copies links.
+fn may_create_link(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let word = command_word(first);
+    let args = &argv[1..];
+    let any = |long: &[&str], shorts: &[char]| args.iter().any(|a| has_option(a, long, shorts));
+    match word.as_ref() {
+        w if NO_LINK_WRITERS.contains(&w) => false,
+        "cp" => any(
+            &[
+                "symbolic-link",
+                "link",
+                "recursive",
+                "archive",
+                "no-dereference",
+            ],
+            &['s', 'l', 'r', 'R', 'a', 'P', 'd'],
+        ),
+        "install" => any(&[], &['l']),
+        _ => true,
+    }
+}
+
+/// `segment`'s write targets that are operands rather than redirects: the
+/// paths its program may place a link at. A redirect writes a regular file
+/// or through what is already there; it never creates a link.
+fn operand_targets(segment: &str) -> Vec<String> {
+    let mut targets = segment_write_targets(segment);
+    for redirect in redirect_targets(segment) {
+        if let Some(at) = targets.iter().position(|t| *t == redirect) {
+            targets.remove(at);
+        }
+    }
+    targets
+}
+
+/// Every reading of a Bash write target, absolute, judged against each
+/// directory the command may run it in ([`bash_target_landing`]'s rules).
+/// `None` when its location depends on something the hook cannot read.
+fn target_readings(
+    target: &str,
+    work_dirs: &[&str],
+    dir: &RunbooksDir,
+    resolver: &Resolver,
+) -> Option<Vec<Vec<Comp>>> {
+    let text = dir.expand(target);
+    let uses_pwd = text.contains("PWD") || text.starts_with("~+");
+    let bases: &[&str] = if text.starts_with('/') && !uses_pwd {
+        &["/"]
+    } else {
+        work_dirs
+    };
+    let mut out = Vec::new();
+    for base in bases {
+        if *base == UNRESOLVABLE_DIR {
+            return None;
+        }
+        let text = if uses_pwd {
+            expand_pwd(&text, base)
+        } else {
+            text.clone()
+        };
+        let shape = PathShape(absolute(&text, base, true));
+        if text.starts_with('~') || shape.has_opaque() {
+            return None;
+        }
+        out.push(shape.lexical());
+        out.extend(shape.physical(resolver));
+    }
+    Some(out)
+}
+
+/// True when `path` is `link` or beneath it. A glob component on either
+/// side matches any one name.
+fn at_or_under(path: &[Comp], link: &[Comp]) -> bool {
+    path.len() >= link.len()
+        && path.iter().zip(link).all(|(p, l)| match (p, l) {
+            (Comp::Wild, _) | (_, Comp::Wild) => true,
+            (Comp::Lit(a), Comp::Lit(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        })
+}
+
+/// A write target and the directory its segment runs in.
+type SegmentTarget = (String, Rc<str>);
+
+/// The first write target that may land under a link another segment of the
+/// same command creates (cadence-hooks#1412).
+///
+/// Every other judgment here reads the filesystem as it is before the command
+/// runs, so a link the command makes itself is invisible to it:
+/// `ln -s <marker-parent> /tmp/x && cp -r forged/markers /tmp/x/` lands
+/// forged markers while every target reads as `/tmp`. So when a segment may
+/// create a link ([`may_create_link`]) at one of its operand targets, a write
+/// target of any *other* segment at or under that path, under either reading,
+/// or one whose location either side leaves unreadable, is refused. Order is
+/// not read: a loop or `&` runs a later segment first.
+///
+/// A program whose writes the parser cannot see at all (`python`, `tar -x`)
+/// is not judged here: it could write the marker directly, which the module
+/// docs already list as a known miss.
+fn link_then_write(
+    links: &[(usize, SegmentTarget)],
+    writes: &[(usize, SegmentTarget)],
+    cwd: &str,
+    whole: &str,
+    dir: &RunbooksDir,
+    resolver: &Resolver,
+    spent: &mut usize,
+) -> Option<BashFinding> {
+    let readings = |(target, seg_dir): &SegmentTarget| {
+        let mut bases: Vec<&str> = vec![seg_dir, cwd, whole];
+        bases.dedup();
+        target_readings(target, &bases, dir, resolver)
+    };
+    let link_readings: Vec<(usize, Option<Vec<Vec<Comp>>>)> = links
+        .iter()
+        .map(|(seg, link)| (*seg, readings(link)))
+        .collect();
+    for (seg, write) in writes {
+        let others: Vec<&Option<Vec<Vec<Comp>>>> = link_readings
+            .iter()
+            .filter(|(link_seg, _)| link_seg != seg)
+            .map(|(_, r)| r)
+            .collect();
+        if others.is_empty() {
+            continue;
+        }
+        *spent = spent.saturating_add(write.0.len().saturating_mul(others.len()));
+        if *spent > JUDGE_BUDGET {
+            return Some(BashFinding::TooLarge);
+        }
+        let Some(write_readings) = readings(write) else {
+            return Some(BashFinding::LinkThenWrite(write.0.clone()));
+        };
+        let under = others.iter().any(|link| match link {
+            None => true,
+            Some(link) => link
+                .iter()
+                .any(|l| write_readings.iter().any(|w| at_or_under(w, l))),
+        });
+        if under {
+            return Some(BashFinding::LinkThenWrite(write.0.clone()));
+        }
+    }
+    None
+}
+
 /// The first Bash write target that lands in the directory — or, failing
 /// that, one whose location the hook cannot read when the command names the
 /// directory. Each segment's targets are judged in the directory that segment
@@ -1036,8 +1202,15 @@ fn bash_write_into(
     // Work dirs already asked whether they name the runbooks dir, with the
     // argv words they were asked with — a flood repeats one directory.
     let mut dir_named = false;
+    // Operand targets of segments that may create a link, and every write
+    // target, each tagged with its segment ([`link_then_write`]).
+    let mut links: Vec<(usize, SegmentTarget)> = Vec::new();
+    let mut writes: Vec<(usize, SegmentTarget)> = Vec::new();
     let mut asked: HashSet<(Rc<str>, Vec<String>)> = HashSet::new();
-    for (segment, seg_dir) in command_segments_with_dirs(command, cwd) {
+    for (index, (segment, seg_dir)) in command_segments_with_dirs(command, cwd)
+        .into_iter()
+        .enumerate()
+    {
         let argv = segment_command_argv(&segment);
         if writer.is_none() {
             writer = unvetted_program(&segment, &argv);
@@ -1051,7 +1224,17 @@ fn bash_write_into(
                 .iter()
                 .any(|d| dir.named_by_work_dir(d, &argv, &resolver));
         }
+        if may_create_link(&argv) {
+            for target in operand_targets(&segment) {
+                if !is_stream_sink(&target) {
+                    links.push((index, (target, seg_dir.clone())));
+                }
+            }
+        }
         for target in segment_write_targets(&segment) {
+            if !is_stream_sink(&target) {
+                writes.push((index, (target.clone(), seg_dir.clone())));
+            }
             if !judged.insert((target.clone(), seg_dir.clone())) {
                 continue;
             }
@@ -1095,6 +1278,12 @@ fn bash_write_into(
                 }
             }
         }
+    }
+    if !links.is_empty()
+        && let Some(finding) =
+            link_then_write(&links, &writes, cwd, &whole, dir, &resolver, &mut spent)
+    {
+        return Some(finding);
     }
     // A command that names the directory may read it, and nothing else: any
     // write it makes, and any program whose writes the parser cannot see
@@ -1347,6 +1536,9 @@ enum BashFinding {
     Program(String),
     /// This write target lands in the scrub-marker directory.
     MarkerTarget(String),
+    /// This write target may land under a link another segment of the
+    /// command creates ([`link_then_write`]).
+    LinkThenWrite(String),
     /// The command is past [`JUDGE_BUDGET`].
     TooLarge,
 }
@@ -1609,6 +1801,18 @@ impl RunbookScrubGuard {
                          read it (cat, ls, grep, head, find without -exec/-delete, …).\n   \
                          {FIX_AND_ESCAPE}",
                         echo(&program)
+                    ),
+                    BashFinding::LinkThenWrite(target) => format!(
+                        "🚫 BLOCKED: guard-runbook-scrub: this command creates a link and, in \
+                         another step, writes to a path that may be under it. The hook judges \
+                         paths before the command runs, so it cannot see where a link the \
+                         command makes itself points: a link to the scrub-marker or runbooks \
+                         directory would let this write land there.\n   \
+                         Found:  {}\n   \
+                         Fix:    run the link, move, or recursive copy as its own command \
+                         first; the next command is then judged with the link in place.\n   \
+                         {FIX_AND_ESCAPE}",
+                        echo(&target)
                     ),
                     BashFinding::TooLarge => format!(
                         "🚫 BLOCKED: guard-runbook-scrub: this command carries too many write \
@@ -2895,6 +3099,141 @@ mod tests {
                 &[],
             );
             assert_eq!(got.outcome, Outcome::Block, "{command}");
+        }
+    }
+
+    /// cadence-hooks#1412: a link the command creates itself is invisible to
+    /// a pre-command reading, so a write under it in another segment is
+    /// refused. Each write alone is allowed (the positive control), so the
+    /// refusal comes from the link step and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_under_a_link_the_command_creates_is_refused() {
+        let f = fixture("a-write-under-a-link-the-command-creates");
+        let cfg = format!("{}/cfg", f.root);
+        let marker_dir = format!("{cfg}/cadence-hooks/markers");
+        let parent = format!("{cfg}/cadence-hooks");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let s = format!("{}/scratch", f.root);
+        std::fs::create_dir_all(&s).unwrap();
+        let vault = Path::new(&f.runbooks)
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        let judge = |command: &str| {
+            let input = make_bash_with_cwd(command, &f.work);
+            run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    marker_dir: Some(&marker_dir),
+                    ..Env::default()
+                },
+                &[],
+            )
+        };
+        for (link, write) in [
+            (
+                format!("ln -s {parent} {s}/x"),
+                format!("cp -r forged/markers {s}/x/"),
+            ),
+            (
+                format!("ln -sfn {marker_dir} {s}/x"),
+                format!("cp forged {s}/x/scrub-abc"),
+            ),
+            (
+                format!("cp -a linked {s}/x"),
+                format!("touch {s}/x/m/scrub-abc"),
+            ),
+            (format!("cp -rs a {s}/x"), format!("tee {s}/x/m/a")),
+            (format!("mv prelink {s}/x"), format!("echo > {s}/x/m/a")),
+            (
+                format!("rsync -a src/ {s}/x"),
+                format!("cp forged {s}/x/m/"),
+            ),
+            (format!("install -l s a {s}/x"), format!("cp f {s}/x/m/")),
+            (
+                format!("cd {s} && ln -s {parent} x"),
+                "cp -r forged/markers x/".to_string(),
+            ),
+            (format!("ln -s {parent} \"$D\""), format!("cp f {s}/y")),
+            (format!("ln -s {parent} {s}/x"), "cp f \"$OUT\"".to_string()),
+            (
+                format!("ln -s {vault} {s}/v"),
+                format!("cp draft.md {s}/v/Runbooks/"),
+            ),
+        ] {
+            assert_eq!(
+                judge(&write).outcome,
+                Outcome::Allow,
+                "control: `{write}` alone"
+            );
+            for command in [
+                format!("{link} && {write}"),
+                format!("{link}; {write}"),
+                // Order is not read: `&` or a loop can run the write later.
+                format!("{write} & {link}"),
+            ] {
+                let got = judge(&command);
+                assert_eq!(got.outcome, Outcome::Block, "{command}");
+                assert!(
+                    got.message
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("creates a link"),
+                    "{command}: {:?}",
+                    got.message
+                );
+            }
+        }
+        // Not refused: no link step, or no write under the link.
+        for command in [
+            format!("ln -s {parent} {s}/x"),
+            format!("ln -s a {s}/x && cp f {s}/y"),
+            format!("cp a {s}/b && cp c {s}/b/"),
+            format!("cat a > {s}/f && cat b >> {s}/f"),
+            format!("echo x > {s}/f && cp {s}/f {s}/g"),
+            format!("rm -rf {s}/x && touch {s}/x"),
+            format!("ln -s a {s}/x 2>/dev/null && echo ok > /dev/null"),
+        ] {
+            assert_eq!(judge(&command).outcome, Outcome::Allow, "{command}");
+        }
+    }
+
+    #[test]
+    fn may_create_link_allows_only_known_plain_writers() {
+        let argv = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        for linker in [
+            "ln -s a b",
+            "mv a b",
+            "rsync -a a b",
+            "cp -r a b",
+            "cp -R a b",
+            "cp -a a b",
+            "cp -s a b",
+            "cp -l a b",
+            "cp -P a b",
+            "cp -d a b",
+            "cp --recursive a b",
+            "cp --arch a b",
+            "cp --no-deref a b",
+            "install -l s a b",
+            "unknown-writer a b",
+        ] {
+            assert!(may_create_link(&argv(linker)), "{linker}");
+        }
+        for plain in [
+            "cp a b",
+            "cp -f -p a b",
+            "install -m 644 a b",
+            "tee a",
+            "touch a",
+            "rm -rf a",
+            "dd of=a",
+            "truncate -s 0 a",
+        ] {
+            assert!(!may_create_link(&argv(plain)), "{plain}");
         }
     }
 

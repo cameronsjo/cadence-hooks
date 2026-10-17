@@ -17,7 +17,7 @@
 //! directory removal included — into the shipped binary as dead code. A
 //! resolver downgrade is the one change that silently reopens that.
 
-use crate::worktree::{is_claude_managed_dir, path_under_temp_root_with_canonical};
+use crate::worktree::{is_claude_managed_dir, path_under_temp_root};
 use std::path::{Path, PathBuf};
 
 /// Env var overriding [`resolve_scratch_dir`]'s fallback root, for the rare
@@ -169,12 +169,6 @@ fn resolve_scratch_dir_with(
     xdg_cache_home: Option<&Path>,
     home: Option<&str>,
 ) -> PathBuf {
-    // `$TMPDIR` is invariant for the process — canonicalize once (a real
-    // `realpath` syscall chain) and reuse it across all three candidates,
-    // rather than re-canonicalizing per candidate inside `escapes_carveout`
-    // (cadence-hooks#403 code review: the relocation path this function
-    // exists for is precisely the one that was paying that cost 2-3x).
-    let tmpdir_canonical = crate::worktree::canonicalize_tmpdir(tmpdir, home);
     let suffix = format!("{tag}-{}", std::process::id());
     let candidate = |base: &Path| base.join(&suffix);
     // Canonicalize `dir` (or its nearest existing ancestor — the `{tag}-{pid}`
@@ -189,15 +183,20 @@ fn resolve_scratch_dir_with(
     // path escapes the carve-out could still land somewhere the guard's
     // real resolution treats as exempt, reopening this exact bug through
     // symlink indirection instead of a direct `/tmp` prefix.
+    // The guards no longer resolve `$TMPDIR` (cadence-hooks#1413), but a
+    // fixture under its resolved spelling is still a temp dir, and on Windows
+    // `canonicalize` returns a `\\?\` spelling the raw value never matches.
+    // Counting it here only relocates more fixtures, which is the safe side.
+    let tmpdir_resolved = crate::worktree::usable_tmpdir(tmpdir, home)
+        .and_then(|t| std::fs::canonicalize(t).ok())
+        .filter(|c| c.parent().is_some());
     let escapes_carveout = |dir: &Path| {
         let resolved = canonicalize_nearest_existing(dir);
         !is_claude_managed_dir(&resolved)
-            && !path_under_temp_root_with_canonical(
-                &resolved,
-                tmpdir,
-                tmpdir_canonical.as_deref(),
-                home,
-            )
+            && !path_under_temp_root(&resolved, tmpdir, home)
+            && !tmpdir_resolved
+                .as_deref()
+                .is_some_and(|c| resolved.starts_with(c))
     };
 
     let default_dir = candidate(root);
@@ -577,9 +576,9 @@ mod tests {
     // ancestor that doesn't match either — so `escapes_carveout` returned
     // true for the "carved-out" default on Windows, and the function
     // short-circuited there without ever reaching the branch under test.
-    // Anchoring on the real temp dir and passing it as `tmpdir` too routes
-    // through the portable `via_env` check on every platform, the same
-    // mechanism that already handles macOS's `/var` vs `/private/var` split.
+    // Anchoring on the real temp dir and passing it as `tmpdir` too matches
+    // through the `$TMPDIR` spelling on every platform, the same
+    // mechanism that handles macOS's `/var` vs `/private/var` split.
 
     /// A directory guaranteed to be recognized as under a carve-out (temp
     /// root) on ANY platform — see the comment above.
@@ -590,8 +589,8 @@ mod tests {
     }
 
     /// The `tmpdir` value to pair with [`temp_carveout_root`], so
-    /// `path_under_temp_root_with_canonical`'s `via_env` branch recognizes
-    /// paths built from it — the same real, resolvable directory on every
+    /// `path_under_temp_root` recognizes paths built
+    /// from it — the same real, resolvable directory on every
     /// platform, unlike a hardcoded `/tmp` literal.
     fn temp_carveout_tmpdir() -> String {
         std::env::temp_dir().to_string_lossy().into_owned()
