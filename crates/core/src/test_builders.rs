@@ -262,7 +262,28 @@ fn timing_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
 /// Check an unchanged wall-clock budget only when timing tests are opted in.
 #[track_caller]
 pub fn assert_elapsed_under(what: &str, elapsed: std::time::Duration, limit: std::time::Duration) {
-    assert_elapsed_under_if(timing_tests_enabled(), what, elapsed, limit);
+    assert_elapsed_under_if(
+        timing_tests_enabled(),
+        what,
+        elapsed,
+        platform_limit(cfg!(windows), limit),
+    );
+}
+
+/// Sub-second budgets get this multiple on Windows. Three GitHub-hosted
+/// `windows-latest` release runs (cadence-hooks#1416) overran the 500 ms
+/// budgets by up to 1.42x (710 ms worst; process spawn and filesystem calls
+/// cost more there), so 3x leaves about 2x headroom over the worst sample.
+const WINDOWS_SUBSECOND_FACTOR: u32 = 3;
+
+/// Budgets of a second or more guard against a hang or a hook deadline, which
+/// platform speed does not move, so they stay as written.
+fn platform_limit(windows: bool, limit: std::time::Duration) -> std::time::Duration {
+    if windows && limit < std::time::Duration::from_secs(1) {
+        limit * WINDOWS_SUBSECOND_FACTOR
+    } else {
+        limit
+    }
 }
 
 #[track_caller]
@@ -275,9 +296,68 @@ fn assert_elapsed_under_if(
     if enabled {
         assert!(
             elapsed < limit,
-            "{what}: {elapsed:?} exceeded budget {limit:?}"
+            "{what}: {elapsed:?} exceeded budget {limit:?} (after any platform scaling)"
         );
     }
+}
+
+/// The text a `group` prints for a member that missed its deadline.
+pub const GROUP_FAIL_OPEN_MARKERS: [&str; 2] = ["did not finish within", "did not block"];
+
+/// Whether a `group` run was a fail-open at its deadline and so says nothing
+/// about the guard: it took at least `deadline`, exited 0 or 1 (1 is what
+/// `merge_group_output` returns when every member timed out), and printed the
+/// degraded text for a member that did not finish. A bare exit 1 without that
+/// text is a crash and never qualifies. Timing opt-in turns this off.
+pub fn is_group_fail_open(
+    enabled: bool,
+    code: Option<i32>,
+    stderr: &str,
+    took: std::time::Duration,
+    deadline: std::time::Duration,
+) -> bool {
+    !enabled
+        && took >= deadline
+        && matches!(code, Some(0 | 1))
+        && GROUP_FAIL_OPEN_MARKERS.iter().all(|m| stderr.contains(m))
+}
+
+/// Assert a `group` that fails open at `deadline` blocked (exit 2) in time.
+///
+/// Past the deadline the group fails open (exit 0, or exit 1 with degraded
+/// text on stderr), so an exit-2 assert on such a run is a wall-clock assert in
+/// disguise. Without [`timing_tests_enabled`], a run that took at least
+/// `deadline` and shows the fail-open signature ([`is_group_fail_open`]) is
+/// load, not a regression, and passes. A crash, a bare exit 1, or any non-block
+/// that finished sooner still fails, as does every non-block when timing is
+/// opted in.
+#[track_caller]
+pub fn assert_blocked_before_deadline(
+    what: &str,
+    code: Option<i32>,
+    stderr: &str,
+    took: std::time::Duration,
+    deadline: std::time::Duration,
+) {
+    assert_blocked_before_deadline_if(timing_tests_enabled(), what, code, stderr, took, deadline);
+}
+
+#[track_caller]
+fn assert_blocked_before_deadline_if(
+    enabled: bool,
+    what: &str,
+    code: Option<i32>,
+    stderr: &str,
+    took: std::time::Duration,
+    deadline: std::time::Duration,
+) {
+    if code == Some(2) || is_group_fail_open(enabled, code, stderr, took, deadline) {
+        return;
+    }
+    panic!(
+        "{what}: exit {code:?} after {took:?}, expected a block (exit 2) before {deadline:?}; \
+         stderr: {stderr}"
+    );
 }
 
 /// Run flood semantics at `size` and four times `size`, and optionally assert
@@ -386,6 +466,72 @@ mod timing_tests {
     #[should_panic(expected = "exceeded budget")]
     fn opted_in_elapsed_budget_rejects_the_boundary() {
         assert_elapsed_under_if(true, "slow", Duration::from_secs(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn windows_widens_only_subsecond_budgets() {
+        let ms = Duration::from_millis;
+        assert_eq!(platform_limit(true, ms(500)), ms(1500));
+        assert_eq!(
+            platform_limit(true, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            platform_limit(true, Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(platform_limit(false, ms(500)), ms(500));
+    }
+
+    const DEGRADED: &str = "cadence-hooks: 'git-safety' did not finish within 5000 ms and \
+                            did not block; see failopen.jsonl\n";
+
+    fn blocked(enabled: bool, code: Option<i32>, stderr: &str, took_ms: u64) {
+        assert_blocked_before_deadline_if(
+            enabled,
+            "case",
+            code,
+            stderr,
+            Duration::from_millis(took_ms),
+            Duration::from_secs(4),
+        );
+    }
+
+    #[test]
+    fn a_block_passes_at_any_speed() {
+        for enabled in [false, true] {
+            blocked(enabled, Some(2), "", 1);
+        }
+    }
+
+    #[test]
+    fn a_degraded_fail_open_past_the_deadline_is_load_unless_timing_is_opted_in() {
+        for code in [Some(0), Some(1)] {
+            blocked(false, code, DEGRADED, 5000);
+            let strict = std::panic::catch_unwind(|| blocked(true, code, DEGRADED, 5000));
+            assert!(strict.is_err(), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_crash_or_bare_exit_past_the_deadline_is_not_load() {
+        let panicked = "cadence-hooks: 'x' hit an internal error (panic) and did not block; see failopen.jsonl\n";
+        for (code, stderr) in [
+            (Some(1), ""),
+            (Some(1), panicked),
+            (Some(0), ""),
+            (None, DEGRADED),
+            (Some(3), DEGRADED),
+        ] {
+            let r = std::panic::catch_unwind(|| blocked(false, code, stderr, 5000));
+            assert!(r.is_err(), "{code:?} {stderr:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a block")]
+    fn a_fast_non_block_is_a_real_failure() {
+        blocked(false, Some(1), DEGRADED, 50);
     }
 
     #[test]

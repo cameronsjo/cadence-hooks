@@ -573,6 +573,25 @@ fn group_collect_budget() -> Duration {
     })
 }
 
+/// Debug builds only: stall every `group` member for `CADENCE_TEST_GROUP_STALL_MS`
+/// before it decides, so a test can make the group miss its deadline without
+/// depending on how fast the machine is. Like `CADENCE_TEST_PANIC`, the trigger
+/// does not exist in a release binary. Debug builds announce it on stderr,
+/// since a stalled member past the deadline fails open.
+#[cfg(debug_assertions)]
+fn test_group_stall() {
+    if let Some(ms) = std::env::var("CADENCE_TEST_GROUP_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        eprintln!(
+            "⚠️  cadence-hooks: CADENCE_TEST_GROUP_STALL_MS={ms} is stalling this group member \
+             (debug builds only); past the deadline it fails open. Unset it outside tests."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// Run several checks against **one** stdin payload in **one** process, then
 /// emit the single response Claude Code reads from a hook process.
 ///
@@ -638,6 +657,8 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
                 let _guard = PanicGuard::arm();
                 let verdict = catch_unwind(AssertUnwindSafe(|| {
                     cadence_hooks_core::deadline::arm();
+                    #[cfg(debug_assertions)]
+                    test_group_stall();
                     let (input, normalized_inputs) = &*shared;
                     decide_member(&member.plan, hook, input, normalized_inputs, Instant::now())
                 }))

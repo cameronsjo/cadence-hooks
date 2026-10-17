@@ -22,7 +22,15 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
         .path()
 }
 
+/// The wired group's hook deadline; past it the group fails open (exit 0, or
+/// exit 1 with degraded text on stderr).
+const GROUP_DEADLINE: Duration = Duration::from_millis(4000);
+
 fn run(args: &[&str], command: &str) -> (Output, Duration) {
+    run_with_env(args, command, &[])
+}
+
+fn run_with_env(args: &[&str], command: &str, env: &[(&str, &str)]) -> (Output, Duration) {
     let payload = serde_json::json!({
         "hook_event_name": "PreToolUse",
         "session_id": "heredoc-flood",
@@ -37,6 +45,7 @@ fn run(args: &[&str], command: &str) -> (Output, Duration) {
     cmd.env_remove("CADENCE_BYPASS")
         .env_remove("CADENCE_DISABLE")
         .env("CADENCE_METRICS_DIR", scratch_metrics_dir())
+        .envs(env.iter().copied())
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -113,9 +122,10 @@ fn bare_prevent_secret_leaks_blocks_nested_heredoc_floods() {
 #[test]
 fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
     // The group fails OPEN at 4000 ms, so an exit 2 here is itself the proof
-    // the scan finished inside the deadline. 200 KB is left to the bare-hook
-    // test above: a debug build of the full group needs ~2 s there, too close
-    // to the deadline to assert on a shared runner.
+    // the scan finished inside the deadline. Crossing it on a loaded machine
+    // passes unless `CADENCE_TIMING_TESTS=1` (cadence-hooks#1366). 200 KB is
+    // left to the bare-hook test above: a debug build of the full group needs
+    // ~2 s there, too close to the deadline to assert on a shared runner.
     for target in [10_000, 50_000] {
         for (name, command) in shapes(target) {
             let (out, took) = run(
@@ -128,13 +138,53 @@ fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
                 ],
                 &command,
             );
-            assert_eq!(
+            cadence_hooks_core::test_builders::assert_blocked_before_deadline(
+                &format!(
+                    "{name} ({} B); stderr: {}",
+                    command.len(),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
                 out.status.code(),
-                Some(2),
-                "{name} ({} B) was not blocked in {took:?}; stderr: {}",
-                command.len(),
-                String::from_utf8_lossy(&out.stderr)
+                &String::from_utf8_lossy(&out.stderr),
+                took,
+                GROUP_DEADLINE,
             );
         }
     }
+}
+
+/// The helper must accept what the real wired group prints when it misses its
+/// deadline, not just a synthetic string (cadence-hooks#1366). A 1 ms budget
+/// makes the group stop waiting after ~1 s, and the debug-only stall keeps
+/// every member busy past that, whatever the machine's speed. The stall knob
+/// does not exist in release builds, so the test is ignored there; the debug
+/// suite runs it on every platform.
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug-only group stall")]
+fn the_real_group_fail_open_is_accepted_only_without_timing_opt_in() {
+    use cadence_hooks_core::test_builders::is_group_fail_open;
+    let (out, took) = run_with_env(
+        &[
+            "group",
+            "cadence/git-safety",
+            "cadence/prevent-secret-writes",
+            "cadence/prevent-secret-leaks",
+            "cadence/warn-docs-update",
+        ],
+        "cat .env",
+        &[
+            ("CADENCE_HOOK_DEADLINE_MS", "1"),
+            ("CADENCE_TEST_GROUP_STALL_MS", "5000"),
+        ],
+    );
+    let (code, stderr) = (out.status.code(), String::from_utf8_lossy(&out.stderr));
+    let deadline = Duration::from_millis(1);
+    assert!(
+        is_group_fail_open(false, code, &stderr, took, deadline),
+        "the real fail-open was not recognised: exit {code:?} after {took:?}; stderr: {stderr}"
+    );
+    assert!(
+        !is_group_fail_open(true, code, &stderr, took, deadline),
+        "strict mode must fail the real fail-open"
+    );
 }

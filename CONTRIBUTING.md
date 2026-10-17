@@ -28,11 +28,23 @@ CADENCE_TIMING_TESTS=1 cargo test --release --workspace --no-fail-fast -- --test
 ```
 
 In PowerShell, set `$env:CADENCE_TIMING_TESTS = '1'` before running the same
-`cargo test` command. CI runs the normal suite on its Linux and Windows runners
-and this release invocation on Linux only: the release budgets are enforced on Linux
-CI only: one observed overrun (676 ms against 500 ms); tracked in
-https://github.com/cameronsjo/cadence-hooks/issues/1416. Use a machine without competing heavy
-workloads: wall-clock measurements still depend on available CPU time.
+`cargo test` command. CI runs this release invocation on Linux and Windows. On
+Windows, budgets under one second are multiplied by 3 (`platform_limit` in
+`crates/core/src/test_builders.rs`): three `windows-latest` samples overran the
+500 ms budgets by up to 1.42x (710 ms worst; cadence-hooks#1416). Budgets of a
+second or more guard against a hang or a hook deadline and stay as written. Use
+a machine without competing heavy workloads: wall-clock measurements still
+depend on available CPU time.
+
+One deadline test is gated differently. `wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline`
+asserts exit 2 from the real `cadence-hooks group`, which fails open past its
+4000 ms deadline (exit 0, or exit 1 with "did not finish within N ms and did not
+block" on stderr). Without `CADENCE_TIMING_TESTS=1`, a run that took at least the
+deadline and shows that signature passes as load; a bare exit 1, a panic, or a
+faster non-block still fails. With the variable set, only the block passes.
+A debug-only test (`the_real_group_fail_open_is_accepted_only_without_timing_opt_in`) drives the real group
+with `CADENCE_HOOK_DEADLINE_MS=1` and `CADENCE_TEST_GROUP_STALL_MS=5000` to prove the helper accepts the real
+fail-open output; the stall knob does not exist in release builds, so release runs ignore that test.
 
 Other timing budgets are not gated by this variable. The five `CADENCE_TEST_PANIC`
 tests exist only in debug builds, so `--release` runs report them as ignored.
