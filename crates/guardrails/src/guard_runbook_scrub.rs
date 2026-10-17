@@ -112,7 +112,12 @@
 //!   blocks as uncomputable; create it with the Write tool.
 //! - Any write target that is exactly the marker directory's parent blocks,
 //!   whatever the writer (a recursive copy there could land a forged marker
-//!   directory) — unless that parent is the root or a shared temp dir.
+//!   directory) — unless that parent is the root or a shared temp dir
+//!   (`/tmp`, or `$TMPDIR` or the platform temp dir in its raw or macOS
+//!   `/private` spelling; see `MarkerDir::new`).
+//! - A temp dir inside home is not a shared temp dir, so a marker-dir
+//!   override directly under one refuses every recursive copy there. On
+//!   Windows that is the default temp dir (`%LOCALAPPDATA%\Temp`).
 //! - A mention is read additively (raw, expanded, and normalized text), so a
 //!   spelling that walks back out (`…/Runbooks/../x.md`) still names it.
 //!
@@ -129,7 +134,7 @@ use cadence_hooks_core::markers;
 use cadence_hooks_core::shell::{
     UNRESOLVABLE_DIR, command_segments_with_dirs, command_word, parse_work_dir, tokenize,
 };
-use cadence_hooks_core::worktree::is_truthy;
+use cadence_hooks_core::worktree::{is_truthy, temp_root_spellings};
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -912,30 +917,67 @@ fn bash_target_landing(
     }
 }
 
-/// True when a Bash write target is exactly the parent of the directory
-/// spelled `spellings` (either reading): a recursive copy or move there
+/// The scrub-marker directory, resolved once per run.
+struct MarkerDir {
+    /// Each spelling that names it: lexical and physical, as components.
+    spellings: Vec<Vec<String>>,
+    /// The spellings' parents a Bash write target may not be (see
+    /// [`bash_target_is_parent`]).
+    parents: Vec<Vec<String>>,
+}
+
+impl MarkerDir {
+    /// `tmpdirs` are the temp-dir values in effect (`$TMPDIR`, the platform
+    /// temp dir). A parent that is the root or a shared temp dir (a
+    /// `CADENCE_MARKER_DIR` override under /tmp) is not kept: refusing it
+    /// would gate every copy there. Each temp dir counts in both spellings,
+    /// since the marker dir is held in both (cadence-hooks#1403: macOS
+    /// `/var/folders/…` is `/private/var/folders/…`). The spellings come from
+    /// [`temp_root_spellings`], which never resolves `$TMPDIR`: a `$TMPDIR`
+    /// that is a symlink, holds `.` or `..`, or sits in or over home counts
+    /// as no temp dir, so a swapped temp dir cannot exempt this parent. The
+    /// parent is exempt only when every one of its spellings is temp, so a
+    /// link placed above the marker dir cannot exempt it either.
+    fn new(spellings: Vec<Vec<String>>, tmpdirs: &[String], home: Option<&str>) -> Self {
+        let mut tmpdirs: Vec<&str> = tmpdirs.iter().map(String::as_str).collect();
+        tmpdirs.dedup();
+        let temp_dirs: BTreeSet<String> = std::iter::once(None)
+            .chain(tmpdirs.into_iter().map(Some))
+            .flat_map(|t| temp_root_spellings(t, home))
+            .map(|t| {
+                t.to_string_lossy()
+                    .trim_end_matches(['/', '\\'])
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let parents: Vec<Vec<String>> = spellings
+            .iter()
+            .filter(|s| s.len() > 1)
+            .map(|s| s[..s.len() - 1].to_vec())
+            .collect();
+        // All or nothing: the parent is exempt only when every spelling of it
+        // is a temp spelling. The physical spelling is read through links
+        // the session can place (`~/.claude/cadence-hooks -> $TMPDIR`), so a
+        // temp physical spelling alone proves nothing; dropping just that
+        // one would let `cp -r forged/markers $TMPDIR` through.
+        let all_temp = parents
+            .iter()
+            .all(|p| temp_dirs.contains(&format!("/{}", p.join("/")).to_ascii_lowercase()));
+        let parents = if all_temp { Vec::new() } else { parents };
+        Self { spellings, parents }
+    }
+}
+
+/// True when a Bash write target is exactly one of `parents`, the marker
+/// dir's parents ([`MarkerDir::parents`]): a recursive copy or move there
 /// (`cp -r forged/markers <parent>`) can land a whole forged directory.
 fn bash_target_is_parent(
     target: &str,
     work_dirs: &[&str],
     dir: &RunbooksDir,
-    spellings: &[Vec<String>],
+    parents: &[Vec<String>],
     resolver: &Resolver,
 ) -> bool {
-    // A parent that is the root or a shared temp dir (a `CADENCE_MARKER_DIR`
-    // override under /tmp) is not refused: that would gate every copy there.
-    let temp_dirs: Vec<String> = ["/tmp".to_string(), "/private/tmp".to_string()]
-        .into_iter()
-        .chain(std::env::var("TMPDIR").ok())
-        .chain(Some(std::env::temp_dir().to_string_lossy().into_owned()))
-        .map(|t| t.trim_end_matches(['/', '\\']).to_ascii_lowercase())
-        .collect();
-    let parents: Vec<&[String]> = spellings
-        .iter()
-        .filter(|s| s.len() > 1)
-        .map(|s| &s[..s.len() - 1])
-        .filter(|p| !temp_dirs.contains(&format!("/{}", p.join("/")).to_ascii_lowercase()))
-        .collect();
     if parents.is_empty() {
         return false;
     }
@@ -982,7 +1024,7 @@ fn bash_write_into(
     command: &str,
     cwd: &str,
     dir: &RunbooksDir,
-    marker_dir: Option<&[Vec<String>]>,
+    marker_dir: Option<&MarkerDir>,
 ) -> Option<BashFinding> {
     let whole = parse_work_dir(command, cwd);
     let mut judged: HashSet<(String, Rc<str>)> = HashSet::new();
@@ -1035,9 +1077,9 @@ fn bash_write_into(
                 }
             }
             if let Some(markers) = marker_dir
-                && (bash_target_landing(&target, &bases, dir, markers, &resolver)
+                && (bash_target_landing(&target, &bases, dir, &markers.spellings, &resolver)
                     == Landing::Inside
-                    || bash_target_is_parent(&target, &bases, dir, markers, &resolver))
+                    || bash_target_is_parent(&target, &bases, dir, &markers.parents, &resolver))
             {
                 return Some(BashFinding::MarkerTarget(target));
             }
@@ -1454,6 +1496,11 @@ impl Check for RunbookScrubGuard {
         let escape = std::env::var(ESCAPE_ENV).ok();
         let home = cadence_hooks_core::paths::user_home().map(|h| h.to_string_lossy().into_owned());
         let marker_dir = markers::polish_dir().to_string_lossy().into_owned();
+        let tmpdirs: Vec<String> = std::env::var("TMPDIR")
+            .ok()
+            .into_iter()
+            .chain(Some(std::env::temp_dir().to_string_lossy().into_owned()))
+            .collect();
         self.run_with(
             input,
             Env {
@@ -1461,6 +1508,7 @@ impl Check for RunbookScrubGuard {
                 escape: escape.as_deref(),
                 home: home.as_deref(),
                 marker_dir: Some(&marker_dir),
+                tmpdirs: &tmpdirs,
             },
             &markers::scrub_marker_present,
         )
@@ -1477,6 +1525,8 @@ struct Env<'a> {
     home: Option<&'a str>,
     /// The scrub-marker directory ([`markers::polish_dir`]).
     marker_dir: Option<&'a str>,
+    /// `$TMPDIR` and [`std::env::temp_dir`], for [`MarkerDir::new`].
+    tmpdirs: &'a [String],
 }
 
 impl RunbookScrubGuard {
@@ -1489,6 +1539,7 @@ impl RunbookScrubGuard {
             escape,
             home,
             marker_dir,
+            tmpdirs,
         } = env;
         let cwd = input
             .cwd
@@ -1503,7 +1554,8 @@ impl RunbookScrubGuard {
         let Some(dir) = RunbooksDir::resolve(dir, home, &cwd) else {
             return CheckResult::allow();
         };
-        // The marker directory, as spellings (lexical and physical).
+        // The marker directory, as spellings (lexical and physical). Its
+        // parents, which only the Bash arm reads, are worked out there.
         let marker_spellings = marker_dir
             .and_then(|m| RunbooksDir::resolve(Some(m), home, &cwd))
             .map(|m| m.spellings);
@@ -1546,7 +1598,8 @@ impl RunbookScrubGuard {
                 let Some(command) = input.command() else {
                     return CheckResult::allow();
                 };
-                bash_write_into(command, &cwd, &dir, marker_spellings.as_deref()).map(|finding| match finding {
+                let marker = marker_spellings.map(|s| MarkerDir::new(s, tmpdirs, home));
+                bash_write_into(command, &cwd, &dir, marker.as_ref()).map(|finding| match finding {
                     BashFinding::Target(target) => bash_block(&target),
                     BashFinding::MarkerTarget(target) => marker_block(&target),
                     BashFinding::Program(program) => format!(
@@ -2704,17 +2757,172 @@ mod tests {
             ("/m-x".to_string(), "cp -r x /".to_string()),
             (format!("{tmp}/m-x"), format!("cp -r x {tmp}")),
         ] {
+            // A temp dir that is itself a symlink never counts as temp, so
+            // the host-temp row says nothing on such a host. The macOS
+            // spellings are pinned with fixed paths in
+            // `a_macos_temp_parent_is_temp_under_both_spellings`.
+            let tmp_is_link = std::fs::symlink_metadata(tmp.trim_end_matches('/'))
+                .is_ok_and(|m| m.file_type().is_symlink());
+            if tmp_is_link && marker_dir.starts_with(tmp.as_str()) {
+                continue;
+            }
             let input = make_bash_with_cwd(&command, &f.work);
             let got = run_env(
                 &input,
                 Env {
                     dir: Some(&f.runbooks),
                     marker_dir: Some(&marker_dir),
+                    tmpdirs: std::slice::from_ref(&tmp),
                     ..Env::default()
                 },
                 &[],
             );
             assert_eq!(got.outcome, Outcome::Allow, "{marker_dir} {command}");
+        }
+    }
+
+    // cadence-hooks#1403, on any platform: the macOS temp trees count as temp
+    // in both spellings, derived without touching the filesystem.
+    #[test]
+    fn a_macos_temp_parent_is_temp_under_both_spellings() {
+        let f = fixture("a-macos-temp-parent-is-temp-under-both-s");
+        for (tmpdir, marker_dir, parent) in [
+            (
+                "/var/folders/zz/T",
+                "/var/folders/zz/T/m-x",
+                "/var/folders/zz/T",
+            ),
+            (
+                "/var/folders/zz/T/",
+                "/private/var/folders/zz/T/m-x",
+                "/private/var/folders/zz/T",
+            ),
+            (
+                "/private/var/folders/zz/T",
+                "/var/folders/zz/T/m-x",
+                "/var/folders/zz/T",
+            ),
+        ] {
+            let input = make_bash_with_cwd(&format!("cp -r x {parent}"), &f.work);
+            let tmpdirs = [tmpdir.to_string()];
+            let got = run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    marker_dir: Some(marker_dir),
+                    tmpdirs: &tmpdirs,
+                    ..Env::default()
+                },
+                &[],
+            );
+            assert_eq!(got.outcome, Outcome::Allow, "{tmpdir} {marker_dir}");
+        }
+    }
+
+    // cadence-hooks#1408 review: a `$TMPDIR` the session can redirect at the
+    // marker parent (a symlink in place of the temp dir, a `..` path, a spot
+    // inside home) never makes that parent count as temp.
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_tmpdir_does_not_exempt_the_marker_parent() {
+        let f = fixture("a-redirected-tmpdir-does-not-exempt-the-");
+        let real = format!("{}/real-parent", f.root);
+        let link = format!("{}/tmp-link", f.root);
+        std::fs::create_dir_all(format!("{real}/m-x")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let verdict = |tmpdir: &str, marker_dir: &str, parent: &str, home: Option<&str>| {
+            let input = make_bash_with_cwd(&format!("cp -r x {parent}"), &f.work);
+            let tmpdirs = [tmpdir.to_string()];
+            run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    marker_dir: Some(marker_dir),
+                    home,
+                    tmpdirs: &tmpdirs,
+                    ..Env::default()
+                },
+                &[],
+            )
+            .outcome
+        };
+        let dotted = format!("{real}/m-x/..");
+        let slashed = format!("{link}/");
+        for marker_dir in [format!("{link}/m-x"), format!("{real}/m-x")] {
+            for parent in [&link, &real] {
+                for (tmpdir, home) in [
+                    (link.as_str(), None),
+                    (slashed.as_str(), None),
+                    (dotted.as_str(), None),
+                    (real.as_str(), Some(f.root.as_str())),
+                ] {
+                    assert_eq!(
+                        verdict(tmpdir, &marker_dir, parent, home),
+                        Outcome::Block,
+                        "TMPDIR={tmpdir} home={home:?} {marker_dir} {parent}"
+                    );
+                }
+            }
+        }
+    }
+
+    // cadence-hooks#1408 review: a link placed above the marker dir that
+    // points its parent at the temp dir (`~/.claude/cadence-hooks -> $TMPDIR`)
+    // gives the parent a temp physical spelling. Its lexical spelling is not
+    // temp, so the parent stays refused under every spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_parent_linked_into_temp_is_still_refused() {
+        let f = fixture("a-marker-parent-linked-into-temp-is-stil");
+        let temp = format!("{}/fake-tmp", f.root);
+        let cfg = format!("{}/cfg", f.root);
+        std::fs::create_dir_all(format!("{temp}/markers")).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::os::unix::fs::symlink(&temp, format!("{cfg}/cadence-hooks")).unwrap();
+        let marker_dir = format!("{cfg}/cadence-hooks/markers");
+        let tmpdirs = [temp.clone()];
+        for parent in [temp.clone(), format!("{cfg}/cadence-hooks")] {
+            let command = format!("cp -r forged/markers {parent}");
+            let input = make_bash_with_cwd(&command, &f.work);
+            let got = run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    marker_dir: Some(&marker_dir),
+                    tmpdirs: &tmpdirs,
+                    ..Env::default()
+                },
+                &[],
+            );
+            assert_eq!(got.outcome, Outcome::Block, "{command}");
+        }
+    }
+
+    // cadence-hooks#1403: the temp exclusion matches both spellings of a temp
+    // root, but a marker parent outside temp is still refused under each.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_temp_marker_parent_is_refused_under_both_spellings() {
+        let f = fixture("a-non-temp-marker-parent-is-refused-unde");
+        let real = format!("{}/real-parent", f.root);
+        let alias = format!("{}/alias-parent", f.root);
+        std::fs::create_dir_all(format!("{real}/m-x")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        for marker_dir in [format!("{alias}/m-x"), format!("{real}/m-x")] {
+            for parent in [&alias, &real] {
+                let command = format!("cp -r x {parent}");
+                let input = make_bash_with_cwd(&command, &f.work);
+                let got = run_env(
+                    &input,
+                    Env {
+                        dir: Some(&f.runbooks),
+                        marker_dir: Some(&marker_dir),
+                        ..Env::default()
+                    },
+                    &[],
+                );
+                assert_eq!(got.outcome, Outcome::Block, "{marker_dir} {command}");
+            }
         }
     }
 
