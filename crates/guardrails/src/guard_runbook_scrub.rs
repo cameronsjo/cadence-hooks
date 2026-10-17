@@ -100,8 +100,10 @@
 //!   read, or by a program whose writes it cannot see, is not caught: the
 //!   marker-dir refusal judges write targets only. (`record-scrub` itself
 //!   trusts its caller, so it is the simpler forgery anyway.) The same
-//!   holds for a link such a program creates: a write through it is not
-//!   refused, since the program could write the marker directly.
+//!   holds for a link such a program creates (`python3 -c 'os.symlink(…)'`,
+//!   `tar -x` of an archive holding a link, `git clone`, `ln` spelled through
+//!   a variable): the link is not judged, alone or with a write, since the
+//!   program could write the marker directly.
 //! - `NotebookEdit` carries its target in `notebook_path`, which no guard
 //!   reads; a notebook is not a runbook.
 //!
@@ -123,12 +125,15 @@
 //! - A mention is read additively (raw, expanded, and normalized text), so a
 //!   spelling that walks back out (`…/Runbooks/../x.md`) still names it.
 //! - A command that creates a link pointing at, above, or below the runbooks
-//!   directory, the marker directory, or its parent, and also writes, blocks
-//!   (`link_then_write`, cadence-hooks#1412), whatever the write. So does one
-//!   whose link target the hook cannot read: `ln -s "$(brew --prefix)/x" y`,
+//!   directory, the marker directory, or its parent blocks on its own
+//!   (`link_then_write`, cadence-hooks#1412): `ln -s ~ /tmp/h` and
+//!   `ln -s ~/.claude x` included, since a write backgrounded by an earlier
+//!   command can go through it later. A command that also writes blocks too
+//!   when a link's target cannot be read: `ln -s "$(brew --prefix)/x" y`,
 //!   operands fed by `xargs`, a `mv`/`cp -r`/`rsync` source that is missing,
 //!   remote, or behind an unreadable `cd`, or a source tree past
-//!   `LINK_WALK_BUDGET` entries (a large `node_modules`). Run the link, move, or copy as its own command first.
+//!   `LINK_WALK_BUDGET` entries (a large `node_modules`). Run the link, move,
+//!   or copy as its own command first.
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -1284,76 +1289,88 @@ fn reading_path(reading: &[Comp]) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Walk the source tree at `path` for a link a copy or move would recreate
-/// pointing at, above, or below a protected directory. True (dangerous) for
-/// such a link, for a source that is missing (an earlier step may create it),
-/// and past `budget` entries. A relative link resolves from where the copy
-/// puts it: under each reading in `dests` of the destination, directly or
-/// under the source's own name. It is dangerous with no readable
-/// destination, or when its `..` climbs out of another link in the same tree,
-/// which the copy recreates and no pre-command reading can follow.
-fn tree_links_relate(
+/// How far a new link may lead toward a protected directory, ordered so the
+/// worst reading of a command wins ([`link_then_write`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Danger {
+    /// Every link it makes points somewhere unrelated.
+    Clean,
+    /// The hook cannot read where a link points (a missing or remote source,
+    /// a substitution, a tree past the walk budget).
+    Unknown,
+    /// A link points at, above, or below a protected directory.
+    Relates,
+}
+
+/// Walk the source tree at `path` for a link a copy or move would recreate,
+/// and say how far it leads toward a protected directory. A relative link
+/// resolves from where the copy puts it: under each reading in `dests` of the
+/// destination, directly or under the source's own name. A missing source (an
+/// earlier step may create it), an unreadable entry, no readable destination
+/// for a relative link, a `..` that climbs out of another link in the same tree
+/// (the copy recreates it, and no pre-command reading can follow it), and a
+/// walk past `budget` entries all read as [`Danger::Unknown`]. The walk stops
+/// at the first link that [`Danger::Relates`].
+fn tree_danger(
     path: &Path,
     dests: &[PathBuf],
     protected: &[Vec<String>],
     resolver: &Resolver,
     budget: &mut usize,
-) -> bool {
+) -> Danger {
+    let leads = |joined: &Path| {
+        let shape = PathShape(PathShape::parse(&joined.to_string_lossy(), false));
+        std::iter::once(shape.lexical())
+            .chain(shape.physical(resolver))
+            .any(|r| relates(&r, protected))
+    };
+    let mut worst = Danger::Clean;
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
         if *budget == 0 {
-            return true;
+            return worst.max(Danger::Unknown);
         }
         *budget -= 1;
         let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            return true;
+            worst = worst.max(Danger::Unknown);
+            continue;
         };
         if meta.file_type().is_symlink() {
             let Ok(target) = std::fs::read_link(&p) else {
-                return true;
+                worst = worst.max(Danger::Unknown);
+                continue;
             };
-            let text = target.to_string_lossy();
             if target.is_absolute() {
-                let shape = PathShape(PathShape::parse(&text, false));
-                let readings = std::iter::once(shape.lexical()).chain(shape.physical(resolver));
-                if readings.into_iter().any(|r| relates(&r, protected)) {
-                    return true;
+                if leads(&target) {
+                    return Danger::Relates;
                 }
             } else if dests.is_empty() || climbs_through_a_link(path, &p, &target) {
-                return true;
+                worst = worst.max(Danger::Unknown);
             } else {
                 let rel = p.strip_prefix(path).unwrap_or(Path::new(""));
                 let rel_parent = rel.parent().unwrap_or(Path::new(""));
                 let name = path.file_name().unwrap_or_default();
-                let homes: Vec<PathBuf> = dests
-                    .iter()
-                    .flat_map(|d| {
-                        if rel.as_os_str().is_empty() {
-                            vec![d.parent().unwrap_or(d).to_path_buf(), d.clone()]
-                        } else {
-                            vec![d.join(rel_parent), d.join(name).join(rel_parent)]
-                        }
-                    })
-                    .collect();
-                let lands = homes.iter().any(|home| {
-                    let joined = home.join(&target);
-                    let shape = PathShape(PathShape::parse(&joined.to_string_lossy(), false));
-                    std::iter::once(shape.lexical())
-                        .chain(shape.physical(resolver))
-                        .any(|r| relates(&r, protected))
+                let lands = dests.iter().any(|d| {
+                    let homes = if rel.as_os_str().is_empty() {
+                        [d.parent().unwrap_or(d).to_path_buf(), d.clone()]
+                    } else {
+                        [d.join(rel_parent), d.join(name).join(rel_parent)]
+                    };
+                    homes.iter().any(|home| leads(&home.join(&target)))
                 });
                 if lands {
-                    return true;
+                    return Danger::Relates;
                 }
             }
         } else if meta.is_dir() {
             let Ok(entries) = std::fs::read_dir(&p) else {
-                return true;
+                worst = worst.max(Danger::Unknown);
+                continue;
             };
             stack.extend(entries.filter_map(|e| e.ok().map(|e| e.path())));
         }
     }
-    false
+    worst
 }
 
 /// True when the relative link `target`, found at `link` inside the tree
@@ -1407,7 +1424,7 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 }
 
 /// Entries the source trees of one command's copies and moves may visit
-/// ([`tree_links_relate`]); past it the command is judged dangerous.
+/// ([`tree_danger`]); past it the walk reads as [`Danger::Unknown`].
 const LINK_WALK_BUDGET: usize = 16_384;
 
 /// A word with each `$(…)` or `` `…` `` replaced by `*`: the reading
@@ -1469,20 +1486,27 @@ struct LinkSegment {
 }
 
 /// The first segment that creates a link which may lead into a protected
-/// directory, when the command also writes somewhere (cadence-hooks#1412).
+/// directory (cadence-hooks#1412).
 ///
 /// Every other judgment here reads the filesystem as it is before the
 /// command runs, so a link the command makes itself is invisible to it:
 /// `ln -s <marker parent> /tmp/x && cp -r forged/markers /tmp/x/` lands
-/// forged markers while every target reads as `/tmp`. Where the write lands
+/// forged markers while every target reads as `/tmp`. Where a write lands
 /// relative to the link cannot be read reliably (`..` after the link, a
 /// recursive copy into the link's parent, a link name the parser never sees),
-/// so the judgment is on where the link *points*: at, above, or below the
-/// runbooks directory, the marker directory, or its parent
-/// (`protected`), or somewhere the hook cannot read. Such a link refuses the
-/// command when another segment writes anything, or when the link step is
-/// itself a copy of several sources (`cp -R a/ b/ dst/`). A link that points
-/// elsewhere (`ln -sf ~/.dotfiles/zshrc ~/.zshrc`) costs nothing.
+/// so the judgment is on where the link *points* ([`Danger`]).
+///
+/// - A link at, above, or below the runbooks directory, the marker directory,
+///   or its parent (`protected`) is refused on its own, whatever else the
+///   command does. Requiring a write in the same command was not enough: a
+///   write backgrounded by an earlier call (`(sleep 10; cp -r forged/markers
+///   /tmp/x/) &`) is judged before the link exists, and the link is then made
+///   by a call that writes nothing.
+/// - A link whose target the hook cannot read is refused only when another
+///   segment writes, or when the link step is itself a copy of several sources
+///   (`cp -R a/ b/ dst/`). Alone it costs nothing (`mv node_modules /tmp/nm`).
+/// - A link that points elsewhere (`ln -sf ~/.dotfiles/zshrc ~/.zshrc`) costs
+///   nothing.
 ///
 /// A program whose writes the parser cannot see at all (`python`, `tar -x`)
 /// is not judged here: it could write the marker directly, which the module
@@ -1502,24 +1526,21 @@ fn link_then_write(
         if seg.kind == LinkKind::None || !judged.insert((&seg.text.0, &seg.seg_dir, &seg.kind)) {
             continue;
         }
-        // Cheap first: a link that nothing writes through costs no walk.
         let several_sources = matches!(&seg.kind, LinkKind::Trees(w, _) if w.len() > 1);
         let other_write = segments
             .iter()
             .enumerate()
             .any(|(j, other)| j != i && other.writes && !same_command(&seg.text, &other.text));
-        if !several_sources && !other_write {
-            continue;
-        }
+        let writes_through = several_sources || other_write;
         let mut bases: Vec<&str> = vec![&seg.seg_dir, cwd, whole];
         bases.dedup();
         let readings = |word: &String, spent: &mut usize| {
             *spent = spent.saturating_add(word.len().saturating_mul(bases.len()));
             target_readings(word, &bases, dir, resolver)
         };
-        let dangerous = match &seg.kind {
-            LinkKind::None => false,
-            LinkKind::Unreadable => true,
+        let danger = match &seg.kind {
+            LinkKind::None => Danger::Clean,
+            LinkKind::Unreadable => Danger::Unknown,
             LinkKind::Targets(words, dest) => {
                 // A relative link target resolves from the link's directory: the
                 // destination, or its parent when it names the link itself.
@@ -1539,16 +1560,21 @@ fn link_then_write(
                 }
                 let mut all: Vec<&str> = bases.clone();
                 all.extend(link_dirs.iter().map(String::as_str));
-                words.iter().any(|w| {
-                    let text = dir.expand(&pwd_as_var(w));
-                    let relative = !text.starts_with('/') && !text.starts_with('~');
-                    if relative && dest_unread {
-                        return true;
-                    }
-                    *spent = spent.saturating_add(w.len().saturating_mul(all.len()));
-                    target_readings(w, &all, dir, resolver)
-                        .is_none_or(|rs| rs.iter().any(|r| relates(r, protected)))
-                })
+                words
+                    .iter()
+                    .map(|w| {
+                        let text = dir.expand(&pwd_as_var(w));
+                        let relative = !text.starts_with('/') && !text.starts_with('~');
+                        *spent = spent.saturating_add(w.len().saturating_mul(all.len()));
+                        match target_readings(w, &all, dir, resolver) {
+                            Some(rs) if rs.iter().any(|r| relates(r, protected)) => Danger::Relates,
+                            None => Danger::Unknown,
+                            Some(_) if relative && dest_unread => Danger::Unknown,
+                            Some(_) => Danger::Clean,
+                        }
+                    })
+                    .max()
+                    .unwrap_or(Danger::Clean)
             }
             LinkKind::Trees(words, dest) => {
                 let dests: Vec<PathBuf> = dest
@@ -1567,49 +1593,74 @@ fn link_then_write(
                 let missing = |r: &Vec<Comp>| {
                     reading_path(r).is_some_and(|p| std::fs::symlink_metadata(p).is_err())
                 };
-                words.iter().any(|w| {
-                    match readings(w, spent) {
-                        None => true,
-                        Some(rs) if plain(w) && rs.iter().all(missing) => false,
-                        Some(rs) => rs.iter().any(|r| {
-                            let literal: Vec<Comp> = r
-                                .iter()
-                                .take_while(|c| matches!(c, Comp::Lit(_)))
-                                .cloned()
-                                .collect();
-                            let Some(base) = reading_path(&literal) else {
-                                return true;
-                            };
-                            // A glob in the last component: walk each match. A glob
-                            // higher up: walk the literal directory above it.
-                            if literal.len() + 1 == r.len() && r.last() == Some(&Comp::Wild) {
-                                let pattern =
-                                    w.trim_end_matches('/').rsplit('/').next().unwrap_or("*");
-                                let Ok(entries) = std::fs::read_dir(&base) else {
-                                    return true;
-                                };
-                                return entries.filter_map(Result::ok).any(|e| {
-                                    glob_matches(pattern, &e.file_name().to_string_lossy())
-                                        && tree_links_relate(
-                                            &e.path(),
-                                            &dests,
-                                            protected,
-                                            resolver,
-                                            &mut walk,
-                                        )
-                                });
+                let mut worst = Danger::Clean;
+                for w in words {
+                    let rs = match readings(w, spent) {
+                        None => {
+                            worst = worst.max(Danger::Unknown);
+                            continue;
+                        }
+                        Some(rs) if plain(w) && rs.iter().all(missing) => continue,
+                        Some(rs) => rs,
+                    };
+                    for r in &rs {
+                        let literal: Vec<Comp> = r
+                            .iter()
+                            .take_while(|c| matches!(c, Comp::Lit(_)))
+                            .cloned()
+                            .collect();
+                        let Some(base) = reading_path(&literal) else {
+                            worst = worst.max(Danger::Unknown);
+                            continue;
+                        };
+                        // A glob in the last component: walk each match. A glob
+                        // higher up: walk the literal directory above it.
+                        let roots: Vec<PathBuf> = if literal.len() + 1 == r.len()
+                            && r.last() == Some(&Comp::Wild)
+                        {
+                            let pattern = w.trim_end_matches('/').rsplit('/').next().unwrap_or("*");
+                            match std::fs::read_dir(&base) {
+                                Ok(entries) => entries
+                                    .filter_map(Result::ok)
+                                    .filter(|e| {
+                                        glob_matches(pattern, &e.file_name().to_string_lossy())
+                                    })
+                                    .map(|e| e.path())
+                                    .collect(),
+                                Err(_) => {
+                                    worst = worst.max(Danger::Unknown);
+                                    Vec::new()
+                                }
                             }
-                            tree_links_relate(&base, &dests, protected, resolver, &mut walk)
-                        }),
+                        } else {
+                            vec![base]
+                        };
+                        for root in roots {
+                            worst = worst
+                                .max(tree_danger(&root, &dests, protected, resolver, &mut walk));
+                            if worst == Danger::Relates {
+                                break;
+                            }
+                        }
                     }
-                })
+                    if worst == Danger::Relates {
+                        break;
+                    }
+                }
+                worst
             }
         };
         if *spent > JUDGE_BUDGET {
             return Some(BashFinding::TooLarge);
         }
-        if dangerous {
-            return Some(BashFinding::LinkThenWrite(echo(&seg.text.0)));
+        match danger {
+            Danger::Relates if !writes_through => {
+                return Some(BashFinding::LinkToProtected(echo(&seg.text.0)));
+            }
+            Danger::Relates | Danger::Unknown if writes_through => {
+                return Some(BashFinding::LinkThenWrite(echo(&seg.text.0)));
+            }
+            _ => {}
         }
     }
     None
@@ -2003,9 +2054,12 @@ enum BashFinding {
     Program(String),
     /// This write target lands in the scrub-marker directory.
     MarkerTarget(String),
-    /// This write target may land under a link another segment of the
-    /// command creates ([`link_then_write`]).
+    /// This segment creates a link that may lead into a protected directory,
+    /// and the command also writes ([`link_then_write`]).
     LinkThenWrite(String),
+    /// This segment creates a link pointing at, above, or below a protected
+    /// directory ([`link_then_write`]).
+    LinkToProtected(String),
     /// The command is past [`JUDGE_BUDGET`].
     TooLarge,
 }
@@ -2278,6 +2332,17 @@ impl RunbookScrubGuard {
                          Found:  {}\n   \
                          Fix:    run the link, move, or copy as its own command first; the next \
                          command is then judged with the link in place.\n   \
+                         {FIX_AND_ESCAPE}",
+                        echo(&target)
+                    ),
+                    BashFinding::LinkToProtected(target) => format!(
+                        "🚫 BLOCKED: guard-runbook-scrub: this command creates a link that points \
+                         at, above, or below the scrub-marker or runbooks directory. A write \
+                         through it, from a later command or one already running in the \
+                         background, could land in that directory where the hook cannot see it.\n   \
+                         Found:  {}\n   \
+                         Fix:    point the link at something else, or write the file directly \
+                         to where it belongs.\n   \
                          {FIX_AND_ESCAPE}",
                         echo(&target)
                     ),
@@ -3674,8 +3739,32 @@ mod tests {
                 || link.starts_with("cp -a -t")
                 || *link == format!("ln -s {parent}")
                 || link.contains(&f.runbooks);
-            if !blocks_alone {
+            // A link the hook cannot read is refused only with a write; alone it
+            // is the control that the write is what refuses it.
+            let unreadable_only = [
+                format!("mv {s}/missing {s}/x"),
+                format!("echo {parent} {s}/x | xargs ln -s"),
+                format!("ln -s \"$D\" {s}/x"),
+                format!("cp -a {s}/t3 {s}/d3"),
+            ];
+            if unreadable_only.contains(link) {
                 assert_eq!(judge(link).outcome, Outcome::Allow, "control: `{link}`");
+            } else {
+                // cadence-hooks#1417 review: a link toward a protected directory
+                // is refused alone, since a write backgrounded by an earlier call
+                // goes through it after both calls were judged.
+                let got = judge(link);
+                assert_eq!(got.outcome, Outcome::Block, "alone: `{link}`");
+                if !blocks_alone {
+                    assert!(
+                        got.message
+                            .as_deref()
+                            .unwrap_or("")
+                            .contains("creates a link that points"),
+                        "alone: `{link}`: {:?}",
+                        got.message
+                    );
+                }
             }
             for write in &writes {
                 for command in [
@@ -3736,6 +3825,53 @@ mod tests {
             format!("ln -s /usr/local/bin/xargs {s}/xa && echo ok > {s}/log"),
         ] {
             assert_eq!(judge(&command).outcome, Outcome::Allow, "{command}");
+        }
+    }
+
+    /// cadence-hooks#1417 review: a lone link is refused only when it points at,
+    /// above, or below a protected directory. Ordinary dotfiles and tool links
+    /// in home, with the marker directory in its default spot under home, still
+    /// pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_link_is_refused_only_toward_a_protected_dir() {
+        let f = fixture("a-lone-link-is-refused-only-toward-a-pro");
+        let home = format!("{}/home", f.root);
+        let marker_dir = format!("{home}/.claude/cadence-hooks/markers");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::create_dir_all(format!("{home}/.dotfiles")).unwrap();
+        let judge = |command: &str| {
+            let input = make_bash_with_cwd(command, &f.work);
+            run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    home: Some(&home),
+                    marker_dir: Some(&marker_dir),
+                    ..Env::default()
+                },
+                &[],
+            )
+            .outcome
+        };
+        for command in [
+            "ln -sf ~/.dotfiles/zshrc ~/.zshrc",
+            "ln -s ~/.dotfiles/gitconfig ~/.gitconfig",
+            "ln -sfn ~/Projects/tool/bin/tool ~/.local/bin/tool",
+            "ln -s ~/.claude/skills/x ~/backup-x",
+            "ln -s ../shared/config.toml config.toml",
+            "cp -a ~/.dotfiles ~/dotfiles-backup",
+        ] {
+            assert_eq!(judge(command), Outcome::Allow, "{command}");
+        }
+        for command in [
+            "ln -s ~ /tmp/h",
+            "ln -s / /tmp/root",
+            "ln -s ~/.claude /tmp/c",
+            "ln -s ~/.claude/cadence-hooks /tmp/c",
+            "ln -s ~/.claude/cadence-hooks/markers/sub /tmp/c",
+        ] {
+            assert_eq!(judge(command), Outcome::Block, "{command}");
         }
     }
 
