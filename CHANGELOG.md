@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`guard-runbook-scrub` refuses a lone copy or move of a tree it cannot read.** #1417 allowed `cp -a`, `cp -R`, `mv` and `rsync` alone when the source was a variable, a substitution, `xargs` input, a missing or unreadable path, or a tree past 16 384 entries, on the reasoning that a tree holds a link toward a protected directory only if a judged command put one there. System links break that: `S="/Volumes/Macintosh HD"; cp -a "$S" /tmp/x` copies a link to `/`, and a copy backgrounded by an earlier call then writes forged scrub markers through it. Such a copy or move is now refused on its own, like a link creator whose target cannot be read. A copy or move with no source in its text (`rsync --version`) is not judged. The cost: `mv "$f" dest/` in a loop, `cp -R "$SRC/." "$DST/"`, and `mv node_modules /tmp/nm` on a large tree block in every session where `CADENCE_RUNBOOKS_DIR` is set; spell the source as a literal existing path, or use `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK`. Over 60 days of recorded sessions, 36 of 6 179 `mv`/`cp`/`rsync` commands had such a source. (cameronsjo/cadence-hooks#1419)
+
 ## [0.128.0] - 2026-10-17
 
 ### Security

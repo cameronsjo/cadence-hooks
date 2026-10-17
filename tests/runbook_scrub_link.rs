@@ -63,6 +63,7 @@ fn a_link_toward_the_marker_dir_blocks_in_whichever_call_makes_it() {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
     let work = root.join("work");
+    std::fs::create_dir_all(work.join("forged/markers")).unwrap();
     // `CADENCE_MARKER_DIR` is the base the marker dir is made under, so it is
     // the marker dir's parent: a recursive copy into a link to it lands one.
     let parent = root.join("cfg");
@@ -124,10 +125,12 @@ fn a_link_toward_the_marker_dir_blocks_in_whichever_call_makes_it() {
 
 /// cameronsjo/cadence-hooks#1417 r2: the same split through a link whose
 /// target the guard cannot read. Each form below names the marker parent only
-/// at run time, so the call that makes the link must block on its own. A copy
-/// or move whose source cannot be read stays allowed alone.
+/// at run time, so the call that makes the link must block on its own.
+/// cameronsjo/cadence-hooks#1419: so must a copy or move whose source tree
+/// cannot be read, since it can hold a system link such as
+/// `/Volumes/Macintosh HD -> /` that no judged command made.
 #[test]
-fn an_unreadable_link_blocks_alone_but_an_unreadable_copy_does_not() {
+fn an_unreadable_link_or_copy_blocks_alone() {
     let scratch = Scratch::outside_checkout(&scratch_root(), "unreadable-link");
     let root = scratch.path().canonicalize().unwrap();
     for d in ["home", "vault/Runbooks", "cfg", "work", "s"] {
@@ -135,6 +138,9 @@ fn an_unreadable_link_blocks_alone_but_an_unreadable_copy_does_not() {
     }
     let work = root.join("work");
     let parent = root.join("cfg");
+    // The forged tree the backgrounded write copies exists: a missing source
+    // is itself refused as unreadable (#1419).
+    std::fs::create_dir_all(work.join("forged/markers")).unwrap();
     let x = root.join("s/x");
     let (p, x) = (parent.display(), x.display());
 
@@ -173,11 +179,19 @@ fn an_unreadable_link_blocks_alone_but_an_unreadable_copy_does_not() {
         "mv node_modules /tmp/nm".to_string(),
         format!("cp -r \"$S\" {x}"),
         format!("rsync -a \"$S\"/ {x}/"),
+        format!("S=/; cp -a \"$S\" {x}"),
     ] {
+        let got = judge(&root, &work, &copy);
         assert_eq!(
-            judge(&root, &work, &copy).status.code(),
-            Some(0),
-            "an unreadable copy or move stays allowed alone: `{copy}`"
+            got.status.code(),
+            Some(2),
+            "an unreadable copy or move must block alone: `{copy}`: {}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&got.stderr).contains("copies or moves a tree"),
+            "`{copy}`: {}",
+            String::from_utf8_lossy(&got.stderr)
         );
     }
 }

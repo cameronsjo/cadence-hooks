@@ -130,12 +130,14 @@
 //!   `ln -s ~/.claude x` included, since a write backgrounded by an earlier
 //!   command can go through it later. So does a link creator whose target
 //!   cannot be read, alone: `ln -s "$D" x`, `ln -s "$(brew --prefix)/x" y`,
-//!   `xargs ln -s`, `rsync -l` of an unreadable source. A copy or move whose
-//!   source cannot be read blocks only when the command also writes: a
-//!   `mv`/`cp -r`/`rsync` source that is missing, remote, or behind an
-//!   unreadable `cd`, or a source tree past `LINK_WALK_BUDGET` entries (a
-//!   large `node_modules`). Run the link, move, or copy as its own command
-//!   first, with a target the hook can read.
+//!   `xargs ln -s`, `rsync -l` of an unreadable source. So does a copy or move
+//!   whose source tree cannot be read, alone (cadence-hooks#1419), since a
+//!   tree can hold a link no judged command made (`/Volumes/Macintosh HD ->
+//!   /`, `/proc/self/root`): a `mv`/`cp -r`/`rsync` source that is a variable
+//!   or substitution, fed by `xargs`, missing, remote, or behind an unreadable
+//!   `cd`, or a source tree past `LINK_WALK_BUDGET` entries (`mv node_modules
+//!   /tmp/nm` on a large one). Spell the source as a literal existing path,
+//!   or use the escape.
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -1208,7 +1210,10 @@ fn link_kind(segment: &str, argv: &[String]) -> LinkKind {
     };
     match kind {
         LinkKind::Targets(w, _) if fed || w.is_empty() => LinkKind::UnreadableLink,
-        LinkKind::Trees(w, _) if fed || w.is_empty() => LinkKind::UnreadableTrees,
+        LinkKind::Trees(_, _) if fed => LinkKind::UnreadableTrees,
+        // A copy or move with no source in its own text copies nothing
+        // (`rsync --version`).
+        LinkKind::Trees(w, _) if w.is_empty() => LinkKind::None,
         other => other,
     }
 }
@@ -1536,9 +1541,10 @@ struct LinkSegment {
 ///   write backgrounded by an earlier call (`(sleep 10; cp -r forged/markers
 ///   /tmp/x/) &`) is judged before the link exists, and the link is then made
 ///   by a call that writes nothing.
-/// - A link whose target the hook cannot read is refused only when another
-///   segment writes, or when the link step is itself a copy of several sources
-///   (`cp -R a/ b/ dst/`). Alone it costs nothing (`mv node_modules /tmp/nm`).
+/// - A link creator, copy, or move whose target or source tree the hook
+///   cannot read is refused on its own too (cadence-hooks#1419): a tree can
+///   hold a link no judged command made (`/Volumes/Macintosh HD -> /`). Only
+///   a writer on no list is refused just when another segment writes.
 /// - A link that points elsewhere (`ln -sf ~/.dotfiles/zshrc ~/.zshrc`) costs
 ///   nothing.
 ///
@@ -1689,11 +1695,12 @@ fn link_then_write(
         if *spent > JUDGE_BUDGET {
             return Some(BashFinding::TooLarge);
         }
-        // A link creator whose target the hook cannot read is refused alone
-        // too: the same two-call split works through `ln -s "$D" x`. A copy or
-        // move that cannot be read stays allowed alone (`mv node_modules /tmp/nm`);
-        // its tree holds a protected link only if a judged link creator or a
-        // program the parser cannot read put one there.
+        // Anything the hook cannot classify is refused alone too: the same
+        // two-call split works through a link creator it cannot read
+        // (`ln -s "$D" x`) and through a copy or move of a tree it cannot read
+        // (cadence-hooks#1419): such a tree can hold a link no judged command
+        // made, like `/Volumes/Macintosh HD -> /` or `/proc/self/root`. Only a
+        // writer on no list stays allowed alone; it copies no tree.
         let creates_links = matches!(seg.kind, LinkKind::Targets(..) | LinkKind::UnreadableLink)
             || rsync_keeps_links(&seg.text.1);
         match danger {
@@ -1702,6 +1709,12 @@ fn link_then_write(
             }
             Danger::Unknown if !writes_through && creates_links => {
                 return Some(BashFinding::LinkToProtected(echo(&seg.text.0)));
+            }
+            Danger::Unknown
+                if !writes_through
+                    && matches!(seg.kind, LinkKind::Trees(..) | LinkKind::UnreadableTrees) =>
+            {
+                return Some(BashFinding::UnreadableTree(echo(&seg.text.0)));
             }
             Danger::Relates | Danger::Unknown if writes_through => {
                 return Some(BashFinding::LinkThenWrite(echo(&seg.text.0)));
@@ -2106,6 +2119,9 @@ enum BashFinding {
     /// This segment creates a link pointing at, above, or below a protected
     /// directory ([`link_then_write`]).
     LinkToProtected(String),
+    /// This segment copies or moves a tree the hook cannot read, which may
+    /// recreate a link toward a protected directory ([`link_then_write`]).
+    UnreadableTree(String),
     /// The command is past [`JUDGE_BUDGET`].
     TooLarge,
 }
@@ -2391,6 +2407,20 @@ impl RunbookScrubGuard {
                          Found:  {}\n   \
                          Fix:    point the link at something else, or write the file directly \
                          to where it belongs.\n   \
+                         {FIX_AND_ESCAPE}",
+                        echo(&target)
+                    ),
+                    BashFinding::UnreadableTree(target) => format!(
+                        "🚫 BLOCKED: guard-runbook-scrub: this command copies or moves a tree \
+                         the hook cannot read (a variable or substitution, `xargs`, a missing \
+                         or unreadable path, or more than {LINK_WALK_BUDGET} entries), so it \
+                         cannot rule out a link inside it that points at, above, or below the \
+                         scrub-marker or runbooks directory. A write through such a link, from \
+                         a later command or one already running in the background, could land \
+                         in that directory where the hook cannot see it.\n   \
+                         Found:  {}\n   \
+                         Fix:    spell each source as a literal path that exists, with fewer than \
+                         {LINK_WALK_BUDGET} entries under it.\n   \
                          {FIX_AND_ESCAPE}",
                         echo(&target)
                     ),
@@ -3540,6 +3570,8 @@ mod tests {
     #[test]
     fn a_temp_or_root_marker_parent_is_not_refused() {
         let f = fixture("a-temp-or-root-marker-parent-is-not-refu");
+        // The copied source exists: a missing one is refused as unreadable (#1419).
+        std::fs::create_dir_all(format!("{}/x", f.work)).unwrap();
         let tmp = std::env::temp_dir().to_string_lossy().into_owned();
         for (marker_dir, command) in [
             (
@@ -3582,6 +3614,7 @@ mod tests {
     #[test]
     fn a_macos_temp_parent_is_temp_under_both_spellings() {
         let f = fixture("a-macos-temp-parent-is-temp-under-both-s");
+        std::fs::create_dir_all(format!("{}/x", f.work)).unwrap();
         for (tmpdir, marker_dir, parent) in [
             (
                 "/var/folders/zz/T",
@@ -3741,6 +3774,9 @@ mod tests {
         std::fs::write(format!("{s}/clean/sub/a"), "a").unwrap();
         std::fs::write(format!("{s}/a.txt"), "a").unwrap();
         std::fs::create_dir_all(format!("{s}/dir")).unwrap();
+        // The forged trees the writes copy exist: a missing source is refused
+        // alone as unreadable (cadence-hooks#1419).
+        std::fs::create_dir_all(format!("{}/forged/markers", f.work)).unwrap();
         let judge = |command: &str| {
             let input = make_bash_with_cwd(command, &f.work);
             run_env(
@@ -3799,33 +3835,27 @@ mod tests {
                 || link.starts_with("cp -a -t")
                 || *link == format!("ln -s {parent}")
                 || link.contains(&f.runbooks);
-            // A link the hook cannot read is refused only with a write; alone it
-            // is the control that the write is what refuses it.
-            // cadence-hooks#1417 r2: an unreadable link creator (`ln -s "$D"`,
-            // `xargs ln`) is refused alone like a relating one; an unreadable copy
-            // or move is not.
-            let unreadable_only = [
+            // cadence-hooks#1417 review: a link toward a protected directory is
+            // refused alone, since a write backgrounded by an earlier call goes
+            // through it after both calls were judged. cadence-hooks#1419: so is
+            // a copy or move of a tree the hook cannot read.
+            let unreadable_tree = [
                 format!("mv {s}/missing {s}/x"),
                 format!("cp -a {s}/t3 {s}/d3"),
             ];
-            if unreadable_only.contains(link) {
-                assert_eq!(judge(link).outcome, Outcome::Allow, "control: `{link}`");
-            } else {
-                // cadence-hooks#1417 review: a link toward a protected directory
-                // is refused alone, since a write backgrounded by an earlier call
-                // goes through it after both calls were judged.
-                let got = judge(link);
-                assert_eq!(got.outcome, Outcome::Block, "alone: `{link}`");
-                if !blocks_alone {
-                    assert!(
-                        got.message
-                            .as_deref()
-                            .unwrap_or("")
-                            .contains("creates a link that points"),
-                        "alone: `{link}`: {:?}",
-                        got.message
-                    );
-                }
+            let got = judge(link);
+            assert_eq!(got.outcome, Outcome::Block, "alone: `{link}`");
+            if !blocks_alone {
+                let want = if unreadable_tree.contains(link) {
+                    "copies or moves a tree the hook cannot read"
+                } else {
+                    "creates a link that points"
+                };
+                assert!(
+                    got.message.as_deref().unwrap_or("").contains(want),
+                    "alone: `{link}`: {:?}",
+                    got.message
+                );
             }
             for write in &writes {
                 for command in [
@@ -3922,13 +3952,30 @@ mod tests {
             "ln -s ~/.claude/skills/x ~/backup-x",
             "ln -s ../shared/config.toml config.toml",
             "cp -a ~/.dotfiles ~/dotfiles-backup",
-            // A copy or move whose source cannot be read stays allowed alone.
-            "mv node_modules /tmp/nm",
-            "cp -r \"$S\" /tmp/c",
-            "rsync -a \"$S\"/ /tmp/c/",
-            "echo a b | xargs mv",
+            "mv ~/.dotfiles ~/dotfiles-old",
         ] {
             assert_eq!(judge(command), Outcome::Allow, "{command}");
+        }
+        // cadence-hooks#1419: a tree no judged command made can still hold a
+        // link toward a protected dir (`/Volumes/Macintosh HD -> /`), so a copy
+        // or move of a tree the hook cannot read is refused alone. `sys` stands
+        // in for that system link; read literally it is refused as relating.
+        std::os::unix::fs::symlink("/", format!("{}/sys", f.root)).unwrap();
+        let sys = format!("{}/sys", f.root);
+        for command in [
+            format!("cp -a {sys} /tmp/c/new"),
+            format!("S={sys}; cp -a \"$S\" /tmp/c/new"),
+            format!("S={sys}; mv \"$S\" /tmp/c/new"),
+            format!("S={sys}; rsync -a \"$S\" /tmp/c/new"),
+            "S=\"/Volumes/Macintosh HD\"; cp -a \"$S\" /tmp/c/new".to_string(),
+            "cp -R \"$(echo /)\" /tmp/c".to_string(),
+            "cp -r \"$S\" /tmp/c".to_string(),
+            "rsync -a \"$S\"/ /tmp/c/".to_string(),
+            "echo a b | xargs mv".to_string(),
+            // A source missing now may be created before the move runs.
+            "mv node_modules /tmp/nm".to_string(),
+        ] {
+            assert_eq!(judge(&command), Outcome::Block, "{command}");
         }
         for command in [
             "ln -s ~ /tmp/h",
