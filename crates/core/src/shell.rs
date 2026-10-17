@@ -16633,8 +16633,10 @@ mod tests {
             // command, so what matters is that nothing resolves a verb.
             ("f()", "f("),
             ("case x in", "case"),
-            // `-c` is a flag, not a function name.
-            ("-c() { rm note.md", "-c()"),
+            // zsh defines a function named `-c` here, so the header is read
+            // loosely and the body's verb exposed (the command is also
+            // marked unread; cameronsjo/cadence-hooks#1405 review, I1).
+            ("-c() { rm note.md", "rm"),
         ] {
             assert_eq!(
                 executable_tokens(segment).first().map(String::as_str),
