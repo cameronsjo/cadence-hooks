@@ -2245,7 +2245,11 @@ mod tests {
                 assert_eq!(result.outcome, expected, "cwd={cwd}");
             }
         }
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "an_eval_flood_is_answered_without_expanding_it",
+            start.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
     }
 
     #[test]
@@ -2688,10 +2692,10 @@ mod tests {
                     want,
                     "{opener:?}{tail:?}"
                 );
-                assert!(
-                    started.elapsed() < limit,
-                    "{opener:?}: {:?}",
-                    started.elapsed()
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{opener:?}: {:?}", started.elapsed()),
+                    started.elapsed(),
+                    limit,
                 );
             }
         }

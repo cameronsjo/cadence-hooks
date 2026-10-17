@@ -459,6 +459,33 @@ mod tests {
         assert_eq!(class("/private/tmp/y", "/Users/x"), PathClass::Temp);
     }
 
+    /// cadence-hooks#1413: a `$TMPDIR` that is a symlink earns no `Temp`
+    /// class for the directory it points at, under either spelling.
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_tmpdir_is_not_temp() {
+        // Outside every temp root, so only `$TMPDIR` can make it temp.
+        let dir = crate::git_fixtures::Scratch::new(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/core-pathclass-scratch"),
+            "symlinked-tmpdir",
+        );
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let classify_under = |base: &Path, tmpdir: &Path| {
+            let ctx = PathClassContext {
+                home: "/Users/x",
+                tmpdir: tmpdir.to_str(),
+            };
+            classify(base.join("a").to_str().unwrap(), &ctx, &|_| false)
+        };
+        assert_eq!(classify_under(&real, &real), PathClass::Temp, "control");
+        assert_ne!(classify_under(&real, &link), PathClass::Temp);
+        assert_ne!(classify_under(&link, &link), PathClass::Temp);
+    }
+
     #[test]
     fn tmp_lookalike_is_not_temp() {
         assert_eq!(class("/tmpfoo/x", "/Users/x"), PathClass::Source);

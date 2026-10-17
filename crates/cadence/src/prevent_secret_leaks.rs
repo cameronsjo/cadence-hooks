@@ -4047,7 +4047,11 @@ mod tests {
         let started = std::time::Instant::now();
         let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_brace_flood_before_a_dotenv_read_still_blocks_promptly",
+            started.elapsed(),
+            std::time::Duration::from_secs(4),
+        );
     }
 
     #[test]
@@ -9474,9 +9478,10 @@ mod tests {
         let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
         let elapsed = started.elapsed();
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(
-            elapsed < std::time::Duration::from_millis(3000),
-            "took {elapsed:?}"
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("took {elapsed:?}"),
+            elapsed,
+            std::time::Duration::from_millis(3000),
         );
     }
 
@@ -9587,9 +9592,10 @@ mod tests {
         let result = SecretLeaksGuard::default().run(&make_bash_input(command));
         let elapsed = started.elapsed();
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(
-            elapsed < std::time::Duration::from_millis(limit_ms),
-            "took {elapsed:?}"
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            &format!("took {elapsed:?}"),
+            elapsed,
+            std::time::Duration::from_millis(limit_ms),
         );
     }
 
@@ -9795,10 +9801,10 @@ mod tests {
             let start = std::time::Instant::now();
             let result = SecretLeaksGuard::default().run(&make_bash_input(&command));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-            assert!(
-                start.elapsed() < nest_time_limit_1118(),
-                "{:?}",
-                start.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                nest_time_limit_1118(),
             );
         }
     }
@@ -10278,10 +10284,10 @@ mod tests {
         for command in [heredocs, pipes, evals] {
             let started = std::time::Instant::now();
             let _ = SecretLeaksGuard::default().run(&make_bash_input(&command));
-            assert!(
-                started.elapsed() < std::time::Duration::from_millis(3000),
-                "took {:?}",
-                started.elapsed()
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("took {:?}", started.elapsed()),
+                started.elapsed(),
+                std::time::Duration::from_millis(3000),
             );
         }
     }

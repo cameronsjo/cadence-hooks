@@ -550,7 +550,11 @@ fn bounded_process_timeout_kills_and_reports_output() {
     let error = run_bounded(&mut command, None, Duration::from_millis(250))
         .expect_err("sleeping process must exceed the bounded deadline");
 
-    assert!(started.elapsed() < Duration::from_secs(1), "{error}");
+    cadence_hooks_core::test_builders::assert_elapsed_under(
+        &error.to_string(),
+        started.elapsed(),
+        Duration::from_secs(1),
+    );
     assert!(error.contains("timed out after 250ms"), "{error}");
     assert!(error.contains("stdout=timeout-stdout"), "{error}");
     assert!(error.contains("stderr=timeout-stderr"), "{error}");

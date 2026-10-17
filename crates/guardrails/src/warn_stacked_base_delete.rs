@@ -591,9 +591,10 @@ mod tests {
             // Measured 0: no push here deletes, so nothing is probed.
             assert!(spawns <= 4, "{unit}: {spawns} git spawns");
             // Hang guard only, far above a healthy run on any runner.
-            assert!(
-                elapsed < std::time::Duration::from_secs(30),
-                "{unit}: took {elapsed:?}"
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{unit}: took {elapsed:?}"),
+                elapsed,
+                std::time::Duration::from_secs(30),
             );
             assert_eq!(result.outcome, Outcome::Allow, "{unit}");
         }
@@ -633,7 +634,11 @@ mod tests {
             let started = std::time::Instant::now();
             let (msg, calls) = push_calls(repo.path(), &command);
             let took = started.elapsed();
-            assert!(took < limit, "{}: {took:?}", &command[..40]);
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{}: {took:?}", &command[..40]),
+                took,
+                limit,
+            );
             assert_eq!(calls, 0);
             assert!(msg.is_some_and(|m| m.contains("more than the 8 checked")));
         }

@@ -477,6 +477,10 @@ mod tests {
         );
         let t = std::time::Instant::now();
         let _ = judge(&cmd, false);
-        assert!(t.elapsed().as_secs_f64() < 5.0);
+        cadence_hooks_core::test_builders::assert_elapsed_under(
+            "a_large_adversarial_command_stays_fast",
+            t.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
     }
 }

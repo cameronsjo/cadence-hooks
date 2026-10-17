@@ -444,9 +444,10 @@ fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
         stderr.contains("multiple git push commands"),
         "blocked by the parse-failure fallback: {stderr}"
     );
-    assert!(
-        elapsed < std::time::Duration::from_secs(4),
-        "judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"
+    cadence_hooks_core::test_builders::assert_elapsed_under(
+        &format!("judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"),
+        elapsed,
+        std::time::Duration::from_secs(4),
     );
     assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
 }

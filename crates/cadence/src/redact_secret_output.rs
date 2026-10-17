@@ -3093,7 +3093,11 @@ mod tests {
             let started = std::time::Instant::now();
             let _ = redact(&input);
             let took = started.elapsed();
-            assert!(took < bound, "{} bytes took {took:?}", input.len());
+            cadence_hooks_core::test_builders::assert_elapsed_under(
+                &format!("{} bytes took {took:?}", input.len()),
+                took,
+                bound,
+            );
         }
     }
 }

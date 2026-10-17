@@ -16399,7 +16399,11 @@ mod tests {
         let many = "{1..4096} ".repeat(200);
         let started = std::time::Instant::now();
         let _ = tokenize(&many);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        crate::test_builders::assert_elapsed_under(
+            "brace_expansion_past_its_bounds_is_left_whole_and_reported",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
         assert!(brace_expansion_overflows(&many));
     }
 
@@ -17299,9 +17303,10 @@ mod tests {
             std::time::Duration::from_secs(10),
             Some(64 * 1024),
         );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "an overflow must end the run, not wait out the timeout"
+        crate::test_builders::assert_elapsed_under(
+            "capped_unbounded_output_is_truncated_at_the_limit_and_returns_promptly",
+            started.elapsed(),
+            std::time::Duration::from_secs(3),
         );
         match result {
             GitSpawn::Truncated(out) => assert_eq!(out.stdout.len(), 64 * 1024),
@@ -17352,7 +17357,11 @@ mod tests {
             Some(input),
         );
         assert!(matches!(result, GitSpawn::TimedOut), "{result:?}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        crate::test_builders::assert_elapsed_under(
+            "input_reaches_stdin_and_a_child_ignoring_it_still_times_out",
+            started.elapsed(),
+            std::time::Duration::from_secs(5),
+        );
     }
 
     #[cfg(unix)]
@@ -17366,9 +17375,10 @@ mod tests {
         assert!(matches!(result, GitSpawn::TimedOut), "got {result:?}");
         // Kill happened at ~100ms, not at the child's 30s — proves the kill
         // path; the clean return (no panic, no hang) proves the reap.
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "kill at timeout, took {elapsed:?}"
+        crate::test_builders::assert_elapsed_under(
+            &format!("kill at timeout, took {elapsed:?}"),
+            elapsed,
+            std::time::Duration::from_secs(2),
         );
         assert!(crate::deadline::hit(), "timeout marks the shared flag");
     }
@@ -17422,9 +17432,10 @@ mod tests {
         }
         // 10x slack over the 300ms deadline, matching the slow-command test —
         // the failure mode being pinned is the grandchild's full 5s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "the orphan must not hold the deadline, took {elapsed:?}"
+        crate::test_builders::assert_elapsed_under(
+            &format!("the orphan must not hold the deadline, took {elapsed:?}"),
+            elapsed,
+            std::time::Duration::from_secs(3),
         );
     }
 
@@ -19175,7 +19186,11 @@ mod tests {
         ] {
             let started = std::time::Instant::now();
             let _ = tokenize(&flood);
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            crate::test_builders::assert_elapsed_under(
+                "tokenize_substitution_scan_stays_linear_on_an_opener_flood",
+                started.elapsed(),
+                std::time::Duration::from_secs(2),
+            );
         }
     }
 
@@ -19964,16 +19979,20 @@ mod tests {
             let _ = tokenize(&command);
             let _ = split_segments(&command);
             let _ = strip_quotes(&command);
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "{unit:?} flood took {:?}",
-                started.elapsed()
+            crate::test_builders::assert_elapsed_under(
+                &format!("{unit:?} flood took {:?}", started.elapsed()),
+                started.elapsed(),
+                std::time::Duration::from_secs(2),
             );
         }
         let long = format!("echo {}'x'", "$".repeat(200_000));
         let started = std::time::Instant::now();
         let _ = split_segments(&long);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        crate::test_builders::assert_elapsed_under(
+            "escaped_or_paired_dollar_quote_flood_stays_linear",
+            started.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     #[test]
@@ -19984,10 +20003,10 @@ mod tests {
             let command = format!("echo {}", unit.repeat(200_000 / unit.len()));
             let started = std::time::Instant::now();
             let _ = tokenize(&command);
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "{unit:?} flood took {:?}",
-                started.elapsed()
+            crate::test_builders::assert_elapsed_under(
+                &format!("{unit:?} flood took {:?}", started.elapsed()),
+                started.elapsed(),
+                std::time::Duration::from_secs(2),
             );
         }
     }
@@ -20657,9 +20676,10 @@ mod tests {
                 input.len()
             );
             // Hang guard only, far above a healthy run.
-            assert!(
-                took < std::time::Duration::from_secs(60),
-                "{unit}: {took:?}"
+            crate::test_builders::assert_elapsed_under(
+                &format!("{unit}: {took:?}"),
+                took,
+                std::time::Duration::from_secs(60),
             );
         }
     }
@@ -20681,7 +20701,11 @@ mod tests {
             let segs = command_segments(&input);
             let took = started.elapsed();
             assert!(!lines.is_empty() && !segs.is_empty());
-            assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+            crate::test_builders::assert_elapsed_under(
+                &format!("{took:?}"),
+                took,
+                std::time::Duration::from_secs(5),
+            );
         }
         // The join still stops at a comment line, found by bisection now.
         let input = format!("echo {}a #;\\\ncat .env", "x\\\n".repeat(1000));
@@ -20725,7 +20749,11 @@ mod tests {
             let stripped = strip_heredoc_bodies(&input);
             let took = started.elapsed();
             assert!(!lines.is_empty() && !segs.is_empty() && !stripped.is_empty());
-            assert!(took < limit, "{:?}: {took:?}", &input[..12]);
+            crate::test_builders::assert_elapsed_under(
+                &format!("{:?}: {took:?}", &input[..12]),
+                took,
+                limit,
+            );
         }
         // The commented shapes still end every logical line at its comment,
         // so the command after the run is its own line.
@@ -20845,9 +20873,10 @@ mod tests {
             let started = std::time::Instant::now();
             let _ = logical_lines(&command);
             let _ = split_segments(&command);
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "{line:?}"
+            crate::test_builders::assert_elapsed_under(
+                &format!("{line:?}"),
+                started.elapsed(),
+                std::time::Duration::from_secs(2),
             );
         }
     }
@@ -21969,7 +21998,11 @@ mod tests {
             let segs = split_segments(&input);
             let took = started.elapsed();
             assert!(!segs.is_empty());
-            assert!(took < limit, "{took:?} on {:.30}", input);
+            crate::test_builders::assert_elapsed_under(
+                &format!("{took:?} on {:.30}", input),
+                took,
+                limit,
+            );
         }
     }
 
@@ -22040,9 +22073,10 @@ mod tests {
                 let started = std::time::Instant::now();
                 let segs = command_segments(&input);
                 let took = started.elapsed();
-                assert!(
-                    took < std::time::Duration::from_secs(5),
-                    "{opener:?}x{n}: command_segments took {took:?}"
+                crate::test_builders::assert_elapsed_under(
+                    &format!("{opener:?}x{n}: command_segments took {took:?}"),
+                    took,
+                    std::time::Duration::from_secs(5),
                 );
                 // With a `#` opener the payload sits inside a comment that
                 // runs to end of input — bash runs none of it — so only the
@@ -22187,9 +22221,10 @@ mod tests {
                     "{name} ({len} B): {} segments, {seg_bytes} B in all",
                     segs.len()
                 );
-                assert!(
-                    took < std::time::Duration::from_secs(20),
-                    "{name} ({len} B): took {took:?}"
+                crate::test_builders::assert_elapsed_under(
+                    &format!("{name} ({len} B): took {took:?}"),
+                    took,
+                    std::time::Duration::from_secs(20),
                 );
             }
         }
@@ -23463,7 +23498,7 @@ mod tests {
             let out = command_segments(&command);
             let took = started.elapsed();
             let bytes: usize = out.iter().map(String::len).sum();
-            assert!(took < limit, "{open:?}: {took:?}");
+            crate::test_builders::assert_elapsed_under(&format!("{open:?}: {took:?}"), took, limit);
             assert!(bytes <= 16 * command.len(), "{open:?}: {bytes} bytes");
         }
     }
@@ -23620,13 +23655,10 @@ mod tests {
             let started = std::time::Instant::now();
             let segs = command_segments(&input);
             let took = started.elapsed();
-            assert!(
-                took < std::time::Duration::from_millis(if cfg!(debug_assertions) {
-                    8000
-                } else {
-                    500
-                }),
-                "{opener:?}: command_segments took {took:?}"
+            crate::test_builders::assert_elapsed_under(
+                &format!("{opener:?}: command_segments took {took:?}"),
+                took,
+                std::time::Duration::from_millis(if cfg!(debug_assertions) { 8000 } else { 500 }),
             );
             assert!(
                 opener.contains(['#', '"']) || segs.iter().any(|s| s.contains("cat .env")),
@@ -23805,7 +23837,11 @@ mod tests {
         let command = format!("{}cat ${{D:-.env}}", "${D:-x ".repeat(40_000));
         let start = std::time::Instant::now();
         let _ = command_segments(&command);
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        crate::test_builders::assert_elapsed_under(
+            "command_segments_unclosed_parameter_flood_stays_fast",
+            start.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
     }
 
     #[test]
@@ -24168,10 +24204,10 @@ mod tests {
             assert!(command.len() >= 200_000);
             let start = std::time::Instant::now();
             let _ = parse_work_dir(&command, "/unowned");
-            assert!(
-                start.elapsed() < std::time::Duration::from_millis(500),
-                "{:?}",
-                start.elapsed()
+            crate::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                std::time::Duration::from_millis(500),
             );
         }
     }
@@ -24631,7 +24667,11 @@ mod tests {
             let located = segment_work_dirs_with_cdpath(&command, "/nonexistent-cwd", false);
             assert!(located.last().is_some(), "{unit}");
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        crate::test_builders::assert_elapsed_under(
+            "a_flood_of_stack_and_toplevel_moves_is_bounded",
+            started.elapsed(),
+            std::time::Duration::from_secs(10),
+        );
     }
 
     /// `cd "$(git rev-parse --show-toplevel)"` lands on the root of the
@@ -24813,7 +24853,11 @@ mod tests {
         for (env_cdpath, command) in [(true, relative), (true, writes), (false, assigned)] {
             let start = std::time::Instant::now();
             let _ = segment_work_dirs_with_cdpath(&command, "/cwd", env_cdpath);
-            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+            crate::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                limit,
+            );
         }
     }
 
@@ -24885,7 +24929,11 @@ mod tests {
             for segment in command_segments(&command) {
                 let _ = variables.resolve_gh(&segment);
             }
-            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+            crate::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                limit,
+            );
         }
     }
 
@@ -24948,7 +24996,11 @@ mod tests {
             assert!(command.len() >= 200_000, "{}", command.len());
             let start = std::time::Instant::now();
             let _ = command_segments_with_dirs(&command, "/unowned");
-            assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+            crate::test_builders::assert_elapsed_under(
+                &format!("{:?}", start.elapsed()),
+                start.elapsed(),
+                limit,
+            );
         }
     }
 
@@ -26293,10 +26345,10 @@ mod tests {
             let started = std::time::Instant::now();
             let segments = command_segments(&command);
             assert!(!segments.is_empty());
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "{unit:?} took {:?}",
-                started.elapsed()
+            crate::test_builders::assert_elapsed_under(
+                &format!("{unit:?} took {:?}", started.elapsed()),
+                started.elapsed(),
+                std::time::Duration::from_secs(5),
             );
         }
     }
@@ -26540,7 +26592,11 @@ mod tests {
         let command = format!("D=ab; {}; rm $D/.env", vec!["D=$D$D"; 40].join("; "));
         let start = std::time::Instant::now();
         let segments = command_segments(&command);
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        crate::test_builders::assert_elapsed_under(
+            "assignment_doubling_chain_stays_bounded",
+            start.elapsed(),
+            std::time::Duration::from_secs(2),
+        );
         assert!(
             segments
                 .iter()
