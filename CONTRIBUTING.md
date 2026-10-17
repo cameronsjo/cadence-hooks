@@ -42,6 +42,9 @@ asserts exit 2 from the real `cadence-hooks group`, which fails open past its
 block" on stderr). Without `CADENCE_TIMING_TESTS=1`, a run that took at least the
 deadline and shows that signature passes as load; a bare exit 1, a panic, or a
 faster non-block still fails. With the variable set, only the block passes.
+A debug-only test (`the_real_group_fail_open_is_accepted_only_without_timing_opt_in`) drives the real group
+with `CADENCE_HOOK_DEADLINE_MS=1` and `CADENCE_TEST_GROUP_STALL_MS=5000` to prove the helper accepts the real
+fail-open output; the stall knob does not exist in release builds, so release runs ignore that test.
 
 Other timing budgets are not gated by this variable. The five `CADENCE_TEST_PANIC`
 tests exist only in debug builds, so `--release` runs report them as ignored.

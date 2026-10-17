@@ -154,13 +154,15 @@ fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
 }
 
 /// The helper must accept what the real wired group prints when it misses its
-/// deadline, not just a synthetic string (cadence-hooks#1366). Forcing a 1 ms
-/// budget makes the group give up on its members after ~1 s, so a 200 KB flood
-/// always crosses it.
+/// deadline, not just a synthetic string (cadence-hooks#1366). A 1 ms budget
+/// makes the group stop waiting after ~1 s, and the debug-only stall keeps
+/// every member busy past that, whatever the machine's speed. The stall knob
+/// does not exist in release builds, so the test is ignored there; the debug
+/// suite runs it on every platform.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug-only group stall")]
 fn the_real_group_fail_open_is_accepted_only_without_timing_opt_in() {
     use cadence_hooks_core::test_builders::is_group_fail_open;
-    let (name, command) = shapes(200_000).remove(0);
     let (out, took) = run_with_env(
         &[
             "group",
@@ -169,14 +171,17 @@ fn the_real_group_fail_open_is_accepted_only_without_timing_opt_in() {
             "cadence/prevent-secret-leaks",
             "cadence/warn-docs-update",
         ],
-        &command,
-        &[("CADENCE_HOOK_DEADLINE_MS", "1")],
+        "cat .env",
+        &[
+            ("CADENCE_HOOK_DEADLINE_MS", "1"),
+            ("CADENCE_TEST_GROUP_STALL_MS", "5000"),
+        ],
     );
     let (code, stderr) = (out.status.code(), String::from_utf8_lossy(&out.stderr));
     let deadline = Duration::from_millis(1);
     assert!(
         is_group_fail_open(false, code, &stderr, took, deadline),
-        "{name}: the real fail-open was not recognised: exit {code:?} after {took:?}; stderr: {stderr}"
+        "the real fail-open was not recognised: exit {code:?} after {took:?}; stderr: {stderr}"
     );
     assert!(
         !is_group_fail_open(true, code, &stderr, took, deadline),
