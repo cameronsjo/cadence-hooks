@@ -4,10 +4,11 @@
 //! On Bash, blocks a literal secret file name handed to an ENUMERATED reader
 //! or sender (`READERS`: `cat`, `grep`, `base64`, `curl -d @`, `gh --input`,
 //! `source`, …), or redirected into one's standard input
-//! (cameronsjo/cadence-hooks#1303). Unknown commands, variables, URL and API
-//! paths, regex patterns, and globs that only share letters with a secret
-//! name are not judged. Safe templates (.env.example, .env.test) are always
-//! allowed. Environment dumps nudge.
+//! (cameronsjo/cadence-hooks#1303), or named anywhere in a command that defines
+//! a shell function (cameronsjo/cadence-hooks#1409).
+//! Unknown commands, variables, URL and API paths, regex patterns, and globs
+//! that only share letters with a secret name are not judged. Safe templates
+//! (.env.example, .env.test) are always allowed. Environment dumps nudge.
 
 use crate::forgectl_hint::{HintKind, with_forgectl_hint};
 use crate::secret_patterns::{
@@ -3099,6 +3100,76 @@ fn without_data_heredocs(command: &str) -> Cow<'_, str> {
 /// Most levels of command text [`segment_reads`] hands back for re-scanning.
 const NESTED_SCAN_DEPTH: usize = 8;
 
+/// A shell function definition anywhere in a command: `NAME()` with or
+/// without a group after it, `function NAME` followed by any word, and an
+/// anonymous `()`. Quotes are not read, so a header inside a quoted string
+/// (a `bash -c` or `eval` script, or prose) counts too; that can only add a
+/// block.
+static FUNCTION_DEFINITION: LazyLock<Regex> = LazyLock::new(|| {
+    const NAME: &str = r#"[^\s(){}<>;&|'"\\$`=]+"#;
+    Regex::new(&format!(
+        r#"(?:^|[\s;&|(){{}}!'"`])(?:function[ \t]+{NAME}\s*\S|(?:{NAME})?[ \t]*\([ \t]*\))"#
+    ))
+    .expect("function definition pattern compiles")
+});
+
+/// The first secret-like word in `command`, read the way the reader scan
+/// reads it: [`command_segments`] resolves visible assignments, `$'…'`,
+/// brace expansion and `printf` substitutions, and [`words_and_stdin`]
+/// joins quoted pieces (`.e''nv` is `.env`). Process substitutions and the
+/// scripts [`segment_reads`] hands back are read too.
+fn first_secret_word(command: &str) -> Option<String> {
+    let mut scripts = vec![(command.to_string(), 0)];
+    while let Some((script, depth)) = scripts.pop() {
+        for segment in command_segments(&script) {
+            let (outer, _) = split_process_substitutions(&segment);
+            let (words, stdin) = words_and_stdin(&outer);
+            if let Some(secret) = words
+                .into_iter()
+                .chain(stdin)
+                .find(|w| names_a_secret(w, Filename::Known))
+            {
+                return Some(secret);
+            }
+            if depth < NESTED_SCAN_DEPTH {
+                let (_, children) = segment_reads(&segment);
+                scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
+            }
+        }
+    }
+    None
+}
+
+/// A secret-like name in a command that defines a shell function:
+/// `f(){ cat "$1"; }; f .env` makes bash read `.env`, yet the name never
+/// sits where a reader takes a file (cameronsjo/cadence-hooks#1409). What
+/// the function does with its arguments is not read: where a body ends, how
+/// it reads them and how a name is spelled each had shapes a list missed
+/// (#1420 review), so any definition and any secret name block. Linear: one
+/// pattern search, then the reader scan's own segmentation.
+fn function_and_secret_word(command: &str, detect: fn() -> bool) -> Option<CheckResult> {
+    if !FUNCTION_DEFINITION.is_match(command) {
+        return None;
+    }
+    let secret = first_secret_word(command)?;
+    Some(CheckResult::block(with_forgectl_hint(
+        format!(
+            "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
+             Found: `{secret}` in a command that defines a shell function\n\
+             Fix: secrets are available to programs via direnv (`direnv allow`) — \
+             run the program directly instead of reading its secret file, or keep \
+             the secret name out of a command that defines a function.\n\
+             Allowed: a function in a command that names no secret file, and a \
+             secret name in a command with no function definition (judged by the \
+             reader rules)."
+        ),
+        HintKind::Read,
+        None,
+        &secret,
+        detect,
+    )))
+}
+
 /// Check if a bash command would put a secret file's contents in front of
 /// the model or send it off the machine.
 ///
@@ -3131,6 +3202,9 @@ fn bash_leaks_secrets(
                 scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
             }
         }
+    }
+    if let Some(block) = function_and_secret_word(command, detect) {
+        return Some(block);
     }
 
     // Warn: env dump commands. Must appear as the executed command at the
@@ -6947,6 +7021,112 @@ mod tests {
     }
 
     #[test]
+    fn function_definition_with_a_secret_word_blocked() {
+        // cameronsjo/cadence-hooks#1409: bash reads `.env` in each of these,
+        // but the name never sits where a reader takes a file.
+        assert_bash(
+            &[
+                r#"f(){ cat "$1"; }; f .env"#,
+                r#"function f { cat "$1"; }; f .env"#,
+                "function f() { cat \"$@\"; }\nf .env",
+                r#"f() { cat $*; }; f x .env"#,
+                r#"f(){ cat < "$1"; }; f .env"#,
+                "f(){ cat; }; f < .env",
+                r#"f() ( cat "$1" ); f .env"#,
+                r#"(f(){ cat "$1"; }; f .env)"#,
+                r#"f(){ cat "$1"; }; sudo f .env"#,
+                r#"f(){ "$@"; }; f cat .env"#,
+                r#"f() { echo "$1" | xargs cat; }; f .env"#,
+                r#"g h(){ cat "$1"; }; g .env"#,
+                r#"f(){ cat ".env.$1"; }; f .env"#,
+                r#"bash -c 'f(){ cat "$1"; }; f .env'"#,
+                r#"f(){ cat $argv; }; f .env"#,
+                r#"() { cat "$1"; } .env"#,
+                // #1420 review, round 1: I-A, I-B, I-C.
+                r#"run(){ "$@"; }; show(){ cat "$1"; }; run show .env"#,
+                r#"f(){ echo $*; cat "$1"; }; f .env "it's""#,
+                r#"f(){ echo $*; cat "$1"; }; f .env '#tag'"#,
+                "f(){ # closes }\n cat \"$1\"; }; f .env",
+                "f(){\n  cat <<EOF\n}\nEOF\n  cat \"$1\"\n}; f .env",
+                r#"f()( case $1 in a) cat "$1";; esac ); f .env"#,
+                // Round 2, I-1: where a body ends.
+                r#"f(){ echo }; cat "$1"; }; f .env"#,
+                r#"f(){ x=a}; cat "$1"; }; f .env"#,
+                r#"f(){ echo "${x:-"}"}"; cat "$1"; }; f .env"#,
+                r#"f(){ case x in }) ;; esac; cat "$1"; }; f .env"#,
+                "f(){ true&# }\ncat \"$1\"; }; f .env",
+                "f(){ true|# }\ncat \"$1\"; }; f .env",
+                "f(){ true(# }\ncat \"$1\"; }; f .env",
+                r#"function f if :; then cat "$1"; fi; f .env"#,
+                r#"function f for x; do cat "$x"; done; f .env"#,
+                "f() if :\nthen cat \"$1\"\nfi\nf .env",
+                "f() while :\ndo cat \"$1\"; break\ndone\nf .env",
+                // I-2: how a body reads its arguments.
+                r#"f(){ cat "${!#}"; }; f .env"#,
+                r#"f(){ n=1; cat "${!n}"; }; f .env"#,
+                r#"f(){ eval "cat \$""1"; }; f .env"#,
+                r#"f(){ getopts a: o; cat "$OPTARG"; }; f -a .env"#,
+                r#"f(){ cat "$_"; }; f .env"#,
+                // I-3: how a name is spelled, read the reader scan's way.
+                r#"f(){ cat "$1"; }; f .e''nv"#,
+                r#"f(){ cat "$1"; }; f ".e"nv"#,
+                r#"f(){ cat "$1"; }; f .en"v""#,
+                r#"f(){ cat "$1"; }; f {.,}env"#,
+                r#"f(){ cat "$1"; }; f $'\x2e'env"#,
+                r#"p=.e; f(){ cat "$1"; }; f "${p}nv""#,
+                r#"f(){ cat "$1"; }; f "$(printf %s .e nv)""#,
+                r#"S=.env.local; f(){ cat "$1"; }; f "$S""#,
+                r#"export S=.env.local; f(){ cat "$1"; }; f "$S""#,
+                // A reader's own name rebound (#1303 allowed these as out of
+                // scope before #1409).
+                "jq(){ cat \"$1\"; }; jq .env.local",
+                "jq () { cat \"$1\"; }; jq .env.local",
+                "function jq { cat $1; }; jq .env.local",
+                "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
+                "eval 'jq(){ cat $1;}'; jq .env.local",
+                // The accepted cost: what the function does is not read.
+                r#"f(){ echo "$1"; }; f .env"#,
+                r#"die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env""#,
+                r#"f(){ echo "$1"; }; f x; git commit -m 'ignore .env'"#,
+                r#"f(){ ls; }; ls .env"#,
+                r#"git commit -m 'the function load reads .env'"#,
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a function definition and a secret name",
+        );
+        assert_bash(
+            &[
+                // A function and no secret word.
+                r#"f(){ cat "$1"; }; f README.md"#,
+                r#"retry(){ for i in 1 2 3; do "$@" && return; done; }; retry cargo test"#,
+                // A safe template is not a secret name.
+                r#"f(){ cat "$1"; }; f .env.example"#,
+                r#"f(){ echo "$HOME"; }; f; git add .env.example"#,
+                // Prose with no definition.
+                r#"git commit -m 'load reads .env'"#,
+                r#"git commit -m 'see the function docs'"#,
+                // Not a definition.
+                r#"awk '{print $1}' notes.txt"#,
+                "for f in a b; do cat \"$f\"; done",
+                "arr=(a b); echo \"${arr[@]}\"",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "no function definition, or no secret name",
+        );
+    }
+
+    #[test]
+    fn function_definition_block_names_the_secret() {
+        let result =
+            SecretLeaksGuard::default().run(&make_bash_input(r#"f(){ cat "$1"; }; f .e''nv"#));
+        let message = result.message.unwrap_or_default();
+        assert!(
+            message.contains("`.env` in a command that defines a shell function"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn secret_read_behind_a_non_blank_before_hash_blocked() {
         // cameronsjo/cadence-hooks#1389: bash and zsh read `x<C>#` as one
         // word for U+3000, NBSP, VT, FF and CR, so no comment starts and the
@@ -7446,11 +7626,8 @@ mod tests {
             &[
                 "jq -R .env.local<x.json",
                 // Same-command shadowing of the name `jq` (#843's analogue).
-                "jq(){ cat \"$1\"; }; jq .env.local",
-                "jq () { cat \"$1\"; }; jq .env.local",
-                "function jq { cat $1; }; jq .env.local",
+                // A function reading its argument blocks instead (#1409).
                 "alias jq=cat; jq .env.local",
-                "eval 'jq(){ cat $1;}'; jq .env.local",
                 "source defs.sh; jq .env.local",
                 ". defs.sh && jq .env.local",
                 "declare -f jq; jq .env.local",
@@ -7464,7 +7641,6 @@ mod tests {
                 "for x in 1; do . ./d.sh; done; jq .env.local",
                 "builtin . ./d.sh; jq .env.local",
                 "command . ./d.sh; jq .env.local",
-                "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
                 "exec jq .env.local",
                 // Rebinding without a definer word (review of 0f93e8d):
                 // the hash table and alias table written through their
