@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Flood-test wall-clock budgets for push walking, bare-hook heredocs, ship judging, posted stdin, and the shared scaling helper now require `CADENCE_TIMING_TESTS=1`. Normal tests keep their semantic assertions and both scaling input sizes; CI checks the unchanged budgets in release mode with one test thread. (cameronsjo/cadence-hooks#1366)
+- The five `CADENCE_TEST_PANIC` tests (which exist only in debug builds) are ignored under `--release`, so the release-mode CI step passes. (cameronsjo/cadence-hooks#1366)
 
 ## [0.127.0] - 2026-10-16
 

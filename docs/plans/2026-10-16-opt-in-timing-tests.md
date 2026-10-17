@@ -40,3 +40,8 @@ CI runs the full normal workspace suite and the full release workspace suite
 with `CADENCE_TIMING_TESTS=1` and one test thread on its existing Linux and Windows
 runners. Git, the draft PR, and the requested final report record delivery and
 hosted-check results. Codex will leave the PR open and draft.
+
+Deviation: the first PR CI run failed in the release step, because five tests
+that arm the debug-only `CADENCE_TEST_PANIC` trigger cannot pass under
+`--release`. They now carry `#[cfg_attr(not(debug_assertions), ignore)]`; the
+debug suite still runs them.

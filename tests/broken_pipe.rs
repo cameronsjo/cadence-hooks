@@ -239,6 +239,10 @@ fn closed_stdout_covers_doctor() {
 /// (`handle_ebadf` in `std::io::stdio`), so a test built on it would assert a
 /// silence that predates this change by years.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn a_genuine_panic_is_still_loud_with_stdout_closed() {
     let tmp = tempfile::tempdir().expect("create a temp metrics dir");
 

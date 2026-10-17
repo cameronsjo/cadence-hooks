@@ -32,6 +32,9 @@ In PowerShell, set `$env:CADENCE_TIMING_TESTS = '1'` before running the same
 on its existing Linux and Windows runners. Use a machine without competing heavy
 workloads: wall-clock measurements still depend on available CPU time.
 
+Other timing budgets are not gated by this variable. The five `CADENCE_TEST_PANIC`
+tests exist only in debug builds, so `--release` runs report them as ignored.
+
 ### Windows
 
 The binary builds and tests natively on Windows (`x86_64-pc-windows-msvc`); CI
