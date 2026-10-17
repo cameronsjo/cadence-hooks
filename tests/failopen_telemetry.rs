@@ -357,6 +357,10 @@ fn non_object_tool_response_writes_no_failopen_row() {
 /// (exit 2). Before the containment the global panic hook exited the process
 /// with 1, which in `group` mode also dropped every other member's block.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn a_parser_panic_is_judged_through_the_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, _) = run_push_remote(tmp.path(), TWO_PUSHES, Some("parse"));
@@ -419,6 +423,10 @@ fn run_push_remote(
 /// The debug-only `hang` mode makes the parse sleep 30 s. Without the budget
 /// the hook waits it out and the 5 s hook timeout lets the pushes through.
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
 fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, elapsed) = run_push_remote(tmp.path(), TWO_PUSHES, Some("hang"));
