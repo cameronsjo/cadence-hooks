@@ -14,6 +14,7 @@
 
 mod support;
 
+use cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES;
 use std::io::Write;
 use std::process::{Command, Output};
 
@@ -348,5 +349,191 @@ fn non_object_tool_response_writes_no_failopen_row() {
     ] {
         let tmp = run_with_payload(args, payload);
         assert!(failopen_rows(tmp.path()).is_empty(), "{args:?}");
+    }
+}
+
+/// A panic on the loop parser's thread is contained (cameronsjo/cadence-hooks
+/// #1401 review): the check reads it as a parse failure and judges the command
+/// through its fallback. Two pushes then block on the fallback's push count
+/// (exit 2). Before the containment the global panic hook exited the process
+/// with 1, which in `group` mode also dropped every other member's block.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
+fn a_parser_panic_is_judged_through_the_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, _) = run_guardrail("guard-push-remote", tmp.path(), TWO_PUSHES, Some("parse"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the loop parser panicked"),
+        "the synthetic parser panic fired: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("multiple git push commands"),
+        "blocked by the parse-failure fallback: {stderr}"
+    );
+    assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
+}
+
+/// Two pushes: the parse-failure fallback counts them and blocks.
+const TWO_PUSHES: &str = "git push origin main && git push upstream main";
+
+/// `guardrails <guard>` on `command`, owners set to `cameronsjo`, with
+/// `CADENCE_TEST_PANIC` set to `test_panic` when given. Returns the output and
+/// the wall-clock run time.
+fn run_guardrail(
+    guard: &str,
+    metrics: &std::path::Path,
+    command: &str,
+    test_panic: Option<&str>,
+) -> (std::process::Output, std::time::Duration) {
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "cwd": metrics,
+        "hook_event_name": "PreToolUse",
+        "session_id": "x",
+    })
+    .to_string();
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", guard]);
+    cmd.env("CADENCE_METRICS_DIR", metrics);
+    cmd.env("CADENCE_ALLOWED_OWNERS", "cameronsjo");
+    cmd.env_remove("CADENCE_TEST_PANIC");
+    if let Some(mode) = test_panic {
+        cmd.env("CADENCE_TEST_PANIC", mode);
+    }
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let started = std::time::Instant::now();
+    let mut child = cmd.spawn().expect("failed to spawn binary");
+    if let Some(ref mut stdin) = child.stdin {
+        match stdin.write_all(payload.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("failed to write child stdin: {e}"),
+        }
+    }
+    let out = child.wait_with_output().expect("failed to wait on binary");
+    (out, started.elapsed())
+}
+
+/// cameronsjo/cadence-hooks#1401: `parse_command` gives the parser a budget.
+/// The debug-only `hang` mode makes the parse sleep 30 s. Without the budget
+/// the hook waits it out and the 5 s hook timeout lets the pushes through.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "CADENCE_TEST_PANIC exists only in debug builds"
+)]
+fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, elapsed) = run_guardrail("guard-push-remote", tmp.path(), TWO_PUSHES, Some("hang"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("CADENCE_TEST_PANIC=hang"),
+        "the synthetic hang fired: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("multiple git push commands"),
+        "blocked by the parse-failure fallback: {stderr}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"
+    );
+    assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
+}
+
+/// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): nesting deep
+/// enough to overflow the parse thread's stack. An overflow aborts the
+/// process (signal 6), which drops the block. Past [`MAX_PARSE_BYTES`] the
+/// command is not parsed, and the fallback judges the pushes. The `[[ ! …`
+/// shape costs 2 bytes per level, the cheapest known; at 16 000 levels it
+/// aborts a debug build when the cap is lifted.
+#[test]
+fn nesting_past_the_byte_cap_is_judged_through_the_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let depth = 16_000;
+    let just_over = MAX_PARSE_BYTES / 2 + 1;
+    let shapes = [
+        format!("[[ {}x ]] && {TWO_PUSHES}", "! ".repeat(just_over)),
+        format!("[[ {}x ]] && {TWO_PUSHES}", "! ".repeat(depth)),
+        format!("{}{TWO_PUSHES}", "true && ".repeat(MAX_PARSE_BYTES / 8 + 1)),
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "if true; then ".repeat(depth),
+            "; fi".repeat(depth)
+        ),
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "while true; do ".repeat(depth),
+            "; done".repeat(depth)
+        ),
+        format!(
+            "{}{TWO_PUSHES}{}",
+            "case x in x) ".repeat(depth),
+            " ;; esac".repeat(depth)
+        ),
+    ];
+    for command in &shapes {
+        assert!(command.len() > MAX_PARSE_BYTES);
+        let (out, _) = run_guardrail("guard-push-remote", tmp.path(), command, None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let head = &command[..40];
+        assert_eq!(out.status.code(), Some(2), "{head}…: {stderr}");
+        assert!(
+            stderr.contains("multiple git push commands"),
+            "{head}…: blocked by the parse-failure fallback: {stderr}"
+        );
+    }
+}
+
+/// A command past [`MAX_PARSE_BYTES`] gets only each guard's parse-failure
+/// fallback. Padding a dangerous loop or chain with a trailing comment must
+/// not turn its block into an allow (cameronsjo/cadence-hooks#1405 security
+/// review r2, Q2).
+#[test]
+fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pad = format!("\n# {}", "x".repeat(MAX_PARSE_BYTES));
+    for (guard, command, cause) in [
+        (
+            "guard-push-remote",
+            "for r in a b; do git push $r main; done",
+            "git push in loop",
+        ),
+        (
+            "guard-push-remote",
+            "while read r; do git push $r main; done < remotes",
+            "git push in loop",
+        ),
+        (
+            "guard-push-remote",
+            TWO_PUSHES,
+            "multiple git push commands",
+        ),
+        (
+            "guard-gh-write",
+            "for i in 1 2; do gh issue close $i -R other/r; done",
+            "gh command in loop",
+        ),
+        (
+            "guard-gh-write",
+            "while read i; do gh pr merge $i -R other/r; done < prs",
+            "gh command in loop",
+        ),
+    ] {
+        let padded = format!("{command}{pad}");
+        let (out, _) = run_guardrail(guard, tmp.path(), &padded, None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{guard} {command:?}: {stderr}");
+        assert!(stderr.contains(cause), "{guard} {command:?}: {stderr}");
     }
 }

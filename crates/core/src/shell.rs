@@ -1237,6 +1237,25 @@ fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) 
 thread_local! {
     static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BRACE_WORD_LEFT_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GLUED_HASH_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FUNCTION_HEADER_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that a double-quoted `"$(…)"` holds a `#` glued to a paren. bash
+/// keeps `a=(x)#` as one word and zsh or `(true)#` starts a comment, and the
+/// scan that finds where the span ends reads only the comment. In bash the
+/// quotes after it then pair across lines and run a line the guards read as
+/// quoted text (cameronsjo/cadence-hooks#1400).
+fn mark_glued_hash_unread() {
+    GLUED_HASH_UNREAD.with(|unread| unread.set(true));
+}
+
+/// Whether a reading on this thread met a `#` glued to a paren inside a
+/// double-quoted `"$(…)"` since the last [`reset_command_unread`]
+/// ([`mark_glued_hash_unread`]). A fail-closed guard refuses such a command
+/// with its own message.
+pub fn glued_hash_unread() -> bool {
+    GLUED_HASH_UNREAD.with(std::cell::Cell::get)
 }
 
 /// Record that a reading of the command on this thread left part of it
@@ -1270,11 +1289,13 @@ pub fn brace_word_left_whole() -> bool {
     BRACE_WORD_LEFT_WHOLE.with(std::cell::Cell::get)
 }
 
-/// Clear [`command_unread`] and [`brace_word_left_whole`] before a check
-/// reads a command.
+/// Clear [`command_unread`], [`brace_word_left_whole`], [`glued_hash_unread`]
+/// and [`function_header_unread`] before a check reads a command.
 pub fn reset_command_unread() {
     COMMAND_UNREAD.with(|unread| unread.set(false));
     BRACE_WORD_LEFT_WHOLE.with(|whole| whole.set(false));
+    GLUED_HASH_UNREAD.with(|unread| unread.set(false));
+    FUNCTION_HEADER_UNREAD.with(|unread| unread.set(false));
 }
 
 /// `text` as `(char, structural)` pairs when bash would brace-expand it — some
@@ -2405,11 +2426,14 @@ pub fn strip_verbatim_prefix(path: &str) -> String {
 /// it would glue `)}` onto the last word of the far more common group form.
 pub fn strip_group_wrappers(segment: &str) -> &str {
     let trimmed = segment.trim();
-    let opened_a_brace_group = trimmed.starts_with('{') && !opens_brace_expansion(trimmed);
+    // A function header in front of the body is not a command word
+    // ([`function_header_len`]); the body's `{` decides what the `}` closes.
+    let body = read_function_header(trimmed).map_or(trimmed, |len| &trimmed[len..]);
+    let opened_a_brace_group = body.starts_with('{') && !opens_brace_expansion(body);
     // A `{` that opens a brace EXPANSION is part of the command word, not a
     // group: `{cat,.env}` runs `cat .env`, and trimming the brace left
     // `cat,.env}`, a word nothing expands (cadence-hooks#1096).
-    let mut rest = trimmed;
+    let mut rest = body;
     // Each `{` whose word runs on (`{a,b}`, `{{x`) costs a walk of that word;
     // past [`MAX_GLUED_BRACE_WALKS`] the strip stops and keeps the text. A
     // glued `{` is not a group opener to bash anyway (`{{echo` is a command
@@ -2417,7 +2441,18 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     // 50 KB run of openers linear (PR #1118 review).
     let mut glued_walks = 0usize;
     loop {
-        rest = rest.trim_start_matches(['(', ' ', '\t']);
+        // A header is read before each `(` is peeled, one per pass: a bulk
+        // trim took the `(` of an anonymous `()` and skipped a header behind
+        // a subshell's `(` (`(f(){ cat .env; }; f)`).
+        rest = rest.trim_start_matches([' ', '\t']);
+        if let Some(len) = read_function_header(rest) {
+            rest = &rest[len..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('(') {
+            rest = after;
+            continue;
+        }
         let Some(after) = rest.strip_prefix('{') else {
             break;
         };
@@ -2756,6 +2791,159 @@ fn is_function_name(word: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Byte length of a function definition's header at the start of `text`,
+/// with the blanks after it, when a body follows: `g()`, `g ( )`,
+/// `function g`, `function g()`, zsh's anonymous `()` and `function`, and
+/// zsh's name lists (`g h()`, `function g h`). `None` for anything else.
+///
+/// After `()` any body counts, since zsh takes a simple command there
+/// (`() cat .env` runs at once). After `function` with no `()`, only a `{`
+/// or `(` body does: otherwise every word after it would read as a name.
+///
+/// For the string-level strips ([`strip_group_wrappers`]), which are the only
+/// ones that can reach a body opener glued to the header: [`tokenize`] makes
+/// `g(){` and `g()(git` one word each, and the token-level
+/// [`strip_function_header`] cannot split them. Leaving them whole hid the
+/// commit in `g(){ git commit -m x; }; g` (cameronsjo/cadence-hooks#1402),
+/// and zsh runs an anonymous function as soon as it is defined.
+///
+/// **Detector direction only**: neither shell runs a word of a header, so
+/// dropping it can only expose a command the body runs.
+pub fn function_header_len(text: &str) -> Option<usize> {
+    // Every header starts with a name, `function` or `()`. Most segments do
+    // not, and every reading of every segment comes through here.
+    if !text
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'('))
+    {
+        return None;
+    }
+    let blank = [' ', '\t'];
+    let (mut rest, keyword) = match text.strip_prefix("function") {
+        Some(after) if after.starts_with(blank) => (after.trim_start_matches(blank), true),
+        _ => (text, false),
+    };
+    // Zero or more names; zsh defines each one in a list.
+    loop {
+        let name_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+            .unwrap_or(rest.len());
+        if !is_function_name(&rest[..name_len]) {
+            break;
+        }
+        rest = rest[name_len..].trim_start_matches(blank);
+    }
+    let parens = rest
+        .strip_prefix('(')
+        .and_then(|inner| inner.trim_start_matches(blank).strip_prefix(')'));
+    let body = match parens {
+        Some(after) => after.trim_start_matches(blank),
+        None if keyword && rest.starts_with(['{', '(']) => rest,
+        None => return None,
+    };
+    (!body.is_empty()).then(|| text.len() - body.len())
+}
+
+/// Byte length of a function definition's header at the start of `text`,
+/// read by [`function_header_len`] or, failing that, by
+/// [`loose_function_header_len`]. A header only the loose reading finds marks
+/// the command unread ([`function_header_unread`]), so the fail-closed guards
+/// refuse it. Either way the header is dropped and the body read.
+pub fn read_function_header(text: &str) -> Option<usize> {
+    function_header_len(text).or_else(|| {
+        let len = loose_function_header_len(text)?;
+        FUNCTION_HEADER_UNREAD.with(|unread| unread.set(true));
+        Some(len)
+    })
+}
+
+/// Byte length of anything shaped like a function header at the start of
+/// `text`, with the blanks after it, when a body follows: any word with no
+/// unquoted `=` (so `arr=()` stays an assignment), then `()`, or `function`
+/// and a word. A leading `!`, `time` or `coproc` is skipped. zsh takes
+/// names [`function_header_len`] does not (`g:x`, `@`, `a+b`, `fé`, `\g`,
+/// `'g'`), and bash takes most of them too, so the shape alone counts:
+/// enumerating name characters never finishes (cameronsjo/cadence-hooks#1405
+/// security review, I1).
+fn loose_function_header_len(text: &str) -> Option<usize> {
+    let blank = [' ', '\t'];
+    let mut rest = text;
+    while let Some(after) = ["!", "time", "coproc"]
+        .iter()
+        .find_map(|prefix| rest.strip_prefix(prefix).filter(|a| a.starts_with(blank)))
+    {
+        rest = after.trim_start_matches(blank);
+    }
+    let (rest, keyword) = match rest.strip_prefix("function") {
+        Some(after) if after.starts_with(blank) => (after.trim_start_matches(blank), true),
+        _ => (rest, false),
+    };
+    let name_len = unquoted_word_len(rest)?;
+    let after_name = rest[name_len..].trim_start_matches(blank);
+    let parens = after_name
+        .strip_prefix('(')
+        .and_then(|inner| inner.trim_start_matches(blank).strip_prefix(')'));
+    let body = match parens {
+        Some(after) => after.trim_start_matches(blank),
+        None if keyword && name_len > 0 && after_name.starts_with(['{', '(']) => after_name,
+        None => return None,
+    };
+    (!body.is_empty()).then(|| text.len() - body.len())
+}
+
+/// Byte length of the shell word at the start of `text`, through its quotes
+/// and backslash escapes, up to a blank or an operator character. `None` for
+/// an unquoted `=` (an assignment, never a name) or an unclosed quote.
+fn unquoted_word_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => break,
+            b'=' => return None,
+            b'\\' => i += 2,
+            b'\'' => i += 2 + text[i + 1..].find('\'')?,
+            b'"' => {
+                i += 1;
+                loop {
+                    match bytes.get(i)? {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Some(i.min(text.len()))
+}
+
+/// Whether `command` holds `${` followed by a blank, a newline or `|`
+/// anywhere, quoted or not. In bash 5.3 that opens a command substitution
+/// (`${ cmd; }`, `${| cmd; }`), where comments and heredocs start; every
+/// reader here takes `${` for a parameter expansion, where they do not, so a
+/// quote in its comment hid the lines after it from every guard
+/// (cameronsjo/cadence-hooks#1405 security review, I3). No other shell or
+/// expansion accepts that spelling, so it is refused, not read. Quoting is
+/// ignored on purpose: a misread quote must not hide one.
+pub fn has_bash_funsub(command: &str) -> bool {
+    command
+        .as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'$' && w[1] == b'{' && matches!(w[2], b' ' | b'\t' | b'\n' | b'|'))
+}
+
+/// Whether a reading on this thread met a function header only
+/// [`loose_function_header_len`] could read since the last
+/// [`reset_command_unread`]. A fail-closed guard refuses such a command with
+/// its own message.
+pub fn function_header_unread() -> bool {
+    FUNCTION_HEADER_UNREAD.with(std::cell::Cell::get)
 }
 
 /// The header of a function definition, in all three spellings. The body's
@@ -8144,7 +8332,8 @@ struct HeredocLex {
     /// whether it sits inside `$( … )` without walking a stack a `(` flood
     /// made deep.
     substs: usize,
-    /// How many [`Opener::Arith`] entries `open` holds ([`paren_step`]).
+    /// How many [`Opener::Arith`] and [`Opener::DollarArith`] entries `open`
+    /// holds ([`paren_step`]).
     arith: usize,
     backticks: bool,
     /// Same latch as [`comment_spans`]: after one `"$( … )"` span that cannot
@@ -8273,9 +8462,10 @@ fn scan_command_line(
                 let arithmetic = chars[j + 1] == '(' && chars.get(j + 2) == Some(&'(');
                 lex.open.push(match chars[j + 1] {
                     '{' => Opener::Brace,
-                    _ if arithmetic => Opener::Paren,
+                    _ if arithmetic => Opener::DollarArith,
                     _ => Opener::Subst,
                 });
+                lex.arith += usize::from(arithmetic);
                 boundary = lex.open.last() == Some(&Opener::Subst);
                 lex.substs += usize::from(boundary);
                 j += 2;
@@ -8313,11 +8503,9 @@ fn scan_command_line(
                     joins,
                 };
             }
-            '{' if matches!(
-                innermost,
-                Some(Opener::Subst | Opener::Paren | Opener::Brace | Opener::Arith)
-            ) =>
-            {
+            // [`comment_spans`]: a bare `{` nests only inside `${…}` or
+            // arithmetic, never directly inside `$(…)`.
+            '{' if brace_nests_in(innermost) => {
                 lex.open.push(Opener::Brace);
             }
             '}' if innermost == Some(Opener::Brace) => {
@@ -8777,6 +8965,13 @@ enum Opener {
     /// comment and `<<` IS a heredoc. Neither reading is safe for the other,
     /// so a `#` or `<<` there ends the scan ([`CommentKind::Unresolved`]).
     Arith,
+    /// The outer level of `$((…))`, closed by `)` like [`Opener::Paren`].
+    /// bash reads it as arithmetic, but zsh retries one that fails to parse
+    /// as a command substitution, where `#` after a blank is a comment and
+    /// `<<` a heredoc (cameronsjo/cadence-hooks#1395). It counts toward
+    /// `arith` ([`paren_step`]), so a `#` or `<<` there ends the scan as it
+    /// does inside [`Opener::Arith`].
+    DollarArith,
 }
 
 /// Can a `#` start a comment directly inside `innermost`? Shell code can
@@ -8785,6 +8980,19 @@ fn comment_context(innermost: Option<Opener>) -> bool {
     matches!(
         innermost,
         None | Some(Opener::Subst | Opener::Group | Opener::ProcSub | Opener::WordParen)
+    )
+}
+
+/// Does an unquoted `{` directly inside `innermost` nest as a brace the next
+/// `}` closes? Inside `${…}` it does, and inside arithmetic it is tracked
+/// the same way. Directly inside `$(…)` it is shell code: a brace group or a
+/// literal, after which comments and heredocs still start. Reading it as a
+/// `${` there hid a `#'` comment, and its `'` then hid the next line from
+/// every guard (cameronsjo/cadence-hooks#1394).
+fn brace_nests_in(innermost: Option<Opener>) -> bool {
+    matches!(
+        innermost,
+        Some(Opener::Paren | Opener::Brace | Opener::Arith | Opener::DollarArith)
     )
 }
 
@@ -8820,8 +9028,9 @@ fn unresolved_in_arith(c: char, at_word: bool, next: Option<char>) -> bool {
 /// - After `)` that closes `$(…)`, `$((…))` or `<(…)`, the word goes on in
 ///   both shells (`$(true)#'`, `<(true)#; cmd`), so `#` is plain text there.
 ///
-/// `arith` counts the [`Opener::Arith`] entries on `open`, so a scanner can
-/// ask whether it is anywhere inside `((…))` without walking the stack.
+/// `arith` counts the [`Opener::Arith`] and [`Opener::DollarArith`] entries
+/// on `open`, so a scanner can ask whether it is anywhere inside `((…))` or
+/// `$((…))` without walking the stack.
 fn paren_step(
     open: &mut Vec<Opener>,
     arith: &mut usize,
@@ -8834,7 +9043,7 @@ fn paren_step(
     if c == '(' {
         if matches!(
             innermost,
-            Some(Opener::Paren | Opener::Brace | Opener::Arith)
+            Some(Opener::Paren | Opener::Brace | Opener::Arith | Opener::DollarArith)
         ) {
             open.push(Opener::Paren);
             return (false, false);
@@ -8858,6 +9067,11 @@ fn paren_step(
         Some(Opener::Brace) => (false, false),
         Some(Opener::Paren | Opener::Subst | Opener::ProcSub) => {
             open.pop();
+            (false, false)
+        }
+        Some(Opener::DollarArith) => {
+            open.pop();
+            *arith -= 1;
             (false, false)
         }
         Some(Opener::Arith) => {
@@ -8963,7 +9177,8 @@ fn comment_spans_scan(text: &str, ambiguous_as_code: bool) -> Vec<(usize, usize,
     let mut before: Option<char> = None;
     let mut quote: Option<Quote> = None;
     let mut open: Vec<Opener> = Vec::new();
-    // How many [`Opener::Arith`] entries `open` holds ([`paren_step`]).
+    // How many [`Opener::Arith`] and [`Opener::DollarArith`] entries `open`
+    // holds ([`paren_step`]).
     let mut arith = 0usize;
     let mut backticks = false;
     let mut boundary = true;
@@ -9051,15 +9266,17 @@ fn comment_spans_scan(text: &str, ambiguous_as_code: bool) -> Vec<(usize, usize,
             }
             '$' if matches!(chars.peek().map(|&(_, n)| n), Some('{' | '(')) => {
                 let opener = chars.next().expect("peeked").1;
-                // `$((` is arithmetic: push `Paren` here and let the `(` arm
-                // below push the second level. `$(` alone is a substitution,
-                // and a word begins right after it (`$(#c⏎…)` is a comment).
+                // `$((` is arithmetic: push `DollarArith` here and let the
+                // `(` arm below push the second level. `$(` alone is a
+                // substitution, and a word begins right after it (`$(#c⏎…)`
+                // is a comment).
                 let arithmetic = opener == '(' && chars.peek().map(|&(_, n)| n) == Some('(');
                 open.push(match opener {
                     '{' => Opener::Brace,
-                    _ if arithmetic => Opener::Paren,
+                    _ if arithmetic => Opener::DollarArith,
                     _ => Opener::Subst,
                 });
+                arith += usize::from(arithmetic);
                 boundary = open.last() == Some(&Opener::Subst);
             }
             '\'' => {
@@ -9111,13 +9328,9 @@ fn comment_spans_scan(text: &str, ambiguous_as_code: bool) -> Vec<(usize, usize,
                 spans.push((i, text.len(), CommentKind::Unresolved));
                 break;
             }
-            // Only nested once an expansion is already open, so a bare
-            // `{ group; }` never pushes.
-            '{' if matches!(
-                open.last(),
-                Some(Opener::Subst | Opener::Paren | Opener::Brace | Opener::Arith)
-            ) =>
-            {
+            // Only nested inside `${…}` or arithmetic, so a bare `{ group; }`
+            // never pushes, at top level or in `$(…)` ([`brace_nests_in`]).
+            '{' if brace_nests_in(open.last().copied()) => {
                 open.push(Opener::Brace);
                 boundary = false;
             }
@@ -11011,7 +11224,7 @@ fn scan_substitution_body_bounded(
     quote_aware: bool,
     budget: usize,
 ) -> Result<(String, usize), ScanStop> {
-    scan_substitution_frames(chars, start, quote_aware, budget, None, None)
+    scan_substitution_frames(chars, start, quote_aware, budget, None, None, &mut false)
 }
 
 /// One `$( … )` level of [`scan_substitution_frames`]: everything the scan
@@ -11091,6 +11304,7 @@ fn scan_substitution_frames(
     budget: usize,
     max_frames: Option<usize>,
     mut memo: Option<&mut SubstMemo>,
+    glued_hash: &mut bool,
 ) -> Result<(String, usize), ScanStop> {
     // Fail the scan rather than the process, and say WHICH failure it was —
     // every caller has to tell "the shell would reject this" from "we gave up".
@@ -11111,22 +11325,23 @@ fn scan_substitution_frames(
         let frame = stack.last_mut().expect("a frame is open");
         // The outcome of the level that just ended, and whether it is still on
         // the stack (a memo hit never was).
-        let (mut child, mut on_stack) = match scan_frame(chars, quote_aware, level_budget, frame) {
-            FrameStep::Done(result) => (result, true),
-            FrameStep::Nested(nested_start) => {
-                if let Some(&hit) = memo.as_ref().and_then(|m| m.get(&nested_start)) {
-                    (hit.map(|end| (String::new(), end)), false)
-                } else if let Some(next_budget) = frame_budget(stack.len()) {
-                    level_budget = next_budget;
-                    stack.push(ScanFrame::new(chars, nested_start));
-                    continue;
-                } else {
-                    // A nested failure is relabelled, never propagated as-is
-                    // (see below).
-                    return Err(ScanStop::NestedTooDeep);
+        let (mut child, mut on_stack) =
+            match scan_frame(chars, quote_aware, level_budget, frame, glued_hash) {
+                FrameStep::Done(result) => (result, true),
+                FrameStep::Nested(nested_start) => {
+                    if let Some(&hit) = memo.as_ref().and_then(|m| m.get(&nested_start)) {
+                        (hit.map(|end| (String::new(), end)), false)
+                    } else if let Some(next_budget) = frame_budget(stack.len()) {
+                        level_budget = next_budget;
+                        stack.push(ScanFrame::new(chars, nested_start));
+                        continue;
+                    } else {
+                        // A nested failure is relabelled, never propagated as-is
+                        // (see below).
+                        return Err(ScanStop::NestedTooDeep);
+                    }
                 }
-            }
-        };
+            };
         // Hand a finished level to its parent, unwinding while parents fail.
         loop {
             if on_stack {
@@ -11177,6 +11392,7 @@ fn scan_frame(
     quote_aware: bool,
     budget: usize,
     frame: &mut ScanFrame,
+    glued_hash: &mut bool,
 ) -> FrameStep {
     let mut j = frame.j;
     let mut depth = frame.depth;
@@ -11357,6 +11573,11 @@ fn scan_frame(
             // The comment text is kept in the body verbatim; the comment pass
             // downstream removes it when the body is re-split.
             if quote.is_none() && boundary && !arithmetic && chars[j] == '#' {
+                // Glued to a paren, the `#` is a comment to one shell and a word
+                // character to another ([`paren_step`]), and this scan reads it
+                // only as a comment. Reported so a caller can refuse what it
+                // cannot read both ways (cameronsjo/cadence-hooks#1400).
+                *glued_hash |= j > 0 && matches!(chars[j - 1], '(' | ')');
                 let end = chars[j..]
                     .iter()
                     .position(|&c| c == '\n')
@@ -11976,6 +12197,7 @@ impl SpanLatch {
                     self.tripped = true;
                     return SubstBound::Unbounded;
                 }
+                let mut glued_hash = false;
                 let found = scan_substitution_frames(
                     chars,
                     start,
@@ -11983,7 +12205,15 @@ impl SpanLatch {
                     MAX_SUBSTITUTION_DEPTH,
                     Some(MAX_QUOTED_SUBSTITUTION_FRAMES),
                     Some(&mut self.memo),
+                    &mut glued_hash,
                 );
+                // This scan reads a `#` glued to a paren only as a comment,
+                // and where the span ends turns on that reading. A command
+                // that holds one is refused rather than read one way
+                // (cameronsjo/cadence-hooks#1400).
+                if glued_hash {
+                    mark_glued_hash_unread();
+                }
                 self.work += match &found {
                     Ok((_, end)) => end - start,
                     Err(_) => chars.len() - start,
@@ -16403,8 +16633,10 @@ mod tests {
             // command, so what matters is that nothing resolves a verb.
             ("f()", "f("),
             ("case x in", "case"),
-            // `-c` is a flag, not a function name.
-            ("-c() { rm note.md", "-c()"),
+            // zsh defines a function named `-c` here, so the header is read
+            // loosely and the body's verb exposed (the command is also
+            // marked unread; cameronsjo/cadence-hooks#1405 review, I1).
+            ("-c() { rm note.md", "rm"),
         ] {
             assert_eq!(
                 executable_tokens(segment).first().map(String::as_str),
