@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.128.0] - 2026-10-17
+
 ### Security
 
 - **A run of unclosed `((` lines no longer stalls `guard-push-remote` into failing open.** The loop parser (`brush-parser`) backtracks exponentially on unclosed `((` or `( (` lines that it then rejects: twenty `(( 1 # x ))` lines took over 120 s, the hook timed out, and the push behind them went through unchecked. A shorter run still used up the git-probe budget, so a fail-closed probe was skipped. The parse now runs on its own thread with a 1 s budget and counts as failed past it. The guard's existing fallbacks (push counting, the loop pattern) and its owner checks then judge the push. A command that ran out the budget once is not parsed again in the same process. A panic in the parser is read the same way, as a parse failure, instead of exiting the process, which in `group` mode also dropped every other check's block. On a saturated host a large ordinary command can also run past the budget; `guard-push-remote` then counts pushes, so a legitimate chain of two pushes blocks. (cameronsjo/cadence-hooks#1401)
