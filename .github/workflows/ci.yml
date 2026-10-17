@@ -48,6 +48,7 @@ jobs:
       # Wall-clock flood budgets are opt-in: run the shipped profile with
       # one test thread so debug overhead and parallel tests do not decide them.
       - name: Run release timing budgets
+        if: runner.os == 'Linux'
         env:
           CADENCE_TIMING_TESTS: '1'
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1

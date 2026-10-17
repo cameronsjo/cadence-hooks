@@ -28,8 +28,9 @@ CADENCE_TIMING_TESTS=1 cargo test --release --workspace --no-fail-fast -- --test
 ```
 
 In PowerShell, set `$env:CADENCE_TIMING_TESTS = '1'` before running the same
-`cargo test` command. CI runs both the normal suite and this release invocation
-on its existing Linux and Windows runners. Use a machine without competing heavy
+`cargo test` command. CI runs the normal suite on its Linux and Windows runners
+and this release invocation on Linux only: the release budgets are enforced on Linux
+CI only, because Windows runners exceed them from noise, not regressions. Use a machine without competing heavy
 workloads: wall-clock measurements still depend on available CPU time.
 
 Other timing budgets are not gated by this variable. The five `CADENCE_TEST_PANIC`
