@@ -301,13 +301,22 @@ pub fn temp_root_spellings(tmpdir: Option<&str>, home: Option<&str>) -> Vec<Path
 /// `path`'s other spelling under macOS's fixed firmlinks, for the two temp
 /// trees only: `/var/folders/…` ↔ `/private/var/folders/…` and `/tmp…` ↔
 /// `/private/tmp…`. Pure; `None` for anything else.
+///
+/// Built as text so the separator stays `/` on every platform: `Path::join`
+/// inserts `\` on Windows, and callers compare these as strings.
 fn firmlink_twin(path: &Path) -> Option<PathBuf> {
-    let private = Path::new("/private");
-    if let Ok(rest) = path.strip_prefix(private) {
-        let public = Path::new("/").join(rest);
-        return is_firmlinked_temp(&public).then_some(public);
-    }
-    is_firmlinked_temp(path).then(|| private.join(path.strip_prefix("/").unwrap_or(path)))
+    let text = path.to_str()?;
+    let twin = match text.strip_prefix("/private") {
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        Some(_) => return None,
+        None => format!("/private{text}"),
+    };
+    let public = if twin.starts_with("/private/") {
+        text
+    } else {
+        twin.as_str()
+    };
+    is_firmlinked_temp(Path::new(public)).then(|| PathBuf::from(twin))
 }
 
 /// `/tmp` or below it, or strictly below `/var/folders`.
@@ -698,6 +707,15 @@ mod tests {
             expect.extend(want.map(PathBuf::from));
             assert_eq!(got, expect, "{tmpdir}");
         }
+        // The twin is text with `/` separators on every platform: callers
+        // compare strings, and `PathBuf` equality would hide a `\`.
+        assert_eq!(
+            firmlink_twin(Path::new("/var/folders/zz/T"))
+                .and_then(|p| p.to_str().map(String::from)),
+            Some("/private/var/folders/zz/T".to_string())
+        );
+        assert_eq!(firmlink_twin(Path::new("/privatex/tmp")), None);
+        assert_eq!(firmlink_twin(Path::new("/private")), None);
         // No duplicates of the fixed roots.
         assert_eq!(temp_root_spellings(Some("/tmp"), None), fixed.to_vec());
         // Inside home, in any case spelling, contributes nothing.
