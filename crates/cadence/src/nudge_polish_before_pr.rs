@@ -3250,9 +3250,17 @@ mod tests {
                 assert_eq!(result.outcome, want, "{head:?}…");
                 let msg = result.message.unwrap_or_default();
                 assert!(msg.contains(needle), "{head:?}…: {msg}");
-                // Release is the shipped profile; debug builds get headroom.
-                let limit = if cfg!(debug_assertions) { 8.0 } else { 0.5 };
-                assert!(elapsed.as_secs_f64() < limit, "{head:?}…: {elapsed:?}");
+                // Keep both verdict assertions above in the normal suite.
+                let limit = if cfg!(debug_assertions) {
+                    std::time::Duration::from_secs(8)
+                } else {
+                    std::time::Duration::from_millis(500)
+                };
+                cadence_hooks_core::test_builders::assert_elapsed_under(
+                    &format!("{head:?}…"),
+                    elapsed,
+                    limit,
+                );
             }
         });
     }
