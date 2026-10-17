@@ -1237,6 +1237,24 @@ fn brace_expand_word(text: &str, structural: &[bool], budget: &mut BraceBudget) 
 thread_local! {
     static COMMAND_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BRACE_WORD_LEFT_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GLUED_HASH_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that a double-quoted `"$(…)"` holds a `#` glued to a paren. bash
+/// keeps `a=(x)#` as one word and zsh or `(true)#` starts a comment, and the
+/// scan that finds where the span ends reads only the comment. In bash the
+/// quotes after it then pair across lines and run a line the guards read as
+/// quoted text (cameronsjo/cadence-hooks#1400).
+fn mark_glued_hash_unread() {
+    GLUED_HASH_UNREAD.with(|unread| unread.set(true));
+}
+
+/// Whether a reading on this thread met a `#` glued to a paren inside a
+/// double-quoted `"$(…)"` since the last [`reset_command_unread`]
+/// ([`mark_glued_hash_unread`]). A fail-closed guard refuses such a command
+/// with its own message.
+pub fn glued_hash_unread() -> bool {
+    GLUED_HASH_UNREAD.with(std::cell::Cell::get)
 }
 
 /// Record that a reading of the command on this thread left part of it
@@ -1270,11 +1288,12 @@ pub fn brace_word_left_whole() -> bool {
     BRACE_WORD_LEFT_WHOLE.with(std::cell::Cell::get)
 }
 
-/// Clear [`command_unread`] and [`brace_word_left_whole`] before a check
-/// reads a command.
+/// Clear [`command_unread`], [`brace_word_left_whole`] and
+/// [`glued_hash_unread`] before a check reads a command.
 pub fn reset_command_unread() {
     COMMAND_UNREAD.with(|unread| unread.set(false));
     BRACE_WORD_LEFT_WHOLE.with(|whole| whole.set(false));
+    GLUED_HASH_UNREAD.with(|unread| unread.set(false));
 }
 
 /// `text` as `(char, structural)` pairs when bash would brace-expand it — some
@@ -11104,7 +11123,7 @@ fn scan_substitution_body_bounded(
     quote_aware: bool,
     budget: usize,
 ) -> Result<(String, usize), ScanStop> {
-    scan_substitution_frames(chars, start, quote_aware, budget, None, None)
+    scan_substitution_frames(chars, start, quote_aware, budget, None, None, &mut false)
 }
 
 /// One `$( … )` level of [`scan_substitution_frames`]: everything the scan
@@ -11184,6 +11203,7 @@ fn scan_substitution_frames(
     budget: usize,
     max_frames: Option<usize>,
     mut memo: Option<&mut SubstMemo>,
+    glued_hash: &mut bool,
 ) -> Result<(String, usize), ScanStop> {
     // Fail the scan rather than the process, and say WHICH failure it was —
     // every caller has to tell "the shell would reject this" from "we gave up".
@@ -11204,22 +11224,23 @@ fn scan_substitution_frames(
         let frame = stack.last_mut().expect("a frame is open");
         // The outcome of the level that just ended, and whether it is still on
         // the stack (a memo hit never was).
-        let (mut child, mut on_stack) = match scan_frame(chars, quote_aware, level_budget, frame) {
-            FrameStep::Done(result) => (result, true),
-            FrameStep::Nested(nested_start) => {
-                if let Some(&hit) = memo.as_ref().and_then(|m| m.get(&nested_start)) {
-                    (hit.map(|end| (String::new(), end)), false)
-                } else if let Some(next_budget) = frame_budget(stack.len()) {
-                    level_budget = next_budget;
-                    stack.push(ScanFrame::new(chars, nested_start));
-                    continue;
-                } else {
-                    // A nested failure is relabelled, never propagated as-is
-                    // (see below).
-                    return Err(ScanStop::NestedTooDeep);
+        let (mut child, mut on_stack) =
+            match scan_frame(chars, quote_aware, level_budget, frame, glued_hash) {
+                FrameStep::Done(result) => (result, true),
+                FrameStep::Nested(nested_start) => {
+                    if let Some(&hit) = memo.as_ref().and_then(|m| m.get(&nested_start)) {
+                        (hit.map(|end| (String::new(), end)), false)
+                    } else if let Some(next_budget) = frame_budget(stack.len()) {
+                        level_budget = next_budget;
+                        stack.push(ScanFrame::new(chars, nested_start));
+                        continue;
+                    } else {
+                        // A nested failure is relabelled, never propagated as-is
+                        // (see below).
+                        return Err(ScanStop::NestedTooDeep);
+                    }
                 }
-            }
-        };
+            };
         // Hand a finished level to its parent, unwinding while parents fail.
         loop {
             if on_stack {
@@ -11270,6 +11291,7 @@ fn scan_frame(
     quote_aware: bool,
     budget: usize,
     frame: &mut ScanFrame,
+    glued_hash: &mut bool,
 ) -> FrameStep {
     let mut j = frame.j;
     let mut depth = frame.depth;
@@ -11450,6 +11472,11 @@ fn scan_frame(
             // The comment text is kept in the body verbatim; the comment pass
             // downstream removes it when the body is re-split.
             if quote.is_none() && boundary && !arithmetic && chars[j] == '#' {
+                // Glued to a paren, the `#` is a comment to one shell and a word
+                // character to another ([`paren_step`]), and this scan reads it
+                // only as a comment. Reported so a caller can refuse what it
+                // cannot read both ways (cameronsjo/cadence-hooks#1400).
+                *glued_hash |= j > 0 && matches!(chars[j - 1], '(' | ')');
                 let end = chars[j..]
                     .iter()
                     .position(|&c| c == '\n')
@@ -12069,6 +12096,7 @@ impl SpanLatch {
                     self.tripped = true;
                     return SubstBound::Unbounded;
                 }
+                let mut glued_hash = false;
                 let found = scan_substitution_frames(
                     chars,
                     start,
@@ -12076,7 +12104,15 @@ impl SpanLatch {
                     MAX_SUBSTITUTION_DEPTH,
                     Some(MAX_QUOTED_SUBSTITUTION_FRAMES),
                     Some(&mut self.memo),
+                    &mut glued_hash,
                 );
+                // This scan reads a `#` glued to a paren only as a comment,
+                // and where the span ends turns on that reading. A command
+                // that holds one is refused rather than read one way
+                // (cameronsjo/cadence-hooks#1400).
+                if glued_hash {
+                    mark_glued_hash_unread();
+                }
                 self.work += match &found {
                     Ok((_, end)) => end - start,
                     Err(_) => chars.len() - start,

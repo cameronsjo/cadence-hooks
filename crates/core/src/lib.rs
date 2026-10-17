@@ -1853,10 +1853,21 @@ pub const UNREAD_COMMAND_BLOCK: &str = "command too large to read in full — a 
      verified\n   Fix: run it as smaller commands, with fewer or smaller `{…}` expansions \
      (or a shorter quoted message with backslashes)";
 
+/// The block a fail-closed guard gives a command whose double-quoted
+/// `"$(…)"` holds a `#` glued to a paren ([`shell::glued_hash_unread`]).
+/// bash reads `a=(x)#` as one word and zsh or `(true)#` as a comment, the
+/// guards read where the substitution ends one way only, and in the other
+/// reading its quotes can hide a line it runs (cameronsjo/cadence-hooks#1400).
+pub const GLUED_HASH_BLOCK: &str = "a `#` glued to `(` or `)` inside a double-quoted `\"$(…)\"` \
+     is a comment to one shell and text to another, so what the substitution runs cannot be \
+     verified\n   Fix: put a space before the `#` if it starts a comment, or quote it (`'#'`) if it \
+     is text";
+
 /// Whether `command`, just read by `check`, counts as unread
-/// ([`UNREAD_COMMAND_BLOCK`] says when).
+/// ([`UNREAD_COMMAND_BLOCK`] and [`GLUED_HASH_BLOCK`] say when).
 fn command_is_unread(check: &dyn Check, command: &str) -> bool {
     shell::command_unread()
+        || shell::glued_hash_unread()
         || (shell::brace_word_left_whole()
             && shell::unexpanded_word_may_hide_a_command(command, check.unread_inert_commands()))
 }
@@ -2127,7 +2138,14 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
             .command()
             .is_some_and(|command| command_is_unread(check, command))
     {
-        return Some(CheckResult::block(UNREAD_COMMAND_BLOCK));
+        // The size advice does not fit a glued `#`, so it gets its own
+        // message unless the command also ran past the reading budget.
+        let message = if shell::glued_hash_unread() && !shell::command_unread() {
+            GLUED_HASH_BLOCK
+        } else {
+            UNREAD_COMMAND_BLOCK
+        };
+        return Some(CheckResult::block(message));
     }
     Some(result)
 }

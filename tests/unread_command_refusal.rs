@@ -269,3 +269,70 @@ fn an_oversized_word_where_it_can_hide_what_runs_is_refused() {
     );
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// cameronsjo/cadence-hooks#1400: bash reads `a=(x)#` as one word, so the
+/// quotes after it pair across lines and the push runs inside the
+/// substitution. The scan that finds where a double-quoted `"$(…)"` ends read
+/// the `#` as a comment, lost the substitution's end, and the push was read as
+/// quoted text. zsh and `(true)#` read the same `#` as a comment, so neither
+/// reading is safe for the other: every fail-closed guard refuses the shape,
+/// with its own message, whatever the substitution runs.
+#[test]
+fn a_glued_hash_in_a_quoted_substitution_is_refused() {
+    for shape in [
+        "echo \"$(a=(x)#; echo \"a\nb\"\nTAIL)\"",
+        "echo \"$( (true)#'\nTAIL\n#')\"",
+        "x=\"$(echo (#'\nTAIL\n#')\"",
+        "echo \"$(echo \"$(a=(x)#; echo \"a\nb\"\nTAIL)\")\"",
+    ] {
+        for (args, tail) in [
+            (["cadence", "git-safety"], "git push --force origin main"),
+            (["cadence", "git-safety"], "echo hi"),
+            (["cadence", "prevent-secret-leaks"], "cat .env"),
+            (["cadence", "prevent-secret-writes"], "echo A=1 > .env"),
+        ] {
+            let command = shape.replace("TAIL", tail);
+            let out = run(&args, &command);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?} {command:?}: {stderr}");
+        }
+    }
+    // The refusal names its own cause, not the size budget.
+    let out = run(
+        &["cadence", "git-safety"],
+        "echo \"$(a=(x)#; echo \"a\nb\"\necho hi)\"",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("glued to `(` or `)`"), "{stderr}");
+    assert!(!stderr.contains("too large"), "{stderr}");
+}
+
+/// Everyday substitutions, and a glued `#` outside a double-quoted one
+/// (read three ways by the comment pass already), are not refused.
+#[test]
+fn ordinary_quoted_substitutions_still_pass() {
+    for command in [
+        "echo \"$(git log -1 --format=%h)\"",
+        "echo \"$(a=(x); echo hi)\"",
+        "x=\"$( (cd /tmp && ls) )\"",
+        "echo \"$(date) #note\"",
+        "echo \"$(date)#anchor\"",
+        "echo \"$(echo a # (comment)\n)\"",
+        "echo \"$(echo '(#)')\"",
+        "echo $(a=(x)#; echo hi)",
+        "git commit -m \"$(cat <<'EOF'\nfix: tidy (#12)\nEOF\n)\"",
+    ] {
+        for args in [
+            ["cadence", "git-safety"],
+            ["cadence", "prevent-secret-leaks"],
+        ] {
+            let out = run(&args, command);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{args:?} {command:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
