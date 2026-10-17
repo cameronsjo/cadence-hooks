@@ -104,6 +104,27 @@
 //!   `tar -x` of an archive holding a link, `git clone`, `ln` spelled through
 //!   a variable): the link is not judged, alone or with a write, since the
 //!   program could write the marker directly.
+//! - **Known miss (cadence-hooks#1419):** a two-call split through an existing
+//!   link that a lone copy or move recreates. A `cp -r`/`-R`/`-a`/`-P`/`-d`,
+//!   `mv` or `rsync -a` whose tree the hook cannot read (`Danger::Unknown`:
+//!   a variable or substitution source, `xargs` input, a missing or remote
+//!   source, an unreadable `cd`, a tree past `LINK_WALK_BUDGET`) is allowed
+//!   alone, and it can recreate a link no judged command made that leads at,
+//!   above, or below a protected directory: `/Volumes/Macintosh HD -> /`
+//!   (`S="/Volumes/Macintosh HD"; cp -a "$S" /tmp/x`), Linux
+//!   `/proc/self/root` or `/proc/<pid>/cwd`, a user's own link to `~`, or a
+//!   link a remote `rsync -a host:x` source chooses. A write backgrounded by
+//!   an earlier call, judged before the link existed, then lands forged
+//!   markers through it. These are the unreadable copies the over-blocks list
+//!   below refuses only with a write. Link creators are refused alone (`ln`,
+//!   `cp -s`, `rsync -l` of an unreadable source); `-a` is the gap. Closing it
+//!   where the link is made cost 36 false blocks in 60 days of recorded
+//!   sessions (36 of 6,179 `mv`/`cp`/`rsync` commands had a variable or
+//!   substitution source; measured 2026-10-17). Checking where a marker came
+//!   from at read time cannot help, since a same-user process can forge any
+//!   recorded provenance (`stat` its own inode, write it in, `mv` it into
+//!   place). The link-time refusal is commit `8163a6f` on branch
+//!   `fix/1419-runbook-scrub-unreadable-source`, kept for reference.
 //! - `NotebookEdit` carries its target in `notebook_path`, which no guard
 //!   reads; a notebook is not a runbook.
 //!
@@ -135,7 +156,8 @@
 //!   `mv`/`cp -r`/`rsync` source that is missing, remote, or behind an
 //!   unreadable `cd`, or a source tree past `LINK_WALK_BUDGET` entries (a
 //!   large `node_modules`). Run the link, move, or copy as its own command
-//!   first, with a target the hook can read.
+//!   first, with a target the hook can read. Alone, such a copy or move is the
+//!   known miss above (cadence-hooks#1419).
 //!
 //! **Charter:** a security guard. Inert when `$CADENCE_RUNBOOKS_DIR` is unset
 //! or blank. Fails open on its own failure (ADR-0001) — no path or command
@@ -3952,6 +3974,58 @@ mod tests {
             "ln -s \"$(brew --prefix)/bin/x\" ~/bin/x",
         ] {
             assert_eq!(judge(command), Outcome::Block, "{command}");
+        }
+    }
+
+    /// Documented residual, cadence-hooks#1419 (module docs, "Known miss"): a
+    /// lone copy or move of a source the hook cannot read is allowed, even when
+    /// that source is a system link to `/`. This pins the accepted behaviour, so
+    /// closing it (the reference is branch
+    /// `fix/1419-runbook-scrub-unreadable-source`) is a deliberate change. The
+    /// literal spelling is the control: the hook refuses the link it can read.
+    #[cfg(unix)]
+    #[test]
+    fn known_miss_1419_an_unreadable_copy_of_a_system_link_is_allowed_alone() {
+        let f = fixture("known-miss-1419-an-unreadable-copy-of-a");
+        let home = format!("{}/home", f.root);
+        let marker_dir = format!("{home}/.claude/cadence-hooks/markers");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        // `sys` stands in for `/Volumes/Macintosh HD -> /`.
+        let sys = format!("{}/sys", f.root);
+        std::os::unix::fs::symlink("/", &sys).unwrap();
+        let judge = |command: &str| {
+            let input = make_bash_with_cwd(command, &f.work);
+            run_env(
+                &input,
+                Env {
+                    dir: Some(&f.runbooks),
+                    home: Some(&home),
+                    marker_dir: Some(&marker_dir),
+                    ..Env::default()
+                },
+                &[],
+            )
+        };
+        for (program, flags) in [("cp", "-a"), ("cp", "-R"), ("mv", ""), ("rsync", "-a")] {
+            let residual = format!("S={sys}; {program} {flags} \"$S\" /tmp/c/new");
+            assert_eq!(
+                judge(&residual).outcome,
+                Outcome::Allow,
+                "residual: {residual}"
+            );
+            // Control: the same copy with the source spelled out is refused
+            // by the link detector, so the source is what the hook misses.
+            let control = format!("{program} {flags} {sys} /tmp/c/new");
+            let got = judge(&control);
+            assert_eq!(got.outcome, Outcome::Block, "control: {control}");
+            assert!(
+                got.message
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("creates a link that points"),
+                "control: {control}: {:?}",
+                got.message
+            );
         }
     }
 

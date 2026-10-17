@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::registry;
 use cadence_hooks_core::capability::on_path;
 use cadence_hooks_core::display::shell_single_quote;
+use cadence_hooks_core::paths::cloud_sync_marker;
 // The session crate's `registry` (peer-session liveness) — aliased because the
 // bare name is already taken by the binary's hook-catalog `registry` above.
 use cadence_hooks_session::identity as session_identity;
@@ -1867,55 +1868,6 @@ fn missing_cli_findings(
             ),
         })
         .collect()
-}
-
-/// Path fragments that mark a cloud-sync provider's local mirror.
-///
-/// Matched case-insensitively against a path's own components, never as a bare
-/// substring — `~/src/dropbox-client` is a project, not a synced tree, and a
-/// substring test would flag it. Each entry is a directory NAME a provider
-/// creates: macOS iCloud Drive lives under `Library/Mobile Documents`, and
-/// modern macOS third-party providers mount under `Library/CloudStorage`.
-const CLOUD_SYNC_MARKERS: &[&str] = &[
-    "OneDrive",
-    "Dropbox",
-    "CloudStorage",
-    "Mobile Documents",
-    "Google Drive",
-    "GoogleDrive",
-    "pCloud Drive",
-    "Sync.com",
-];
-
-/// The provider marker in `path`, if any component names one.
-///
-/// Component-wise and case-insensitive: a provider directory is a real path
-/// segment, so testing components avoids the `dropbox-client` false positive a
-/// substring search produces, while still catching a nested repo far below the
-/// sync root.
-///
-/// A component matches on exact equality **or** on a `"<marker> - "` prefix.
-/// The second form is not a nicety: a Microsoft 365 business or school tenant
-/// syncs to a folder named `OneDrive - <Organization>`, which is the dominant
-/// real-world shape of the very deployment this check exists to catch, and
-/// exact equality alone silently never fires for it. The separator is spelled
-/// with surrounding spaces deliberately — a bare `-` boundary would re-admit
-/// `dropbox-client`, the exact false positive component matching was chosen to
-/// avoid.
-fn cloud_sync_marker(path: &Path) -> Option<&'static str> {
-    path.components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .find_map(|segment| {
-            CLOUD_SYNC_MARKERS
-                .iter()
-                .find(|m| {
-                    segment.eq_ignore_ascii_case(m)
-                        || segment.len() > m.len() + 3
-                            && segment[..m.len()].eq_ignore_ascii_case(m)
-                            && segment[m.len()..].starts_with(" - ")
-                })
-                .copied()
-        })
 }
 
 /// Warn when a directory the guard suite reads on every hook sits inside a

@@ -1438,9 +1438,11 @@ fn reconcile_findings(
 ///    edit — including the edit that removes the term. (Its `None`-on-unreadable
 ///    default is also self-locking, and its own docs warn blocking guards off
 ///    it.)
-/// 3. **Code and config outside every git work tree are not scanned.** They
-///    cannot leave the machine without a post, and the post is scanned
-///    (cameronsjo/cadence#1708). A prose draft is still scanned there
+/// 3. **Code and config proven local are not scanned.** Outside every git
+///    work tree and every cloud-synced tree, they cannot leave the machine
+///    without a post, and the post is scanned (cameronsjo/cadence#1708).
+///    Anything the check cannot resolve is scanned
+///    ([`context::is_provably_local`]). A prose draft is still scanned there
 ///    ([`context::is_prose_draft`]).
 ///
 /// The residual this accepts: content entering a file by some other route (a
@@ -1467,13 +1469,14 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         return CheckResult::allow();
     }
 
-    // Code or config outside every git work tree never leaves the machine on
-    // its own (cameronsjo/cadence#1708). A prose draft keeps the scan even
+    // Code or config proven local (outside every work tree, synced tree and
+    // network mount) never leaves the machine on its own
+    // (cameronsjo/cadence#1708). A prose draft keeps the scan even
     // there: it is the file a later `--body "$(cat F)"` or `cat F |` posts,
     // and the post-time scan does not read through either. A file inside a
     // work tree keeps the scan, because the post-time scan never sees a
     // commit's file content. An MCP write has no path and is scanned.
-    if context::is_outside_git_tree(file_path) && !context::is_prose_draft(file_path) {
+    if context::is_provably_local(file_path) && !context::is_prose_draft(file_path) {
         return CheckResult::allow();
     }
 
@@ -5671,16 +5674,20 @@ destinations = ["me/*", "them/exact"]
     // Windows paths lose their backslashes to shell escaping, as in real bash.
     #[cfg(unix)]
     #[test]
-    fn writes_outside_a_work_tree_skip_the_identity_scan() {
+    fn provably_local_writes_skip_the_identity_scan() {
         // (tool, path, expected). Outside every work tree, code and config
         // cannot leave without a post (cadence#1708); a prose draft and
         // anything inside a work tree keep the scan.
+        // A real home dir: macOS mounts `/home` by autofs, which is not a
+        // local file system, so a literal `/home/u` is scanned there.
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().display();
         let table: Vec<(&str, String, Outcome)> = vec![
             ("Write", "/tmp/scratch/poll.sh".into(), Outcome::Allow),
-            ("Write", "/home/u/.zshrc".into(), Outcome::Allow),
+            ("Write", format!("{home}/.zshrc"), Outcome::Allow),
             (
                 "Edit",
-                "/home/u/.config/tool/config.toml".into(),
+                format!("{home}/.config/tool/config.toml"),
                 Outcome::Allow,
             ),
             // A prose draft is what `--body "$(cat F)"` posts unscanned.
@@ -5718,6 +5725,173 @@ destinations = ["me/*", "them/exact"]
                     *want,
                     "{tool} {path}"
                 );
+            }
+        });
+    }
+
+    /// An Edit that introduces a fixture term into `path`.
+    #[cfg(unix)]
+    fn term_edit(path: &std::path::Path) -> CheckResult {
+        let input = HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(path.to_str().expect("utf-8 path").into()),
+                new_string: Some("label = \"acmecorp\"".into()),
+                old_string: Some("label = \"x\"".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        RedactExternalContent.run(&input)
+    }
+
+    /// A home directory holding a tool's config, and a real git repo beside
+    /// it with a tracked, an untracked and an ignored config file.
+    #[cfg(unix)]
+    fn home_and_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".config/tool")).unwrap();
+        std::fs::write(home.join(".config/tool/config.toml"), "label = \"x\"\n").unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        cadence_hooks_core::git_fixtures::init_repo(&repo);
+        for name in ["tracked.toml", "untracked.toml", "ignored.toml"] {
+            std::fs::write(repo.join(name), "label = \"x\"\n").unwrap();
+        }
+        std::fs::write(repo.join(".gitignore"), "ignored.toml\n").unwrap();
+        cadence_hooks_core::git_fixtures::git_in(&repo, &["add", "tracked.toml", ".gitignore"]);
+        (root, home, repo)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_config_edit_passes_and_the_same_edit_in_a_repo_blocks() {
+        // cadence#1708: the home config file cannot leave the machine; every
+        // file in a work tree can, tracked or not (untracked and ignored files
+        // can be added or force-added).
+        let (_root, home, repo) = home_and_repo();
+        with_env(FIXTURE, &[], || {
+            let local = home.join(".config/tool/config.toml");
+            assert_eq!(term_edit(&local).outcome, Outcome::Allow);
+            for name in ["tracked.toml", "untracked.toml", "ignored.toml"] {
+                assert_eq!(
+                    term_edit(&repo.join(name)).outcome,
+                    Outcome::Block,
+                    "{name}"
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_from_home_into_a_repo_blocks() {
+        // The Edit writes through the link, so the file lands in the repo.
+        // A dangling link counts too: a Write to it creates the repo file.
+        let (_root, home, repo) = home_and_repo();
+        let live = home.join(".config/tool/live.toml");
+        std::os::unix::fs::symlink(repo.join("tracked.toml"), &live).unwrap();
+        let dangling = home.join(".config/tool/dangling.toml");
+        std::os::unix::fs::symlink(repo.join("not-yet.toml"), &dangling).unwrap();
+        let dir_link = home.join("linked-dir");
+        std::os::unix::fs::symlink(repo.join("missing-dir"), &dir_link).unwrap();
+        with_env(FIXTURE, &[], || {
+            assert_eq!(term_edit(&live).outcome, Outcome::Block, "live link");
+            assert_eq!(
+                term_edit(&dangling).outcome,
+                Outcome::Block,
+                "dangling link"
+            );
+            assert_eq!(
+                term_edit(&dir_link.join("new.toml")).outcome,
+                Outcome::Block,
+                "dangling directory link"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unresolvable_path_blocks() {
+        // When the hook cannot read whether a `.git` sits above the file, it
+        // cannot prove the file is local, so it scans.
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, home, _repo) = home_and_repo();
+        let locked = home.join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        struct Unlock<'a>(&'a std::path::Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                // Best effort while unwinding; a panic here would abort.
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _unlock = Unlock(&locked);
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let verdict = with_env(FIXTURE, &[], || term_edit(&locked.join("sub/config.toml")));
+        if !unreadable {
+            eprintln!("skipped: running as a user who can read a mode-000 directory");
+            return;
+        }
+        assert_eq!(verdict.outcome, Outcome::Block);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_edit_in_a_cloud_synced_tree_blocks() {
+        // A synced tree leaves the machine with no post at all.
+        let root = tempfile::tempdir().unwrap();
+        let synced = root.path().join("Library/Mobile Documents/app");
+        std::fs::create_dir_all(&synced).unwrap();
+        with_env(FIXTURE, &[], || {
+            assert_eq!(
+                term_edit(&synced.join("config.toml")).outcome,
+                Outcome::Block
+            );
+            let plain = root.path().join("Library/app/config.toml");
+            assert_eq!(term_edit(&plain).outcome, Outcome::Allow);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_config_edit_under_a_file_provider_root_blocks() {
+        // iCloud's Desktop & Documents sync marks `~/Documents` with a File
+        // Provider domain and leaves its path unmarked.
+        let root = tempfile::tempdir().unwrap();
+        let documents = root.path().join("Documents");
+        std::fs::create_dir_all(documents.join("tool")).unwrap();
+        let ok = std::process::Command::new("xattr")
+            .args(["-w", "com.apple.file-provider-domain-id", "fixture"])
+            .arg(&documents)
+            .status()
+            .expect("run xattr")
+            .success();
+        assert!(ok, "xattr -w");
+        with_env(FIXTURE, &[], || {
+            let synced = documents.join("tool/config.toml");
+            assert_eq!(term_edit(&synced).outcome, Outcome::Block);
+            let beside = root.path().join("tool/config.toml");
+            assert_eq!(term_edit(&beside).outcome, Outcome::Allow);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_into_a_repo_and_other_version_control_block() {
+        let (root, home, repo) = home_and_repo();
+        let hard = home.join(".config/tool/hard.toml");
+        std::fs::hard_link(repo.join("tracked.toml"), &hard).unwrap();
+        for marker in [".jj", ".hg"] {
+            std::fs::create_dir_all(root.path().join(format!("vcs{marker}/{marker}"))).unwrap();
+        }
+        with_env(FIXTURE, &[], || {
+            assert_eq!(term_edit(&hard).outcome, Outcome::Block, "hard link");
+            for marker in [".jj", ".hg"] {
+                let file = root.path().join(format!("vcs{marker}/src/config.toml"));
+                assert_eq!(term_edit(&file).outcome, Outcome::Block, "{marker}");
             }
         });
     }
