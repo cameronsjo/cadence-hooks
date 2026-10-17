@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- The wired-group heredoc flood test no longer fails when a loaded machine pushes one call past the group's 4000 ms hook deadline (where the group fails open and exits 0). Past the deadline a fail-open (exit 0) passes unless `CADENCE_TIMING_TESTS=1`; a non-block that finishes sooner still fails. The release timing step (Linux and Windows) keeps the strict check. (cameronsjo/cadence-hooks#1366)
+- The wired-group heredoc flood test (`wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline`) no longer fails when a loaded machine pushes one call past the group's 4000 ms hook deadline. Past the deadline the group fails open: exit 0, or exit 1 with a "did not finish within N ms and did not block" line on stderr when every member timed out. That signature now passes unless `CADENCE_TIMING_TESTS=1`; a block, a bare exit 1, a panic, or a non-block that finishes sooner is judged as before. The release timing step (Linux and Windows) keeps the strict check. (cameronsjo/cadence-hooks#1366)
 - The release timing step runs on Windows CI again. Sub-second budgets get 3x on Windows (three runner samples overran 500 ms budgets by up to 1.42x); longer budgets are unchanged. (cameronsjo/cadence-hooks#1416)
 
 ## [0.128.0] - 2026-10-17
