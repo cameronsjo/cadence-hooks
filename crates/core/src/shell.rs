@@ -8937,7 +8937,7 @@ fn ends_with_unescaped_gt(text: &str) -> bool {
 /// its own kind. One counter for both kinds is not enough: `${` and `$(` close
 /// on different characters, and the other character is ordinary data inside
 /// them.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Opener {
     /// `${…}` — a parameter expansion, closed by `}`.
     Brace,
@@ -16249,6 +16249,54 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- comment_context / brace_nests_in (cadence-hooks#1410) ---
+
+    /// Every [`Opener`] variant. The `match` has no wildcard arm, so a new
+    /// variant fails to compile here until it is handled; add it to the
+    /// array in the same edit.
+    fn every_opener() -> Vec<Opener> {
+        let all = vec![
+            Opener::Brace,
+            Opener::Paren,
+            Opener::Subst,
+            Opener::Group,
+            Opener::ProcSub,
+            Opener::WordParen,
+            Opener::Arith,
+            Opener::DollarArith,
+        ];
+        for opener in &all {
+            match opener {
+                Opener::Brace
+                | Opener::Paren
+                | Opener::Subst
+                | Opener::Group
+                | Opener::ProcSub
+                | Opener::WordParen
+                | Opener::Arith
+                | Opener::DollarArith => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn comment_context_and_brace_nests_in_are_complements_for_every_opener() {
+        // Shell code (comments start, `{` is a brace group or a literal) and
+        // expansion or arithmetic (`{` nests, no comments) are the only two
+        // kinds of context. A variant in both, or in neither, desynchronizes
+        // the two scanners that consult these predicates.
+        let mut contexts: Vec<Option<Opener>> = vec![None];
+        contexts.extend(every_opener().into_iter().map(Some));
+        for innermost in contexts {
+            assert_ne!(
+                comment_context(innermost),
+                brace_nests_in(innermost),
+                "comment_context and brace_nests_in must disagree on {innermost:?}"
+            );
+        }
+    }
 
     // --- strip_leading_keywords / skip_runner_flags (#528 review C1) ---
 
