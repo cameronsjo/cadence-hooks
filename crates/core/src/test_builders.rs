@@ -479,6 +479,22 @@ mod timing_tests {
     }
 
     #[test]
+    fn a_crash_past_the_deadline_is_not_load() {
+        for code in [Some(1), None] {
+            let r = std::panic::catch_unwind(|| {
+                assert_blocked_before_deadline_if(
+                    false,
+                    "crash",
+                    code,
+                    Duration::from_secs(5),
+                    Duration::from_secs(4),
+                )
+            });
+            assert!(r.is_err(), "{code:?}");
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "expected a block")]
     fn a_fast_non_block_is_a_real_failure() {
         assert_blocked_before_deadline_if(
