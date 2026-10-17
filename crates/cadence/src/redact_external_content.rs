@@ -5730,6 +5730,7 @@ destinations = ["me/*", "them/exact"]
     }
 
     /// An Edit that introduces a fixture term into `path`.
+    #[cfg(unix)]
     fn term_edit(path: &std::path::Path) -> CheckResult {
         let input = HookInput {
             tool_name: Some("Edit".into()),
@@ -5746,6 +5747,7 @@ destinations = ["me/*", "them/exact"]
 
     /// A home directory holding a tool's config, and a real git repo beside
     /// it with a tracked, an untracked and an ignored config file.
+    #[cfg(unix)]
     fn home_and_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
