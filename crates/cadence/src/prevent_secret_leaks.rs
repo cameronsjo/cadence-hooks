@@ -4,8 +4,8 @@
 //! On Bash, blocks a literal secret file name handed to an ENUMERATED reader
 //! or sender (`READERS`: `cat`, `grep`, `base64`, `curl -d @`, `gh --input`,
 //! `source`, …), or redirected into one's standard input
-//! (cameronsjo/cadence-hooks#1303), or named anywhere after a function definition
-//! whose body reads a positional parameter (cameronsjo/cadence-hooks#1409).
+//! (cameronsjo/cadence-hooks#1303), or named anywhere in a command that defines
+//! a shell function (cameronsjo/cadence-hooks#1409).
 //! Unknown commands, variables, URL and API paths, regex patterns, and globs
 //! that only share letters with a secret name are not judged. Safe templates
 //! (.env.example, .env.test) are always allowed. Environment dumps nudge.
@@ -3100,144 +3100,72 @@ fn without_data_heredocs(command: &str) -> Cow<'_, str> {
 /// Most levels of command text [`segment_reads`] hands back for re-scanning.
 const NESTED_SCAN_DEPTH: usize = 8;
 
-/// A positional parameter read: `$1`…`$9`, `$@`, `$*`, zsh's `$argv`,
-/// braced or not, every `${` form that starts with one (zsh flags included:
-/// `${1:-x}`, `${#1}`, `${!1}`, `${=1}`, `${(q)1}`, `${argv[1]}`), and a
-/// `for NAME` with no `in`, which loops over them.
-static POSITIONAL_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\$(?:[1-9@*]|argv\b|\{[!#=~^]*(?:\([^)]*\))?[!#=~^]*(?:[1-9@*]|argv\b))|(?:^|[\s;&|(){}])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*(?:;|\n|do(?:[\s;]|$))",
-    )
-    .expect("positional pattern compiles")
-});
-
-/// A function definition's header: `function NAME…` (group 1) or
-/// `[NAME] ()`, which also matches zsh's name lists and anonymous functions.
-/// Quotes are not read, so a header inside a quoted string (a `bash -c`
-/// script, or prose) counts too; that can only add a block.
-static FUNCTION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+/// A shell function definition anywhere in a command: `NAME()` with or
+/// without a group after it, `function NAME` followed by any word, and an
+/// anonymous `()`. Quotes are not read, so a header inside a quoted string
+/// (a `bash -c` or `eval` script, or prose) counts too; that can only add a
+/// block.
+static FUNCTION_DEFINITION: LazyLock<Regex> = LazyLock::new(|| {
     const NAME: &str = r#"[^\s(){}<>;&|'"\\$`=]+"#;
     Regex::new(&format!(
-        r#"(?:^|[\s;&|(){{}}!'"`])(?:(function)[ \t]+{NAME}(?:[ \t]+{NAME})*(?:[ \t]*\([ \t]*\))?|(?:{NAME})?[ \t]*\([ \t]*\))"#
+        r#"(?:^|[\s;&|(){{}}!'"`])(?:function[ \t]+{NAME}\s*\S|(?:{NAME})?[ \t]*\([ \t]*\))"#
     ))
-    .expect("function header pattern compiles")
+    .expect("function definition pattern compiles")
 });
 
-/// Byte length of the body at the start of `text`, or `None` when this scan
-/// cannot tell where it ends: an unclosed group, or a comment, heredoc,
-/// backtick, `$'…'` string or (in a `( … )` body) `case`, any of which can
-/// hold a closer the shell does not read as one. A body that is not a group
-/// (zsh's `f() cmd`) runs to the end of its line.
-fn function_body_len(text: &str) -> Option<usize> {
-    let (open, close) = match text.chars().next() {
-        Some('{') => ('{', '}'),
-        Some('(') => ('(', ')'),
-        _ => return Some(text.find('\n').unwrap_or(text.len())),
-    };
-    let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut in_double = false;
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        let c = b as char;
-        match c {
-            '\\' => i += 1,
-            '`' => return None,
-            '\'' if !in_double => {
-                if i > 0 && bytes[i - 1] == b'$' {
-                    return None;
-                }
-                i += 1 + text[i + 1..].find('\'')?;
-            }
-            '"' => in_double = !in_double,
-            '#' if !in_double
-                && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b';')) =>
+/// The first secret-like word in `command`, read the way the reader scan
+/// reads it: [`command_segments`] resolves visible assignments, `$'…'`,
+/// brace expansion and `printf` substitutions, and [`words_and_stdin`]
+/// joins quoted pieces (`.e''nv` is `.env`). Process substitutions and the
+/// scripts [`segment_reads`] hands back are read too.
+fn first_secret_word(command: &str) -> Option<String> {
+    let mut scripts = vec![(command.to_string(), 0)];
+    while let Some((script, depth)) = scripts.pop() {
+        for segment in command_segments(&script) {
+            let (outer, _) = split_process_substitutions(&segment);
+            let (words, stdin) = words_and_stdin(&outer);
+            if let Some(secret) = words
+                .into_iter()
+                .chain(stdin)
+                .find(|w| names_a_secret(w, Filename::Known))
             {
-                return None;
+                return Some(secret);
             }
-            '<' if !in_double && bytes.get(i + 1) == Some(&b'<') => return None,
-            _ if in_double => {}
-            _ if c == open => depth += 1,
-            _ if c == close => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    // A `case` pattern's `)` closes nothing; a `(` body holding one
-                    // cannot be delimited by counting.
-                    if open == '(' && text[..i].contains("case") {
-                        return None;
-                    }
-                    return Some(i + 1);
-                }
+            if depth < NESTED_SCAN_DEPTH {
+                let (_, children) = segment_reads(&segment);
+                scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
             }
-            _ => {}
         }
-        i += 1;
     }
     None
 }
 
-/// Where the first function `command` defines that reads a positional
-/// parameter begins, or would begin if its body cannot be delimited
-/// ([`function_body_len`]). One pass: a header inside a body already scanned
-/// is skipped, since that body's scan covered it.
-fn positional_function_start(command: &str) -> Option<usize> {
-    let mut scanned_to = 0;
-    for header in FUNCTION_HEADER.captures_iter(command) {
-        let whole = header.get(0)?;
-        if whole.start() < scanned_to {
-            continue;
-        }
-        let rest = command[whole.end()..].trim_start();
-        // `function NAME` with no group after it is prose, not a definition.
-        if header.get(1).is_some() && !rest.starts_with(['{', '(']) {
-            continue;
-        }
-        let Some(len) = function_body_len(rest) else {
-            return Some(whole.start());
-        };
-        if POSITIONAL_REFERENCE.is_match(&rest[..len]) {
-            return Some(whole.start());
-        }
-        scanned_to = command.len() - rest.len() + len;
+/// A secret-like name in a command that defines a shell function:
+/// `f(){ cat "$1"; }; f .env` makes bash read `.env`, yet the name never
+/// sits where a reader takes a file (cameronsjo/cadence-hooks#1409). What
+/// the function does with its arguments is not read: where a body ends, how
+/// it reads them and how a name is spelled each had shapes a list missed
+/// (#1420 review), so any definition and any secret name block. Linear: one
+/// pattern search, then the reader scan's own segmentation.
+fn function_and_secret_word(command: &str, detect: fn() -> bool) -> Option<CheckResult> {
+    if !FUNCTION_DEFINITION.is_match(command) {
+        return None;
     }
-    None
-}
-
-/// A function that reads a positional parameter, in a command that names a
-/// secret file anywhere after the definition: `f(){ cat "$1"; }; f .env`
-/// makes bash read `.env`, yet the name never sits where a reader takes a
-/// file (cameronsjo/cadence-hooks#1409). Which call reaches which body is
-/// not traced: every word after the definition, split at shell punctuation
-/// and quotes, is a candidate. Linear in the command's length.
-fn positional_function_reads_secret(command: &str, detect: fn() -> bool) -> Option<CheckResult> {
-    let start = positional_function_start(command)?;
-    let secret = command[start..]
-        .split(|c: char| c.is_whitespace() || ";&|()<>{}'\"`=@:,".contains(c))
-        .find(|word| {
-            // A positional glued to text (`.env.$1`, `$1.env`) stands for
-            // some argument; any argument fills it.
-            !word.is_empty()
-                && (names_a_secret(word, Filename::Known)
-                    || word.contains('$')
-                        && names_a_secret(
-                            &POSITIONAL_REFERENCE.replace_all(word, "x"),
-                            Filename::Known,
-                        ))
-        })?;
+    let secret = first_secret_word(command)?;
     Some(CheckResult::block(with_forgectl_hint(
         format!(
             "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
-             Found: `{secret}` in a command that defines a function reading its \
-             arguments (`$1`, `$@`, …)\n\
+             Found: `{secret}` in a command that defines a shell function\n\
              Fix: secrets are available to programs via direnv (`direnv allow`) — \
              run the program directly instead of reading its secret file, or keep \
-             the secret name out of a command that defines such a function.\n\
-             Allowed: a function with no positional parameter, and one in a command \
-             that names no secret file."
+             the secret name out of a command that defines a function.\n\
+             Allowed: a function in a command that names no secret file, and a \
+             secret name in a command with no function definition (judged by the \
+             reader rules)."
         ),
         HintKind::Read,
         None,
-        secret,
+        &secret,
         detect,
     )))
 }
@@ -3275,7 +3203,7 @@ fn bash_leaks_secrets(
             }
         }
     }
-    if let Some(block) = positional_function_reads_secret(command, detect) {
+    if let Some(block) = function_and_secret_word(command, detect) {
         return Some(block);
     }
 
@@ -7093,118 +7021,109 @@ mod tests {
     }
 
     #[test]
-    fn positional_function_with_a_secret_word_blocked() {
+    fn function_definition_with_a_secret_word_blocked() {
         // cameronsjo/cadence-hooks#1409: bash reads `.env` in each of these,
         // but the name never sits where a reader takes a file.
         assert_bash(
             &[
                 r#"f(){ cat "$1"; }; f .env"#,
-                r#"f() { cat "$1"; }; f .env"#,
                 r#"function f { cat "$1"; }; f .env"#,
-                r#"function f() { cat "$@"; }; f .env"#,
                 "function f() { cat \"$@\"; }\nf .env",
                 r#"f() { cat $*; }; f x .env"#,
-                r#"f(){ grep -n KEY "${1}"; }; f .env"#,
                 r#"f(){ cat < "$1"; }; f .env"#,
+                "f(){ cat; }; f < .env",
                 r#"f() ( cat "$1" ); f .env"#,
                 r#"(f(){ cat "$1"; }; f .env)"#,
                 r#"f(){ cat "$1"; }; sudo f .env"#,
                 r#"f(){ "$@"; }; f cat .env"#,
-                r#"f(){ shift; cat "$1"; }; f x .env"#,
-                r#"f(){ x=$1; cat "$x"; }; f .env"#,
                 r#"f() { echo "$1" | xargs cat; }; f .env"#,
-                r#"f(){ for x in "$@"; do cat "$x"; done; }; f .env"#,
-                r#"F(){ cat "$1"; }; F .env"#,
                 r#"g h(){ cat "$1"; }; g .env"#,
-                r#"function g h { cat "$1"; }; h .env"#,
-                r#"f(){ cat ".env.$1"; }; f production"#,
+                r#"f(){ cat ".env.$1"; }; f .env"#,
                 r#"bash -c 'f(){ cat "$1"; }; f .env'"#,
-                // zsh: `$argv`, flags, `for x;` and an anonymous function.
                 r#"f(){ cat $argv; }; f .env"#,
-                r#"f(){ cat ${=1}; }; f .env"#,
-                r#"f(){ for x; do cat "$x"; done; }; f .env"#,
                 r#"() { cat "$1"; } .env"#,
-                // #1420 security review I-A: a function reached through `"$@"`.
+                // #1420 review, round 1: I-A, I-B, I-C.
                 r#"run(){ "$@"; }; show(){ cat "$1"; }; run show .env"#,
-                r#"g(){ $1 "$2"; }; f(){ cat "$1"; }; g f .env"#,
-                // I-B: an argument's quote or `#`.
                 r#"f(){ echo $*; cat "$1"; }; f .env "it's""#,
                 r#"f(){ echo $*; cat "$1"; }; f .env '#tag'"#,
-                // I-C: a closer in a comment, a heredoc or a `case` pattern.
                 "f(){ # closes }\n cat \"$1\"; }; f .env",
                 "f(){\n  cat <<EOF\n}\nEOF\n  cat \"$1\"\n}; f .env",
                 r#"f()( case $1 in a) cat "$1";; esac ); f .env"#,
+                // Round 2, I-1: where a body ends.
+                r#"f(){ echo }; cat "$1"; }; f .env"#,
+                r#"f(){ x=a}; cat "$1"; }; f .env"#,
+                r#"f(){ echo "${x:-"}"}"; cat "$1"; }; f .env"#,
+                r#"f(){ case x in }) ;; esac; cat "$1"; }; f .env"#,
+                "f(){ true&# }\ncat \"$1\"; }; f .env",
+                "f(){ true|# }\ncat \"$1\"; }; f .env",
+                "f(){ true(# }\ncat \"$1\"; }; f .env",
+                r#"function f if :; then cat "$1"; fi; f .env"#,
+                r#"function f for x; do cat "$x"; done; f .env"#,
+                "f() if :\nthen cat \"$1\"\nfi\nf .env",
+                "f() while :\ndo cat \"$1\"; break\ndone\nf .env",
+                // I-2: how a body reads its arguments.
+                r#"f(){ cat "${!#}"; }; f .env"#,
+                r#"f(){ n=1; cat "${!n}"; }; f .env"#,
+                r#"f(){ eval "cat \$""1"; }; f .env"#,
+                r#"f(){ getopts a: o; cat "$OPTARG"; }; f -a .env"#,
+                r#"f(){ cat "$_"; }; f .env"#,
+                // I-3: how a name is spelled, read the reader scan's way.
+                r#"f(){ cat "$1"; }; f .e''nv"#,
+                r#"f(){ cat "$1"; }; f ".e"nv"#,
+                r#"f(){ cat "$1"; }; f .en"v""#,
+                r#"f(){ cat "$1"; }; f {.,}env"#,
+                r#"f(){ cat "$1"; }; f $'\x2e'env"#,
+                r#"p=.e; f(){ cat "$1"; }; f "${p}nv""#,
+                r#"f(){ cat "$1"; }; f "$(printf %s .e nv)""#,
+                r#"S=.env.local; f(){ cat "$1"; }; f "$S""#,
+                r#"export S=.env.local; f(){ cat "$1"; }; f "$S""#,
                 // A reader's own name rebound (#1303 allowed these as out of
                 // scope before #1409).
                 "jq(){ cat \"$1\"; }; jq .env.local",
                 "jq () { cat \"$1\"; }; jq .env.local",
-                "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
                 "function jq { cat $1; }; jq .env.local",
+                "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
                 "eval 'jq(){ cat $1;}'; jq .env.local",
-                // The accepted cost: the body only prints, but the rule does not
-                // read what it does.
+                // The accepted cost: what the function does is not read.
                 r#"f(){ echo "$1"; }; f .env"#,
                 r#"die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env""#,
+                r#"f(){ echo "$1"; }; f x; git commit -m 'ignore .env'"#,
+                r#"f(){ ls; }; ls .env"#,
+                r#"git commit -m 'the function load reads .env'"#,
             ],
             cadence_hooks_core::Outcome::Block,
-            "a positional function and a secret name",
+            "a function definition and a secret name",
         );
         assert_bash(
             &[
-                // A positional function with no secret name.
+                // A function and no secret word.
                 r#"f(){ cat "$1"; }; f README.md"#,
-                r#"f(){ cat "$1"; }; f .env.example"#,
                 r#"retry(){ for i in 1 2 3; do "$@" && return; done; }; retry cargo test"#,
-                // A secret name before the definition is not after it.
-                r#"ls .env; f(){ echo "$1"; }; f x"#,
-                // No positional parameter in the body.
-                r#"f(){ ls; }; ls .env"#,
+                // A safe template is not a secret name.
+                r#"f(){ cat "$1"; }; f .env.example"#,
                 r#"f(){ echo "$HOME"; }; f; git add .env.example"#,
-                // `function` in prose, with no group after it.
-                r#"git commit -m 'the function load takes $1 from .env'"#,
-                // Not a function definition.
-                r#"cat "$1""#,
+                // Prose with no definition.
+                r#"git commit -m 'load reads .env'"#,
+                r#"git commit -m 'see the function docs'"#,
+                // Not a definition.
                 r#"awk '{print $1}' notes.txt"#,
                 "for f in a b; do cat \"$f\"; done",
+                "arr=(a b); echo \"${arr[@]}\"",
             ],
             cadence_hooks_core::Outcome::Allow,
-            "no positional function, or no secret name after one",
-        );
-        // A function with no positional parameter is judged as before.
-        assert_bash(
-            &[r#"f(){ cat .env; }; f"#],
-            cadence_hooks_core::Outcome::Block,
-            "the body's own literal read",
+            "no function definition, or no secret name",
         );
     }
 
     #[test]
-    fn positional_function_block_names_the_secret() {
+    fn function_definition_block_names_the_secret() {
         let result =
-            SecretLeaksGuard::default().run(&make_bash_input(r#"f(){ cat "$1"; }; f .env"#));
+            SecretLeaksGuard::default().run(&make_bash_input(r#"f(){ cat "$1"; }; f .e''nv"#));
         let message = result.message.unwrap_or_default();
         assert!(
-            message.contains("`.env` in a command that defines a function reading its arguments"),
+            message.contains("`.env` in a command that defines a shell function"),
             "{message}"
         );
-    }
-
-    #[test]
-    fn function_body_len_stops_at_what_it_cannot_delimit() {
-        assert_eq!(function_body_len(r#"{ cat "$1"; }; f"#), Some(13));
-        assert_eq!(function_body_len("( a ) b"), Some(5));
-        assert_eq!(function_body_len(r#"{ echo '}'; }"#), Some(13));
-        assert_eq!(function_body_len("cat $1; f\nnext"), Some(9));
-        for unclear in [
-            "{ # }\n}",
-            "{ cat <<E\n}\nE\n}",
-            "{ echo `}`; }",
-            "{ echo $'\\''; }",
-            "( case x in a) ;; esac )",
-            "{ unclosed",
-        ] {
-            assert_eq!(function_body_len(unclear), None, "{unclear:?}");
-        }
     }
 
     #[test]

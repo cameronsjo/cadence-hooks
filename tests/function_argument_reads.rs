@@ -63,18 +63,18 @@ fn a_secret_name_passed_to_a_reading_function_is_blocked() {
             r#"f(){ git add "$@"; }; f .env"#,
         ],
         2,
-        "a positional function and a secret name",
+        "a function definition and a secret name",
     );
     let out = run(r#"f(){ cat "$1"; }; f .env"#);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("in a command that defines a function reading its arguments"),
+        stderr.contains("in a command that defines a shell function"),
         "the block names the rule: {stderr}"
     );
 }
 
 #[test]
-fn positional_functions_with_no_secret_name_still_pass() {
+fn functions_with_no_secret_name_still_pass() {
     assert_exit(
         &[
             r#"f(){ echo "$1"; }; f notes.txt"#,
@@ -83,15 +83,15 @@ fn positional_functions_with_no_secret_name_still_pass() {
             r#"cat "$1""#,
         ],
         0,
-        "a positional function with no secret name",
+        "a function definition with no secret name",
     );
 }
 
 #[test]
 fn two_hundred_definitions_and_a_long_command_are_judged_in_one_pass() {
-    // The rule reads the command once for definitions and once for words, so
-    // 200 definitions and a long tail cost a few milliseconds, not a walk per
-    // call (#1420 security review I-D). The budget applies under
+    // The rule is one pattern search plus the reader scan's own
+    // segmentation, so 200 definitions and a long tail cost about what the
+    // reader scan does, not a walk per call (#1420 security review I-D). The budget applies under
     // `CADENCE_TIMING_TESTS=1` in release.
     let definitions: String = (0..200)
         .map(|i| format!("f{i}(){{ # don't\n echo \"$1\"; f{} \"$1\"; }}\n", i + 1))
@@ -115,7 +115,6 @@ fn two_hundred_definitions_and_a_long_command_are_judged_in_one_pass() {
         Some(2),
         "a secret name after the definitions"
     );
-    // Every body opens with a comment, which the scan cannot delimit, so it
-    // reads as a positional function; with no secret word it still passes.
+    // With no secret word, the definitions alone do not block.
     assert_eq!(allowed.status.code(), Some(0), "no secret name");
 }
