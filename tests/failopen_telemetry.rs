@@ -342,3 +342,49 @@ fn non_object_tool_response_writes_no_failopen_row() {
         assert!(failopen_rows(tmp.path()).is_empty(), "{args:?}");
     }
 }
+
+/// A panic on the loop parser's thread is contained (cameronsjo/cadence-hooks
+/// #1401 review): the check reads it as a parse failure and judges the command
+/// through its fallback. Two pushes then block on the fallback's push count
+/// (exit 2). Before the containment the global panic hook exited the process
+/// with 1, which in `group` mode also dropped every other member's block.
+#[test]
+fn a_parser_panic_is_judged_through_the_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push origin main && git push upstream main"},
+        "cwd": tmp.path(),
+        "hook_event_name": "PreToolUse",
+        "session_id": "x",
+    })
+    .to_string();
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", "guard-push-remote"]);
+    cmd.env("CADENCE_METRICS_DIR", tmp.path());
+    cmd.env("CADENCE_TEST_PANIC", "parse");
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn binary");
+    if let Some(ref mut stdin) = child.stdin {
+        match stdin.write_all(payload.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("failed to write child stdin: {e}"),
+        }
+    }
+    let out = child.wait_with_output().expect("failed to wait on binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the loop parser panicked"),
+        "the synthetic parser panic fired: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("multiple git push commands"),
+        "blocked by the parse-failure fallback: {stderr}"
+    );
+    assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
+}

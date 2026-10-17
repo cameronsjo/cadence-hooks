@@ -3565,12 +3565,13 @@ fn strip_group_punctuation(raw: &str) -> &str {
     let mut rest = raw.trim();
     loop {
         // A function header (`g(){`, `g()(git`, zsh's anonymous `() {`) is
-        // not a command word (cameronsjo/cadence-hooks#1402). Read it before
-        // the `(` trim, which would take the `(` of `()`.
+        // not a command word (cameronsjo/cadence-hooks#1402). It is read
+        // before each `(` is peeled, one per pass: a bulk trim took the `(`
+        // of `()` in `( () { … } )`.
         let trimmed = rest.trim_start_matches([' ', '\t']);
         let trimmed = cadence_hooks_core::shell::function_header_len(trimmed)
             .map_or(trimmed, |len| &trimmed[len..]);
-        let trimmed = trimmed.trim_start_matches(['(', ' ', '\t']);
+        let trimmed = trimmed.strip_prefix('(').unwrap_or(trimmed);
         let trimmed = match trimmed.strip_prefix('{') {
             Some(after) if after.starts_with([' ', '\t']) || after.is_empty() => after,
             _ => trimmed,
@@ -6070,6 +6071,10 @@ mod tests {
             "function { git commit -m x; }",
             "g h(){ git commit -m x; }; g",
             "function g h { git commit -m x; }; g",
+            // A definition inside a subshell.
+            "(g(){ git commit -m x; }; g)",
+            "( g(){ git commit -m x; }; g )",
+            "( () { git commit -m x; } )",
         ] {
             assert_eq!(
                 git_commit_targets(command, "/cwd"),

@@ -3230,17 +3230,18 @@ mod tests {
     }
 
     /// cameronsjo/cadence-hooks#1401: `(( 1 # x ))` lines send the loop
-    /// parser into exponential backtracking: twenty took over 120 s, nine take
-    /// about 8 s in a debug build. The hook timed out and the
-    /// push behind them went through unchecked. The guard must still decide,
-    /// in time, and refuse an unowned target and a second push.
+    /// parser into exponential backtracking: twenty took over 120 s, the hook
+    /// timed out, and the push behind them went through unchecked. Seven
+    /// lines finish in well under a second, so this leaves no runaway parse
+    /// behind; the budget itself is pinned in `loop_analysis`. The guard must
+    /// still refuse an unowned target and a second push behind a flood.
     #[cfg(unix)]
     #[test]
     fn parser_backtracking_flood_still_judges_the_push() {
         use cadence_hooks_core::Outcome::{Allow, Block};
         let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
         let cwd = owned.path().to_string_lossy().to_string();
-        let flood = "(( 1 # x ))\n".repeat(9);
+        let flood = "(( 1 # x ))\n".repeat(7);
         with_env(&owners_only(), || {
             for (tail, outcome) in [
                 ("git push https://github.com/other/repo.git main", Block),

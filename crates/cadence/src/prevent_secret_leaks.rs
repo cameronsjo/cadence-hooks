@@ -5340,6 +5340,9 @@ mod tests {
             // glued to the `{` hid the body's head word until
             // cameronsjo/cadence-hooks#1402.
             format!("f(){{ {s}; }}; f"),
+            format!("(f(){{ {s}; }}; f)"),
+            // zsh runs an anonymous function at once.
+            format!("( () {{ {s}; }} )"),
             format!("while false; do :; done; ! {s}"),
             format!("eval \"{s}\""),
             "eval `echo cat .env`".to_string(),

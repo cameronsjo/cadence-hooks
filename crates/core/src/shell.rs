@@ -2412,7 +2412,7 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     // A `{` that opens a brace EXPANSION is part of the command word, not a
     // group: `{cat,.env}` runs `cat .env`, and trimming the brace left
     // `cat,.env}`, a word nothing expands (cadence-hooks#1096).
-    let mut rest = trimmed;
+    let mut rest = body;
     // Each `{` whose word runs on (`{a,b}`, `{{x`) costs a walk of that word;
     // past [`MAX_GLUED_BRACE_WALKS`] the strip stops and keeps the text. A
     // glued `{` is not a group opener to bash anyway (`{{echo` is a command
@@ -2420,13 +2420,18 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
     // 50 KB run of openers linear (PR #1118 review).
     let mut glued_walks = 0usize;
     loop {
-        // Before the `(` trim, which would take the `(` of an anonymous `()`.
+        // A header is read before each `(` is peeled, one per pass: a bulk
+        // trim took the `(` of an anonymous `()` and skipped a header behind
+        // a subshell's `(` (`(f(){ cat .env; }; f)`).
         rest = rest.trim_start_matches([' ', '\t']);
         if let Some(len) = function_header_len(rest) {
             rest = &rest[len..];
             continue;
         }
-        rest = rest.trim_start_matches(['(', ' ', '\t']);
+        if let Some(after) = rest.strip_prefix('(') {
+            rest = after;
+            continue;
+        }
         let Some(after) = rest.strip_prefix('{') else {
             break;
         };
@@ -2786,6 +2791,15 @@ fn is_function_name(word: &str) -> bool {
 /// **Detector direction only**: neither shell runs a word of a header, so
 /// dropping it can only expose a command the body runs.
 pub fn function_header_len(text: &str) -> Option<usize> {
+    // Every header starts with a name, `function` or `()`. Most segments do
+    // not, and every reading of every segment comes through here.
+    if !text
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'('))
+    {
+        return None;
+    }
     let blank = [' ', '\t'];
     let (mut rest, keyword) = match text.strip_prefix("function") {
         Some(after) if after.starts_with(blank) => (after.trim_start_matches(blank), true),

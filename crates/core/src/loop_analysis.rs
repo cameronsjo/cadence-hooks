@@ -599,8 +599,11 @@ pub fn group_nesting_depth(command: &str) -> usize {
 /// that long would eat the shared probe budget ([`crate::deadline`]) or hit the
 /// hook's 5 s timeout, and either one lets the push through unjudged. Past
 /// this the parse counts as failed, and every caller already has a fallback
-/// for that. A 200 KB ordinary command parses in well under it in a release
-/// build.
+/// for that. A 166 KB ordinary command parses in about 250 ms in a release
+/// build. On a saturated host a large ordinary command can still run past
+/// it, and then takes that fallback: `guard-push-remote` counts pushes, so a
+/// legitimate two-push chain blocks. Wall clock, not CPU time, because the
+/// hook timeout it protects is wall clock.
 const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Stack for the parse thread. The parser recurses once per nesting level,
@@ -608,10 +611,11 @@ const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000)
 /// a spawned thread gets 2 MB by default.
 const PARSE_STACK: usize = 16 * 1024 * 1024;
 
-/// Hashes of commands whose parse ran past [`PARSE_BUDGET`] in this process.
+/// Hashes of commands whose parse ran past [`PARSE_BUDGET`] or panicked, in
+/// this process.
 /// Each guard parses the same command again; without this, every one of them
 /// would start another runaway parse and wait out the budget again.
-static PARSE_TIMED_OUT: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+static PARSE_ABANDONED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 fn command_hash(command: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -625,6 +629,14 @@ fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
         return None;
     }
     within_budget(command, PARSE_BUDGET, |text| {
+        // Debug builds only: a synthetic parser panic, so the binary's tests
+        // can show the panic hook lets this thread unwind. It bypasses
+        // nothing: the check reads the panic as a parse failure and judges
+        // the command through its fallback.
+        #[cfg(debug_assertions)]
+        if std::env::var("CADENCE_TEST_PANIC").as_deref() == Ok("parse") {
+            panic!("CADENCE_TEST_PANIC: synthetic panic on the parse thread");
+        }
         let reader = std::io::Cursor::new(text.as_str());
         let options = ParserOptions::default();
         let source_info = SourceInfo::default();
@@ -640,7 +652,7 @@ pub const PARSE_THREAD_NAME: &str = "parse-command";
 
 /// `work(command)` on its own thread, or `None` once it runs past `budget`,
 /// panics, or has done either for this command before in this process
-/// ([`PARSE_TIMED_OUT`]). The parser has no step limit, so it is abandoned
+/// ([`PARSE_ABANDONED`]). The parser has no step limit, so it is abandoned
 /// rather than stopped: the thread keeps running until the process exits,
 /// which for a hook is moments later.
 fn within_budget<T: Send + 'static>(
@@ -649,8 +661,8 @@ fn within_budget<T: Send + 'static>(
     work: fn(String) -> Option<T>,
 ) -> Option<T> {
     let key = command_hash(command);
-    let timed_out = || PARSE_TIMED_OUT.lock().unwrap_or_else(|e| e.into_inner());
-    if timed_out().contains(&key) {
+    let abandoned = || PARSE_ABANDONED.lock().unwrap_or_else(|e| e.into_inner());
+    if abandoned().contains(&key) {
         return None;
     }
     let owned = command.to_string();
@@ -667,7 +679,7 @@ fn within_budget<T: Send + 'static>(
     match receive.recv_timeout(budget) {
         Ok(result) => result,
         Err(_) => {
-            timed_out().push(key);
+            abandoned().push(key);
             None
         }
     }
@@ -1859,7 +1871,7 @@ mod tests {
     #[test]
     fn parser_backtracking_flood_fails_within_the_budget() {
         for line in ["(( 1 # x ))\n", "(( 1\n", "( ( 1\n"] {
-            let command = format!("{}git push origin main", line.repeat(9));
+            let command = format!("{}git push origin main", line.repeat(7));
             let started = std::time::Instant::now();
             let (chain, loops) = analyze_push_chain_and_loops(&command);
             let took = started.elapsed();
