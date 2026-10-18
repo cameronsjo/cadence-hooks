@@ -3132,6 +3132,22 @@ fn assigns_positionals(word: &str) -> bool {
     name == "argv" || (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Can `word` resolve to a [`SHELL_HEADS`] name or `$SHELL`? Every such
+/// name ends in `h`, so a word that does not (after a `.exe`), holds no
+/// backslash and starts with no `$` is skipped before [`command_word`]
+/// resolves it: the check runs on every word of every segment.
+fn may_name_a_shell(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let stem = if bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        &bytes[..bytes.len() - 4]
+    } else {
+        bytes
+    };
+    matches!(stem.last(), Some(b'h' | b'H'))
+        || bytes.first() == Some(&b'$')
+        || bytes.contains(&b'\\')
+}
+
 /// Does a segment whose dequoted words are `words`, running the command
 /// `words[head..]`, set positional parameters: a shell `-c` script with words
 /// after it (or run by `xargs`, `parallel` or `find -exec`), a shell `-s`
@@ -3148,10 +3164,10 @@ fn sets_positionals(words: &[String], head: usize) -> bool {
         if i < options_end {
             continue;
         }
-        let verb = command_word(w);
-        let shell =
-            SHELL_HEADS.contains(&verb.as_ref()) || matches!(w.as_str(), "$SHELL" | "${SHELL}");
-        if shell {
+        if may_name_a_shell(w)
+            && (SHELL_HEADS.contains(&command_word(w).as_ref())
+                || matches!(w.as_str(), "$SHELL" | "${SHELL}"))
+        {
             let (takes, end) =
                 shell_takes_positionals(&words[i..], handed_arguments(words, head, i));
             if takes {
@@ -3159,7 +3175,9 @@ fn sets_positionals(words: &[String], head: usize) -> bool {
             }
             options_end = i + end;
         }
-        if (i == head && verb == "set" && set_takes_positionals(&words[i + 1..]))
+        if (i == head
+            && head_verb.as_deref() == Some("set")
+            && set_takes_positionals(&words[i + 1..]))
             || ((i <= head || declares) && assigns_positionals(w))
         {
             return true;
