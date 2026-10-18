@@ -16955,8 +16955,15 @@ mod tests {
 
     #[test]
     fn skip_runner_flags_refuses_verbs_it_does_not_model() {
+        let tokens = words("chrt -f 99 rm note.md");
+        assert!(skip_runner_flags("chrt", &tokens[1..]).is_none());
+        // `doas` is modelled since cadence-hooks#1422.
         let tokens = words("doas -u me rm note.md");
-        assert!(skip_runner_flags("doas", &tokens[1..]).is_none());
+        assert_eq!(
+            skip_runner_flags("doas", &tokens[1..])
+                .and_then(|rest| rest.first().map(String::as_str)),
+            Some("rm")
+        );
     }
 
     // --- command_word (the one verb normalization) ---
