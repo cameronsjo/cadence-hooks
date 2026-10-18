@@ -25,7 +25,8 @@ use cadence_hooks_core::shell::{
 };
 use std::path::{Component, Path, PathBuf};
 
-/// Is `file_path` provably local: outside every version-controlled work tree,
+/// Is `file_path` provably local: inside a fixed local config or temp location
+/// ([`in_local_location`]), and outside every version-controlled work tree,
 /// every synced tree and every network mount?
 ///
 /// Such a file cannot leave the machine by itself. For code and config the
@@ -38,6 +39,12 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// - the path is non-empty, absolute, and carries no `..` component (an MCP
 ///   write has no path and is always scanned);
+/// - the resolved path sits in a fixed local location: a dotfile directly in
+///   the home directory, `~/.config`, `~/.local`, `~/.cache`, or a system
+///   temp dir. Everything else is scanned, so a sync folder this code has
+///   never heard of (`Dropbox (<team>)`, `Insync`, `Sync`) is scanned too
+///   (cameronsjo/cadence-hooks#1429). The checks below still apply inside
+///   those locations;
 /// - every symlink on the way resolves: a dangling link (to the file or to a
 ///   directory above it) means the write lands wherever the link points, which
 ///   may be a work tree that does not hold the file yet;
@@ -58,10 +65,20 @@ use std::path::{Component, Path, PathBuf};
 ///   to read whether a `.git` is there means "cannot tell", which scans.
 ///
 /// The residuals: a later `cp`, `git add` of a copy, or `chezmoi add` can bring
-/// the text into a repo with no Edit call, and a bare-repo dotfiles setup
-/// (`--git-dir=~/.dotfiles --work-tree=~`) has no `.git` above the files it
-/// tracks. The leak-ledger scan is the net for both.
+/// the text into a repo with no Edit call; a file written before a `git init`
+/// in the same directory was judged with no repo there; and a repo whose work
+/// tree is set elsewhere (a bare-repo dotfiles setup,
+/// `--git-dir=~/.dotfiles --work-tree=~`, or any `core.worktree` repo) has no
+/// `.git` above the files it tracks. An app that syncs its own settings
+/// from an allowed location (an editor's settings sync under `~/.config`) is
+/// a fourth. The leak-ledger scan is the net for all four.
 pub(super) fn is_provably_local(file_path: Option<&str>) -> bool {
+    is_provably_local_in(file_path, &LocalRoots::current())
+}
+
+/// [`is_provably_local`] against explicit roots, so tests can place a home
+/// directory outside the system temp dirs.
+fn is_provably_local_in(file_path: Option<&str>, roots: &LocalRoots) -> bool {
     let Some(raw) = file_path.filter(|p| !p.is_empty()) else {
         return false;
     };
@@ -72,6 +89,10 @@ pub(super) fn is_provably_local(file_path: Option<&str>) -> bool {
     let Some(resolved) = resolve_deepest(path) else {
         return false;
     };
+    if !in_local_location(&resolved, roots) {
+        return false;
+    }
+    // Defence in depth inside the allowed locations.
     if paths::cloud_sync_marker(path).is_some() || paths::cloud_sync_marker(&resolved).is_some() {
         return false;
     }
@@ -83,6 +104,93 @@ pub(super) fn is_provably_local(file_path: Option<&str>) -> bool {
         && has_one_name(&resolved)
         // The file itself when it exists: a file can be mounted on its own.
         && paths::syncs_or_mounts_remotely(&resolved) == Some(false)
+}
+
+/// Directories under the home directory that hold only local config, state
+/// and cache (the XDG base directories).
+const LOCAL_HOME_DIRS: &[&str] = &[".config", ".local", ".cache"];
+
+/// Where [`in_local_location`] looks: the canonical home directory, and
+/// whether the system temp dirs count.
+struct LocalRoots {
+    home: Option<PathBuf>,
+    system_temp: bool,
+}
+
+impl LocalRoots {
+    /// Neither root comes from the environment. A repo's settings `env` block
+    /// reaches hooks, so a `HOME` or `TMPDIR` pointed at a synced folder would
+    /// exempt it: the home directory comes from the account database, and the
+    /// temp dirs are fixed paths. (`core::worktree`'s temp roots read
+    /// `TMPDIR`, so they are not reused here.)
+    fn current() -> Self {
+        Self {
+            home: paths::account_home().and_then(|h| h.canonicalize().ok()),
+            system_temp: true,
+        }
+    }
+}
+
+/// Is the resolved path in one of the fixed local locations: a dotfile
+/// directly in the home directory, a file under [`LOCAL_HOME_DIRS`], or a file
+/// under a system temp dir?
+///
+/// An allowlist, because a list of sync folders is never complete
+/// (cameronsjo/cadence-hooks#1429).
+fn in_local_location(resolved: &Path, roots: &LocalRoots) -> bool {
+    let strictly_under = |root: &Path| {
+        resolved
+            .strip_prefix(root)
+            .is_ok_and(|rest| rest.components().next().is_some())
+    };
+    if let Some(home) = &roots.home {
+        let dotfile = resolved.parent() == Some(home.as_path())
+            && resolved
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|n| n.len() > 1 && n.starts_with('.'));
+        if dotfile
+            || LOCAL_HOME_DIRS
+                .iter()
+                .any(|d| strictly_under(&home.join(d)))
+        {
+            return true;
+        }
+    }
+    if !roots.system_temp {
+        return false;
+    }
+    if ["/tmp", "/private/tmp"]
+        .iter()
+        .any(|t| strictly_under(Path::new(t)))
+    {
+        return true;
+    }
+    // macOS per-user temp: /var/folders/<xx>/<id>/T/…, reached as /private/var.
+    // Elsewhere the path means nothing, so it is not a temp dir there.
+    cfg!(target_os = "macos")
+        && ["/var/folders", "/private/var/folders"].iter().any(|root| {
+            resolved.strip_prefix(root).is_ok_and(|rest| {
+                let mut parts = rest.components();
+                matches!(
+                    (parts.next(), parts.next(), parts.next(), parts.next()),
+                    (Some(_), Some(_), Some(t), Some(_)) if t.as_os_str() == "T"
+                )
+            })
+        })
+}
+
+/// Does a scratch directory count as a system temp dir? Tests that expect an
+/// exemption for a `tempfile` path use this to skip, saying why, under a
+/// `TMPDIR` elsewhere (`/run/user/…`, `~/tmp`).
+#[cfg(test)]
+pub(super) fn scratch_counts_as_system_temp(dir: &Path) -> bool {
+    let roots = LocalRoots {
+        home: None,
+        system_temp: true,
+    };
+    dir.canonicalize()
+        .is_ok_and(|d| in_local_location(&d.join("probe"), &roots))
 }
 
 /// Is `path` absent, or a file with no second hard link? A second link may
@@ -391,7 +499,8 @@ mod tests {
     fn outside_git_tree_needs_a_plain_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         // Only macOS and Linux can prove a path local; elsewhere nothing is.
-        let local = cfg!(any(target_os = "macos", target_os = "linux"));
+        let local = cfg!(any(target_os = "macos", target_os = "linux"))
+            && scratch_counts_as_system_temp(dir.path());
         let plain = dir.path().join("notes.md");
         assert_eq!(is_provably_local(plain.to_str()), local);
         assert_eq!(
@@ -416,6 +525,7 @@ mod tests {
         assert_eq!(
             is_provably_local(root.path().join("notes.md").to_str()),
             cfg!(any(target_os = "macos", target_os = "linux"))
+                && scratch_counts_as_system_temp(root.path())
         );
     }
 
@@ -440,6 +550,121 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::os::unix::fs::symlink(root.path().join("gone"), repo.join(".git")).unwrap();
         assert!(!is_provably_local(repo.join("config.toml").to_str()));
+    }
+
+    /// A home directory with the temp rule off, so only the home allowlist can
+    /// exempt anything in it.
+    fn fake_home() -> (tempfile::TempDir, LocalRoots, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let roots = LocalRoots {
+            home: Some(home.clone()),
+            system_temp: false,
+        };
+        (dir, roots, home)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn home_config_locations_stay_exempt() {
+        let (_dir, roots, home) = fake_home();
+        for rel in [
+            ".zshrc",
+            ".config/x.toml",
+            ".config/tool/deep/config.toml",
+            ".local/share/tool/state.json",
+            ".cache/tool/run.sh",
+        ] {
+            assert!(
+                is_provably_local_in(home.join(rel).to_str(), &roots),
+                "{rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_home_location_is_scanned() {
+        // cadence-hooks#1429: sync folders no list names, and anything else
+        // outside the fixed local locations.
+        let (_dir, roots, home) = fake_home();
+        for rel in [
+            "Dropbox (Acme)/x.toml",
+            "Dropbox (Personal)/x.toml",
+            "Insync/x.toml",
+            "MEGAsync/x.toml",
+            "Seafile/x.toml",
+            "Tresorit/x.toml",
+            "SynologyDrive/x.toml",
+            "Yandex.Disk/x.toml",
+            "kDrive/x.toml",
+            "Syncthing/x.toml",
+            "Sync/x.toml",
+            "Creative Cloud Files/x.toml",
+            "My Drive/x.toml",
+            "Google Drive (a@b)/x.toml",
+            "Documents/tool/config.toml",
+            "Projects/tool/config.toml",
+            "Library/LaunchAgents/x.plist",
+            "plain.toml",
+            ".claude/settings.json",
+            ".configx/x.toml",
+        ] {
+            // The allowlist itself, on every platform; the whole check too,
+            // though off macOS and Linux it refuses everything anyway.
+            assert!(!in_local_location(&home.join(rel), &roots), "{rel}");
+            assert!(
+                !is_provably_local_in(home.join(rel).to_str(), &roots),
+                "{rel}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_out_of_home_config_is_judged_where_it_lands() {
+        let (_dir, roots, home) = fake_home();
+        let config = home.join(".config");
+        // A repo inside the allowed location: the repo walk scans it.
+        let repo = config.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("tracked.toml"), "x").unwrap();
+        std::os::unix::fs::symlink(repo.join("tracked.toml"), config.join("to-repo.toml")).unwrap();
+        // A sync folder outside it: the allowlist scans it.
+        let synced = home.join("Dropbox (Acme)");
+        std::fs::create_dir_all(&synced).unwrap();
+        std::os::unix::fs::symlink(synced.join("x.toml"), config.join("to-sync.toml")).unwrap();
+        std::fs::write(synced.join("x.toml"), "x").unwrap();
+        for name in ["to-repo.toml", "to-sync.toml"] {
+            assert!(
+                !is_provably_local_in(config.join(name).to_str(), &roots),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_temp_locations_table() {
+        let roots = LocalRoots {
+            home: None,
+            system_temp: true,
+        };
+        let table = [
+            ("/tmp/x.sh", true),
+            ("/private/tmp/a/b.toml", true),
+            ("/var/folders/ab/cd1234/T/x.sh", cfg!(target_os = "macos")),
+            (
+                "/private/var/folders/ab/cd1234/T/sub/x.sh",
+                cfg!(target_os = "macos"),
+            ),
+            ("/tmp", false),
+            ("/var/folders/ab/cd1234/C/x.sh", false),
+            ("/var/folders/ab/cd1234/T", false),
+            ("/var/tmp/x.sh", false),
+            ("/tmpx/x.sh", false),
+        ];
+        for (path, want) in table {
+            assert_eq!(in_local_location(Path::new(path), &roots), want, "{path}");
+        }
     }
 
     #[test]
