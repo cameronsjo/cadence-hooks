@@ -13117,7 +13117,16 @@ fn shell_c_argument(segment: &str) -> Option<String> {
 /// three argument-free flags; `-h`/`-V` print and exit, so they stay unlisted
 /// and refuse the peel.
 pub const COMMAND_RUNNERS: &[&str] = &[
-    "sudo", "xargs", "nice", "stdbuf", "timeout", "env", "setsid",
+    "sudo",
+    "xargs",
+    "nice",
+    "stdbuf",
+    "timeout",
+    "env",
+    "setsid",
+    "ionice",
+    "caffeinate",
+    "doas",
 ];
 
 /// Peel transparent prefixes and command runners off the front of an executable
@@ -13335,6 +13344,25 @@ const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
 const SETSID_NO_ARGUMENT_SHORT_FLAGS: &str = "cfw";
 const SETSID_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ctty", "--fork", "--wait"];
 
+/// `ionice`'s options (util-linux) that still run a command: `-c CLASS`,
+/// `-n LEVEL` and `-t`. `-p`, `-P` and `-u` name processes instead of a
+/// command, so they are left out and refuse the walk.
+const IONICE_NO_ARGUMENT_SHORT_FLAGS: &str = "t";
+const IONICE_VALUE_SHORT_FLAGS: &str = "cn";
+const IONICE_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ignore"];
+const IONICE_VALUE_LONG_FLAGS: &[&str] = &["--class", "--classdata"];
+
+/// macOS `caffeinate`'s assertion flags `-dimsu`, and `-t SECONDS` and
+/// `-w PID`, which take a value. It runs the utility after its options.
+const CAFFEINATE_NO_ARGUMENT_SHORT_FLAGS: &str = "dimsu";
+const CAFFEINATE_VALUE_SHORT_FLAGS: &str = "tw";
+
+/// `doas`'s options that still run the command: `-n` and `-u USER`. `-s`
+/// (a shell), `-L` and `-C` run no command of their own, so they refuse the
+/// walk.
+const DOAS_NO_ARGUMENT_SHORT_FLAGS: &str = "n";
+const DOAS_VALUE_SHORT_FLAGS: &str = "u";
+
 /// `env`'s options, spanning both implementations: `-u -C -i -0 -v` are common,
 /// and `-P utilpath` is BSD-only — it is in `/usr/bin/env`'s own usage line on
 /// macOS (`env [-0iv] [-C workdir] [-P utilpath] [-S string] [-u name] …`) and
@@ -13433,6 +13461,24 @@ fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
             SETSID_NO_ARGUMENT_SHORT_FLAGS,
             "",
             SETSID_NO_ARGUMENT_LONG_FLAGS,
+            &[] as &[&str],
+        ),
+        "ionice" => (
+            IONICE_NO_ARGUMENT_SHORT_FLAGS,
+            IONICE_VALUE_SHORT_FLAGS,
+            IONICE_NO_ARGUMENT_LONG_FLAGS,
+            IONICE_VALUE_LONG_FLAGS,
+        ),
+        "caffeinate" => (
+            CAFFEINATE_NO_ARGUMENT_SHORT_FLAGS,
+            CAFFEINATE_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            &[] as &[&str],
+        ),
+        "doas" => (
+            DOAS_NO_ARGUMENT_SHORT_FLAGS,
+            DOAS_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
             &[] as &[&str],
         ),
         "env" => (
@@ -16909,8 +16955,15 @@ mod tests {
 
     #[test]
     fn skip_runner_flags_refuses_verbs_it_does_not_model() {
+        let tokens = words("chrt -f 99 rm note.md");
+        assert!(skip_runner_flags("chrt", &tokens[1..]).is_none());
+        // `doas` is modelled since cadence-hooks#1422.
         let tokens = words("doas -u me rm note.md");
-        assert!(skip_runner_flags("doas", &tokens[1..]).is_none());
+        assert_eq!(
+            skip_runner_flags("doas", &tokens[1..])
+                .and_then(|rest| rest.first().map(String::as_str)),
+            Some("rm")
+        );
     }
 
     // --- command_word (the one verb normalization) ---
@@ -22993,6 +23046,16 @@ mod tests {
             ("setsid --wait -- rm", Some("rm")),
             ("/usr/bin/setsid -c rm", Some("rm")),
             ("setsid -V rm", Some("setsid")),
+            // cadence-hooks#1422: `ionice`, `caffeinate` and `doas` run their
+            // operand; the options that name no command refuse the walk.
+            ("ionice -c3 rm", Some("rm")),
+            ("ionice -c 2 -n 7 -t rm", Some("rm")),
+            ("ionice -p 42 rm", Some("ionice")),
+            ("caffeinate -i rm", Some("rm")),
+            ("caffeinate -t 60 -d rm", Some("rm")),
+            ("doas rm", Some("rm")),
+            ("doas -n -u root rm", Some("rm")),
+            ("doas -s rm", Some("doas")),
             // `git` is NOT a command runner: it runs a subcommand from its own
             // fixed set, so peeling its globals here would drop a subcommand
             // name into an executable position it never occupies.
