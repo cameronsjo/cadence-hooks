@@ -3106,30 +3106,29 @@ const DECLARATION_BUILTINS: &[&str] = &[
 const FIND_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
 const FD_EXEC_OPTIONS: &[&str] = &["-x", "-X", "--exec", "--exec-batch"];
 
-/// Is the word at `i` the command that `xargs`, `parallel`, `find -exec` or
-/// `fd -x` runs, and so is handed arguments it did not list? `xargs` is
-/// peeled off as a runner, so its command is the segment's `head`.
-fn handed_arguments(words: &[String], head: usize, i: usize) -> bool {
-    let verb_at = |at: usize| words.get(at).map(|w| command_word(w));
-    let head_verb = verb_at(head);
-    let previous = i
-        .checked_sub(1)
-        .and_then(|at| words.get(at))
-        .map(String::as_str);
-    (i == head && words[..head].iter().any(|w| command_word(w) == "xargs"))
-        || (i == head + 1 && head_verb.as_deref() == Some("parallel"))
-        || (head_verb.as_deref() == Some("find")
-            && previous.is_some_and(|p| FIND_ACTIONS.contains(&p)))
-        || (matches!(head_verb.as_deref(), Some("fd" | "fdfind"))
-            && previous.is_some_and(|p| FD_EXEC_OPTIONS.contains(&p)))
-}
-
 /// Does a word assign zsh's positional parameters: `argv=`, `argv+=`,
 /// `argv[…]=`, or a digit name (`1=.env`)?
 fn assigns_positionals(word: &str) -> bool {
     let name = word.split_once(['=', '[']).map_or("", |(name, _)| name);
     let name = name.strip_suffix('+').unwrap_or(name);
     name == "argv" || (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `parallel`'s input-source separators; its command ends at the first.
+const PARALLEL_SOURCES: &[&str] = &[":::", "::::", ":::+", "::::+"];
+
+/// Where the command a `find` action or `fd` exec option at `action` runs
+/// begins, after the shared runner peel (`-exec env sh -c …`). The peel reads
+/// at most [`PEEL_WORD_LIMIT`] words, so a run of actions stays linear.
+fn exec_command_start(words: &[String], action: usize) -> usize {
+    let from = action + 1;
+    let window = &words[from.min(words.len())..(from + PEEL_WORD_LIMIT).min(words.len())];
+    let start = from + window.len() - peel_command_runners(window).len();
+    // `busybox sh` runs the applet named by its first operand.
+    match words.get(start) {
+        Some(w) if MULTICALL.contains(&command_word(w).as_ref()) => start + 1,
+        _ => start,
+    }
 }
 
 /// Can `word` resolve to a [`SHELL_HEADS`] name or `$SHELL`? Every such
@@ -3159,17 +3158,43 @@ fn sets_positionals(words: &[String], head: usize) -> bool {
     let declares = head_verb
         .as_deref()
         .is_some_and(|v| DECLARATION_BUILTINS.contains(&v));
+    let head_is = |names: &[&str]| head_verb.as_deref().is_some_and(|v| names.contains(&v));
+    // A shell is handed arguments it did not list when it is the command
+    // `xargs` (peeled off as a runner, so the segment's command), `parallel`
+    // (its first shell before an input source), or a `find` action or `fd`
+    // exec option (behind the shared runner peel) runs.
+    let through_xargs = words[..head.min(words.len())]
+        .iter()
+        .any(|w| command_word(w) == "xargs");
+    let mut parallel_slot = head_is(&["parallel"]);
+    let exec_options: &[&str] = if head_is(&["find"]) {
+        FIND_ACTIONS
+    } else if head_is(&["fd", "fdfind"]) {
+        FD_EXEC_OPTIONS
+    } else {
+        &[]
+    };
+    let mut exec_start = None;
     let mut options_end = 0;
     for (i, w) in words.iter().enumerate() {
         if i < options_end {
             continue;
         }
+        if i > head && PARALLEL_SOURCES.contains(&w.as_str()) {
+            parallel_slot = false;
+        }
+        if i > head && exec_options.contains(&w.as_str()) {
+            exec_start = Some(exec_command_start(words, i));
+        }
         if may_name_a_shell(w)
             && (SHELL_HEADS.contains(&command_word(w).as_ref())
                 || matches!(w.as_str(), "$SHELL" | "${SHELL}"))
         {
-            let (takes, end) =
-                shell_takes_positionals(&words[i..], handed_arguments(words, head, i));
+            let handed = (i == head && through_xargs)
+                || (i > head && parallel_slot)
+                || exec_start == Some(i);
+            parallel_slot = parallel_slot && i <= head;
+            let (takes, end) = shell_takes_positionals(&words[i..], handed);
             if takes {
                 return true;
             }
@@ -7541,6 +7566,21 @@ mod tests {
                 r#"find . -name .env | xargs sh -c 'cat "$@"' _"#,
                 r#"echo .env | parallel sh -c 'cat "$0"'"#,
                 r#"find . -name .env -exec sh -c 'cat "$0"' {} +"#,
+                // Fix round 1: an option or a runner between the hander and
+                // the shell.
+                r#"echo .env | parallel -j4 sh -c 'cat "$0"'"#,
+                r#"echo .env | parallel -k sh -c 'cat "$0"'"#,
+                r#"echo .env | parallel --will-cite sh -c 'cat "$0"'"#,
+                r#"echo .env | parallel nice sh -c 'cat "$0"'"#,
+                "echo .env | parallel -j4 bash -s",
+                r#"fd .env -x env sh -c 'cat "$0"'"#,
+                r#"fd .env -x nice sh -c 'cat "$0"'"#,
+                r#"fd .env --exec-batch busybox sh -c 'cat "$@"'"#,
+                r#"echo .env | xargs ionice sh -c 'cat "$0"'"#,
+                r#"echo .env | xargs ionice -c3 sh -c 'cat "$0"'"#,
+                r#"echo .env | xargs caffeinate sh -c 'cat "$0"'"#,
+                r#"echo .env | xargs doas sh -c 'cat "$0"'"#,
+                r#"echo .env | xargs nice -n5 sh -c 'cat "$0"'"#,
                 r#"find . -name .env -exec bash -c 'cat "$@"' bash {} +"#,
                 r#"set .env; cat "$1""#,
                 r#"set -e -- .env; cat "$1""#,
@@ -7606,6 +7646,8 @@ mod tests {
                 "strace -f -x sh -c 'ls .env'",
                 "watch -x bash -c 'ls'; touch .env",
                 "echo xargs sh -c foo; ls .env",
+                // A shell after `parallel`'s input source is data.
+                "parallel echo ::: sh -c; ls .env",
             ],
             cadence_hooks_core::Outcome::Allow,
             "no positional parameters, or no secret name",
