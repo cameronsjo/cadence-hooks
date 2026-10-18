@@ -3101,21 +3101,28 @@ const DECLARATION_BUILTINS: &[&str] = &[
     "typeset", "declare", "local", "export", "readonly", "integer", "float",
 ];
 
-/// Words after which a shell is handed arguments it did not list: `find`'s
-/// actions and `fd`'s `-x`/`-X`. `xargs` and `parallel` are peeled off as
-/// runners, so they are looked for by name too.
-const ARGUMENT_HANDERS: &[&str] = &[
-    "xargs",
-    "parallel",
-    "-exec",
-    "-execdir",
-    "-ok",
-    "-okdir",
-    "-x",
-    "-X",
-    "--exec",
-    "--exec-batch",
-];
+/// `find`'s actions and `fd`'s options that run the next word as a command
+/// with arguments it did not list.
+const FIND_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
+const FD_EXEC_OPTIONS: &[&str] = &["-x", "-X", "--exec", "--exec-batch"];
+
+/// Is the word at `i` the command that `xargs`, `parallel`, `find -exec` or
+/// `fd -x` runs, and so is handed arguments it did not list? `xargs` is
+/// peeled off as a runner, so its command is the segment's `head`.
+fn handed_arguments(words: &[String], head: usize, i: usize) -> bool {
+    let verb_at = |at: usize| words.get(at).map(|w| command_word(w));
+    let head_verb = verb_at(head);
+    let previous = i
+        .checked_sub(1)
+        .and_then(|at| words.get(at))
+        .map(String::as_str);
+    (i == head && words[..head].iter().any(|w| command_word(w) == "xargs"))
+        || (i == head + 1 && head_verb.as_deref() == Some("parallel"))
+        || (head_verb.as_deref() == Some("find")
+            && previous.is_some_and(|p| FIND_ACTIONS.contains(&p)))
+        || (matches!(head_verb.as_deref(), Some("fd" | "fdfind"))
+            && previous.is_some_and(|p| FD_EXEC_OPTIONS.contains(&p)))
+}
 
 /// Does a word assign zsh's positional parameters: `argv=`, `argv+=`,
 /// `argv[…]=`, or a digit name (`1=.env`)?
@@ -3136,7 +3143,6 @@ fn sets_positionals(words: &[String], head: usize) -> bool {
     let declares = head_verb
         .as_deref()
         .is_some_and(|v| DECLARATION_BUILTINS.contains(&v));
-    let mut handed = false;
     let mut options_end = 0;
     for (i, w) in words.iter().enumerate() {
         if i < options_end {
@@ -3146,13 +3152,13 @@ fn sets_positionals(words: &[String], head: usize) -> bool {
         let shell =
             SHELL_HEADS.contains(&verb.as_ref()) || matches!(w.as_str(), "$SHELL" | "${SHELL}");
         if shell {
-            let (takes, end) = shell_takes_positionals(&words[i..], handed);
+            let (takes, end) =
+                shell_takes_positionals(&words[i..], handed_arguments(words, head, i));
             if takes {
                 return true;
             }
             options_end = i + end;
         }
-        handed = handed || ARGUMENT_HANDERS.contains(&verb.as_ref());
         if (i == head && verb == "set" && set_takes_positionals(&words[i + 1..]))
             || ((i <= head || declares) && assigns_positionals(w))
         {
@@ -7515,6 +7521,8 @@ mod tests {
                 // Was a #1303 accepted miss: the secret word is in the
                 // command, and `xargs` hands `sh -c` its arguments.
                 r#"find . -name .env | xargs sh -c 'cat "$@"' _"#,
+                r#"echo .env | parallel sh -c 'cat "$0"'"#,
+                r#"find . -name .env -exec sh -c 'cat "$0"' {} +"#,
                 r#"find . -name .env -exec bash -c 'cat "$@"' bash {} +"#,
                 r#"set .env; cat "$1""#,
                 r#"set -e -- .env; cat "$1""#,
@@ -7572,6 +7580,14 @@ mod tests {
                 r#"kubectl exec -it pod -- sh -c 'ls'; echo "see .env""#,
                 r"ssh host bash -lc 'uptime'; git commit -m 'drop .env'",
                 "watch -n1 bash -c 'ls'; echo .env",
+                // Second security review: a hander word whose command is not
+                // the shell.
+                "docker ps -q | xargs -I{} docker exec {} sh -c 'ls -la /app/.env'",
+                "ssh -X host sh -c 'ls -la ~/app/.env'",
+                r#"ssh -X host bash -c 'ls'; echo "check .env""#,
+                "strace -f -x sh -c 'ls .env'",
+                "watch -x bash -c 'ls'; touch .env",
+                "echo xargs sh -c foo; ls .env",
             ],
             cadence_hooks_core::Outcome::Allow,
             "no positional parameters, or no secret name",
