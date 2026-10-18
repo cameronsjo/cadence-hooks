@@ -4,8 +4,9 @@
 //! On Bash, blocks a literal secret file name handed to an ENUMERATED reader
 //! or sender (`READERS`: `cat`, `grep`, `base64`, `curl -d @`, `gh --input`,
 //! `source`, …), or redirected into one's standard input
-//! (cameronsjo/cadence-hooks#1303), or named anywhere in a command that defines
-//! a shell function (cameronsjo/cadence-hooks#1409).
+//! (cameronsjo/cadence-hooks#1303), or named anywhere the reader scan reads a
+//! word in a command that defines a shell function
+//! (cameronsjo/cadence-hooks#1409, #1425).
 //! Unknown commands, variables, URL and API paths, regex patterns, and globs
 //! that only share letters with a secret name are not judged. Safe templates
 //! (.env.example, .env.test) are always allowed. Environment dumps nudge.
@@ -26,6 +27,7 @@ use cadence_hooks_core::shell::{
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -2989,14 +2991,60 @@ const STDIN_CONSUMERS: &[&str] = &[
 /// Wrappers that run an applet named by their first operand.
 const MULTICALL: &[&str] = &["busybox", "toybox"];
 
+/// What [`segment_reads`] finds in one segment.
+struct SegmentReads {
+    /// `(verb, secret word)` reads.
+    reads: Vec<(String, String)>,
+    /// Command texts the segment runs that were not expanded.
+    children: Vec<String>,
+    /// The first secret-like word in any position, when asked for.
+    secret_word: Option<String>,
+    /// A word assigns a `BASH_FUNC_` environment import.
+    imports_function: bool,
+}
+
+/// The name of bash's environment import of a function, `BASH_FUNC_<name>%%`
+/// or the older `BASH_FUNC_<name>()`.
+static FUNCTION_IMPORT_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^BASH_FUNC_\S*(?:%%|\(\))$").expect("function import pattern compiles")
+});
+
+/// Does a dequoted `word` assign a function import? bash imports the value
+/// after quote removal, which [`command_segments`] does not do for an `env`
+/// operand, so the name decides, whatever the value (#1430). The word keeps
+/// its unquoted backslashes (`BASH_FUNC_f\%\%=`), so they are dropped here.
+fn imports_a_function(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    if name.contains('\\') {
+        FUNCTION_IMPORT_NAME.is_match(&name.replace('\\', ""))
+    } else {
+        FUNCTION_IMPORT_NAME.is_match(name)
+    }
+}
+
 /// One segment's `(verb, secret word)` reads — a literal secret name handed
 /// to an enumerated reader or sender as a file, or redirected into one's
 /// standard input (cameronsjo/cadence-hooks#1303) — and the command texts it
 /// runs that [`command_segments`] did not expand (process substitutions, a
-/// shell `-c` script behind options it does not walk).
-fn segment_reads(segment: &str) -> (Vec<(String, String)>, Vec<String>) {
+/// shell `-c` script behind options it does not walk), and, when
+/// `find_secret`, the segment's first secret-like word in any position.
+fn segment_reads(segment: &str, find_secret: bool) -> SegmentReads {
     let (outer, mut children) = split_process_substitutions(segment);
     let (words, stdin) = words_and_stdin(&outer);
+    let imports_function = words.iter().any(|w| imports_a_function(w));
+    // Any secret-like word, for the function rule: read here so the rule
+    // reuses this segmentation instead of walking the command again (#1425).
+    let secret_word = find_secret
+        .then(|| {
+            words
+                .iter()
+                .chain(&stdin)
+                .find(|w| names_a_secret(w, Filename::Known))
+                .cloned()
+        })
+        .flatten();
     let mut argv = if words.len() > PEEL_WORD_LIMIT {
         linear_peel(&words)
     } else {
@@ -3009,10 +3057,20 @@ fn segment_reads(segment: &str) -> (Vec<(String, String)>, Vec<String>) {
             .filter(|w| names_a_secret(w, Filename::Known))
             .map(|w| ("<".to_string(), w))
             .collect();
-        return (reads, children);
+        return SegmentReads {
+            reads,
+            children,
+            secret_word,
+            imports_function,
+        };
     };
     if head.starts_with('#') {
-        return (Vec::new(), children);
+        return SegmentReads {
+            reads: Vec::new(),
+            children,
+            secret_word,
+            imports_function,
+        };
     }
     let mut verb = command_word(head).into_owned();
     if MULTICALL.contains(&verb.as_str()) && argv.len() > 1 {
@@ -3076,7 +3134,12 @@ fn segment_reads(segment: &str) -> (Vec<(String, String)>, Vec<String>) {
         );
     }
     let reads = found.into_iter().map(|w| (verb.clone(), w)).collect();
-    (reads, children)
+    SegmentReads {
+        reads,
+        children,
+        secret_word,
+        imports_function,
+    }
 }
 
 /// `command` with the bodies of heredocs no shell runs left out, for a
@@ -3100,59 +3163,100 @@ fn without_data_heredocs(command: &str) -> Cow<'_, str> {
 /// Most levels of command text [`segment_reads`] hands back for re-scanning.
 const NESTED_SCAN_DEPTH: usize = 8;
 
-/// A shell function definition anywhere in a command: `NAME()` with or
-/// without a group after it, `function NAME` followed by any word, and an
-/// anonymous `()`. Quotes are not read, so a header inside a quoted string
-/// (a `bash -c` or `eval` script, or prose) counts too; that can only add a
-/// block.
+/// A shell function definition: `NAME()` with or without a group after it,
+/// `function NAME` followed by any word, an anonymous `()` or zsh
+/// `function {`, a value starting `() {` (bash's `BASH_FUNC_f%%=() {…}`
+/// environment import), and an assignment to zsh's `functions` array. Quotes
+/// are not read, so a header inside a quoted string (a `bash -c` or `eval`
+/// script, or prose) counts too; that can only add a block.
 static FUNCTION_DEFINITION: LazyLock<Regex> = LazyLock::new(|| {
     const NAME: &str = r#"[^\s(){}<>;&|'"\\$`=]+"#;
     Regex::new(&format!(
-        r#"(?:^|[\s;&|(){{}}!'"`])(?:function[ \t]+{NAME}\s*\S|(?:{NAME})?[ \t]*\([ \t]*\))"#
+        r#"(?:^|[\s;&|(){{}}!'"`])(?:function[ \t]+{NAME}\s*\S|function[ \t]*\{{|(?:{NAME})?[ \t]*\([ \t]*\)|functions(?:\[|\+?=))|=\(\)[ \t]*\{{"#
     ))
     .expect("function definition pattern compiles")
 });
 
-/// The first secret-like word in `command`, read the way the reader scan
-/// reads it: [`command_segments`] resolves visible assignments, `$'…'`,
-/// brace expansion and `printf` substitutions, and [`words_and_stdin`]
-/// joins quoted pieces (`.e''nv` is `.env`). Process substitutions and the
-/// scripts [`segment_reads`] hands back are read too.
-fn first_secret_word(command: &str) -> Option<String> {
-    let mut scripts = vec![(command.to_string(), 0)];
-    while let Some((script, depth)) = scripts.pop() {
-        for segment in command_segments(&script) {
-            let (outer, _) = split_process_substitutions(&segment);
-            let (words, stdin) = words_and_stdin(&outer);
-            if let Some(secret) = words
-                .into_iter()
-                .chain(stdin)
-                .find(|w| names_a_secret(w, Filename::Known))
-            {
-                return Some(secret);
-            }
-            if depth < NESTED_SCAN_DEPTH {
-                let (_, children) = segment_reads(&segment);
-                scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
+/// A word that assigns a variable, `NAME=value` or `NAME+=value`.
+static ASSIGNMENT_WORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)$").expect("assignment pattern compiles")
+});
+
+/// A `$NAME` or `${NAME}` reference, or `${NAME:-…}` and the other
+/// default operators, read as the variable's value.
+static VARIABLE_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-=+?][^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))")
+        .expect("reference pattern compiles")
+});
+
+/// Record each variable `segment` assigns a parenthesis, which
+/// [`command_segments`] leaves unsubstituted: `P='('; eval "f$P) {…}"`
+/// defines `f` (#1425). Words are read dequoted, every assignment word
+/// counts (`P='(' Q=')'`), and a later value replaces an earlier one, as in
+/// bash.
+fn record_paren_assignments(segment: &str, vars: &mut HashMap<String, String>) {
+    // A parenthesis written as itself, or as an escape in `$'…'`.
+    if !segment.contains('=') || !(segment.contains(['(', ')']) || segment.contains("$'")) {
+        return;
+    }
+    let (words, _) = words_and_stdin(segment);
+    for word in &words {
+        if let Some(captures) = ASSIGNMENT_WORD.captures(word) {
+            let value = &captures[2];
+            if value.contains(['(', ')']) {
+                vars.insert(captures[1].to_string(), value_ends(value));
             }
         }
     }
-    None
 }
 
-/// A secret-like name in a command that defines a shell function:
-/// `f(){ cat "$1"; }; f .env` makes bash read `.env`, yet the name never
-/// sits where a reader takes a file (cameronsjo/cadence-hooks#1409). What
-/// the function does with its arguments is not read: where a body ends, how
-/// it reads them and how a name is spelled each had shapes a list missed
-/// (#1420 review), so any definition and any secret name block. Linear: one
-/// pattern search, then the reader scan's own segmentation.
-fn function_and_secret_word(command: &str, detect: fn() -> bool) -> Option<CheckResult> {
-    if !FUNCTION_DEFINITION.is_match(command) {
-        return None;
+/// The first and last few characters of `value`. A header inside a value
+/// is already in the text: written with a literal parenthesis it is in the
+/// assignment's own segment, and [`command_segments`] decodes a `$'…'`
+/// value into the reference. Only a value's ends can join the text around a
+/// reference into a new header, so keeping just the ends bounds the
+/// substituted text (#1425 security review).
+fn value_ends(value: &str) -> String {
+    const KEEP: usize = 4;
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 2 * KEEP {
+        return value.to_string();
     }
-    let secret = first_secret_word(command)?;
-    Some(CheckResult::block(with_forgectl_hint(
+    chars[..KEEP]
+        .iter()
+        .chain(&chars[chars.len() - KEEP..])
+        .collect()
+}
+
+/// Does `text` define a shell function, read as is or with the
+/// parenthesis-valued variables in `vars` substituted? A wrong substitution
+/// can only add a block. One pass over `text` per call.
+fn defines_a_function(text: &str, vars: &HashMap<String, String>) -> bool {
+    FUNCTION_DEFINITION.is_match(text)
+        || (!vars.is_empty()
+            && text.contains('$')
+            && FUNCTION_DEFINITION.is_match(&VARIABLE_REFERENCE.replace_all(
+                text,
+                |captures: &regex::Captures| {
+                    let name = captures
+                        .get(1)
+                        .or_else(|| captures.get(2))
+                        .map_or("", |m| m.as_str());
+                    vars.get(name)
+                        .cloned()
+                        .unwrap_or_else(|| captures[0].to_string())
+                },
+            )))
+}
+
+/// The block for a secret-like name in a command that defines a shell
+/// function: `f(){ cat "$1"; }; f .env` makes bash read `.env`, yet the name
+/// never sits where a reader takes a file (cameronsjo/cadence-hooks#1409).
+/// What the function does with its arguments is not read: where a body
+/// ends, how it reads them and how a name is spelled each had shapes a list
+/// missed (#1420 review), so any definition and any secret name block.
+fn function_block(secret: &str, detect: fn() -> bool) -> CheckResult {
+    CheckResult::block(with_forgectl_hint(
         format!(
             "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
              Found: `{secret}` in a command that defines a shell function\n\
@@ -3165,9 +3269,9 @@ fn function_and_secret_word(command: &str, detect: fn() -> bool) -> Option<Check
         ),
         HintKind::Read,
         None,
-        &secret,
+        secret,
         detect,
-    )))
+    ))
 }
 
 /// Check if a bash command would put a secret file's contents in front of
@@ -3188,23 +3292,44 @@ fn bash_leaks_secrets(
     // Segmented from the ORIGINAL command (#508): `command_segments` expands
     // `bash -c` scripts, substitutions, and visible assignments, so a wrapped
     // or `F=.env; cat $F` read is a segment of its own.
+    // The function rule (#1409) reads the same walk: a definition in the
+    // raw text, any script or any resolved segment arms it, so a header
+    // spelled with a continuation, `eval` quoting or `$'…'` counts (#1425).
+    let mut defines_function = false;
+    let mut paren_vars: HashMap<String, String> = HashMap::new();
+    let mut secret_word: Option<String> = None;
     let mut scripts = vec![(command.to_string(), 0)];
     while let Some((script, depth)) = scripts.pop() {
+        defines_function = defines_function || defines_a_function(&script, &paren_vars);
         for segment in command_segments(&script) {
-            let (reads, children) = segment_reads(&segment);
+            if !defines_function {
+                record_paren_assignments(&segment, &mut paren_vars);
+                defines_function = defines_a_function(&segment, &paren_vars);
+            }
+            let SegmentReads {
+                reads,
+                children,
+                secret_word: secret,
+                imports_function,
+            } = segment_reads(&segment, secret_word.is_none());
+            defines_function = defines_function || imports_function;
             for (verb, token) in reads {
                 if envrc_bash_read_allowed(&token, cwd, || *command_has_cd, || *envrc_replaceable) {
                     continue;
                 }
                 return Some(read_block(&verb, &token, detect));
             }
+            secret_word = secret_word.or(secret);
             if depth < NESTED_SCAN_DEPTH {
                 scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
             }
         }
+        // The script again with every value its segments assigned: the
+        // segmentation can substitute an older value (`P=')'; P='('`).
+        defines_function = defines_function || defines_a_function(&script, &paren_vars);
     }
-    if let Some(block) = function_and_secret_word(command, detect) {
-        return Some(block);
+    if defines_function && let Some(secret) = secret_word {
+        return Some(function_block(&secret, detect));
     }
 
     // Warn: env dump commands. Must appear as the executed command at the
@@ -7112,6 +7237,105 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "no function definition, or no secret name",
+        );
+    }
+
+    #[test]
+    fn function_definition_found_in_resolved_text_blocked() {
+        // cameronsjo/cadence-hooks#1425, I1: a header the raw text does not
+        // show, spelled with a continuation, `eval` quoting, `$'…'` or an
+        // assignment. Each makes bash or zsh read `.env`.
+        assert_bash(
+            &[
+                "fu\\\nnction f { cat \"$1\"; }; f .env",
+                "function \\\nf { cat \"$1\"; }; f .env",
+                "f(\\\n){ cat \"$1\"; }; f .env",
+                r#"eval f\(\)\{\ cat\ \$1\;\ \}; f .env"#,
+                r#"eval "f(""){ cat \$1; }"; f .env"#,
+                "eval \"f(\\\n){ cat \\$1; }\"; f .env",
+                r#"eval $'f\x28\x29{ cat "$1"; }'; f .env"#,
+                r#"eval $'f\50\51{ cat "$1"; }'; f .env"#,
+                r#"P='('; eval "f$P) { cat \$1; }"; f .env"#,
+                r#"eval "f$(printf %s '(' ')'){ cat \"\$1\"; }"; f .env"#,
+                // Polish review: the last value counts, and every
+                // assignment word in a segment.
+                r#"P=')'; P='('; eval "f$P) { cat \$1; }"; f .env"#,
+                r#"P='(' Q=')'; eval "f$P$Q{ cat \$1; }"; f .env"#,
+                r#"export P='(' Q=')'; eval "f${P}${Q}{ cat \$1; }"; f .env"#,
+                // Security review I-2: a default operator, and `$'…'`.
+                r#"P='('; eval "f${P:-}) { cat \$1; }"; f .env"#,
+                r#"P='('; eval "f${P-}) { cat \$1; }"; f .env"#,
+                r#"P=$'\x28'; eval "f$P) { cat \$1; }"; f .env"#,
+                // Only a value's ends are substituted; a header inside a
+                // long value is still read where it is written.
+                r#"P=$'#padding\nf\x28\x29{ cat "$1"; }'; eval "$P"; f .env"#,
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a definition only the resolved text shows",
+        );
+    }
+
+    #[test]
+    fn function_definition_spellings_blocked() {
+        // cameronsjo/cadence-hooks#1425, I2: zsh's nameless `function {`,
+        // its `functions` array, and bash's environment import.
+        assert_bash(
+            &[
+                "function { cat $1; } .env",
+                "functions[f]='cat $1'; f .env",
+                "functions+=(f 'cat $1'); f .env",
+                r#"env 'BASH_FUNC_f%%=() { cat "$1"; }' bash -c 'f .env'"#,
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a definition spelling",
+        );
+        assert_bash(
+            &[
+                "files=(); echo README.md",
+                // Only a value starting `() {` is an import (security review).
+                "files=(); echo .env",
+                "declare -a args=(); args+=(--env-file .env); docker compose \"${args[@]}\" config",
+                "x=foo(); echo .env",
+                r#"echo "call=compute()" .env"#,
+                "echo functions; echo .env.example",
+                // `functions` is read only as a command word.
+                "jq '.functions[0]' package.json; echo .env",
+                "cmd --functions=all; echo .env",
+                r#"git commit -m 'the functions page'"#,
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a spelling with no secret name",
+        );
+    }
+
+    #[test]
+    fn function_import_found_by_its_name_blocked() {
+        // #1430 review: bash imports a function from any `BASH_FUNC_<name>%%`
+        // whose value is `() {` after quote removal, and `command_segments`
+        // does not decode an `env` operand, so the name decides.
+        assert_bash(
+            &[
+                r#"env BASH_FUNC_f%%=$'\x28\x29 { cat "$1"; }' bash -c 'f .env'"#,
+                r"env BASH_FUNC_f%%=$'\50\51 { cat $1; }' bash -c 'f .env'",
+                r"env BASH_FUNC_f%%=\(\)\ \{\ cat\ \$1\;\ \} bash -c 'f .env'",
+                r"env BASH_FUNC_f%%='('')'' { cat $1; }' bash -c 'f .env'",
+                r#"env BASH_FUNC_f%%="("")"' { cat $1; }' bash -c 'f .env'"#,
+                r"env 'BASH_FUNC_f()=() { cat $1; }' bash -c 'f .env'",
+                r"export BASH_FUNC_f%%=$'\x28\x29 { cat $1; }'; bash -c 'f .env'",
+                r"BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
+                r"env BASH_FUNC_f\%\%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
+                r#"env "BASH_FUNC_f%%"=$'\x28\x29 { cat $1; }' bash -c 'f .env'"#,
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a function import named BASH_FUNC_",
+        );
+        assert_bash(
+            &[
+                r"env BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f README.md'",
+                "echo BASH_FUNC_f; echo .env.example",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "an import with no secret name",
         );
     }
 
