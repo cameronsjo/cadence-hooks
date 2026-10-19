@@ -792,7 +792,7 @@ fn describe(range: &Range) -> String {
             range
                 .sources
                 .iter()
-                .map(|s| sane(s))
+                .map(|s| shown(s))
                 .collect::<Vec<_>>()
                 .join("`, `")
         )
@@ -827,6 +827,20 @@ fn sources_are_commits(work_dir: &str, range: &Range) -> Result<(), Stop> {
             describe(range)
         ))),
     }
+}
+
+/// Does `source` peel to a commit? A failed or timed-out probe reads as no.
+fn peels_to_commit(work_dir: &str, source: &str) -> bool {
+    let peeled = format!("{source}^{{commit}}");
+    matches!(
+        git(
+            work_dir,
+            &["rev-parse", "-q", "--verify", &peeled],
+            4096,
+            Budget::Probe
+        ),
+        Git::Ok(_)
+    )
 }
 
 /// git push matches a refspec source against ref NAMES before reading it as
@@ -1442,10 +1456,12 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
         }
     }
     let shas: Vec<String> = tags.iter().map(|(_, sha)| sha.clone()).collect();
-    for ((name, _), object) in tags
-        .iter()
-        .zip(read_objects(work_dir, &shas, "tag objects")?)
-    {
+    let objects = match read_objects(work_dir, &shas, "tag objects") {
+        Ok(objects) => objects,
+        Err(stop) if hits.is_empty() => return Err(stop),
+        Err(_) => return Ok(hits),
+    };
+    for ((name, _), object) in tags.iter().zip(objects) {
         // The header's `type` line: a tag of a tag carries a second message
         // this read never sees, a tag of a tree or blob publishes content no
         // patch shows.
@@ -1715,18 +1731,45 @@ fn judge_invocation(
     writer: Option<&str>,
     exempt: Exempt,
 ) -> Result<(), Stop> {
-    let Some(range) = range_of(inv, hints)? else {
+    let Some(mut range) = range_of(inv, hints)? else {
         return Ok(());
     };
-    let explain = |stop| explain_unresolved_range(&inv.work_dir, &range, writer, stop);
-    sources_are_commits(&inv.work_dir, &range).map_err(explain)?;
-    hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
-    let (shas, over) = outbound(&inv.work_dir, &range).map_err(explain)?;
     // A part that cannot be scanned does not stop the others: a secret found
     // anywhere still blocks, and only an otherwise clean push is let through
     // with the warning.
-    let mut hits = Vec::new();
     let mut unscanned: Option<Stop> = None;
+    if let Err(stop) = sources_are_commits(&inv.work_dir, &range) {
+        // A source that does not peel to a commit (a tree or blob tag, a
+        // missing ref) warns, and the sources that do are still scanned, so
+        // `git push origin main treetag` still finds a secret on `main`.
+        unscanned = Some(explain_unresolved_range(
+            &inv.work_dir,
+            &range,
+            writer,
+            stop,
+        ));
+        range
+            .sources
+            .retain(|s| s == "HEAD" || peels_to_commit(&inv.work_dir, s));
+    }
+    hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
+    let (shas, over) = match outbound(&inv.work_dir, &range) {
+        Ok(found) => found,
+        Err(stop) => {
+            let stop = explain_unresolved_range(&inv.work_dir, &range, writer, stop);
+            // Nothing to walk, but the ref names the push writes are still
+            // read for a secret.
+            if let Some(what) = range.names.iter().find_map(|n| scan_text(n)) {
+                return Err(Stop::Found(vec![Hit {
+                    sha: "ref".into(),
+                    path: "(pushed ref name)".into(),
+                    what,
+                }]));
+            }
+            return Err(unscanned.unwrap_or(stop));
+        }
+    };
+    let mut hits = Vec::new();
     let mut keep = |part: Result<Vec<Hit>, Stop>, hits: &mut Vec<Hit>| match part {
         Ok(found) => hits.extend(found),
         Err(Stop::Found(found)) => hits.extend(found),
@@ -2049,6 +2092,27 @@ mod tests {
         ] {
             assert_blocks(&fx.run(command), &["src/cfg.txt", "would publish a secret"]);
         }
+    }
+
+    /// A source that does not peel to a commit warns, and the other sources
+    /// of the same push are still scanned.
+    #[test]
+    fn a_tree_tag_source_beside_a_secret_branch_still_blocks() {
+        let fx = Fx::new("treetag-beside");
+        fx.git(&["tag", "-a", "treetag", "-m", "t", "HEAD^{tree}"]);
+        fx.commit("src/cfg.txt", &format!("key={}\n", aws_key()), "add cfg");
+        for command in [
+            "git push origin main treetag",
+            "git push origin main refs/tags/treetag:refs/tags/z",
+            "git push origin treetag main",
+        ] {
+            assert_blocks(&fx.run(command), &["src/cfg.txt"]);
+        }
+        let name = format!("refs/tags/x-{}", gh_token());
+        assert_blocks(
+            &fx.run(&format!("git push origin treetag:{name}")),
+            &["ref name"],
+        );
     }
 
     #[test]
