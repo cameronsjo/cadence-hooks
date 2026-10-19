@@ -143,11 +143,10 @@ fn modest_brace_expansions_still_pass() {
 }
 
 /// Every guard that refuses an unread command.
-const REFUSING: [[&str; 2]; 6] = [
+const REFUSING: [[&str; 2]; 5] = [
     ["cadence", "git-safety"],
     ["cadence", "prevent-secret-writes"],
     ["cadence", "prevent-secret-leaks"],
-    ["cadence", "prevent-secret-push"],
     ["guardrails", "guard-push-remote"],
     ["obsidian", "trash-guard"],
 ];

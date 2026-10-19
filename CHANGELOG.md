@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`prevent-secret-push` warns instead of blocking a push it cannot fully read; a secret it finds still blocks.** Every refusal of the form "this push cannot be scanned" (a `cd "$D"` or `git -C "$VAR"` it cannot follow, a `$SHA` source, a commit made in the same call as the push, an unborn branch, a directory an earlier command creates, a submodule-recursing push, a range over 2000 commits or a patch over 32 MiB, a failed or timed-out git spawn, `git send-pack`/`http-push`/remote helpers, a dashed `git-push`) now lets the push go ahead with a warning that names the cause and its fix. These refusals made up most of the guard's friction reports (cameronsjo/cadence-hooks#1378, #1381, #1384, #1386) and almost never stood between a secret and a remote. A warning never ends the scan: the parts of the push it could read are still scanned, and so is every later push in the same command, so a secret found anywhere blocks as before. The alias probe is gone: a `git <sub>` is no longer looked up in the config to prove it is not an alias that pushes, so the refusals for an unresolved directory, a config redirect, `help.autocorrect` or a wrapper's `"$@"` no longer fire, and a push through a config alias goes ahead unscanned. The guard no longer refuses a command the dispatch seam could not fully expand. `CADENCE_ALLOW_SECRET_PUSH` now applies only to a found secret; a warning needs no escape and writes no bypass row. (cameronsjo/cadence-hooks#1373)
+
 ## [0.129.0] - 2026-10-18
 
 ### Security
