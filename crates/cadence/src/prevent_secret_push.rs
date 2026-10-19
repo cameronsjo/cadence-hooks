@@ -1419,6 +1419,8 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
             });
         }
     }
+    // A ref or tag this cannot scan warns, unless a secret was found too.
+    let mut unscannable: Option<String> = None;
     let mut tags: Vec<(String, String)> = Vec::new();
     for r in &refs {
         match r.kind.as_str() {
@@ -1428,11 +1430,15 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
                     tags.push((r.name.clone(), r.sha.clone()));
                 }
             }
-            other => hits.push(Hit {
-                sha: "ref".into(),
-                path: shown(&r.name),
-                what: format!("points at a {}, which this guard cannot scan", sane(other)),
-            }),
+            other => {
+                unscannable.get_or_insert_with(|| {
+                    format!(
+                        "the ref `{}` points at a {}, which this guard cannot scan",
+                        shown(&r.name),
+                        sane(other)
+                    )
+                });
+            }
         }
     }
     let shas: Vec<String> = tags.iter().map(|(_, sha)| sha.clone()).collect();
@@ -1449,13 +1455,12 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
             .take_while(|l| !l.is_empty())
             .find_map(|l| l.strip_prefix("type "));
         if target != Some("commit") {
-            hits.push(Hit {
-                sha: "tag".into(),
-                path: shown(name),
-                what: format!(
-                    "tags a {}, which this guard cannot scan",
+            unscannable.get_or_insert_with(|| {
+                format!(
+                    "the tag `{}` tags a {}, which this guard cannot scan",
+                    shown(name),
                     sane(target.unwrap_or("unreadable object"))
-                ),
+                )
             });
         }
         if let Some(what) = scan_text(&object.body) {
@@ -1466,7 +1471,10 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
             });
         }
     }
-    Ok(hits)
+    match unscannable {
+        Some(why) if hits.is_empty() => Err(Stop::Refused(why)),
+        _ => Ok(hits),
+    }
 }
 
 /// Every reason the command's pushes stop short of a clean scan: a
@@ -1786,7 +1794,7 @@ fn render_unscanned(stop: &Stop) -> String {
         Stop::Found(_) => ("", None),
     };
     let mut out = format!(
-        "prevent-secret-push: this push goes ahead without a secret scan — {why}.\n\
+        "prevent-secret-push: this push goes ahead without a full secret scan — {why}.\n\
          What it publishes was not fully checked for credentials."
     );
     if let Some(fix) = fix {
@@ -2002,7 +2010,7 @@ mod tests {
     fn assert_warns(r: &CheckResult, needles: &[&str]) {
         assert_eq!(r.outcome, Outcome::Nudge, "{:?}", r.message);
         let msg = r.message.as_deref().unwrap_or("");
-        assert!(msg.contains("without a secret scan"), "{msg}");
+        assert!(msg.contains("without a full secret scan"), "{msg}");
         for n in needles {
             assert!(msg.contains(n), "missing {n:?} in {msg}");
         }
@@ -2718,17 +2726,17 @@ mod tests {
         let blob = git_out(&fx.work, &["hash-object", "-w", file.to_str().unwrap()]);
         fx.git(&["tag", "blobtag", &blob]);
         assert_warns(&fx.run("git push origin blobtag"), &["blobtag"]);
-        assert_blocks(&fx.run("git push --tags origin"), &["blobtag", "blob"]);
+        assert_warns(&fx.run("git push --tags origin"), &["blobtag", "blob"]);
         let fx = Fx::new("treetag");
         fx.git(&["tag", "-a", "treetag", "-m", "t", "HEAD^{tree}"]);
         assert_warns(&fx.run("git push origin treetag"), &["treetag"]);
-        assert_blocks(&fx.run("git push --tags origin"), &["treetag", "tree"]);
+        assert_warns(&fx.run("git push --tags origin"), &["treetag", "tree"]);
         // A tag of a tag hides a second message.
         let fx = Fx::new("nestedtag");
         fx.git(&["tag", "-a", "inner", "-m", &format!("x {}", gh_token())]);
         fx.git(&["tag", "-a", "outer", "-m", "outer", "inner"]);
         fx.git(&["tag", "-d", "inner"]);
-        assert_blocks(&fx.run("git push origin outer"), &["outer", "tag"]);
+        assert_warns(&fx.run("git push origin outer"), &["outer", "tag"]);
     }
 
     #[test]
@@ -2977,7 +2985,7 @@ mod tests {
         let tag = git_out(&fx.work, &["rev-parse", "refs/tags/tt"]);
         fx.git(&["tag", "-d", "tt"]);
         force_ref(&fx, "refs/heads/tt", &tag);
-        assert_blocks(&fx.run("git push --all origin"), &["tree"]);
+        assert_warns(&fx.run("git push --all origin"), &["tree"]);
     }
 
     #[test]
