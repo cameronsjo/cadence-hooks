@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`git-safety` nudges on every `git rebase`, including onto `main` or `master`.** `git rebase origin/main` already nudged, but `git rebase main`, `git rebase -i master` and `git rebase --onto X Y main` blocked as "Rebase onto protected branch". A rebase rewrites local history that the reflog restores, which cadence-ecosystem ADR-0046 rule 2 does not count as a costly harm. Every form now gets the existing "may modify history or lose work" nudge. A force-push of the result to `main` still blocks. (Part of cameronsjo/cadence-hooks#1443)
 
+## [0.130.1] - 2026-10-20
+
+### Fixed
+
+- **The redaction scan's `skill-id` category no longer flags a host:port or an image tag.** `media-mcp:3000`, `obaass-mcp:3000`, `homelab-mcp:main`, `ghcr.io/owner/core:main`, a bare `mcp:3000` and `core:v1.2` were reported as skill IDs because the namespace matched at the end of a longer name and the skill part allowed a leading digit. A skill ID is now matched only when its namespace starts the token (a `/` that starts it, as in `/cadence:outro`, still counts), its skill name starts with a letter, and no `.` plus a name character follows it. True skill IDs such as `cadence:writing-skills` and `cadence-forge:polish` still flag; a standalone `mcp:main` still flags, since its shape is a skill ID's.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
