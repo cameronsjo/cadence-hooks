@@ -8,9 +8,10 @@
 
 use crate::registry;
 use cadence_hooks_core::{HookEvent, LOGGER_SAMPLE_PAYLOAD};
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Maximum bytes of payload echoed in the report. User-supplied payloads
 /// (`--payload`) can carry real command text or file content — bound the
@@ -18,12 +19,20 @@ use std::process::{Command, Stdio};
 /// `--show-payload` opts in to the full echo.
 const PAYLOAD_PREVIEW_LIMIT: usize = 200;
 
-/// Run `<namespace> <subcommand>` against a sample (or `--payload`) payload
-/// and print a report.
+/// How long `try` waits for piped stdin to reach end of file. A pipe that
+/// stays open with nothing on it (a harness that never closes stdin) must not
+/// hang `try`; past this it runs the generated sample and says so.
+const STDIN_WAIT: Duration = Duration::from_secs(2);
+
+/// Run `<namespace> <subcommand>` against a payload and print a report.
+///
+/// The payload is the `--payload` file, else a payload piped to stdin, else a
+/// generated sample. Stdin that is a terminal, empty, or still open after
+/// [`STDIN_WAIT`] falls back to the sample.
 ///
 /// Exit code: the hook's own exit code on a successful run (0 allow/nudge,
 /// 2 block), or 1 when the hook could not be run at all (unknown name,
-/// unreadable payload file, spawn failure).
+/// unreadable payload file or stdin, spawn failure).
 pub fn run(
     namespace: &str,
     subcommand: &str,
@@ -47,9 +56,9 @@ pub fn run(
         return 1;
     };
 
-    let payload = match payload_file {
+    let (payload, user_supplied) = match payload_file {
         Some(path) => match std::fs::read_to_string(path) {
-            Ok(s) => s,
+            Ok(s) => (s, true),
             Err(e) => {
                 eprintln!(
                     "cadence-hooks: cannot read payload file {}: {e}",
@@ -58,7 +67,35 @@ pub fn run(
                 return 1;
             }
         },
-        None => sample_payload_with_cwd(namespace, subcommand, entry.event()),
+        None => {
+            let piped = if std::io::stdin().is_terminal() {
+                Piped::Empty
+            } else {
+                read_piped(std::io::stdin(), STDIN_WAIT)
+            };
+            match piped {
+                Piped::Payload(s) => (s, true),
+                Piped::Empty => (
+                    sample_payload_with_cwd(namespace, subcommand, entry.event()),
+                    false,
+                ),
+                Piped::TimedOut => {
+                    eprintln!(
+                        "cadence-hooks: stdin stayed open with no payload for {} s; \
+                         running the generated sample. Pipe a payload, or pass --payload FILE.",
+                        STDIN_WAIT.as_secs()
+                    );
+                    (
+                        sample_payload_with_cwd(namespace, subcommand, entry.event()),
+                        false,
+                    )
+                }
+                Piped::Failed(e) => {
+                    eprintln!("cadence-hooks: cannot read the payload piped to stdin: {e}");
+                    return 1;
+                }
+            }
+        }
     };
 
     let exe = match std::env::current_exe() {
@@ -78,7 +115,7 @@ pub fn run(
     cadence_hooks_core::outln!("Event:    {event_label}");
     cadence_hooks_core::outln!(
         "Payload:  {}",
-        payload_preview(payload.trim(), payload_file.is_some(), show_payload)
+        payload_preview(payload.trim(), user_supplied, show_payload)
     );
     cadence_hooks_core::outln!();
 
@@ -178,6 +215,37 @@ pub fn run(
     print_stream("Stderr", &output.stderr);
 
     code
+}
+
+/// What `try` found on a non-terminal stdin.
+#[derive(Debug, PartialEq)]
+enum Piped {
+    /// A payload: anything but whitespace.
+    Payload(String),
+    /// Nothing, or only whitespace (stdin is `/dev/null`, or closed at once).
+    Empty,
+    /// No end of file within the wait.
+    TimedOut,
+    /// The read failed (for example, the bytes are not UTF-8).
+    Failed(String),
+}
+
+/// Read `reader` to end of file on a helper thread, waiting at most `wait`.
+///
+/// On a timeout the thread is left blocked on the read; the process exits
+/// when `try` finishes, which ends it.
+fn read_piped<R: Read + Send + 'static>(mut reader: R, wait: Duration) -> Piped {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = tx.send(reader.read_to_string(&mut buf).map(|_| buf));
+    });
+    match rx.recv_timeout(wait) {
+        Ok(Ok(s)) if s.trim().is_empty() => Piped::Empty,
+        Ok(Ok(s)) => Piped::Payload(s),
+        Ok(Err(e)) => Piped::Failed(e.to_string()),
+        Err(_) => Piped::TimedOut,
+    }
 }
 
 /// The hook's stdout decoded per the hook protocol.
@@ -421,6 +489,49 @@ mod tests {
         let short = r#"{"tool_name":"Bash"}"#;
         let preview = payload_preview(short, true, false);
         assert_eq!(preview, short, "short payloads need no truncation");
+    }
+
+    // --- piped stdin ---
+
+    #[test]
+    fn piped_payload_is_used() {
+        let piped = read_piped(
+            std::io::Cursor::new(r#"{"tool_name":"Bash"}"#),
+            Duration::from_secs(5),
+        );
+        assert_eq!(piped, Piped::Payload(r#"{"tool_name":"Bash"}"#.into()));
+    }
+
+    #[test]
+    fn empty_or_blank_stdin_falls_back_to_the_sample() {
+        for input in ["", "  \n"] {
+            let piped = read_piped(std::io::Cursor::new(input), Duration::from_secs(5));
+            assert_eq!(piped, Piped::Empty, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn stdin_that_never_closes_times_out() {
+        struct Stalled;
+        impl Read for Stalled {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(3));
+                Ok(0)
+            }
+        }
+        assert_eq!(
+            read_piped(Stalled, Duration::from_millis(50)),
+            Piped::TimedOut
+        );
+    }
+
+    #[test]
+    fn non_utf8_stdin_is_a_read_failure() {
+        let piped = read_piped(
+            std::io::Cursor::new(vec![0xff, 0xfe]),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(piped, Piped::Failed(_)), "{piped:?}");
     }
 
     // --- stdout protocol decoding ---
