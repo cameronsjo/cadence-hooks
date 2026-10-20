@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`guard-push-remote` nudges, not blocks, on a chain or loop it cannot parse.** The loop parser reads at most 12 KB (since 0.128.0). On a parse failure the guard blocked any command with two pushes ("multiple git push commands — cannot verify targets") and any loop holding a push. So a long comment or heredoc in front of `git push origin feat && git push origin feat:feat2` blocked, and the fix text suggested the shape it had just blocked. Under cadence-ecosystem ADR-0046 rule 3 the guard now goes on to judge each push on its own target, and the command gets a nudge. A push to a remote you do not own still blocks. (Part of cameronsjo/cadence-hooks#1443)
 
+## [0.130.1] - 2026-10-20
+
+### Fixed
+
+- **The redaction scan's `skill-id` category no longer flags a host:port or an image tag.** `media-mcp:3000`, `obaass-mcp:3000`, `homelab-mcp:main`, `ghcr.io/owner/core:main`, a bare `mcp:3000` and `core:v1.2` were reported as skill IDs because the namespace matched at the end of a longer name and the skill part allowed a leading digit. A skill ID is now matched only when its namespace starts the token (a `/` that starts it, as in `/cadence:outro`, still counts), its skill name starts with a letter, and no `.` plus a name character follows it. True skill IDs such as `cadence:writing-skills` and `cadence-forge:polish` still flag; a standalone `mcp:main` still flags, since its shape is a skill ID's.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
