@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`guard-gh-write` counts a loop with a comment or non-ASCII text as plain.** A plain loop's literal `gh api` paths count as its targets, but any `#` or byte outside printable ASCII refused that shape. So `for n in 1 2; do gh api -X POST repos/<owner>/<repo>/issues/$n/comments -f body=x; done # ping both`, or the same loop with `body=café`, blocked from an unowned directory. That refusal worked around a comment-stripper bug that #1390 fixed. Now only `|` and `&` refuse the shape. (Part of cameronsjo/cadence-hooks#1443)
 
+## [0.130.1] - 2026-10-20
+
+### Fixed
+
+- **The redaction scan's `skill-id` category no longer flags a host:port or an image tag.** `media-mcp:3000`, `obaass-mcp:3000`, `homelab-mcp:main`, `ghcr.io/owner/core:main`, a bare `mcp:3000` and `core:v1.2` were reported as skill IDs because the namespace matched at the end of a longer name and the skill part allowed a leading digit. A skill ID is now matched only when its namespace starts the token (a `/` that starts it, as in `/cadence:outro`, still counts), its skill name starts with a letter, and no `.` plus a name character follows it. True skill IDs such as `cadence:writing-skills` and `cadence-forge:polish` still flag; a standalone `mcp:main` still flags, since its shape is a skill ID's.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
