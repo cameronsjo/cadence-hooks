@@ -122,7 +122,7 @@ struct PathShape(Vec<Comp>);
 
 impl PathShape {
     /// Split `text` into components. `shell` classifies glob and opaque
-    /// components (a Bash target); a Write-tool path is all literal.
+    /// components; every caller passes a tool path, which is all literal.
     fn parse(text: &str, shell: bool) -> Vec<Comp> {
         text.replace('\\', "/")
             .split('/')
@@ -289,8 +289,8 @@ fn physical_walk(path: &Path) -> Option<(PathBuf, bool)> {
 
 /// [`physical`] with each distinct parent directory walked once per run.
 ///
-/// A command with thousands of targets in a handful of directories would
-/// otherwise re-walk (and re-`stat`) the same directory chain per target. The
+/// Several paths in a handful of directories would otherwise re-walk (and
+/// re-`stat`) the same directory chain per path. The
 /// final component is still looked up every time, since it may itself be a
 /// symlink (a file link pointing into the protected dir).
 #[derive(Default)]
@@ -593,8 +593,7 @@ impl RunbookScrubGuard {
         let Some(dir) = RunbooksDir::resolve(dir, home, &cwd) else {
             return CheckResult::allow();
         };
-        // The marker directory, as spellings (lexical and physical). Its
-        // parents, which only the Bash arm reads, are worked out there.
+        // The marker directory, as spellings (lexical and physical).
         let marker_spellings = marker_dir
             .and_then(|m| RunbooksDir::resolve(Some(m), home, &cwd))
             .map(|m| m.spellings);
@@ -872,6 +871,15 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn a_tilde_in_the_configured_directory_expands() {
+        let write = with_cwd(make_write("/home/op/Vault/Runbooks/a.md", "b"), "/");
+        assert_eq!(
+            outcome(&write, Some("~/Vault/Runbooks"), &[]),
+            Outcome::Block
+        );
     }
 
     #[test]

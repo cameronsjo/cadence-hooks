@@ -777,7 +777,7 @@ fn scan_prepared(command: &str, cwd: &str, env: CdEnv<'_>, plain: Option<&Plain>
     if out.unreadable.is_some() {
         let here = normalize_target(cwd);
         if !out.commits.contains(&here) {
-            out.guesses.push(here.clone());
+            out.guesses.note(&here, true);
             out.commits.push(here);
         }
     }
@@ -932,11 +932,7 @@ fn merge_scan(out: &mut Scan, extra: Scan) {
             out.read_commits.push(target);
         }
     }
-    for target in extra.guesses {
-        if !out.guesses.contains(&target) {
-            out.guesses.push(target);
-        }
-    }
+    out.guesses.merge(extra.guesses);
 }
 
 /// Test stand-in for the on-disk probes: every path exists, so the parser
@@ -1153,11 +1149,47 @@ struct Scan {
     /// A commit after it is in a directory the command names, not only a
     /// stand-in. Local to one walk: [`merge_scan`] keeps the first walk's.
     cd_names_cwd: Option<usize>,
-    /// Commit targets the guard guessed, not read: one built on a directory
-    /// value it could not read, or the session cwd standing in for a commit
-    /// whose checkout is [`Scan::unreadable`] ([`scan_prepared`],
-    /// cameronsjo/cadence-hooks#1437).
-    guesses: Vec<CommitTarget>,
+    /// Which commit targets the guard guessed rather than read
+    /// (cameronsjo/cadence-hooks#1437).
+    guesses: Guesses,
+}
+
+/// Commit targets the guard guessed: one built on a directory value it could
+/// not read, or the session cwd standing in for a commit whose checkout is
+/// [`Scan::unreadable`] ([`scan_prepared`]). A target any commit read is not
+/// a guess, so two spellings that fold to one path cannot hide a reading
+/// (cameronsjo/cadence-hooks#1437).
+#[derive(Default)]
+struct Guesses {
+    guessed: Vec<CommitTarget>,
+    read: Vec<CommitTarget>,
+}
+
+impl Guesses {
+    fn note(&mut self, target: &CommitTarget, guess: bool) {
+        let list = if guess {
+            &mut self.guessed
+        } else {
+            &mut self.read
+        };
+        if !list.contains(target) {
+            list.push(target.clone());
+        }
+    }
+
+    fn merge(&mut self, other: Guesses) {
+        for target in &other.guessed {
+            self.note(target, true);
+        }
+        for target in &other.read {
+            self.note(target, false);
+        }
+    }
+
+    /// Only guessed: no commit in the command read this target.
+    fn only_guessed(&self, target: &CommitTarget) -> bool {
+        self.guessed.contains(target) && !self.read.contains(target)
+    }
 }
 
 /// The words a segment's command runs with: every unquoted redirection (and a
@@ -3444,7 +3476,7 @@ fn union_commits(
                     git_dir,
                     env,
                     &mut scratch,
-                    &mut Vec::new(),
+                    &mut Guesses::default(),
                 );
                 for target in &targets {
                     let read = i > 0
@@ -4294,7 +4326,7 @@ fn commit_targets_of(
     env_git_dir: Option<&str>,
     env: CdEnv<'_>,
     unreadable: &mut Option<String>,
-    guesses: &mut Vec<CommitTarget>,
+    guesses: &mut Guesses,
 ) -> Vec<CommitTarget> {
     let Some(verb) = argv.first() else {
         return Vec::new();
@@ -4352,8 +4384,15 @@ fn commit_targets_of(
                         // hop reads the path the last one built.
                         hops += 1;
                         if unread.is_some() {
-                            // The target is already unreadable; this hop
-                            // cannot make it readable again.
+                            // The target is already unreadable; only an
+                            // absolute hop the guard reads lands it again
+                            // (cameronsjo/cadence-hooks#1437).
+                            let fixed = chdir_landing(value, "/a", env)
+                                .filter(|l| chdir_landing(value, "/b", env).as_ref() == Some(l));
+                            if let Some(landed) = fixed.filter(|_| hops <= MAX_DASH_C_HOPS) {
+                                redirect = Some(lexical_normalize(&landed));
+                                redirect_lost = false;
+                            }
                             idx += 2;
                             continue;
                         }
@@ -4445,27 +4484,30 @@ fn commit_targets_of(
     // un-normalized path is enough to make a licensed chain half-match and
     // block (security review, #378).
     let mut targets: Vec<CommitTarget> = Vec::new();
-    let mut guessed = |target: &CommitTarget, guess: bool| {
-        if guess && !guesses.contains(target) {
-            guesses.push(target.clone());
-        }
-    };
     if let Some((wt, guess)) = resolved_work_tree {
         let wt = normalize_target(&wt);
-        guessed(&wt, guess);
+        guesses.note(&wt, guess);
         targets.push(wt);
     }
     if let Some((gd, guess)) = resolved_git_dir.filter(|(p, _)| !is_linked_worktree_admin_dir(p)) {
         let gd = normalize_target(&gd);
         if !targets.contains(&gd) {
-            guessed(&gd, guess);
+            guesses.note(&gd, guess);
             targets.push(gd);
         }
     }
-    if targets.is_empty() {
+    // A work tree the guard cannot read leaves git finding the repository,
+    // and so the branch the commit lands on, from the base as usual.
+    let work_tree_guessed = git_dir.or(env_git_dir).is_none()
+        && targets
+            .first()
+            .is_some_and(|wt| guesses.guessed.contains(wt));
+    if targets.is_empty() || work_tree_guessed {
         let target = normalize_target(&redirect.unwrap_or_else(|| effective_dir.to_string()));
-        guessed(&target, redirect_lost);
-        targets.push(target);
+        if !targets.contains(&target) {
+            guesses.note(&target, redirect_lost);
+            targets.push(target);
+        }
     }
     targets
 }
@@ -4571,7 +4613,7 @@ fn inchain_dismissed_prepared(
                     git_dir,
                     env,
                     &mut None,
-                    &mut Vec::new(),
+                    &mut Guesses::default(),
                 ) {
                     if let Some(reason) = active.get(&target) {
                         dismissed.entry(target).or_insert_with(|| reason.clone());
@@ -5395,7 +5437,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     // So is a cwd that stands in for a commit whose checkout
                     // the guard could not read, such as `git -C "$V" commit`
                     // (cameronsjo/cadence-hooks#1437).
-                    let stands_in = guesses.contains(&target);
+                    let stands_in = guesses.only_guessed(&target);
                     let guessed = stands_in
                         || (plain.is_none()
                             && same_dir(&target, cwd)
@@ -5407,7 +5449,14 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     // The warning names what the guard could not read, not
                     // the cwd it judged in its place.
                     let result = match unreadable.as_deref().filter(|_| stands_in) {
-                        Some(message) => CheckResult::block(message.to_string()),
+                        Some(message) => with_union_worktree_hint(
+                            with_unresolved_cd_hint(
+                                CheckResult::block(message.to_string()),
+                                unresolved_cd.as_deref(),
+                            ),
+                            &union_cd_dirs,
+                            &mut probe,
+                        ),
                         None => result,
                     };
                     guess.get_or_insert(result);
@@ -12103,7 +12152,6 @@ mod tests {
         for cmd in [
             "git -C \"$V\" commit -m x",
             "git -C \"$V\"/sub commit -m x",
-            "git --work-tree=\"$V\" commit -m x",
             "GIT_DIR=$V git commit -m x",
         ] {
             let mut input = make_bash(cmd);
@@ -12114,10 +12162,19 @@ mod tests {
             assert!(message.contains("$V"), "{cmd:?}: {message}");
             assert!(message.contains("cannot tell where"), "{cmd:?}: {message}");
         }
-        assert_eq!(
-            outcome_from(&primary, "git -C \"$V\" commit -m x; git commit -m y"),
-            Outcome::Block
-        );
+        let p = primary.to_string_lossy().into_owned();
+        for cmd in [
+            "git -C \"$V\" commit -m x; git commit -m y".to_string(),
+            // A guess that folds onto a path another commit read.
+            "git -C \"$V\"/.. commit -m x; git commit -m y".to_string(),
+            // An absolute hop the guard reads lands the commit again.
+            format!("git -C \"$V\" -C {p} commit -m x"),
+            // git still finds the repository from the cwd or `-C`.
+            "git --work-tree=\"$V\" commit -m x".to_string(),
+            format!("git -C {p} --work-tree=\"$V\" commit -m x"),
+        ] {
+            assert_eq!(outcome_from(&primary, &cmd), Outcome::Block, "{cmd:?}");
+        }
         let allowed_from_w = [
             "git -C sub/.. commit -m x",
             "env -i git commit -m x",
