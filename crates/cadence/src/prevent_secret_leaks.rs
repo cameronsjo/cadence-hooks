@@ -3621,10 +3621,6 @@ impl Check for SecretLeaksGuard {
         "prevent-secret-leaks"
     }
 
-    fn refuses_unread_commands(&self) -> bool {
-        true
-    }
-
     fn run(&self, input: &HookInput) -> CheckResult {
         let tool = input.normalized_tool_name().unwrap_or("");
 

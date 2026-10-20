@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Guards judge what they read and allow the rest (cadence-ecosystem ADR-0046, phase 1).** A Bash command the parser could not read in full was refused by `git-safety`, `prevent-secret-leaks`, `prevent-secret-writes`, `prevent-secret-push`, `guard-push-remote`, `trash-guard` and `guard-runbook-scrub` ("command too large", a `#` glued to `(` or `)`, a loosely read function header, a bash 5.3 `${ cmd; }`). The shared refusal is gone: each guard now judges the parts it read, so `git reset --hard` beside an unreadable shape still blocks, and padding or exotic spelling no longer refuses an ordinary command. Guards stop accidents by a cooperative model, not deliberate evasion. (cameronsjo/cadence-hooks#1442)
+- **`guard-runbook-scrub` no longer judges Bash.** It checks `Write`, `Edit` and MCP edits into the runbooks directory and the scrub-marker directory as before. Its Bash reading refused links, copies and paths it could not resolve and drew three false-block reports in three days (#1434, #1435, #1441); the bytes a shell command writes are not knowable before it runs. (cameronsjo/cadence-hooks#1442)
+- **`enforce-worktree` warns, not blocks, when a commit's `git -C`, `--work-tree`, `--git-dir` or `GIT_DIR` value cannot be read.** `git -C "$tmp" commit` from a primary checkout was blocked with a message naming the cwd checkout, which the commit may not touch. It now runs with a warning that names the unreadable value; a readable commit into a primary in the same command still blocks. (cameronsjo/cadence-hooks#1437)
+
 ## [0.129.0] - 2026-10-18
 
 ### Security

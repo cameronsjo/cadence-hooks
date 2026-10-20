@@ -1801,103 +1801,6 @@ pub trait Check {
     fn skip_at_effort(&self) -> &[&str] {
         &[]
     }
-
-    /// Whether this check refuses a Bash command part of which no reading
-    /// could take in ([`shell::command_unread`]): a word bash brace-expands
-    /// left whole when the expansion budget is spent. `false` (default) for
-    /// advisory checks; the fail-closed guards answer `true`
-    /// (cameronsjo/cadence-hooks#1279).
-    fn refuses_unread_commands(&self) -> bool {
-        false
-    }
-
-    /// The commands whose argument lists this refusing check never judges,
-    /// so a brace word left whole there for its own bound cannot hide
-    /// anything from it ([`shell::unexpanded_word_may_hide_a_command`]). A
-    /// check that judges the paths `touch`/`mkdir` create narrows it to
-    /// [`shell::UNREAD_INERT_COMMANDS`].
-    fn unread_inert_commands(&self) -> &'static [&'static str] {
-        shell::UNREAD_INERT_OR_CREATING_COMMANDS
-    }
-}
-
-/// The block a fail-closed guard gives a command it could not read in full
-/// ([`Check::refuses_unread_commands`]).
-///
-/// **When a command counts as unread** ([`unread_block`]):
-///
-/// - **The brace budget is spent** — the call's or the thread's
-///   ([`shell::command_unread`]). Every expanding word after that point is left
-///   whole, so what follows may be unread whatever it is: padding a command
-///   until the budget ran out left `{git,reset,--hard}` whole
-///   (cameronsjo/cadence-hooks#1279). Also when a wrapper's second reading
-///   runs past its allowance (a ~400 KB `git commit -m '…\n…'` does).
-/// - **One word is past its own bound** (more than 4,096 words or 64 groups),
-///   the budget intact ([`shell::brace_word_left_whole`]), **and** it may sit
-///   where it hides what runs ([`shell::unexpanded_word_may_hide_a_command`]):
-///   in command position, under a command that is not a fixed literal, inside
-///   a wrapper's script (`bash -c`, `eval`, `xargs`, `find -exec`), in a
-///   heredoc a shell runs, or in an argument list a guard judges.
-///
-/// Deliberately **not** refused: such a word alone in the argument list of a
-/// fixed inert command ([`Check::unread_inert_commands`]: `echo`, `printf`,
-/// `:`, `for … in`, and `touch`/`mkdir` for checks that do not judge created
-/// paths) whose output is not piped past a data sink, and any word in a
-/// heredoc body no shell runs. Bash runs `for i in {1..5000}`, `touch
-/// file{1..5000}.txt` and minified JSON in `cat > x.json <<'EOF'` harmlessly,
-/// and no guard judges those words, so they hide nothing. Words after the
-/// lone word are still expanded and judged, so `: {1..5000}; {git,reset,--hard}`
-/// blocks on its merits.
-pub const UNREAD_COMMAND_BLOCK: &str = "command too large to read in full — a brace expansion \
-     (or a wrapper's second reading) ran past what the guard reads, so what it runs cannot be \
-     verified\n   Fix: run it as smaller commands, with fewer or smaller `{…}` expansions \
-     (or a shorter quoted message with backslashes)";
-
-/// The block a fail-closed guard gives a command whose double-quoted
-/// `"$(…)"` holds a `#` glued to a paren ([`shell::glued_hash_unread`]).
-/// bash reads `a=(x)#` as one word and zsh or `(true)#` as a comment, the
-/// guards read where the substitution ends one way only, and in the other
-/// reading its quotes can hide a line it runs (cameronsjo/cadence-hooks#1400).
-pub const GLUED_HASH_BLOCK: &str = "a `#` glued to `(` or `)` inside a double-quoted `\"$(…)\"` \
-     is a comment to one shell and text to another, so what the substitution runs cannot be \
-     verified\n   Fix: put a space before the `#` if it starts a comment, or quote it (`'#'`) if it \
-     is text";
-
-/// The block a fail-closed guard gives a command holding bash 5.3's `${ cmd; }`
-/// or `${| cmd; }` ([`shell::has_bash_funsub`]), which every reader here takes
-/// for a parameter expansion (cameronsjo/cadence-hooks#1405 security review).
-pub const FUNSUB_BLOCK: &str = "`${` followed by a space, newline or `|` is bash 5.3's \
-     `${ cmd; }` command substitution, which the guards cannot read, so what it runs cannot be \
-     verified\n   Fix: use `$(cmd)` instead; for a parameter expansion, drop the space after `${`";
-
-/// The block a fail-closed guard gives a command defining a function whose
-/// header the guards read only loosely ([`shell::function_header_unread`]):
-/// a name outside `[A-Za-z0-9_.-]`, or a `!` in front. zsh, and bash for most
-/// of them, runs the body (cameronsjo/cadence-hooks#1405 security review).
-pub const FUNCTION_HEADER_BLOCK: &str = "a function definition with an unusual name (or a `!` \
-     before it) is read only loosely, so what its body runs cannot be verified\n   Fix: name \
-     the function with letters, digits, `_`, `-` or `.` only, starting with a letter or `_`";
-
-/// The block for `command`, just read by `check`, when it counts as unread:
-/// the size message if the reading budget ran out, otherwise the message for
-/// the shape the guards cannot read. `None` when it was read in full
-/// ([`UNREAD_COMMAND_BLOCK`] and the other blocks say when).
-fn unread_block(check: &dyn Check, command: &str) -> Option<&'static str> {
-    if shell::command_unread() {
-        Some(UNREAD_COMMAND_BLOCK)
-    } else if shell::glued_hash_unread() {
-        Some(GLUED_HASH_BLOCK)
-    } else if shell::has_bash_funsub(command) {
-        Some(FUNSUB_BLOCK)
-    } else if shell::function_header_unread() {
-        Some(FUNCTION_HEADER_BLOCK)
-    } else if shell::brace_word_left_whole()
-        && shell::unexpanded_word_may_hide_a_command(command, check.unread_inert_commands())
-    {
-        Some(UNREAD_COMMAND_BLOCK)
-    } else {
-        None
-    }
 }
 
 /// Pure: should `run_check` short-circuit for the given effort level?
@@ -2154,20 +2057,10 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
     // A `cd`/`git -C` target the command bound to a literal earlier reads as
     // that literal to every check (cameronsjo/cadence-hooks#1287).
     let input = &*with_resolved_dir_variables(input);
+    // A command the parser could not read in full is judged on what it did
+    // read, never refused for the rest: guards stop accidents, not evasion
+    // (cameronsjo/cadence-hooks#1442).
     let result = check.run(input);
-    // A fail-closed guard never allows a command it could not read in full:
-    // padding a command until the brace budget was spent left a later
-    // `{git,reset,--hard}` whole, and it ran past every guard
-    // (cameronsjo/cadence-hooks#1279). A bypass the guard honoured stands.
-    if check.refuses_unread_commands()
-        && matches!(result.outcome, Outcome::Allow | Outcome::Nudge)
-        && result.bypass.is_none()
-        && let Some(message) = input
-            .command()
-            .and_then(|command| unread_block(check, command))
-    {
-        return Some(CheckResult::block(message));
-    }
     Some(result)
 }
 
