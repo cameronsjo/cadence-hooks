@@ -4390,8 +4390,11 @@ fn commit_targets_of(
                             let fixed = chdir_landing(value, "/a", env)
                                 .filter(|l| chdir_landing(value, "/b", env).as_ref() == Some(l));
                             if let Some(landed) = fixed.filter(|_| hops <= MAX_DASH_C_HOPS) {
+                                // git chdirs there whatever came before, so
+                                // the unread hop no longer matters.
                                 redirect = Some(lexical_normalize(&landed));
                                 redirect_lost = false;
+                                unread = None;
                             }
                             idx += 2;
                             continue;
@@ -12174,6 +12177,14 @@ mod tests {
             format!("git -C {p} --work-tree=\"$V\" commit -m x"),
         ] {
             assert_eq!(outcome_from(&primary, &cmd), Outcome::Block, "{cmd:?}");
+        }
+        // A re-landed `-C` is a reading: no warning, and later hops follow it.
+        let w = wt.to_string_lossy().into_owned();
+        for cmd in [
+            format!("git -C \"$V\" -C {w} commit -m x"),
+            format!("git -C \"$V\" -C {p} -C ../wt commit -m x"),
+        ] {
+            assert_eq!(outcome_from(&primary, &cmd), Outcome::Allow, "{cmd:?}");
         }
         let allowed_from_w = [
             "git -C sub/.. commit -m x",
