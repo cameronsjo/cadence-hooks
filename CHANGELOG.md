@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`guard-push-remote` nudges, not blocks, on a chain or loop it cannot parse.** The loop parser reads at most 12 KB (since 0.128.0). On a parse failure the guard blocked any command with two pushes ("multiple git push commands — cannot verify targets") and any loop holding a push. So a long comment or heredoc in front of `git push origin feat && git push origin feat:feat2` blocked, and the fix text suggested the shape it had just blocked. Under cadence-ecosystem ADR-0046 rule 3 the guard now goes on to judge each push on its own target, and the command gets a nudge. A push to a remote you do not own still blocks. (Part of cameronsjo/cadence-hooks#1443)
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
