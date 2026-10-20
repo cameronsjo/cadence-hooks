@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.130.0] - 2026-10-20
+
 ### Changed
 
 - **Guards judge what they read and allow the rest (cadence-ecosystem ADR-0046, phase 1).** A Bash command the parser could not read in full was refused by `git-safety`, `prevent-secret-leaks`, `prevent-secret-writes`, `prevent-secret-push`, `guard-push-remote`, `trash-guard` and `guard-runbook-scrub` ("command too large", a `#` glued to `(` or `)`, a loosely read function header, a bash 5.3 `${ cmd; }`). The shared refusal is gone: each guard now judges the parts it read, so `git reset --hard` beside an unreadable shape still blocks, and padding or exotic spelling no longer refuses an ordinary command. Guards stop accidents by a cooperative model, not deliberate evasion. (cameronsjo/cadence-hooks#1442)
