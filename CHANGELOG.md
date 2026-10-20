@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`guard-gh-write` no longer blocks a `-R` write behind an `eval` or `trap` it cannot read.** An `eval "$(direnv export bash)"`, `eval "$X"` or `trap "$CMD" DEBUG` in front of `gh pr comment 1 -R owner/repo` made `GH_HOST` unknown, so the write blocked. That text cannot be read before it runs, so it is now skipped and the write is judged on the hosts the guard did read. An `eval` string that sets `GH_HOST` in plain text still counts. (Part of cameronsjo/cadence-hooks#1443)
 
+## [0.130.1] - 2026-10-20
+
+### Fixed
+
+- **The redaction scan's `skill-id` category no longer flags a host:port or an image tag.** `media-mcp:3000`, `obaass-mcp:3000`, `homelab-mcp:main`, `ghcr.io/owner/core:main`, a bare `mcp:3000` and `core:v1.2` were reported as skill IDs because the namespace matched at the end of a longer name and the skill part allowed a leading digit. A skill ID is now matched only when its namespace starts the token (a `/` that starts it, as in `/cadence:outro`, still counts), its skill name starts with a letter, and no `.` plus a name character follows it. True skill IDs such as `cadence:writing-skills` and `cadence-forge:polish` still flag; a standalone `mcp:main` still flags, since its shape is a skill ID's.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
