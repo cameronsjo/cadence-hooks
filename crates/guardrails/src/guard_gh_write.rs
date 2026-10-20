@@ -3844,6 +3844,7 @@ impl Check for GhWriteGuard {
                 .expect("pattern should compile")
         });
         let may_loop = LOOP_WORD.is_match(command);
+        let mut unread_loop = false;
         let analysis = if may_loop {
             loop_analysis::analyze_gh_loops(command)
         } else {
@@ -4059,15 +4060,11 @@ impl Check for GhWriteGuard {
                 // All looped gh commands are read-only — allow
             }
             LoopAnalysis::ParseFailed => {
-                // Regex fallback when AST parser can't handle the syntax
-                let stripped = strip_quotes(command);
-                if LOOP_PATTERN.is_match(&stripped) {
-                    return CheckResult::block(
-                        "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
-                         Fix: run each gh command individually with `-R owner/repo` (for \
-                         `gh api`, a literal `repos/<owner>/<repo>/…` path)",
-                    );
-                }
+                // The loop parser could not read the command (past its byte
+                // cap, say). A loop is not refused for that (cadence-ecosystem
+                // ADR-0046 rule 3): each write segment is judged below, and
+                // the loop gets a nudge naming the fix.
+                unread_loop = LOOP_PATTERN.is_match(&strip_quotes(command));
             }
             LoopAnalysis::NoLoops => {} // Continue to write detection
         }
@@ -4120,9 +4117,19 @@ impl Check for GhWriteGuard {
         }
 
         // No write segments, or every write segment targets an owned repo.
+        if unread_loop && judged.saw_write {
+            return CheckResult::nudge(UNREAD_LOOP_NUDGE);
+        }
         CheckResult::allow()
     }
 }
+
+/// The nudge for a loop the loop parser could not read: its writes were
+/// judged one segment at a time, without the loop gate.
+const UNREAD_LOOP_NUDGE: &str = "⚠️  git-guardrails: gh command in a loop the guard could not \
+     parse — each gh write it read was checked on its own\n   \
+     Verify: give every gh write in the loop `-R owner/repo` (for `gh api`, a literal \
+     `repos/<owner>/<repo>/…` path)";
 
 /// Bytes of script [`command_segments`] may read across every reading of one
 /// command: 24 passes' worth, plus room for short inputs, capped so no input
@@ -4169,6 +4176,8 @@ struct WriteJudgments {
     seen: std::collections::HashSet<[String; 4]>,
     /// Distinct directories besides the whole-command one judged so far.
     dirs: Vec<std::rc::Rc<str>>,
+    /// A gh write segment was read.
+    saw_write: bool,
 }
 
 /// The block for a command whose writes run in more than
@@ -4468,6 +4477,7 @@ fn judge_write_segments(
         if !is_write_command(&segment) && !is_write_command(&requote_words(&segment)) {
             continue;
         }
+        judged.saw_write = true;
 
         // Fail-safe: block when unconfigured.
         if allowed_owners.is_empty() {
@@ -6088,14 +6098,52 @@ mod tests {
                     .as_ref()
                     .map(|m| m.rule_id.as_str())
                     .unwrap_or("");
-                // Either loop-gate verdict: a missing target, or a loop body
-                // the loop analysis cannot read at all.
-                assert!(
-                    rule == "gh-write-loop-missing-repo"
-                        || msg(&result).contains("gh command in loop — cannot verify targets"),
+                assert_eq!(
+                    rule,
+                    "gh-write-loop-missing-repo",
                     "strict={strict}: {command} was not blocked by the loop gate: {}",
                     msg(&result)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_the_parser_cannot_read_nudges_and_each_write_is_still_judged() {
+        // cadence-ecosystem ADR-0046 rule 3: a command past the loop parser's
+        // byte cap is not refused for being hard to read. Each gh write it
+        // holds is judged on its own, and a loop gets a nudge naming `-R`.
+        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
+        let pad = format!(
+            "\n# {}",
+            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
+        );
+        for (command, outcome) in [
+            // A read-only loop, or one with no gh at all: nothing to nudge.
+            (
+                "for i in 1 2; do gh pr view $i -R cameronsjo/forgectl; done",
+                Allow,
+            ),
+            ("for b in feat dev; do git push origin $b; done", Allow),
+            (
+                "for i in 1 2; do gh issue close $i -R cameronsjo/forgectl; done",
+                Nudge,
+            ),
+            ("for i in 1 2; do gh issue close $i -R evil/x; done", Block),
+            // No target and no owned checkout to fall back on (`/tmp`).
+            ("for i in 1 2; do gh issue close $i; done", Block),
+            (
+                "while read i; do gh pr merge $i -R evil/x; done < prs",
+                Block,
+            ),
+            // No loop: nothing for the loop gate to say.
+            ("gh pr view 1 -R cameronsjo/forgectl", Allow),
+        ] {
+            let padded = format!("{command}{pad}");
+            let result = run_1344(&padded, "cameronsjo", false);
+            assert_eq!(result.outcome, outcome, "{command}: {}", msg(&result));
+            if outcome == Nudge {
+                assert!(msg(&result).contains("-R owner/repo"), "{}", msg(&result));
             }
         }
     }
@@ -6216,12 +6264,32 @@ mod tests {
             "s/a/b/", "gs/a/b/", "a", "A", "c", "h", "t", "r", "e", "u", "l", "q", "Q", "P", "x",
             "&",
         ] {
-            commands.push(format!(
-                "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:{m}; done"
-            ));
+            // Unquoted, `$b:&;` is a syntax error to the loop parser: below.
+            if m != "&" {
+                commands.push(format!(
+                    "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:{m}; done"
+                ));
+            }
             commands.push(format!(
                 r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x "$b:{m}"; done"#
             ));
+        }
+        // A loop the parser cannot read (a syntax error) is judged one write
+        // at a time. Each write names an owned repo, so it nudges
+        // (cadence-ecosystem ADR-0046 rule 3).
+        for unread in [
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:&; done",
+            r#"for b in a; do gh api -X DELETE "repos/cameronsjo/forgectl/x/${b"; done"#,
+        ] {
+            for strict in [false, true] {
+                let result = run_1344(unread, "cameronsjo", strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Nudge,
+                    "strict={strict}: {unread}: {}",
+                    msg(&result)
+                );
+            }
         }
         // Every brace form other than a bare name, and the unbraced flags.
         for e in [
@@ -6248,7 +6316,6 @@ mod tests {
             "${(s:,:)b}",
             "${b[1]}",
             "${!b}",
-            "${b",
             "$b[1]",
             "$=b",
             "$~b",
