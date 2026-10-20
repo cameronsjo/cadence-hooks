@@ -1455,10 +1455,6 @@ impl Check for ObsidianTrashGuard {
         "obsidian-trash-guard"
     }
 
-    fn refuses_unread_commands(&self) -> bool {
-        true
-    }
-
     fn run(&self, input: &HookInput) -> CheckResult {
         match std::env::var("OBSIDIAN_VAULT") {
             Ok(vault) if !vault.is_empty() => judge(input, &vault, &RealFs),

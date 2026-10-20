@@ -344,11 +344,6 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
-    // Unfiltered so every Bash write form into `CADENCE_RUNBOOKS_DIR`
-    // (redirects, `tee`, `cp`, `rsync`, `sed -i`, …) reaches it: no glob names
-    // them all, and a Bash write there blocks outright
-    // (cameronsjo/cadence-hooks#755, wired in cameronsjo/cadence#1547).
-    "guardrails guard-runbook-scrub",
     // Wired on a PostToolUse `Bash` matcher with no `if:`: it masks secret
     // values in the command's *output*, which no command-side glob can predict
     // (cameronsjo/cadence-hooks#776, wired in cameronsjo/cadence#1565).
@@ -3215,10 +3210,9 @@ type MatcherEntry = (&'static str, Option<&'static str>);
 ///
 /// A guard registered under several matchers is easy to half-unwire: drop one
 /// entry and every other assertion in this file still passes, because the
-/// command is still registered *somewhere* (#1246). `guard-runbook-scrub` is
-/// the motivating case — it scrubs file writes under the Write/Edit matcher and
-/// shell commands under the Bash matcher, and losing either half silently
-/// stops half of its coverage.
+/// command is still registered *somewhere* (#1246). `guard-runbook-scrub` was
+/// the motivating case, when it also judged shell commands under the Bash
+/// matcher (until cameronsjo/cadence-hooks#1442).
 ///
 /// Each requirement is `(event, probe)`. `Some(tool)` means some entry for this
 /// command under `event` must have a matcher that fires on `tool` (as
@@ -3231,15 +3225,6 @@ type MatcherEntry = (&'static str, Option<&'static str>);
 /// that test: add the new entry to its row by hand, or losing it later
 /// passes every assertion.
 const MULTI_MATCHER_HOOKS: &[(&str, &[MatcherEntry])] = &[
-    (
-        "guardrails guard-runbook-scrub",
-        &[
-            ("PreToolUse", Some("Write")),
-            ("PreToolUse", Some("Edit")),
-            ("PreToolUse", Some("MultiEdit")),
-            ("PreToolUse", Some("Bash")),
-        ],
-    ),
     (
         "cadence prevent-secret-leaks",
         &[
