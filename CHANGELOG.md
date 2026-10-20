@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`guard-gh-write` no longer blocks a `-R` write behind an `eval` or `trap` it cannot read.** An `eval "$(direnv export bash)"`, `eval "$X"` or `trap "$CMD" DEBUG` in front of `gh pr comment 1 -R owner/repo` made `GH_HOST` unknown, so the write blocked. That text cannot be read before it runs, so it is now skipped and the write is judged on the hosts the guard did read. An `eval` string that sets `GH_HOST` in plain text still counts. (Part of cameronsjo/cadence-hooks#1443)
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed

