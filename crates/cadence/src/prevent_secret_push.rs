@@ -2383,6 +2383,23 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
     Ok(hits)
 }
 
+/// Does this push name every commit it publishes by a literal full object id
+/// (`git push origin <40-hex>:refs/heads/b`)? Then what it publishes does not
+/// depend on the directory it runs in. Deletes publish nothing and are
+/// skipped; `--all`, `--mirror` and `--tags` publish refs the refspecs do not
+/// name, and an implicit refspec stands for `HEAD`, so none of them qualify.
+fn names_commits_by_id(inv: &PushInvocation) -> bool {
+    let is_id = |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
+    !inv.all_or_mirror
+        && !inv.tags
+        && !inv.mirror
+        && inv.refspecs.iter().any(|r| !r.is_delete)
+        && inv
+            .refspecs
+            .iter()
+            .all(|r| r.is_delete || (!r.implicit && r.source.as_deref().is_some_and(is_id)))
+}
+
 fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
     let calls = git_calls(command, cwd);
     let hints = command_hints(&calls);
@@ -2395,6 +2412,30 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
     for inv in push_invocations_every_dir(command, cwd) {
         if inv.dry_run {
             continue;
+        }
+        // A push that names every source by a literal full commit id
+        // publishes exactly those commits, whatever directory it runs in
+        // (`git -C "$WT" push origin <sha>:refs/heads/b`). Where the directory
+        // is unreadable, scan them from the cwd repository, which shares
+        // objects with its worktrees: a secret blocks, a clean scan allows,
+        // and a commit that repository cannot read falls through to the
+        // refusal below. A source that is not a literal id still refuses.
+        // Residual: the commits already on the remote are read from the cwd
+        // repository's remote-tracking refs, so when the directory is another
+        // repository that holds the same objects, a commit published there
+        // but not to the push's remote is not rescanned.
+        let unread_dir =
+            inv.work_dir == UNRESOLVABLE_DIR || (inv.unresolved && inv.directory_unverified);
+        if unread_dir && !inv.repository_unresolved && names_commits_by_id(&inv) {
+            let mut at = inv.clone();
+            if at.work_dir == UNRESOLVABLE_DIR {
+                at.work_dir = cwd.to_string();
+            }
+            match judge_invocation(&at, &hints, writer.as_deref(), exempt) {
+                Ok(()) => continue,
+                Err(found @ Stop::Found(_)) => return Err(found),
+                Err(_) => {}
+            }
         }
         if inv.unresolved {
             // An unreadable directory change is the cause the message can
@@ -4595,6 +4636,71 @@ mod tests {
             let r = fx.run(&seen);
             assert_eq!(r.outcome, Outcome::Allow, "{command}: {:?}", r.message);
         }
+    }
+
+    /// A push whose every source is a literal full commit id names its
+    /// content exactly, so a directory named by a variable (`git -C "$WT"
+    /// push origin <sha>:refs/heads/b`, the push-by-sha form) does not stop
+    /// the scan: the guard reads that commit from the cwd repository, which
+    /// shares objects with its worktrees. A secret in it still blocks, and a
+    /// commit the cwd repository does not have, or a source that is not a
+    /// literal id, still refuses as before.
+    #[test]
+    fn a_literal_sha_push_scans_through_an_unread_directory() {
+        let fx = Fx::new("sha-unread-dir");
+        let wt = fx.work.parent().unwrap().join("wt-sha");
+        let wt_s = wt.to_str().unwrap().replace('\\', "/");
+        fx.git(&["worktree", "add", "-q", &wt_s, "-b", "fix", "main"]);
+        let head = |dir: &Path| git_stdin(dir, &["rev-parse", "HEAD"], b"");
+        std::fs::write(wt.join("ok.txt"), "fine\n").unwrap();
+        git_in(&wt, &["add", "ok.txt"]);
+        git_in(&wt, &["commit", "-q", "-m", "clean"]);
+        let clean = head(&wt);
+        for command in [
+            format!("git -C \"$WT\" push --no-follow-tags origin {clean}:refs/heads/fix"),
+            format!("git -C $WT push origin {clean}:refs/heads/fix"),
+            format!("cd \"$WT\" && git push origin {clean}:refs/heads/fix"),
+        ] {
+            assert_allows(&fx.run(&command));
+        }
+
+        std::fs::write(wt.join("cfg.txt"), format!("key={}\n", aws_key())).unwrap();
+        git_in(&wt, &["add", "cfg.txt"]);
+        git_in(&wt, &["commit", "-q", "-m", "cfg"]);
+        let dirty = head(&wt);
+        assert_blocks(
+            &fx.run(&format!(
+                "git -C \"$WT\" push --no-follow-tags origin {dirty}:refs/heads/fix"
+            )),
+            &["would publish a secret", "cfg.txt"],
+        );
+        // Two refspecs, one clean and one not: the secret still blocks.
+        assert_blocks(
+            &fx.run(&format!(
+                "git -C \"$WT\" push origin {clean}:refs/heads/a {dirty}:refs/heads/b"
+            )),
+            &["would publish a secret"],
+        );
+
+        // A source that is not a literal id still refuses, naming the token.
+        for command in [
+            "git -C \"$WT\" push origin \"$SHA\":refs/heads/fix".to_string(),
+            "git -C \"$WT\" push origin fix".to_string(),
+            "git -C \"$WT\" push origin HEAD:refs/heads/fix".to_string(),
+            format!("git -C \"$WT\" push origin {clean}:refs/heads/a fix:refs/heads/b"),
+            format!("git -C \"$WT\" push --all origin {clean}:refs/heads/fix"),
+            format!("git -C \"$WT\" push --tags origin {clean}:refs/heads/fix"),
+        ] {
+            assert_blocks(&fx.run(&command), &["$WT", "literal path"]);
+        }
+        // A literal id the cwd repository does not have cannot be read: refused.
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        assert_blocks(
+            &fx.run(&format!(
+                "git -C \"$WT\" push origin {absent}:refs/heads/fix"
+            )),
+            &["$WT", "literal path"],
+        );
     }
 
     /// The generic "narrow the push" advice, which fits none of the causes

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`prevent-secret-push` scans a push-by-SHA in a directory named by a variable.** `git -C "$WT" push --no-follow-tags origin <40-hex>:refs/heads/<branch>` was refused with "the push runs in a directory named by `$WT`, which this guard cannot resolve", while the same push after `cd /literal/path &&` passed. A literal full commit id names the content exactly, whatever directory the push runs in, so the guard now scans those commits from the cwd repository (which shares objects with its worktrees): a secret still blocks and a clean scan allows. The same applies after `cd "$WT" &&`. Still refused: a source that is not a literal id (`"$SHA"`, a branch name, `HEAD`, an implicit refspec), `--all`, `--mirror` and `--tags`, and a commit the cwd repository does not have.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
