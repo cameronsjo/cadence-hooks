@@ -7,6 +7,9 @@
 .claude/intros/
 .claude/agent-memory/
 .claude/worktrees/
+# Approved plans persist-plan-approval saves here (CADENCE_PLANS_DIR in
+# .claude/settings.json); docs/plans/ is frozen (#1446).
+.claude/plans/
 
 # OpenSpec CLI pin install (scripts/openspec.sh)
 /scripts/openspec/node_modules/

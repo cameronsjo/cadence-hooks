@@ -8,7 +8,7 @@ Thank you for your interest in cadence-hooks. This project is currently maintain
 git clone https://github.com/cameronsjo/cadence-hooks.git
 cd cadence-hooks
 make ci    # Run fmt check, clippy, and tests
-scripts/openspec.sh validate --all --strict --no-interactive   # specs; needs Node >= 20.19
+scripts/openspec.sh validate --all --strict --no-interactive   # specs; needs Node 20.19+ or 22.13+
 ```
 
 Requires Rust 2024 edition (1.85+).

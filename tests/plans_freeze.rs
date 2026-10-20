@@ -18,6 +18,10 @@ fn docs_plans_takes_no_new_plans() {
     let mut rejected = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        // Editor and OS droppings (.DS_Store, swap files) are not plans.
+        if name.starts_with('.') {
+            continue;
+        }
         let date = name.get(..PLANS_FROZEN_AFTER.len()).unwrap_or("");
         let dated = date.len() == PLANS_FROZEN_AFTER.len()
             && date.bytes().enumerate().all(|(i, b)| {

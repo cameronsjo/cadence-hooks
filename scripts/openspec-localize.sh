@@ -6,7 +6,7 @@
 # would run whatever `openspec` is on PATH, unpinned, with no prompt; with
 # none on PATH an agent tends to reach for `npx openspec`, which on npm is an
 # unrelated package. This rewrites the allowance to the wrapper and adds a
-# note under each file's frontmatter. TestOpenSpecSkillsUsePinnedCLI fails
+# note under each file's frontmatter. tests/openspec_skills.rs fails
 # until it has run, so rerun it after every `openspec update`. Idempotent.
 set -euo pipefail
 

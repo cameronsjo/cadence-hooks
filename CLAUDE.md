@@ -16,9 +16,9 @@ cadence-hooks plans work with [OpenSpec](https://github.com/Fission-AI/OpenSpec)
 - `openspec/specs/<capability>/spec.md` says what the shipped binary does: each hook's verdicts, messages, switches and files. Read the relevant spec before changing a hook.
 - New behavior starts as a change: `openspec/changes/<id>/` with `proposal.md`, delta specs, `design.md` when it needs one, and `tasks.md`. `/opsx:propose`, `/opsx:apply` and `/opsx:archive` drive it in Claude Code (the `openspec-*` skills in Codex). Every change links its issue.
 - Archive a change (`scripts/openspec.sh archive <id>`) in the PR that finishes it, so the specs move with the code.
-- Run the CLI only through `scripts/openspec.sh`, which installs the pinned version from `scripts/openspec/package-lock.json` (needs Node >= 20.19). CI runs `scripts/openspec.sh validate --all --strict --no-interactive`.
+- Run the CLI only through `scripts/openspec.sh`, which installs the pinned version from `scripts/openspec/package-lock.json` (needs Node 20.19+ or 22.13+). CI runs `scripts/openspec.sh validate --all --strict --no-interactive`.
 - The `openspec-*` skills and `/opsx` commands are generated. After `scripts/openspec.sh update`, run `scripts/openspec-localize.sh` so they call the pinned wrapper; `tests/openspec_skills.rs` fails until you do.
-- `docs/plans/` is frozen: `tests/plans_freeze.rs` rejects a plan dated after 2026-10-20. The plans already there finish in place.
+- `docs/plans/` is frozen: `tests/plans_freeze.rs` rejects a plan dated after 2026-10-20. The plans already there finish in place. `.claude/settings.json` points `CADENCE_PLANS_DIR` at the gitignored `.claude/plans/`, so `persist-plan-approval` keeps saving approved plans without tripping the freeze.
 - ADRs in `docs/adr/` stay. A spec says what the behavior is; an ADR says why. `docs/hooks.md` stays the operator catalog.
 
 ## Release (fully automated — do NOT create tags or edit the tap formula manually)
