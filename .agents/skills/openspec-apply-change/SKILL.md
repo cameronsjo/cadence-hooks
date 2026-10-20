@@ -1,7 +1,7 @@
 ---
 name: openspec-apply-change
 description: Implement tasks from an OpenSpec change. Use when the user wants to start implementing, continue implementation, or work through tasks. Also use when the user says "openspec apply", "opsx apply", or "openspec implement".
-allowed-tools: Bash(scripts/openspec.sh:*)
+allowed-tools: Bash(scripts/openspec.sh list:*), Bash(scripts/openspec.sh status:*), Bash(scripts/openspec.sh instructions:*), Bash(scripts/openspec.sh context:*), Bash(scripts/openspec.sh new change:*), Bash(scripts/openspec.sh show:*), Bash(scripts/openspec.sh validate:*), Bash(scripts/openspec.sh schemas:*), Bash(scripts/openspec.sh store list:*)
 license: MIT
 compatibility: Requires openspec CLI.
 metadata:

@@ -1,7 +1,7 @@
 ---
 name: "OPSX: Propose"
 description: "Propose a new change - create it and generate all artifacts in one step"
-allowed-tools: Bash(scripts/openspec.sh:*)
+allowed-tools: Bash(scripts/openspec.sh list:*), Bash(scripts/openspec.sh status:*), Bash(scripts/openspec.sh instructions:*), Bash(scripts/openspec.sh context:*), Bash(scripts/openspec.sh new change:*), Bash(scripts/openspec.sh show:*), Bash(scripts/openspec.sh validate:*), Bash(scripts/openspec.sh schemas:*), Bash(scripts/openspec.sh store list:*)
 category: "Workflow"
 tags: ["workflow", "artifacts", "experimental"]
 ---

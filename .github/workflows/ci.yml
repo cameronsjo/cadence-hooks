@@ -72,3 +72,16 @@ jobs:
         run: |
           node --version
           scripts/openspec.sh validate --all --strict --no-interactive
+
+      - name: Generated skills use the pinned CLI
+        # `openspec update` resets the generated skills to a bare, unpinned
+        # `openspec` grant that covers every subcommand. Rerunning the
+        # localize script must change nothing, and it fails on a grant it
+        # does not recognize.
+        run: |
+          set -euo pipefail
+          bash scripts/openspec-localize.sh
+          if ! git diff --exit-code -- .claude .agents/skills; then
+            echo "::error::generated OpenSpec skills are not localized to the pinned CLI; run scripts/openspec-localize.sh and commit the result"
+            exit 1
+          fi

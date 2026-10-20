@@ -3,9 +3,10 @@
 //!
 //! `openspec init` and `openspec update` write files that pre-allow a bare
 //! `openspec` (`allowed-tools: Bash(openspec:*)`), which would run whatever
-//! `openspec` is on PATH, unpinned, with no prompt. `scripts/openspec-localize.sh`
-//! rewrites them to `scripts/openspec.sh`; this test fails when a regeneration
-//! undoes that, and the fix is to rerun the script.
+//! `openspec` is on PATH, unpinned, with no prompt, for every subcommand.
+//! `scripts/openspec-localize.sh` narrows the grant to the wrapper and the
+//! subcommands the skills run; this test fails when a regeneration undoes
+//! that, and the fix is to rerun the script.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,7 +54,9 @@ fn openspec_skills_use_the_pinned_cli() {
         .iter()
         .filter(|f| {
             let body = fs::read_to_string(f).unwrap_or_default();
-            body.contains("Bash(openspec:") || !body.contains(PINNED_MARKER)
+            body.contains("Bash(openspec")
+                || body.contains("Bash(scripts/openspec.sh:")
+                || !body.contains(PINNED_MARKER)
         })
         .map(|f| f.strip_prefix(root).unwrap_or(f).display().to_string())
         .collect();

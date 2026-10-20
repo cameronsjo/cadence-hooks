@@ -1,7 +1,7 @@
 ---
 name: openspec-propose
 description: Propose a new OpenSpec change with all artifacts generated in one step. Use when the user wants to quickly describe what they want to build and get a complete proposal with design, specs, and tasks ready for implementation. Also use when the user says "openspec propose" or "opsx propose".
-allowed-tools: Bash(scripts/openspec.sh:*)
+allowed-tools: Bash(scripts/openspec.sh list:*), Bash(scripts/openspec.sh status:*), Bash(scripts/openspec.sh instructions:*), Bash(scripts/openspec.sh context:*), Bash(scripts/openspec.sh new change:*), Bash(scripts/openspec.sh show:*), Bash(scripts/openspec.sh validate:*), Bash(scripts/openspec.sh schemas:*), Bash(scripts/openspec.sh store list:*)
 license: MIT
 compatibility: Requires openspec CLI.
 metadata:

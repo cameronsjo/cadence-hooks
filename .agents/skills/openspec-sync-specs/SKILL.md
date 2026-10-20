@@ -1,7 +1,7 @@
 ---
 name: openspec-sync-specs
 description: Sync delta specs from an OpenSpec change to main specs. Use when the user wants to update main specs with changes from a delta spec, without archiving the change. Also use when the user says "openspec sync" or "opsx sync".
-allowed-tools: Bash(scripts/openspec.sh:*)
+allowed-tools: Bash(scripts/openspec.sh list:*), Bash(scripts/openspec.sh status:*), Bash(scripts/openspec.sh instructions:*), Bash(scripts/openspec.sh context:*), Bash(scripts/openspec.sh new change:*), Bash(scripts/openspec.sh show:*), Bash(scripts/openspec.sh validate:*), Bash(scripts/openspec.sh schemas:*), Bash(scripts/openspec.sh store list:*)
 license: MIT
 compatibility: Requires openspec CLI.
 metadata:
