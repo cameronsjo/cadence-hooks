@@ -1365,6 +1365,24 @@ fn list_refs(
 /// must peel straight to a commit; a ref naming anything but a commit or a
 /// tag warns; each name goes through the text scanner.
 fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
+    // A listing or read that fails still leaves the written ref names to
+    // read, so a secret in one blocks rather than warns.
+    scan_refs_and_tags_listed(work_dir, range).or_else(|stop| {
+        let hits: Vec<Hit> = range
+            .names
+            .iter()
+            .filter_map(|name| scan_text(name))
+            .map(|what| Hit {
+                sha: "ref".into(),
+                path: "(pushed ref name)".into(),
+                what,
+            })
+            .collect();
+        if hits.is_empty() { Err(stop) } else { Ok(hits) }
+    })
+}
+
+fn scan_refs_and_tags_listed(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
     let mut refs: Vec<PublishedRef> = Vec::new();
     // Named sources, by the object each one resolves to — whatever the ref's
     // path, or a raw sha: its UNPEELED type decides.
@@ -1738,6 +1756,7 @@ fn judge_invocation(
     // anywhere still blocks, and only an otherwise clean push is let through
     // with the warning.
     let mut unscanned: Option<Stop> = None;
+    let mut early: Vec<Hit> = Vec::new();
     if let Err(stop) = sources_are_commits(&inv.work_dir, &range) {
         // A source that does not peel to a commit (a tree or blob tag, a
         // missing ref) warns, and the sources that do are still scanned, so
@@ -1748,11 +1767,34 @@ fn judge_invocation(
             writer,
             stop,
         ));
+        let (kept, dropped): (Vec<String>, Vec<String>) = std::mem::take(&mut range.sources)
+            .into_iter()
+            .partition(|s| s == "HEAD" || peels_to_commit(&inv.work_dir, s));
+        range.sources = kept;
+        // A dropped source that is a tag object (a tag of a tree or blob)
+        // still has a readable message.
+        for name in &dropped {
+            let Ok(objects) = read_objects(&inv.work_dir, std::slice::from_ref(name), "tag") else {
+                continue;
+            };
+            for object in objects.into_iter().filter(|o| o.kind == "tag") {
+                if let Some(what) = scan_text(&object.body) {
+                    early.push(Hit {
+                        sha: "tag".into(),
+                        path: shown(name),
+                        what,
+                    });
+                }
+            }
+        }
+    }
+    if let Err(stop) = hex_sources_are_not_ref_names(&inv.work_dir, &range) {
+        // The object-id-looking sources warn; the others are still scanned.
+        unscanned.get_or_insert(stop);
         range
             .sources
-            .retain(|s| s == "HEAD" || peels_to_commit(&inv.work_dir, s));
+            .retain(|s| !(matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())));
     }
-    hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
     let (shas, over) = match outbound(&inv.work_dir, &range) {
         Ok(found) => found,
         Err(stop) => {
@@ -1760,16 +1802,19 @@ fn judge_invocation(
             // Nothing to walk, but the ref names the push writes are still
             // read for a secret.
             if let Some(what) = range.names.iter().find_map(|n| scan_text(n)) {
-                return Err(Stop::Found(vec![Hit {
+                early.push(Hit {
                     sha: "ref".into(),
                     path: "(pushed ref name)".into(),
                     what,
-                }]));
+                });
+            }
+            if !early.is_empty() {
+                return Err(Stop::Found(early));
             }
             return Err(unscanned.unwrap_or(stop));
         }
     };
-    let mut hits = Vec::new();
+    let mut hits = early;
     let mut keep = |part: Result<Vec<Hit>, Stop>, hits: &mut Vec<Hit>| match part {
         Ok(found) => hits.extend(found),
         Err(Stop::Found(found)) => hits.extend(found),
@@ -2113,6 +2158,16 @@ mod tests {
             &fx.run(&format!("git push origin treetag:{name}")),
             &["ref name"],
         );
+        // The tag of a tree is not walked, but its own message is read.
+        fx.git(&[
+            "tag",
+            "-a",
+            "secrettree",
+            "-m",
+            &format!("t {}", gh_token()),
+            "HEAD^{tree}",
+        ]);
+        assert_blocks(&fx.run("git push origin secrettree"), &["GitHub token"]);
     }
 
     #[test]
