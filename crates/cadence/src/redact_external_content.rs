@@ -878,16 +878,41 @@ fn json_strings(value: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Category 1 — skill/plugin IDs (`<ns>:<name>`). Derived from [`NAMESPACES`],
 /// longest-first so the most specific namespace wins regardless of the regex
-/// engine's alternation-preference semantics. The `[a-z0-9]` immediately after
+/// engine's alternation-preference semantics. The `[a-z]` immediately after
 /// the colon is the prose firewall: `the cadence: of work` (space after colon)
-/// never matches; `cadence:attune` does.
+/// never matches; `cadence:attune` does. A skill name is kebab-case and starts
+/// with a letter, so a port (`mcp:3000`) is not one. [`skill_id_stands_alone`]
+/// adds the boundary checks this regex engine (no lookaround) cannot express.
 static SKILL_ID: LazyLock<Regex> = LazyLock::new(|| {
     let mut ns: Vec<&str> = NAMESPACES.to_vec();
     ns.sort_by_key(|n| std::cmp::Reverse(n.len()));
     let alt = ns.join("|");
-    Regex::new(&format!(r"\b({alt}):([a-z0-9][a-z0-9-]*)\b"))
-        .expect("skill-id pattern should compile")
+    Regex::new(&format!(r"\b({alt}):([a-z][a-z0-9-]*)\b")).expect("skill-id pattern should compile")
 });
+
+/// Characters that continue a host name, image name or path segment.
+fn continues_name(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// Does the [`SKILL_ID`] match at `start..end` stand alone as a skill ID?
+///
+/// The namespace has to start the token: `media-mcp:3000`, `homelab-mcp:main`
+/// and `ghcr.io/owner/core:main` end in a namespace but are a host:port or an
+/// image:tag, so a match preceded by a name character, or by a `/` that is
+/// itself inside a path, is not a skill ID. A `/` at the start of a token
+/// (`/cadence:outro`, the slash-command form) still is. A match followed by
+/// `.` and a name character (`core:v1.2`) is a version or domain, not a skill.
+fn skill_id_stands_alone(body: &str, start: usize, end: usize) -> bool {
+    let mut before = body[..start].chars().rev();
+    match before.next() {
+        Some(c) if continues_name(c) => return false,
+        Some('/') if before.next().is_some_and(continues_name) => return false,
+        _ => {}
+    }
+    let mut after = body[end..].chars();
+    !(after.next() == Some('.') && after.next().is_some_and(char::is_alphanumeric))
+}
 
 /// Category 3 — marketplace / plugin-cache locations. Scanned BEFORE the
 /// broader local-path category so the more specific `~/.claude/plugins/…` is
@@ -1083,6 +1108,9 @@ enum ConfigScope {
 struct CategoryDescriptor {
     name: &'static str,
     pattern: &'static Regex,
+    /// Extra shape check on a match (`body`, start, end); `None` keeps every
+    /// match. Used where the regex engine cannot express a boundary.
+    accept: Option<fn(&str, usize, usize) -> bool>,
     /// Ceiling used when no override applies. `always`(0) means "redact at
     /// every destination" — the tier algebra's designed extreme, which is where
     /// the fail-closed tier sits. It is not outside the algebra; it is its edge.
@@ -1806,24 +1834,28 @@ fn universal_categories() -> [CategoryDescriptor; 4] {
         CategoryDescriptor {
             name: "skill-id",
             pattern: &SKILL_ID,
+            accept: Some(skill_id_stands_alone),
             default_ceiling: "owned-internal",
             config_scope: ConfigScope::RepoConfig,
         },
         CategoryDescriptor {
             name: "marketplace",
             pattern: &MARKETPLACE_PATH,
+            accept: None,
             default_ceiling: "owned-internal",
             config_scope: ConfigScope::RepoConfig,
         },
         CategoryDescriptor {
             name: "local-path",
             pattern: &LOCAL_PATH,
+            accept: None,
             default_ceiling: "owned-internal",
             config_scope: ConfigScope::RepoConfig,
         },
         CategoryDescriptor {
             name: "harness-noun",
             pattern: &HARNESS_NOUN,
+            accept: None,
             default_ceiling: "owned-internal",
             config_scope: ConfigScope::RepoConfig,
         },
@@ -1836,6 +1868,9 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
 
     for desc in universal_categories() {
         for m in desc.pattern.find_iter(body) {
+            if desc.accept.is_some_and(|ok| !ok(body, m.start(), m.end())) {
+                continue;
+            }
             // Claim the offset when first seen (so a lower-priority category
             // never re-reports it), then decide whether the audience gate keeps
             // it.
@@ -3787,6 +3822,59 @@ mod tests {
     const BODY_ACME: &str = "Deploy for ACME-INC today.";
     const BODY_WIDGET: &str = "Partner WIDGET-CO ships it.";
 
+    /// Skill-id snippets a public-tier scan reports for `body`.
+    fn skill_ids(body: &str) -> Vec<String> {
+        scan_body(body, &RedactionConfig::default(), 3)
+            .into_iter()
+            .filter(|h| h.category == "skill-id")
+            .map(|h| h.snippet)
+            .collect()
+    }
+
+    // A host:port or an image:tag whose host or image name merely ENDS in a
+    // namespace is not a skill ID: the namespace has to start the token, and
+    // the skill name is kebab-case starting with a letter.
+    #[test]
+    fn skill_id_skips_host_port_and_image_tags() {
+        for body in [
+            "Service at media-mcp:3000 and obaass-mcp:3000.",
+            "Bare port mcp:3000 is a port, not a skill.",
+            "Pull homelab-mcp:main, then ghcr.io/cameronsjo/core:main.",
+            "Pinned to core:v1.2 and cadence:x.y today.",
+            "A path segment a/cadence:attune is part of a path.",
+            "Tags image:main and `:main` carry no namespace.",
+        ] {
+            assert!(
+                skill_ids(body).is_empty(),
+                "no skill-id expected in {body:?}, got {:?}",
+                skill_ids(body)
+            );
+        }
+    }
+
+    // The true positives the shape rule above must keep.
+    #[test]
+    fn skill_id_still_flags_real_skill_ids() {
+        for (body, want) in [
+            ("Use cadence:writing-skills here.", "cadence:writing-skills"),
+            ("Run `cadence-forge:polish` first.", "cadence-forge:polish"),
+            ("Invoke /cadence:outro now.", "cadence:outro"),
+            ("End with cadence:attune.", "cadence:attune"),
+            ("(see mcp:go-server-template)", "mcp:go-server-template"),
+            ("line start\ncore:lore", "core:lore"),
+            (
+                "Two in one: cadence:arrange, cadence:tend",
+                "cadence:arrange",
+            ),
+        ] {
+            let got = skill_ids(body);
+            assert!(
+                got.iter().any(|s| s == want),
+                "expected {want:?} flagged in {body:?}, got {got:?}"
+            );
+        }
+    }
+
     // --- The two fail-direction traps, asserted directly ---
 
     #[test]
@@ -3988,6 +4076,7 @@ mod tests {
         let repo_scoped = CategoryDescriptor {
             name: "probe",
             pattern: &HARNESS_NOUN,
+            accept: None,
             default_ceiling: "owned-internal",
             config_scope: ConfigScope::RepoConfig,
         };

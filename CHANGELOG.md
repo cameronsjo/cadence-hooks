@@ -11,6 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`prevent-secret-leaks` no longer blocks a command for defining a shell function.** Since 0.129.0 (#1409, #1425) any command that defined a function and named a secret anywhere blocked, whatever the function did. So `die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env"` and `f(){ echo hi; }; f; git commit -m '.env'` both blocked. cadence-ecosystem ADR-0046 rule 1 puts function indirection out of scope, so the rule is gone. A literal read still blocks, inside a function body or out (`f(){ cat .env; }; f`). A read through a function argument (`f(){ cat "$1"; }; f .env`) now passes, as the ADR accepts. (Part of cameronsjo/cadence-hooks#1443)
 - **`prevent-secret-leaks` no longer blocks a command for setting positional parameters.** Since 0.129.0 (#1422) any command that set them and named a secret anywhere blocked, whatever the script did with them. So `bash -c 'echo hi' _ x; git commit -m 'mention .env'`, `set -- a b; git commit -m 'mention .env'` and `docker run --env-file .env img sh -c 'x' _ y` all blocked. cadence-ecosystem ADR-0046 rule 1 puts positional-parameter indirection out of scope, so the rule is gone. A literal read still blocks, and so does a `-c` script behind a shell option cluster (`bash -eo pipefail -c 'cat .env'`). A read through `$1` (`bash -c 'cat "$1"' _ .env`, `set -- .env; cat "$1"`) now passes, as the ADR accepts. (Part of cameronsjo/cadence-hooks#1443)
 
+## [0.130.1] - 2026-10-20
+
+### Fixed
+
+- **The redaction scan's `skill-id` category no longer flags a host:port or an image tag.** `media-mcp:3000`, `obaass-mcp:3000`, `homelab-mcp:main`, `ghcr.io/owner/core:main`, a bare `mcp:3000` and `core:v1.2` were reported as skill IDs because the namespace matched at the end of a longer name and the skill part allowed a leading digit. A skill ID is now matched only when its namespace starts the token (a `/` that starts it, as in `/cadence:outro`, still counts), its skill name starts with a letter, and no `.` plus a name character follows it. True skill IDs such as `cadence:writing-skills` and `cadence-forge:polish` still flag; a standalone `mcp:main` still flags, since its shape is a skill ID's.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed
