@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::registry;
-use cadence_hooks_core::capability::on_path;
+use cadence_hooks_core::capability::{on_path, resolve_on_path};
 use cadence_hooks_core::display::shell_single_quote;
 use cadence_hooks_core::paths::cloud_sync_marker;
 // The session crate's `registry` (peer-session liveness) — aliased because the
@@ -618,7 +618,7 @@ fn scan_hooks_json(
                     path,
                     find_line_number(raw, cmd),
                     HOOK_CLI_DEPENDENCIES,
-                    on_path,
+                    |cli| resolve_on_path(cli).is_some(),
                 ));
 
                 // Check 1: shell-expansion bug (Error).
@@ -1886,7 +1886,9 @@ fn missing_cli_findings(
 ///
 /// The hooks.json command names only `cadence-hooks`, so
 /// [`missing_cli_findings`] cannot see these. Optional by design: the hook
-/// stays fail-open, and `doctor` says once that it is doing nothing.
+/// stays fail-open, and `doctor` says once that it is doing nothing. The
+/// installed check is `resolve_on_path`, the same lookup the hook runs, not
+/// the shell-level [`on_path`]: on Windows the two differ for npm's shims.
 const HOOK_CLI_DEPENDENCIES: &[(&str, &str, &str, &str)] = &[(
     "cadence",
     "markdown-lint",

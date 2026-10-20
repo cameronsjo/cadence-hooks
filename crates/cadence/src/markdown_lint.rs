@@ -4,6 +4,7 @@
 //! installed, so this hook degrades gracefully; `cadence-hooks doctor` reports
 //! the missing CLI and its install command.
 
+use cadence_hooks_core::capability::resolve_on_path;
 use cadence_hooks_core::display::{
     HOOK_OUTPUT_BUDGET_UTF16, MAX_BLOCK_FIX_UTF16, MAX_PATH_DISPLAY, MAX_RECOVERY_HINT_UTF16,
     clamp_hook_output, sanitize_field, shell_single_quote, utf16_len,
@@ -49,14 +50,12 @@ impl Check for MarkdownLint {
         let content = input.content().unwrap();
         let path = input.file_path().unwrap();
 
-        // Check if markdownlint is available
-        if Command::new("markdownlint")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        // Run the path doctor checks, not the bare name: on Windows
+        // `Command::new("markdownlint")` finds only `markdownlint.exe`, while
+        // npm installs `markdownlint.cmd`.
+        let Some(markdownlint) = resolve_on_path("markdownlint") else {
             return CheckResult::allow(); // Not installed: doctor reports it
-        }
+        };
 
         // Write content to temp file and lint
         let tmp = match tempfile::NamedTempFile::new() {
@@ -68,7 +67,7 @@ impl Check for MarkdownLint {
             return CheckResult::allow();
         }
 
-        let output = match Command::new("markdownlint").arg(tmp.path()).output() {
+        let output = match Command::new(&markdownlint).arg(tmp.path()).output() {
             Ok(out) => out,
             Err(_) => return CheckResult::allow(),
         };
