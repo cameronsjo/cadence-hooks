@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - **`prevent-secret-leaks` no longer blocks a command for defining a shell function.** Since 0.129.0 (#1409, #1425) any command that defined a function and named a secret anywhere blocked, whatever the function did. So `die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env"` and `f(){ echo hi; }; f; git commit -m '.env'` both blocked. cadence-ecosystem ADR-0046 rule 1 puts function indirection out of scope, so the rule is gone. A literal read still blocks, inside a function body or out (`f(){ cat .env; }; f`). A read through a function argument (`f(){ cat "$1"; }; f .env`) now passes, as the ADR accepts. (Part of cameronsjo/cadence-hooks#1443)
+- **`prevent-secret-leaks` no longer blocks a command for setting positional parameters.** Since 0.129.0 (#1422) any command that set them and named a secret anywhere blocked, whatever the script did with them. So `bash -c 'echo hi' _ x; git commit -m 'mention .env'`, `set -- a b; git commit -m 'mention .env'` and `docker run --env-file .env img sh -c 'x' _ y` all blocked. cadence-ecosystem ADR-0046 rule 1 puts positional-parameter indirection out of scope, so the rule is gone. A literal read still blocks, and so does a `-c` script behind a shell option cluster (`bash -eo pipefail -c 'cat .env'`). A read through `$1` (`bash -c 'cat "$1"' _ .env`, `set -- .env; cat "$1"`) now passes, as the ADR accepts. (Part of cameronsjo/cadence-hooks#1443)
 
 ## [0.130.0] - 2026-10-20
 
