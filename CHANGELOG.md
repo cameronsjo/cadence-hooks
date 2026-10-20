@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`guard-gh-write` counts a loop with a comment or non-ASCII text as plain.** A plain loop's literal `gh api` paths count as its targets, but any `#` or byte outside printable ASCII refused that shape. So `for n in 1 2; do gh api -X POST repos/<owner>/<repo>/issues/$n/comments -f body=x; done # ping both`, or the same loop with `body=café`, blocked from an unowned directory. That refusal worked around a comment-stripper bug that #1390 fixed. Now only `|` and `&` refuse the shape. (Part of cameronsjo/cadence-hooks#1443)
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed

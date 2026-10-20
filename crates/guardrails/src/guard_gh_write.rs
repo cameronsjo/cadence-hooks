@@ -1910,8 +1910,8 @@ fn api_writes_are_literal(api_writes: &[String]) -> bool {
 /// loop's shape.
 const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only in a plain loop: \
      `for` headers with a lowercase name and plain values, `do`, `done`, and `gh api`, `pr`, \
-     `issue` or similar commands with plain arguments, in printable ASCII, joined by `;` or \
-     newlines only, with no redirect, `||`/`&&`, pipe, `&`, comment, or other command; make the loop plain or run each call \
+     `issue` or similar commands with plain arguments, joined by `;` or newlines only, with no \
+     redirect, `||`/`&&`, pipe, `&`, or other command; make the loop plain or run each call \
      outside it";
 
 /// The fix for a loop in which every gh command names its target, but which
@@ -3263,8 +3263,8 @@ enum LoopedWriteKind {
 ///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
 ///   word or one of `/ - , @ + =`.
 ///
-/// The command must also be printable ASCII, space, tab, and newline only,
-/// with no `#`, `|`, or `&`, so segments are joined by `;` and newlines only.
+/// The command must also hold no `|` or `&`, so segments are joined by `;`
+/// and newlines only. Comments are dropped as the shell drops them.
 ///
 /// Those two forms are the only ones neither bash nor zsh rewrites: the value
 /// is a plain header word, so the expansion is that word, cannot split into a
@@ -3305,12 +3305,15 @@ fn loop_targets_are_literal(command: &str) -> bool {
         "histchars",
         "pipestatus",
     ];
+    /// Letters, digits, a few punctuation bytes, and any byte outside ASCII
+    /// (`body=café`): no shell reads one of those as syntax.
     fn plain(word: &str) -> bool {
         !word.is_empty()
             && !word.contains("..")
             && !word.starts_with('=')
             && word.bytes().all(|b| {
                 b.is_ascii_alphanumeric()
+                    || !b.is_ascii()
                     || matches!(
                         b,
                         b'_' | b'.' | b'/' | b':' | b'=' | b'@' | b',' | b'+' | b'-'
@@ -3363,20 +3366,11 @@ fn loop_targets_are_literal(command: &str) -> bool {
         }
         Some(out)
     }
-    // Printable ASCII, space, tab, and newline only: the comment stripper
-    // behind `split_segments` reads some characters the shell does not as a
-    // word boundary (U+3000, VT, CR), so `x<U+3000>#; export …` would hide
-    // the `export` from this check while the shell runs it. With those gone
-    // the stripper and the shell agree on ASCII comments, so the `#` refusal
-    // is a second layer no known input needs; it costs `done # note` the
-    // relaxed policy.
-    // `|` and `&` are refused too: a plain loop is joined by `;` and
-    // newlines only, never a pipe, `&&`/`||`, or a background job.
-    if command.contains(['#', '|', '&'])
-        || !command
-            .bytes()
-            .all(|b| matches!(b, b' ' | b'\t' | b'\n') || b.is_ascii_graphic())
-    {
+    // A plain loop is joined by `;` and newlines only, never a pipe,
+    // `&&`/`||`, or a background job. A comment is fine: `split_segments`
+    // drops it the way the shell does, ending a word only at a shell blank
+    // (#1390), so the command after it is still a segment here.
+    if command.contains(['|', '&']) {
         return false;
     }
     fn is_checkout_verb(word: &str) -> bool {
@@ -6056,6 +6050,12 @@ mod tests {
             "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr --repo cameronsjo/forgectl view $i; done",
             "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh issue --repo=cameronsjo/forgectl view $i; done",
             "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh issue -Rcameronsjo/forgectl view $i; done",
+            // A comment, and text outside ASCII (cadence-ecosystem ADR-0046
+            // rule 1: a non-bash blank before `#` is out of scope).
+            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done # clean both",
+            "# drop the stale branches\nfor b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done",
+            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b # stale\ndone",
+            "for n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=café; done",
         ] {
             assert!(
                 loop_targets_are_literal(command),
@@ -6330,10 +6330,11 @@ mod tests {
     }
 
     #[test]
-    fn a_character_the_comment_stripper_misreads_keeps_the_loop_gate() {
-        // Security review of 5db0fea: the comment stripper treats these as a
-        // word boundary and the shell does not, so a `#` after one hides the
-        // rest of the line from `split_segments` while the shell runs it.
+    fn a_command_after_a_comment_still_keeps_the_loop_gate() {
+        // A `#` no longer refuses the plain shape by itself, so what follows
+        // it must still be read. Since #1390 the stripper ends a word only at
+        // a shell blank, so `list<C>#` opens no comment and the `export` is
+        // a segment of its own; a real comment ends at the newline.
         let mut commands = Vec::new();
         for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
             commands.push(format!(
