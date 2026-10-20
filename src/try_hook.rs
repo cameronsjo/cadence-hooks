@@ -19,15 +19,16 @@ use std::time::Duration;
 /// `--show-payload` opts in to the full echo.
 const PAYLOAD_PREVIEW_LIMIT: usize = 200;
 
-/// How long `try` waits for piped stdin to reach end of file. A pipe that
-/// stays open with nothing on it (a harness that never closes stdin) must not
-/// hang `try`; past this it runs the generated sample and says so.
+/// How long `try` waits for the first byte of piped stdin. A pipe that stays
+/// open with nothing on it (a harness that never closes stdin) must not hang
+/// `try`; past this it runs the generated sample and says so. Once a byte has
+/// arrived, `try` reads to end of file however long the producer takes.
 const STDIN_WAIT: Duration = Duration::from_secs(2);
 
 /// Run `<namespace> <subcommand>` against a payload and print a report.
 ///
 /// The payload is the `--payload` file, else a payload piped to stdin, else a
-/// generated sample. Stdin that is a terminal, empty, or still open after
+/// generated sample. Stdin that is a terminal, empty, or silent for
 /// [`STDIN_WAIT`] falls back to the sample.
 ///
 /// Exit code: the hook's own exit code on a successful run (0 allow/nudge,
@@ -224,27 +225,70 @@ enum Piped {
     Payload(String),
     /// Nothing, or only whitespace (stdin is `/dev/null`, or closed at once).
     Empty,
-    /// No end of file within the wait.
+    /// No byte and no end of file within the wait.
     TimedOut,
     /// The read failed (for example, the bytes are not UTF-8).
     Failed(String),
 }
 
-/// Read `reader` to end of file on a helper thread, waiting at most `wait`.
+/// What the reader thread reports.
+enum ReadEvent {
+    /// The first bytes arrived; the rest follows in a [`ReadEvent::Done`].
+    Started,
+    /// End of file, or a read error.
+    Done(std::io::Result<String>),
+}
+
+/// Read `reader` to end of file on a helper thread.
 ///
-/// On a timeout the thread is left blocked on the read; the process exits
-/// when `try` finishes, which ends it.
+/// Only the wait for the first byte is bounded by `wait`: a slow producer that
+/// has started (`ssh host cat p.json | try …`) is read to the end, because
+/// dropping its bytes would run the sample in place of the payload. On a
+/// timeout the thread is left blocked on the read; the process exits when
+/// `try` finishes, which ends it.
 fn read_piped<R: Read + Send + 'static>(mut reader: R, wait: Duration) -> Piped {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = tx.send(reader.read_to_string(&mut buf).map(|_| buf));
+        let mut chunk = [0u8; 8192];
+        let first = loop {
+            match reader.read(&mut chunk) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        };
+        let mut buf = match first {
+            Err(e) => {
+                let _ = tx.send(ReadEvent::Done(Err(e)));
+                return;
+            }
+            Ok(0) => {
+                let _ = tx.send(ReadEvent::Done(Ok(String::new())));
+                return;
+            }
+            Ok(n) => chunk[..n].to_vec(),
+        };
+        let _ = tx.send(ReadEvent::Started);
+        let rest = reader.read_to_end(&mut buf).and_then(|_| {
+            String::from_utf8(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        });
+        let _ = tx.send(ReadEvent::Done(rest));
     });
-    match rx.recv_timeout(wait) {
-        Ok(Ok(s)) if s.trim().is_empty() => Piped::Empty,
-        Ok(Ok(s)) => Piped::Payload(s),
-        Ok(Err(e)) => Piped::Failed(e.to_string()),
-        Err(_) => Piped::TimedOut,
+    let done = match rx.recv_timeout(wait) {
+        Ok(ReadEvent::Done(r)) => r,
+        Ok(ReadEvent::Started) => match rx.recv() {
+            Ok(ReadEvent::Done(r)) => r,
+            _ => return Piped::Failed("the stdin reader stopped".into()),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Piped::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Piped::Failed("the stdin reader stopped".into());
+        }
+    };
+    match done {
+        Ok(s) if s.trim().is_empty() => Piped::Empty,
+        Ok(s) => Piped::Payload(s),
+        Err(e) => Piped::Failed(e.to_string()),
     }
 }
 
@@ -522,6 +566,32 @@ mod tests {
         assert_eq!(
             read_piped(Stalled, Duration::from_millis(50)),
             Piped::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_slow_producer_that_started_in_time_is_read_in_full() {
+        // First chunk inside the wait, the rest well after it: the payload
+        // must not be dropped for the sample (the false-ALLOW this fixes).
+        struct Slow(u8);
+        impl Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                let part: &[u8] = match self.0 {
+                    1 => br#"{"tool_name":"#,
+                    2 => {
+                        std::thread::sleep(Duration::from_millis(300));
+                        br#""Bash"}"#
+                    }
+                    _ => b"",
+                };
+                buf[..part.len()].copy_from_slice(part);
+                Ok(part.len())
+            }
+        }
+        assert_eq!(
+            read_piped(Slow(0), Duration::from_millis(50)),
+            Piped::Payload(r#"{"tool_name":"Bash"}"#.into())
         );
     }
 

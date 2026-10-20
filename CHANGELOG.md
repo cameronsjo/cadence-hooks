@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **`cadence-hooks try` reads a payload piped to stdin.** It ignored stdin and always ran the generated sample unless `--payload FILE` was given, so `… | cadence-hooks try <ns> <hook>` tested `git status` and could report ALLOW for a payload that blocks. A piped payload now runs; `--payload` still wins, and empty stdin (`/dev/null`) runs the sample as before. Stdin that stays open with nothing on it for 2 s runs the sample with a warning, and stdin that is not UTF-8 exits 1.
+- **`cadence-hooks try` reads a payload piped to stdin.** It ignored stdin and always ran the generated sample unless `--payload FILE` was given, so `… | cadence-hooks try <ns> <hook>` tested `git status` and could report ALLOW for a payload that blocks. A piped payload now runs; `--payload` still wins, and empty stdin (`/dev/null`) runs the sample as before. Stdin that sends nothing for 2 s runs the sample with a warning; once bytes arrive, `try` reads to the end however slow the producer. Stdin that is not UTF-8 exits 1.
 
 ## [0.130.0] - 2026-10-20
 
