@@ -9,6 +9,18 @@ Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatch
 - `cargo fmt --all` before `make ci` after writing long assert lines — fmt-check fails CI otherwise.
 - **Local `make ci` green does NOT guarantee CI green — and toolchain drift is the SECOND cause to check, not the first.** Until 2026-09-06 the `clippy` target ran `cargo clippy --workspace` with no `--all-targets`, so it never linted test code at all while CI did: a lint in a `#[cfg(test)]` module passed locally and failed CI with matching toolchains on both sides. That misreads as toolchain drift every time, and the `rustup update` it prescribes fixes nothing. The target now carries `--all-targets` (cadence-hooks#874). **Before blaming the toolchain, compare the two invocations and confirm `cargo clippy --version` actually differs from CI's** — the real drift case is real (CI runs latest stable, which flags lints an older local clippy doesn't, e.g. `collapsible_match` on 1.96), so `rustup update` before a PR is still worth it, but only after the flags match.
 
+## Specs and changes (OpenSpec)
+
+cadence-hooks plans work with [OpenSpec](https://github.com/Fission-AI/OpenSpec) (#1446).
+
+- `openspec/specs/<capability>/spec.md` says what the shipped binary does: each hook's verdicts, messages, switches and files. Read the relevant spec before changing a hook.
+- New behavior starts as a change: `openspec/changes/<id>/` with `proposal.md`, delta specs, `design.md` when it needs one, and `tasks.md`. `/opsx:propose`, `/opsx:apply` and `/opsx:archive` drive it in Claude Code (the `openspec-*` skills in Codex). Every change links its issue.
+- Archive a change (`scripts/openspec.sh archive <id>`) in the PR that finishes it, so the specs move with the code.
+- Run the CLI only through `scripts/openspec.sh`, which installs the pinned version from `scripts/openspec/package-lock.json` (needs Node >= 20.19). CI runs `scripts/openspec.sh validate --all --strict --no-interactive`.
+- The `openspec-*` skills and `/opsx` commands are generated. After `scripts/openspec.sh update`, run `scripts/openspec-localize.sh` so they call the pinned wrapper; `tests/openspec_skills.rs` fails until you do.
+- `docs/plans/` is frozen: `tests/plans_freeze.rs` rejects a plan dated after 2026-10-20. The plans already there finish in place.
+- ADRs in `docs/adr/` stay. A spec says what the behavior is; an ADR says why. `docs/hooks.md` stays the operator catalog.
+
 ## Release (fully automated — do NOT create tags or edit the tap formula manually)
 
 1. Every PR stages its CHANGELOG bullet under `## [Unreleased]`. On each push to main, `prepare-release.yml` keeps one `chore(main): release X.Y.Z` PR current (branch `prepare-release/main`): `scripts/prepare-release.sh` picks the version (`### Fixed` only → patch, anything else → minor), runs `make bump`, moves the workspace lines in `Cargo.lock`, and adds a `## [X.Y.Z] - DATE` heading under `## [Unreleased]`. The App commits it through the REST API so GitHub signs it. An empty `[Unreleased]` closes the PR.

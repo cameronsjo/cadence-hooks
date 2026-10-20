@@ -7,3 +7,6 @@
 .claude/intros/
 .claude/agent-memory/
 .claude/worktrees/
+
+# OpenSpec CLI pin install (scripts/openspec.sh)
+/scripts/openspec/node_modules/
