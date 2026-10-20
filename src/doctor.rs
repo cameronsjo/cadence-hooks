@@ -610,6 +610,17 @@ fn scan_hooks_json(
                     find_line_number(raw, cmd),
                 ));
 
+                // Check 0c: a wired binary hook whose own external CLI is
+                // missing, which Check 0 cannot see from the command text.
+                findings.extend(hook_dependency_findings(
+                    cmd,
+                    plugin,
+                    path,
+                    find_line_number(raw, cmd),
+                    HOOK_CLI_DEPENDENCIES,
+                    on_path,
+                ));
+
                 // Check 1: shell-expansion bug (Error).
                 if let Some(span) = detect_single_quoted_envvar(cmd) {
                     findings.push(Finding {
@@ -1866,6 +1877,60 @@ fn missing_cli_findings(
                 "install `{name}` or put it on PATH; if the hook is no longer \
                  wanted, remove its entry rather than leaving it inert"
             ),
+        })
+        .collect()
+}
+
+/// A binary hook that shells to an external CLI and allows without a word when
+/// the CLI is missing: `(namespace, hook, cli, install command)`.
+///
+/// The hooks.json command names only `cadence-hooks`, so
+/// [`missing_cli_findings`] cannot see these. Optional by design: the hook
+/// stays fail-open, and `doctor` says once that it is doing nothing.
+const HOOK_CLI_DEPENDENCIES: &[(&str, &str, &str, &str)] = &[(
+    "cadence",
+    "markdown-lint",
+    "markdownlint",
+    "npm install -g markdownlint-cli",
+)];
+
+/// A note per wired hook in `deps` whose CLI `resolves` cannot find.
+///
+/// A note, not a warning: the hook is optional, so a machine without the CLI
+/// must not read as unhealthy. Full `doctor` prints it; `--quiet` never does.
+fn hook_dependency_findings(
+    command: &str,
+    plugin: &str,
+    path: &Path,
+    line: Option<usize>,
+    deps: &[(&str, &str, &str, &str)],
+    resolves: impl Fn(&str) -> bool,
+) -> Vec<Finding> {
+    let wired: Vec<(String, String)> = match group_members(command) {
+        Some(members) => members
+            .iter()
+            .filter_map(|m| {
+                let (ns, sub) = m.trim_matches(|c| c == '\'' || c == '"').split_once('/')?;
+                Some((ns.to_string(), sub.to_string()))
+            })
+            .collect(),
+        None => extract_invocation(command).into_iter().collect(),
+    };
+    deps.iter()
+        .filter(|(ns, hook, _, _)| wired.iter().any(|(n, h)| n == ns && h == hook))
+        .filter(|(_, _, cli, _)| !resolves(cli))
+        .map(|(ns, hook, cli, install)| Finding {
+            severity: Severity::Note,
+            blocker: Blocker::No,
+            plugin: plugin.to_string(),
+            file: path.to_path_buf(),
+            line,
+            snippet: format!("missing CLI: {cli}"),
+            diagnosis: format!(
+                "`{ns} {hook}` is wired but `{cli}` is not on PATH, so the hook \
+                 allows every file without checking it"
+            ),
+            remediation: format!("install it: `{install}`"),
         })
         .collect()
 }
@@ -5636,6 +5701,56 @@ mod tests {
             Severity::Warning,
             "heuristic extraction must never be able to fail the run"
         );
+    }
+
+    #[test]
+    fn hook_dependency_findings_name_the_install_command_when_the_cli_is_missing() {
+        let deps = &[("cadence", "markdown-lint", "markdownlint", "npm i -g x")];
+        let direct = "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence markdown-lint";
+        let grouped = "cadence-hooks group cadence/terminology cadence/markdown-lint";
+        for cmd in [direct, grouped] {
+            let found = hook_dependency_findings(
+                cmd,
+                "cadence",
+                Path::new("/h.json"),
+                Some(3),
+                deps,
+                |_| false,
+            );
+            assert_eq!(found.len(), 1, "{cmd}");
+            assert_eq!(
+                found[0].severity,
+                Severity::Note,
+                "must not move the exit code"
+            );
+            assert_eq!(found[0].blocker, Blocker::No, "must not reach --quiet");
+            assert!(
+                found[0].remediation.contains("npm i -g x"),
+                "{}",
+                found[0].remediation
+            );
+            assert_eq!(found[0].line, Some(3));
+        }
+    }
+
+    #[test]
+    fn hook_dependency_findings_stay_silent_when_installed_or_not_wired() {
+        let deps = &[("cadence", "markdown-lint", "markdownlint", "npm i -g x")];
+        let wired = "cadence-hooks cadence markdown-lint";
+        let other = "cadence-hooks cadence terminology";
+        let p = Path::new("/h.json");
+        assert!(hook_dependency_findings(wired, "c", p, None, deps, |_| true).is_empty());
+        assert!(hook_dependency_findings(other, "c", p, None, deps, |_| false).is_empty());
+    }
+
+    #[test]
+    fn hook_cli_dependencies_name_registered_hooks() {
+        for (ns, hook, _, _) in HOOK_CLI_DEPENDENCIES {
+            assert!(
+                registry::entry(ns, hook).is_some(),
+                "{ns} {hook} is not a hook"
+            );
+        }
     }
 
     #[test]

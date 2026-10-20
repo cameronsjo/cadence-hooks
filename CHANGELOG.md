@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`doctor` notes a wired `markdown-lint` hook whose `markdownlint` CLI is missing.** The hook allows every file without a word when the CLI is not on `PATH`, so a successful Write was no sign the file was linted. A full `doctor` run now prints a note naming the install command (`npm install -g markdownlint-cli`). It is a note, not a warning: the exit code and `doctor --quiet` are unchanged, and the hook still allows.
+
 ## [0.130.0] - 2026-10-20
 
 ### Changed

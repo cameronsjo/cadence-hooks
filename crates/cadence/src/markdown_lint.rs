@@ -1,7 +1,8 @@
 //! Run markdownlint on markdown files being written.
 //!
-//! Shells out to `markdownlint` CLI if available. Skips silently when
-//! the tool is not installed, so this hook degrades gracefully.
+//! Shells out to `markdownlint` CLI if available. Allows when the tool is not
+//! installed, so this hook degrades gracefully; `cadence-hooks doctor` reports
+//! the missing CLI and its install command.
 
 use cadence_hooks_core::display::{
     HOOK_OUTPUT_BUDGET_UTF16, MAX_BLOCK_FIX_UTF16, MAX_PATH_DISPLAY, MAX_RECOVERY_HINT_UTF16,
@@ -54,7 +55,7 @@ impl Check for MarkdownLint {
             .output()
             .is_err()
         {
-            return CheckResult::allow(); // Skip if not installed
+            return CheckResult::allow(); // Not installed: doctor reports it
         }
 
         // Write content to temp file and lint
