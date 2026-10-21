@@ -47,9 +47,10 @@ Stderr:   (none)
 `additionalContext` as readable text, re-prompt envelopes show the reason,
 and the outcome line distinguishes `ALLOW` / `NUDGE` / `LOOP-BLOCK` / `BLOCK`.
 
-Use `--payload <file>` to test with a real payload instead of the generated
-sample, and `--show-payload` to echo a user-supplied payload in full (the
-default is a bounded preview).
+Use `--payload <file>`, or pipe the payload to `try` on stdin, to test with a
+real payload instead of the generated sample. `--payload` wins when both are
+given; empty stdin (such as `/dev/null`) runs the sample. `--show-payload`
+echoes a user-supplied payload in full (the default is a bounded preview).
 
 To pipe a payload by hand, match the shape to the hook's event
 (`cadence-hooks list` shows each hook's event):
