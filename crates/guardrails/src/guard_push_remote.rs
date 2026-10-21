@@ -4632,6 +4632,57 @@ mod tests {
         });
     }
 
+    /// The config cap counts directory and remote pairs, not remotes: two
+    /// remotes over three `git -C` directories are six pairs and block,
+    /// though no other cap is passed.
+    // Embeds a native path in a POSIX shell string.
+    #[cfg(unix)]
+    #[test]
+    fn the_config_cap_counts_directory_and_remote_pairs() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let dirs: Vec<_> = (1..=3)
+            .map(|_| {
+                let dir = checkout_with_origin("https://github.com/cameronsjo/x.git");
+                for n in 1..=2 {
+                    let url = format!("https://github.com/cameronsjo/r{n}.git");
+                    cadence_hooks_core::git_fixtures::git_in(
+                        dir.path(),
+                        &["remote", "add", &format!("r{n}"), &url],
+                    );
+                }
+                dir
+            })
+            .collect();
+        let cwd = dirs[0].path().to_string_lossy().to_string();
+        let pushes = |dir_count: usize| {
+            (1..=2)
+                .flat_map(|n| {
+                    dirs[..dir_count].iter().map(move |d| {
+                        format!(
+                            "git -C {} -c remote.pushDefault=r{n} push",
+                            d.path().display()
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" && ")
+        };
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(2), &cwd));
+            assert_eq!(result.outcome, Allow, "four pairs: {:?}", result.message);
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(3), &cwd));
+            assert_eq!(result.outcome, Block, "six pairs: {:?}", result.message);
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too many push remotes to verify")),
+                "six pairs: {:?}",
+                result.message
+            );
+        });
+    }
+
     /// "Literal `git -C` push loops": the loop reader takes only a command
     /// that begins with `for`, so a comment line before the loop sends it to
     /// the general loop checks and their remote cap.
