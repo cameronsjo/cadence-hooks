@@ -7184,6 +7184,8 @@ mod tests {
                 // and `cat .env`.
                 "watch -dn 1 -x echo 'x; cat .env'",
                 "watch -dn 'cat .env'",
+                // After `--`, `-x` is the command's first word, not an option.
+                "watch -- -x echo 'x; cat .env'",
                 // tmux runs `run-shell`'s first word under `sh -c` and
                 // ignores a second.
                 "tmux run-shell 'cat .env' x",

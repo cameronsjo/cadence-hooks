@@ -25910,6 +25910,7 @@ mod tests {
             ("watch -dn 1 -x echo 'x; cat .env'", "cat .env"),
             ("watch -dn 1 -x sh -c 'cat .env'", "1 -x sh -c cat .env"),
             ("watch -dn 'cat .env'", "cat .env"),
+            ("watch -- -x echo 'x; cat .env'", "cat .env"),
             ("watch --interval -x sh -c 'cat .env'", "sh -c cat .env"),
             ("watch echo 'x; cat .env'", "cat .env"),
             ("tmux run-shell 'cat .env' x", "cat .env x"),
