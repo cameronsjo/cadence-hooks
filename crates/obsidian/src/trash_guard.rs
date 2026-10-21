@@ -568,11 +568,14 @@ fn is_inert_segment(argv: &[String], segment: &str) -> bool {
         && redirect_targets(segment).is_empty()
 }
 
-/// Verbs that run a command string they were handed in a child of their own and
-/// delete nothing themselves: a shell's `-c`, `env -S`, `script -c`, `flock`,
-/// `watch`, and `su`/`runuser`. These are the wrappers core reads a script out
-/// of ([`segment_scripts`]) that are not also a deletion or a re-pointing
-/// shape: `find -exec`, `git`, `tmux`, `eval` and `trap` are left out.
+/// Verbs that run a command string they were handed in a child of their own: a
+/// shell's `-c`, `env -S`, `script -c`, `flock`, `watch`, and `su`/`runuser`.
+/// These are the wrappers core reads a script out of ([`segment_scripts`]) that
+/// are not also a deletion or a re-pointing shape: `find -exec`, `git`, `tmux`,
+/// `eval` and `trap` are left out. What the wrapper does with its own file
+/// operands is not judged, as on `main` for the bare forms: `script` truncates
+/// its typescript file and `flock` creates its lock file, and
+/// `script -q -c 'echo hi' note.md` already allowed there.
 const SCRIPT_WRAPPERS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "env", "script", "flock", "watch", "su", "runuser",
 ];
@@ -608,9 +611,8 @@ impl<'a> ListedSegments<'a> {
 /// That holds only while the list really holds them, so each script is read
 /// afresh and every segment of it must already be listed. Past the nesting
 /// [`command_segments`] expands, the deepest commands are not listed (`flock a
-/// flock b flock c flock d flock e rm note.md`), and a variable the command
-/// assigned first is listed resolved (`X=note.md; sh -c 'rm $X'`): both keep
-/// the verdict. So does a wrapper core read no script out of (`sh script.sh`,
+/// flock b flock c flock d flock e rm note.md`), and the wrapper keeps the
+/// verdict. So does a wrapper core read no script out of (`sh script.sh`,
 /// `watch` with no command, an option it could not classify), and a wrapper
 /// behind `xargs`, whose stdin words land on the end of the command the
 /// wrapper runs.
@@ -645,6 +647,9 @@ fn is_script_wrapper(
 /// never lifts one. The directory walk places a wrapper's whole script where
 /// the wrapper starts, so a `cd` inside the script would put its deletions
 /// somewhere the walk does not look: `cd /tmp && sh -c 'cd /vault; rm x.md'`.
+/// A directory option (`env -C`, `env --chdir`) or a login shell (`su -`,
+/// `su -l`, `runuser -l`, `sudo -i`) is not followed, the same as for a bare
+/// deletion: the walk does not place those either.
 fn may_move_directory(text: &str) -> bool {
     ["cd", "pushd", "popd"]
         .iter()
@@ -1783,6 +1788,8 @@ mod tests {
             "script -q -t -c '{}' /dev/null",
             "sh -c '{}'",
             "bash -c '{}'",
+            "zsh -c '{}'",
+            "dash -c '{}'",
             "watch -x {}",
             "runuser -u app -- {}",
             "env -S 'A=1' {}",
@@ -1851,7 +1858,14 @@ mod tests {
                 "rm /tmp/a; sh -c \"sh -c \\\"sh -c 'sh -c \\\\\\\"rm note.md\\\\\\\"'\\\"\"",
                 Block,
             ),
-            // A variable assigned first is listed resolved, not as written.
+            // Every segment of the script must be listed, not just one: the
+            // first `rm` is listed (it is also a top-level segment), the
+            // second is past the nesting the walk expands.
+            (
+                "rm /tmp/x; flock /tmp/a flock /tmp/b flock /tmp/c flock /tmp/d sh -c 'rm /tmp/x; rm note.md'",
+                Block,
+            ),
+            // A segment that assigns a variable is not inert.
             ("X=note.md; sh -c 'rm $X'", Block),
             ("X=/tmp/a Y=note.md; sh -c 'rm $Y'", Block),
             (
@@ -1900,6 +1914,10 @@ mod tests {
             ("rm /tmp/a; ssh host rm /tmp/b", Block),
             ("rm /tmp/a; my_wrapper rm /tmp/b", Block),
             ("tmux new-session 'rm /tmp/a'", Block),
+            // `trap` and `git` hand a command string to a shell, and are not
+            // script wrappers.
+            ("trap 'rm -f /tmp/a' EXIT; rm /tmp/b", Block),
+            ("git rebase -x 'rm /tmp/a' main", Block),
         ];
         for &(command, expected) in cases {
             let result = check_destructive_in_vault(command, "/vault", "/vault", &fs);
@@ -2315,30 +2333,48 @@ mod tests {
             // A `cd` inside the wrapper moves it off the directory the walk
             // placed it in.
             (vault, "cd /tmp && sh -c 'cd -; rm x.md'", Block),
-            (vault, "cd /tmp && sh -c 'cd /vault; rm x.md'", Block),
+            (
+                vault,
+                "cd /tmp && sh -c 'cd /home/me/vault; rm x.md'",
+                Block,
+            ),
             (
                 vault,
                 "cd /tmp && sh -c 'cd $OBSIDIAN_VAULT && rm x.md'",
                 Block,
             ),
-            (vault, "cd /tmp && bash -c 'pushd /vault; rm x.md'", Block),
             (
                 vault,
-                "cd /tmp && flock /tmp/l sh -c 'cd /vault; rm x.md'",
+                "cd /tmp && bash -c 'pushd /home/me/vault; rm x.md'",
                 Block,
             ),
             (
                 vault,
-                "cd /tmp && env -S 'A=1' sh -c 'cd /vault; rm x.md'",
+                "cd /tmp && flock /tmp/l sh -c 'cd /home/me/vault; rm x.md'",
                 Block,
             ),
             (
                 vault,
-                "cd /tmp && sh -c 'rm -rf build; cd /vault; rm x.md'",
+                "cd /tmp && env -S 'A=1' sh -c 'cd /home/me/vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build; cd /home/me/vault; rm x.md'",
                 Block,
             ),
             (vault, "cd /tmp && sh -c 'find . -delete'", Block),
             (vault, "cd /tmp && flock /tmp/l git rm -r x", Block),
+            // `trap` and `git` run a command string too, but they are not
+            // script wrappers: the handler runs at exit, wherever the shell
+            // ends up, and an alias or `rebase -x` runs in git's directory.
+            (vault, "cd /tmp && trap 'rm -rf build' EXIT", Block),
+            (
+                vault,
+                "cd /tmp && trap 'rm -rf build' EXIT; cd $OBSIDIAN_VAULT",
+                Block,
+            ),
+            (vault, "cd /tmp && git -c alias.x='!rm -rf build' x", Block),
             (vault, "cd /tmp && xargs sh -c 'rm a'", Block),
             (
                 vault,
