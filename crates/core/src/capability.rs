@@ -14,7 +14,8 @@
 //! reason: `stat` on a stalled mount does not fail, it hangs, and a hang in
 //! message composition swallows a block that was already decided.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -29,6 +30,64 @@ pub fn on_path(name: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|dir| is_executable_at(&dir.join(name)))
+}
+
+/// The full path that `std::process::Command` can run for `name`, found on
+/// the current `PATH`.
+///
+/// A binary hook that shells to a CLI runs this path, not the bare name, and
+/// `doctor` asks the same function whether that CLI is installed, so the two
+/// cannot disagree. The bare name would not do on Windows: `Command::new`
+/// searches `PATH` for `name.exe` only, while Node's global installs ship
+/// `name.cmd`. Given a full `.cmd` or `.bat` path, std runs it through
+/// `cmd.exe` and escapes the arguments, or returns an error when it cannot.
+///
+/// Narrower than [`on_path`], which answers for the shell: on Windows an
+/// extensionless file (npm's `sh` shim) runs under Git Bash but not under
+/// `Command`, so it does not count here.
+pub fn resolve_on_path(name: &str) -> Option<PathBuf> {
+    resolve_in(name, &std::env::var_os("PATH")?)
+}
+
+/// [`resolve_on_path`] against an explicit `PATH` value, so a test can use a
+/// temp dir without touching the process environment.
+pub fn resolve_in(name: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path).find_map(|dir| runnable_at(&dir.join(name)))
+}
+
+#[cfg(unix)]
+fn runnable_at(candidate: &Path) -> Option<PathBuf> {
+    is_executable_at(candidate).then(|| candidate.to_path_buf())
+}
+
+/// `candidate` plus the first `PATHEXT` suffix that `CreateProcess` (via std)
+/// can start, else `candidate` itself when it already names such a file.
+#[cfg(windows)]
+fn runnable_at(candidate: &Path) -> Option<PathBuf> {
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".to_string());
+    let with_ext = pathext
+        .split(';')
+        .filter(|&ext| spawnable(ext))
+        .map(|ext| {
+            let mut p = candidate.as_os_str().to_os_string();
+            p.push(ext);
+            PathBuf::from(p)
+        })
+        .find(|p| p.is_file());
+    with_ext.or_else(|| {
+        let ext = candidate.extension()?.to_str()?;
+        (spawnable(&format!(".{ext}")) && candidate.is_file()).then(|| candidate.to_path_buf())
+    })
+}
+
+/// True for an extension `CreateProcess` (via std) can start: `.vbs`, `.js`
+/// and the rest of `PATHEXT` need a host program, so `Command` cannot.
+#[cfg(windows)]
+fn spawnable(ext: &str) -> bool {
+    [".com", ".exe", ".bat", ".cmd"]
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(ext))
 }
 
 /// True when `candidate` is something the shell could actually exec.
@@ -165,6 +224,58 @@ mod tests {
         // differs by machine — assert only the direction that is machine-
         // independent.
         assert!(!on_path("cadence-hooks-no-such-binary-8f3a1c"));
+    }
+
+    #[test]
+    fn resolve_in_returns_the_full_path_command_can_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().as_os_str();
+        assert_eq!(resolve_in("cadence-resolve-probe", path), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tool = dir.path().join("cadence-resolve-probe");
+            std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(resolve_in("cadence-resolve-probe", path), None);
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(resolve_in("cadence-resolve-probe", path), Some(tool));
+        }
+        #[cfg(windows)]
+        {
+            let cmd = dir.path().join("cadence-resolve-probe.cmd");
+            std::fs::write(&cmd, "@echo off\n").unwrap();
+            assert_eq!(
+                lowercase(resolve_in("cadence-resolve-probe", path)),
+                lowercase(Some(cmd))
+            );
+        }
+    }
+
+    /// The suffix comes from `PATHEXT`, which is upper case (`.CMD`), and the
+    /// file system ignores case, so compare paths without it.
+    #[cfg(windows)]
+    fn lowercase(path: Option<PathBuf>) -> Option<String> {
+        path.map(|p| p.to_string_lossy().to_lowercase())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_in_picks_an_npm_cmd_shim_over_its_sh_and_ps1_siblings() {
+        // npm writes `name` (sh), `name.cmd` and `name.ps1`. `Command` cannot
+        // start the sh or ps1 file, and `Command::new("name")` looks only for
+        // `name.exe`, so the hook must be handed the `.cmd` path.
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["markdownlint", "markdownlint.cmd", "markdownlint.ps1"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        assert_eq!(
+            lowercase(resolve_in("markdownlint", dir.path().as_os_str())),
+            lowercase(Some(dir.path().join("markdownlint.cmd")))
+        );
+        std::fs::remove_file(dir.path().join("markdownlint.cmd")).unwrap();
+        assert_eq!(resolve_in("markdownlint", dir.path().as_os_str()), None);
     }
 
     #[test]
