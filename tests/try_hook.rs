@@ -193,6 +193,82 @@ fn try_accepts_payload_file_override() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn try_reads_a_payload_piped_to_stdin() {
+    // A piped payload used to be ignored in favour of the generated sample,
+    // so a probe piped to `try` tested `git status` and could read ALLOW.
+    let mut cmd = cadence_hooks();
+    cmd.args(["try", "cadence", "terminology"]);
+    let output = run_with_stdin(
+        cmd,
+        r#"{"tool_name":"Bash","tool_input":{"command":"echo piped-payload-marker"}}"#,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    assert!(
+        stdout.contains("piped-payload-marker"),
+        "report echoes the piped payload: {stdout}"
+    );
+    assert!(
+        !stdout.contains("git status"),
+        "the generated sample must not run: {stdout}"
+    );
+}
+
+#[test]
+fn try_payload_file_wins_over_piped_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload_path = dir.path().join("payload.json");
+    std::fs::write(
+        &payload_path,
+        r#"{"tool_name":"Bash","tool_input":{"command":"echo file-marker"}}"#,
+    )
+    .unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["try", "cadence", "terminology", "--payload"])
+        .arg(&payload_path);
+    let output = run_with_stdin(
+        cmd,
+        r#"{"tool_name":"Bash","tool_input":{"command":"echo stdin-marker"}}"#,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("file-marker"),
+        "file payload runs: {stdout}"
+    );
+    assert!(
+        !stdout.contains("stdin-marker"),
+        "stdin is not read: {stdout}"
+    );
+}
+
+#[test]
+fn try_refuses_a_piped_payload_it_cannot_read() {
+    let mut cmd = cadence_hooks();
+    cmd.args(["try", "cadence", "terminology"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&[0xff, 0xfe, b'{'])
+        .unwrap();
+    let output = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot read the payload piped to stdin"),
+        "names the stdin read failure: {stderr}"
+    );
+}
+
 // ── try: error paths ─────────────────────────────────────────────────
 
 #[test]
