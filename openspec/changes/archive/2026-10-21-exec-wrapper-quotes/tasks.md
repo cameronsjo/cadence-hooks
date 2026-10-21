@@ -1,7 +1,7 @@
 ## 1. Behavior
 
-- [x] 1.1 Surface the command behind `flock FILE CMD…`, BSD `script FILE CMD…`, `watch -x`/`--exec`, `runuser -u USER CMD…`, the words after `env -S STRING` and a several-word tmux shell command with `quoted_script`
-- [x] 1.2 Keep `joined_script` for `watch` without `-x` and a one-word tmux shell command, which run under `sh -c`
+- [x] 1.1 Surface the command behind `flock FILE CMD…`, BSD `script FILE CMD…`, `watch -x`/`--exec`, `runuser -u USER CMD…`, the words after `env -S STRING` and a several-word tmux shell command (not `run-shell` or `pipe-pane`) with `quoted_script`
+- [x] 1.2 Keep `joined_script` for `watch` without `-x`, a one-word tmux shell command, and tmux `run-shell` and `pipe-pane`, which run under `sh -c`
 - [x] 1.3 Pin the surfaced scripts in core (`a_wrapper_that_execs_its_words_keeps_each_word_whole`)
 - [x] 1.4 Move the `flock` and `script` rows in `positional_parameters_do_not_change_the_verdict` from the accepted-cost allows to the blocks, and pin the quoted-`;` rows as allows
 

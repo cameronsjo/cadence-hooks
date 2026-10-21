@@ -7,7 +7,7 @@
 - Core keeps each word whole when it surfaces the command behind these wrappers, as it already did for `find -exec`. Every guard that reads a wrapped command gets the same reading.
 - `flock /tmp/l sh -c 'cat .env'`, `script -q /dev/null sh -c 'cat .env'`, `watch -x sh -c 'cat .env'`, `env -S 'sh -c' 'cat .env'` and `tmux new -d sh -c 'cat .env'` block again.
 - `flock /tmp/l echo 'x; cat .env'`, `watch -x echo 'x; cat .env'` and `runuser -u app -- echo 'x; cat .env'` no longer block.
-- `watch` without `-x` hands its words to `sh -c` as one string, so it is read as before: `watch echo 'x; cat .env'` blocks and `watch sh -c 'cat .env'`, which reads no file, passes. A tmux shell command given as one word runs under `sh -c` too.
+- `watch` without `-x` hands its words to `sh -c` as one string, so it is read as before: `watch echo 'x; cat .env'` blocks and `watch sh -c 'cat .env'`, which reads no file, passes. A tmux shell command given as one word runs under `sh -c` too, and so do `run-shell` and `pipe-pane`, which tmux never execs: `tmux run-shell 'cat .env' x` still blocks.
 
 ## Capabilities
 
@@ -17,11 +17,11 @@ None.
 
 ### Modified Capabilities
 
-- `command-reading`: adds "Words an exec wrapper runs stay whole".
+- `command-reading`: adds "Words an exec wrapper runs stay whole" and "Words a wrapper runs under sh -c are read joined".
 - `secret-reads`: "A script the guard does not read is allowed" no longer names `flock FILE CMD…` or BSD `script FILE CMD…`.
 
 ## Impact
 
-- `cadence-hooks-core` `crates/core/src/shell.rs`: `flock_command`, `script_command`, `watch_command` (with `-x`/`--exec`), `su_script` (`runuser -u`), `env_split_string_script` and `tmux_command_script` (several words) use `quoted_script` instead of `joined_script`.
-- Every Bash-reading guard sees the change. Scored on the everyday corpus (303 rows, bare and behind each of the five wrappers, across 14 guards): no new block; 15 nudges from `git-safety` on `<wrapper> eval "$(…)"` drop, matching the bare `eval "$(…)"`.
+- `cadence-hooks-core` `crates/core/src/shell.rs`: `flock_command`, `script_command`, `watch_command` (with `-x`/`--exec`), `su_script` (`runuser -u`), `env_split_string_script` and `tmux_command_script` (several words, except `run-shell` and `pipe-pane`) use `quoted_script` instead of `joined_script`.
+- Every Bash-reading guard sees the change. Scored on the everyday corpus (303 rows, bare and behind seven wrapper spellings, across 14 guards): no new block; 21 nudges from `git-safety` on `<wrapper> eval "$(…)"` drop, matching the bare `eval "$(…)"`.
 - No env var, config key, ledger, marker file or hooks.json change.

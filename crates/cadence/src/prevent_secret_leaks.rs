@@ -7163,16 +7163,26 @@ mod tests {
                 r#"flock /tmp/l sh -c "cat .env""#,
                 "script -q /dev/null sh -c 'cat .env'",
                 "script -q /dev/null bash -c 'source .env && env'",
+                "script -q /dev/null -- sh -c 'cat .env'",
+                "script -q -- /dev/null sh -c 'cat .env'",
                 "watch -x sh -c 'cat .env'",
                 "watch --exec sh -c 'cat .env'",
+                "watch --ex sh -c 'cat .env'",
                 "watch -n 1 -x sh -c 'cat .env'",
                 "watch -xn 1 sh -c 'cat .env'",
+                "watch -xd sh -c 'cat .env'",
                 "env -S 'sh -c' 'cat .env'",
                 "env -S sh -c 'cat .env'",
                 "tmux new -d sh -c 'cat .env'",
                 "tmux neww sh -c 'cat .env'",
+                "tmux respawn-pane -k sh -c 'cat .env'",
+                "tmux display-popup sh -c 'cat .env'",
                 // Without `-x`, `watch`'s `sh -c` splits the words again.
                 "watch echo 'x; cat .env'",
+                // tmux runs `run-shell`'s first word under `sh -c` and
+                // ignores a second.
+                "tmux run-shell 'cat .env' x",
+                "tmux run -b 'cat .env' x",
             ],
             cadence_hooks_core::Outcome::Block,
             "a literal read beside positional parameters",
@@ -7186,12 +7196,21 @@ mod tests {
                 r#"flock /tmp/l echo "x; cat .env""#,
                 "watch -x echo 'x; cat .env'",
                 "runuser -u app -- echo 'x; cat .env'",
+                "runuser -u app echo 'x; cat .env'",
                 "env -S 'echo hi' 'x; cat .env'",
                 "tmux new -d echo 'x; cat .env'",
                 // Without `-x`, `watch` hands its words to `sh -c` as one
                 // string: that shell runs `sh -c cat .env`, a script of
-                // `cat` with `$0` set to `.env`, which reads no file.
+                // `cat` with `$0` set to `.env`, which reads no file. `-dx`
+                // is `-d` with the value `x`, and `-n -x` an interval of
+                // `-x`, so neither execs.
                 "watch sh -c 'cat .env'",
+                "watch -dx sh -c 'cat .env'",
+                "watch -n -x sh -c 'cat .env'",
+                // tmux refuses three words for `run-shell` and two for
+                // `pipe-pane`, so these run nothing; read joined, as before.
+                "tmux run-shell sh -c 'cat .env'",
+                "tmux pipe-pane sh -c 'cat .env'",
             ],
             cadence_hooks_core::Outcome::Allow,
             "a quoted `;` behind a wrapper that execs its words",

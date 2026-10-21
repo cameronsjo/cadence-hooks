@@ -16121,34 +16121,51 @@ fn watch_command(operands: &[String]) -> Option<String> {
 
 /// Whether `watch`'s leading options include `-x`/`--exec` (getopt_long
 /// takes `--ex` as the shortest unique prefix). A short cluster is walked up
-/// to its first value-taking letter, whose value is the rest of the word.
+/// to its first value-taking letter, whose value is the rest of the word or,
+/// for `-n`/`-q` at the end of one, the next word (`-n -x` is an interval of
+/// `-x`). `-d` takes only a glued value, so `-dx` is not exec.
 fn watch_execs(options: &[String]) -> bool {
-    options.iter().any(|raw| {
+    let mut i = 0;
+    while let Some(raw) = options.get(i) {
+        i += 1;
         let tok = unescape_word(raw);
         if let Some(long) = tok.strip_prefix("--") {
             let name = long.split_once('=').map_or(long, |(name, _)| name);
-            return name.len() >= 2 && "exec".starts_with(name);
+            if name.len() >= 2 && "exec".starts_with(name) {
+                return true;
+            }
+            if !long.contains('=') && WATCH_VALUE_LONG_FLAGS.contains(&tok.as_ref()) {
+                i += 1;
+            }
+            continue;
         }
         let Some(cluster) = tok.strip_prefix('-') else {
-            return false;
+            continue;
         };
-        for c in cluster.chars() {
+        for (at, c) in cluster.char_indices() {
             if c == 'x' {
                 return true;
             }
+            if c == 'd' {
+                break;
+            }
             if WATCH_VALUE_SHORT_FLAGS.contains(c) {
-                return false;
+                if cluster[at + c.len_utf8()..].is_empty() {
+                    i += 1;
+                }
+                break;
             }
         }
-        false
-    })
+    }
+    false
 }
 
 /// Index of the first operand after a utility's leading options (stopping at,
 /// and skipping, `--`), given which options take a value. An unlisted option
 /// is read as argument-free. A value-taking one misread that way puts its
 /// value first and hides the command behind it, so each caller lists every
-/// value-taking option of its utility.
+/// value-taking option of its utility, by its exact spelling (a getopt_long
+/// abbreviation such as `--int` is not matched).
 fn skip_simple_options(operands: &[String], value_short: &str, value_long: &[&str]) -> usize {
     let mut i = 0;
     while let Some(raw) = operands.get(i) {
@@ -16261,6 +16278,11 @@ enum TmuxOperands {
     /// Every operand is the shell command and its arguments: one word is a
     /// script, several are words tmux execs.
     Command,
+    /// The operands, joined, are one script tmux runs under `sh -c`
+    /// (`run-shell`, `pipe-pane`). tmux runs only the first and refuses more
+    /// than two (`run-shell`) or one (`pipe-pane`); joining them all keeps a
+    /// read in that first word seen.
+    Script,
     /// Only the first operand is a shell command (`if-shell`).
     First,
     /// The operands are keys typed into a pane (`send-keys`).
@@ -16276,14 +16298,14 @@ const TMUX_COMMANDS: &[(&str, &str, &str, TmuxOperands)] = &[
     ("split-window", "splitw", "celtFp", TmuxOperands::Command),
     ("respawn-pane", "respawnp", "cet", TmuxOperands::Command),
     ("respawn-window", "respawnw", "cet", TmuxOperands::Command),
-    ("run-shell", "run", "cdt", TmuxOperands::Command),
+    ("run-shell", "run", "cdt", TmuxOperands::Script),
     (
         "display-popup",
         "popup",
         "bcdehsStTwxy",
         TmuxOperands::Command,
     ),
-    ("pipe-pane", "pipep", "t", TmuxOperands::Command),
+    ("pipe-pane", "pipep", "t", TmuxOperands::Script),
     ("if-shell", "if", "t", TmuxOperands::First),
     ("send-keys", "send", "cNt", TmuxOperands::Keys),
 ];
@@ -16366,12 +16388,12 @@ fn tmux_command_script(command: &[String]) -> Option<String> {
         // One operand is a script tmux runs under `sh -c`. Several are a
         // command `new-session`, `new-window`, `split-window`, `respawn-*`
         // and `display-popup` exec directly (tmux 3.4's manual, measured), so
-        // each keeps its quotes; `run-shell` and `pipe-pane` refuse more
-        // than one.
+        // each keeps its quotes.
         TmuxOperands::Command => match operands {
             [script] => joined_script(std::slice::from_ref(script)),
             _ => quoted_script(operands),
         },
+        TmuxOperands::Script => joined_script(operands),
         TmuxOperands::First => joined_script(operands.get(..1)?),
         TmuxOperands::Keys => {
             let script = operands
@@ -25831,15 +25853,31 @@ mod tests {
             ("flock -n /tmp/l sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("flock /tmp/l echo 'x; cat .env'", "echo 'x; cat .env'"),
             ("script -q /dev/null sh -c 'cat .env'", "sh -c 'cat .env'"),
+            (
+                "script -q /dev/null -- sh -c 'cat .env'",
+                "sh -c 'cat .env'",
+            ),
+            (
+                "script -q -- /dev/null sh -c 'cat .env'",
+                "sh -c 'cat .env'",
+            ),
             ("watch -x sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("watch --exec sh -c 'cat .env'", "sh -c 'cat .env'"),
+            ("watch --ex sh -c 'cat .env'", "sh -c 'cat .env'"),
+            ("watch --exe sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("watch -n 1 -x sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("watch -xn 1 sh -c 'cat .env'", "sh -c 'cat .env'"),
+            ("watch -xd sh -c 'cat .env'", "sh -c 'cat .env'"),
+            ("watch --interval 1 -x sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("runuser -u me -- echo 'x; cat .env'", "echo 'x; cat .env'"),
+            ("runuser -u me echo 'x; cat .env'", "echo 'x; cat .env'"),
             ("env -S 'sh -c' 'cat .env'", "sh -c 'cat .env'"),
             ("tmux new -d sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("tmux neww sh -c 'cat .env'", "sh -c 'cat .env'"),
             ("tmux splitw -h echo 'x; cat .env'", "echo 'x; cat .env'"),
+            ("tmux respawnp -k sh -c 'cat .env'", "sh -c 'cat .env'"),
+            ("tmux respawnw -k sh -c 'cat .env'", "sh -c 'cat .env'"),
+            ("tmux popup sh -c 'cat .env'", "sh -c 'cat .env'"),
             // An inert word is written bare.
             ("flock /tmp/l cat ./.env", "cat ./.env"),
         ] {
@@ -25849,14 +25887,22 @@ mod tests {
                 "{command:?} must surface {inner:?}, got {segments:?}"
             );
         }
-        // Without `-x` (and with `-n`'s value `x`), `watch` hands its words
-        // to `sh -c` as one string, which splits them again. So does tmux
-        // with a single word.
+        // Without `-x` (and with `-n`'s value `x`, `-n`'s value `-x`, or
+        // `-d`'s glued value `x`), `watch` hands its words to `sh -c` as one
+        // string, which splits them again. So does tmux with a single word,
+        // and `run-shell` and `pipe-pane`, which tmux never execs: it runs
+        // their first word under `sh -c` and refuses more than two words
+        // (`run-shell`) or one (`pipe-pane`).
         for (command, inner) in [
             ("tmux new -d 'echo x; cat .env'", "cat .env"),
             ("watch sh -c 'cat .env'", "sh -c cat .env"),
             ("watch -nx sh -c 'cat .env'", "sh -c cat .env"),
+            ("watch -n -x sh -c 'cat .env'", "sh -c cat .env"),
+            ("watch -dx sh -c 'cat .env'", "sh -c cat .env"),
             ("watch echo 'x; cat .env'", "cat .env"),
+            ("tmux run-shell 'cat .env' x", "cat .env x"),
+            ("tmux run -b sh -c 'cat .env'", "sh -c cat .env"),
+            ("tmux pipe-pane sh -c 'cat .env'", "sh -c cat .env"),
         ] {
             let segments = command_segments(command);
             assert!(
