@@ -448,12 +448,17 @@ fn consumer_is_allowed(segment: &str, vouched: &Vouch) -> bool {
 /// The first word of a shell's `words` that is not an option or an option's
 /// value. `pipefail` in `bash -euo pipefail scripts/secret-keys.sh` is the
 /// value of `-o` ([`shell_option_takes_value`]), and `+e` is an option, so
-/// neither is the script the shell runs.
+/// neither is the script the shell runs. `None` under `-s`: stdin is then the
+/// script, so the shell runs the decrypted text as commands.
 fn shell_first_operand<'a>(shell: &str, words: &'a [String]) -> Option<&'a String> {
     let mut words = words.iter();
     while let Some(word) = words.next() {
         if !word.starts_with(['-', '+']) {
             return Some(word);
+        }
+        // Before the value test: `-so pipefail` still reads stdin.
+        if word.starts_with('-') && !word.starts_with("--") && word.contains('s') {
+            return None;
         }
         if shell_option_takes_value(shell, word) {
             words.next();
@@ -820,6 +825,8 @@ mod tests {
                 "sops -d secrets.sops.yaml | bash -o pipefail scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | bash +e scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | zsh -euo pipefail scripts/secret-keys.sh",
+                // zsh's `-O` is a plain flag, so zsh runs the file after it.
+                "sops -d secrets.sops.yaml | zsh -O scripts/secret-keys.sh",
             ] {
                 assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
             }
@@ -827,6 +834,14 @@ mod tests {
             for command in [
                 "sops -d secrets.sops.yaml | bash -euo pipefail scripts/other.sh",
                 "sops -d secrets.sops.yaml | bash -euo pipefail",
+                // zsh runs `other.sh` and `extglob`, not the key lister.
+                "sops -d secrets.sops.yaml | zsh -O scripts/other.sh scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | zsh -O extglob scripts/secret-keys.sh",
+                // Under `-s` stdin is the script: bash runs the plaintext as
+                // commands and prints its lines to stderr.
+                "sops -d secrets.sops.yaml | bash -s scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -so pipefail scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -euo pipefail -s scripts/secret-keys.sh",
             ] {
                 assert_eq!(outcome(command), Outcome::Block, "{command:?}");
             }

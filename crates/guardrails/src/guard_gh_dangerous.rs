@@ -1330,6 +1330,8 @@ mod tests {
             "cat notes.md | bash",
             // A script file after the value makes stdin data again.
             "echo 'gh repo delete o/r --yes' | bash -euo pipefail script.sh",
+            // zsh's `-O` is a plain flag: zsh runs the file `extglob`.
+            "echo 'gh repo delete o/r --yes' | zsh -O extglob",
         ] {
             let result = GhDangerousGuard.run(&make_bash(command));
             assert_eq!(

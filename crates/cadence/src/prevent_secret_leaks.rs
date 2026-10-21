@@ -9319,6 +9319,9 @@ mod tests {
                 "bash -o posix -c 'cat .env'",
                 "bash -O extglob -c 'cat .env'",
                 "bash --rcfile /dev/null -c 'cat .env'",
+                // Core stops at `pipefail` after `-oe`, so only the fallback
+                // walk reads past `--rcfile` here.
+                "bash --rcfile /dev/null -oe pipefail -c 'cat .env'",
                 "bash +x -c 'cat .env'",
                 "sudo -D /x bash -o posix -c 'cat .env'",
                 "su -lc 'cat .env' root",
