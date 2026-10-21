@@ -42,6 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`guard-push-remote`'s chain block no longer says the bare push came after the branch switch.** The block for a chain of pushes with a bare one that also switches branch or changes tracking said it found the push "after a branch switch or tracking change". The switch can sit anywhere in the chain (`git push && git checkout main && git push origin feat` blocks too), and any git subcommand the guard does not know to leave the branch alone counts as one (`git checkout -- README.md` does). So the text now says "in a chain that may switch branch or change tracking". The verdict is unchanged. (Part of cameronsjo/cadence-hooks#1443)
 
+- **Guards read the command behind `runuser -u USER --` when it has a `-c`, and behind `--user=USER` or `-uUSER`.** Core took the first `-c` anywhere in `runuser`'s words as runuser's own command option. After `runuser -u USER --` the words are the command runuser execs, so in `runuser -u app -- head -c 5 .env` the `-c` is `head`'s, and core read `5` as the command. `prevent-secret-leaks` allowed it, and `runuser -u app -- grep -c x .env` too. Core also knew only `-u USER` and `--user USER`, so `runuser --user=app -- cat .env` and `runuser -uapp cat .env` passed, and in `-ucarol` it read the `c` as `-c`. A cluster ending in `u` (`runuser -mu app -- cat .env`) was not read as `-u` either. Each now blocks. `su` is unchanged: it hands the words after `--` to the user's shell, which runs a `-c` there. (Part of cameronsjo/cadence-hooks#1443)
+
 ## [0.130.1] - 2026-10-20
 
 ### Fixed

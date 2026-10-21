@@ -7017,6 +7017,43 @@ mod tests {
     }
 
     #[test]
+    fn a_read_behind_runuser_user_is_seen() {
+        // `runuser -u USER [--] CMD…` execs CMD, so a `-c` after `--` is
+        // CMD's own (`head -c 5`), not runuser's command option. The user
+        // can also be glued on (`-uapp`, `--user=app`).
+        assert_bash(
+            &[
+                "runuser -u app -- head -c 5 .env",
+                "runuser -u app -- grep -c x .env",
+                "runuser --user=app -- cat .env",
+                "runuser --user=app -- head -c 5 .env",
+                "runuser -uapp -- cat .env",
+                "runuser -uapp cat .env",
+                // A user named with a `c`, and `-u` at the end of a cluster.
+                "runuser -ucarol cat .env",
+                "runuser -uapache -- cat .env",
+                "runuser -ucarol -- head -c 5 .env",
+                "runuser -mu app -- cat .env",
+                // su hands the words after `--` to the user's shell, which
+                // runs their `-c`.
+                "su root -- -c 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a read runuser or su runs",
+        );
+        // Without `--`, getopt permutes, takes `head`'s `-c` as runuser's
+        // own and refuses it beside `-u`: nothing runs.
+        assert_bash(
+            &[
+                "runuser -u app head -c 5 .env",
+                "runuser -ucarol cat README.md",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a runuser command line runuser refuses",
+        );
+    }
+
+    #[test]
     fn positional_parameters_do_not_change_the_verdict() {
         // cadence-ecosystem ADR-0046 rule 1: a read through a positional
         // parameter is out of scope, so setting them no longer blocks a
