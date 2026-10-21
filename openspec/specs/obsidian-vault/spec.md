@@ -139,7 +139,7 @@ From a cwd inside the vault, `trash-guard` SHALL judge a deletion that a script 
 - **THEN** the hook exits 0
 
 ### Requirement: What a wrapper does not hand to the operand walk
-A deletion behind a wrapper SHALL keep the cwd verdict, and so block, when the wrapper sits behind `xargs`, runs `find`, `git rm` or `eval`, changes directory before it deletes, follows a sibling that could re-point an operand (`ln`, `mv`, `cd`), or has a script the guard did not read in full (nested past what it expands, or using a variable the command assigned first).
+A deletion behind a wrapper SHALL keep the cwd verdict, and so block, when the wrapper sits behind `xargs`, runs `find`, `git rm` or `eval`, runs `cd`, `pushd` or `popd` inside its script, follows `ln`, `mv`, or a `cd` the walk cannot place, or has a script the guard did not read in full (nested past what it expands). A directory option or login shell (`env -C`, `env --chdir`, `su -`, `su -l`, `runuser -l`, `sudo -i`) is not followed, the same as for a bare deletion.
 
 #### Scenario: Wrapper changes directory itself
 - **WHEN** the cwd is the vault and a Bash call runs `cd /tmp && sh -c 'cd /vault; rm x.md'`

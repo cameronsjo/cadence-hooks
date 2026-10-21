@@ -7,8 +7,8 @@ Under cadence-ecosystem ADR-0046 a guard blocks only on what it read exactly, an
 ## What Changes
 
 - From a cwd inside the vault, a segment that is a script wrapper (a shell's `-c`, `env -S`, `script -c`, `flock`, `watch`, `su`/`runuser`) no longer ends the operand walk. Its script's own segments are judged operand by operand, the way a bare deletion is. The same holds for the directory walk that places a deletion after a `cd`.
-- A wrapper still keeps the cwd verdict when it is behind `xargs`, when core read no script out of it, when any segment of its script is not in the walk's list (nesting past what core expands, a variable assigned first), and, in the directory walk, when it mentions `cd`, `pushd` or `popd`, because the walk places a wrapper's whole script where the wrapper starts.
-- `find`, `git`, `tmux`, `eval` and `trap` are not script wrappers here and keep the cwd verdict, as do a sibling that could re-point an operand (`ln`, `mv`, `cd`) and a deletion the guard reads as aimed into the vault.
+- A wrapper still keeps the cwd verdict when it is behind `xargs`, when core read no script out of it, when any segment of its script is not in the walk's list (nesting past what core expands), and, in the directory walk, when it mentions `cd`, `pushd` or `popd`, because the walk places a wrapper's whole script where the wrapper starts.
+- `find`, `git`, `tmux`, `eval` and `trap` are not script wrappers here and keep the cwd verdict, as do `ln` and `mv` siblings, a `cd` sibling the walk cannot place, and a deletion the guard reads as aimed into the vault. A directory option or login shell (`env -C`, `env --chdir`, `su -`, `su -l`, `runuser -l`, `sudo -i`) is not followed, the same as for a bare deletion.
 - MODIFY "What the guard cannot read is allowed": its example of a runner option the guard cannot classify named `env -S 'rm x'`, which core has read since cameronsjo/cadence-hooks#1144 and which blocks. The example is now `nice --bogus rm x`.
 - ADD "A deletion behind a wrapper is judged like a bare one" and "What a wrapper does not hand to the operand walk".
 
