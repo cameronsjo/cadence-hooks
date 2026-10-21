@@ -32,10 +32,10 @@
 //! runner's status word, and `Token expired` (a name, a space, a word, at the
 //! start of a line outside a `.netrc`/vault table) is prose, not a pair. A
 //! bare `pass:` after an ordinary word on its line (`one record per pass: x`)
-//! masks its unquoted value only when the value's first word that holds a
-//! letter or a digit looks like a credential ([`pass_key_position`],
-//! [`secret_like`]). A corpus test holds everyday output (test runners,
-//! builds, git over code, listings, error prose) at zero masks.
+//! masks its unquoted value only when the value's first word looks like a
+//! credential ([`pass_key_position`], [`first_word`], [`secret_like`]). A
+//! corpus test holds everyday output (test runners, builds, git over code,
+//! listings, error prose) at zero masks.
 //!
 //! **Views.** Every detector runs on the output with ANSI CSI sequences
 //! removed (`grep --color`, coloured logs), and again on windows around each
@@ -590,9 +590,9 @@ pub enum Strength {
     /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
     /// string's `&pass=` all mask, as does a longer number. In the mid-line
     /// colon form, out of key position ([`pass_key_position`]), an unquoted
-    /// value masks only when, on top of those rules, its first word that holds
-    /// a letter or a digit is credential-shaped ([`secret_like`]); a quoted
-    /// value keeps those rules alone.
+    /// value masks only when, on top of those rules, its first word
+    /// ([`first_word`]) is credential-shaped ([`secret_like`]); a quoted value
+    /// keeps those rules alone.
     Tally,
 }
 
@@ -842,7 +842,9 @@ fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
     }
     let after = &value[digits..];
     let next = after.trim_start_matches([' ', '\t']);
-    let complete = after.trim_end().is_empty()
+    // Read from the front: this runs once per match, and a trim from the end
+    // would walk a long trailing blank run each time.
+    let complete = after.chars().all(char::is_whitespace)
         || closes_count(after)
         || (next.len() < after.len() && starts_key_field(next));
     complete.then_some(digits)
@@ -1679,12 +1681,15 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 }
                 // The unquoted value runs to the end of the line, so a note or
                 // a next field after the secret is part of it: judge its first
-                // word that holds a letter or a digit. When that word is not
-                // credential-shaped, nothing masks and only that word is spent,
-                // so a secret-named field later on the line is still read
-                // ("Admin pass: hunter2, DB pass: <secret>"). The spend must
-                // not look at the rest of the line: a trim there would walk a
-                // long blank run once per match.
+                // word (`first_word`). When that word is not credential-shaped,
+                // nothing masks and only that word is spent, so a secret-named
+                // field later on the line is still read ("Admin pass: hunter2,
+                // DB pass: <secret>"). This runs once per match, so it and the
+                // short count test above read the value from its front and
+                // stop early; a trim from the end would walk a long blank run
+                // once per match. The search reads to the end of the line only
+                // when no word there qualifies, and then no secret name is left
+                // on it.
                 if weak_pass {
                     let first = first_word(rest);
                     if !first.is_some_and(|(word, _)| secret_like(word)) {
@@ -1693,7 +1698,13 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                     }
                 }
                 let tally = (strength == Strength::Counter).then(|| tally_len(rest));
-                (0, tally.flatten().unwrap_or(rest.trim_end().len()), false)
+                // Trim only when no count ends the value: a run of counts
+                // (`lastpass: 5 lastpass: 5 …`) reaches here once per match.
+                (
+                    0,
+                    tally.flatten().unwrap_or_else(|| rest.trim_end().len()),
+                    false,
+                )
             }
         };
         done = start + ve;
@@ -1739,10 +1750,9 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
 ///   Go's `{User:admin Pass:x}`).
 ///
 /// After any other word it may be prose, as in "the second pass: done", and
-/// the caller masks its unquoted value only when the value's first word that
-/// holds a letter or a digit looks like a credential ([`first_word`]), besides
-/// its usual rules. A quoted value, every other name and the `pass=` form keep
-/// their rules.
+/// the caller masks its unquoted value only when the value's first word
+/// ([`first_word`]) looks like a credential, besides its usual rules. A quoted
+/// value, every other name and the `pass=` form keep their rules.
 ///
 /// Each scan stops at a newline, a blank or the first byte that does not
 /// qualify, and reads at most two words back, so a long line stays linear.
@@ -1801,15 +1811,24 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
         .is_ok_and(|prev| prev.ends_with([':', '=']) && field(prev))
 }
 
-/// The first blank-separated word of `value` that holds a letter or a digit,
-/// and the byte offset in `value` where it ends. A markup mark, a cell border,
-/// an arrow or an emoji before a secret (`**`, `|`, `->`, `🔑`) is not a word
-/// to judge. It stops at the first such word, so the cost is bounded by the
-/// text up to it.
+/// The first blank-separated word of `value` that holds a letter or a digit
+/// and is not a closing HTML tag, and the byte offset in `value` where it
+/// ends. A markup mark, a cell border, an arrow, an emoji or a closing tag
+/// before a secret (`**`, `|`, `->`, `🔑`, `</b>`) is not a word to judge.
+/// When no word qualifies, the first blank-separated word is judged, so a
+/// value of symbols only is still read. The search stops at the first word
+/// that qualifies, and only a line with no such word left is read to its
+/// end, so the cost is bounded by the text up to that word.
 fn first_word(value: &str) -> Option<(&str, usize)> {
+    let closing_tag = |w: &str| {
+        w.strip_prefix("</")
+            .and_then(|t| t.strip_suffix('>'))
+            .is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+    };
     let word = value
         .split_whitespace()
-        .find(|w| w.chars().any(char::is_alphanumeric))?;
+        .find(|w| w.chars().any(char::is_alphanumeric) && !closing_tag(w))
+        .or_else(|| value.split_whitespace().next())?;
     // `word` is a subslice of `value`, so the pointer difference is its offset.
     let end = word.as_ptr() as usize - value.as_ptr() as usize + word.len();
     Some((word, end))
@@ -3030,10 +3049,11 @@ mod tests {
     /// cameronsjo/cadence-hooks#1449: out of key position the unquoted value
     /// of a bare `pass:` runs to the end of the line, so a note, a next field
     /// or a closing `|` after the secret is part of it. The value is judged by
-    /// its first word that holds a letter or a digit, on top of every rule a
-    /// bare `pass` has in key position. When that word is not a credential,
-    /// only it is spent, so a secret-named field later on the line is read.
-    /// A quoted value is not judged by its first word.
+    /// its first word that holds a letter or a digit and is not a closing tag
+    /// (with none, its first word), on top of every rule a bare `pass` has in
+    /// key position. When that word is not a credential, only it is spent, so
+    /// a secret-named field later on the line is read. A quoted value is not
+    /// judged by its first word.
     #[test]
     fn issue_1449_pass_value_is_judged_by_its_first_word() {
         let p = pw();
@@ -3087,12 +3107,36 @@ mod tests {
             format!("Admin pass: | {p}\n"),
             format!("Admin pass: \u{2192} {p}\n"),
             format!("Admin pass: \u{1F511} {p}\n"),
+            // Nor is a closing HTML tag.
+            format!("<b>DB pass:</b> {p}\n"),
+            format!("<code>DB pass:</code> {p}\n"),
             // A quoted value keeps the rules of a bare `pass` alone.
             format!("Admin pass: \"{p}\"\n"),
         ];
         for input in &masks {
             let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
             assert!(!out.contains(&p), "{input:?} -> {out:?}");
+        }
+        // Passwords that are not `p`. With no word that holds a letter or a
+        // digit, the first word is judged: a password of symbols only. A digit
+        // counts as a letter does, and so does a letter outside ASCII; each row
+        // with a note fails if its half is dropped, since the note would then
+        // be judged in place of the password.
+        let symbols = "~!@#$%^&*()_+";
+        let digits = "8675309!";
+        // `пароль_секрет`
+        let cyrillic =
+            "\u{43f}\u{430}\u{440}\u{43e}\u{43b}\u{44c}_\u{441}\u{435}\u{43a}\u{440}\u{435}\u{442}";
+        let others = [
+            (format!("Admin pass: {symbols}\n"), symbols),
+            (format!("WiFi pass: {digits}\n"), digits),
+            (format!("WiFi pass: {digits} (guest)\n"), digits),
+            (format!("Admin pass: {cyrillic}\n"), cyrillic),
+            (format!("Admin pass: {cyrillic} (new)\n"), cyrillic),
+        ];
+        for (input, secret) in &others {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(secret), "{input:?} -> {out:?}");
         }
         // The mask runs to the end of the line, notes included.
         assert_eq!(
@@ -3113,6 +3157,14 @@ mod tests {
             "+ // the second pass: done\n",
             "x pass: 5 hunter2\n",
             "lint pass: ok and the build is green\n",
+            // No word holds a letter or a digit: the first word is judged, and
+            // these are too short, a rule or a placeholder.
+            "Admin pass: ->\n",
+            "the second pass: ...\n",
+            "lint pass: --\n",
+            "Second pass: ========\n",
+            "x pass: ** **\n",
+            "x pass: ********\n",
             // Code, which the value test refuses: a type, an expression closing
             // a field.
             "  private pass: string|null;\n",
@@ -3462,6 +3514,12 @@ mod tests {
             // blank run after the last of these matches must not be walked
             // once per match.
             format!("{}{}", "x pass: y ".repeat(1_000), " ".repeat(4 * MB)),
+            // A value that starts with a digit is first tried as a count, once
+            // per match; neither that test nor a count that ends the value may
+            // walk back over the blank run at the end of the line.
+            format!("{}{}", "x pass: 5 ".repeat(1_000), " ".repeat(4 * MB)),
+            format!("x{}{}", " pass: 5".repeat(1_000), " ".repeat(4 * MB)),
+            format!("x{}{}", " lastpass: 5".repeat(1_000), " ".repeat(4 * MB)),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
