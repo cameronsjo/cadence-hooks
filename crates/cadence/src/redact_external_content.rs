@@ -2621,6 +2621,51 @@ impl Drop for EnvCleanup {
     }
 }
 
+/// Env a post's verdict reads that a Claude session can export. With
+/// `CADENCE_ALLOWED_OWNERS` naming this repo's owner, a post to its own
+/// origin is owned and every skill-id hit goes silent (#684), so a test that
+/// expects a nudge fails when run alone in such a shell.
+#[cfg(test)]
+const AMBIENT_POST_ENV: [&str; 3] = ["CADENCE_AUDIENCE", "CADENCE_ALLOWED_OWNERS", "GH_REPO"];
+
+/// Clears [`AMBIENT_POST_ENV`] for the outermost hold on [`TERMS_ENV_LOCK`]
+/// and puts each prior value back when dropped, including on unwind. Under a
+/// nested hold it does nothing, so env the outer test set stays. Declare it
+/// after the lock guard so it drops first.
+#[cfg(test)]
+struct AmbientPostEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+#[cfg(test)]
+impl AmbientPostEnv {
+    fn clear(guard: &TermsEnvGuard) -> Self {
+        if guard.0.is_none() {
+            return Self(Vec::new());
+        }
+        let saved = AMBIENT_POST_ENV
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        for k in AMBIENT_POST_ENV {
+            // SAFETY: serialized by TERMS_ENV_LOCK, which `guard` holds.
+            unsafe { std::env::remove_var(k) };
+        }
+        Self(saved)
+    }
+}
+
+#[cfg(test)]
+impl Drop for AmbientPostEnv {
+    fn drop(&mut self) {
+        for (k, v) in &self.0 {
+            // SAFETY: dropped before the lock guard it was made under.
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+}
+
 /// Hold [`TERMS_ENV_LOCK`] with the term-source override explicitly CLEARED,
 /// then run `f`.
 ///
@@ -2634,7 +2679,8 @@ fn with_terms_cleared<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let _guard = lock_terms_env();
+    let guard = lock_terms_env();
+    let _ambient = AmbientPostEnv::clear(&guard);
     let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
     // SAFETY: serialized by TERMS_ENV_LOCK, held for this whole scope.
     unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
@@ -2813,8 +2859,11 @@ mod tests {
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
 
+    /// Run the hook on `cmd` from this checkout. Called from inside a test
+    /// that already holds the lock, it keeps the env that test set.
     fn run(cmd: &str) -> CheckResult {
-        let _guard = lock_terms_env();
+        let guard = lock_terms_env();
+        let _ambient = AmbientPostEnv::clear(&guard);
         RedactExternalContent.run(&make_bash(cmd))
     }
 
@@ -4134,7 +4183,8 @@ mod tests {
     where
         F: FnOnce() -> R,
     {
-        let _guard = lock_terms_env();
+        let guard = lock_terms_env();
+        let _ambient = AmbientPostEnv::clear(&guard);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, toml_body).unwrap();
