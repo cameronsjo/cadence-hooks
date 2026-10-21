@@ -122,14 +122,18 @@ Before judging, `prevent-secret-leaks` SHALL peel command runners (`sudo`, `env`
 - **THEN** the hook allows
 
 ### Requirement: A script the guard does not read is allowed
-`prevent-secret-leaks` MUST allow a `-c` script behind a wrapper the guard does not peel, or whose operands it re-joins without their quotes (`parallel`, `fd -x`/`-X`, `bash -s` with operands, `flock FILE CMD…`, BSD `script FILE CMD…`), like the bare `parallel cat .env ::: a`. A script piped into a shell is not read either. A bare command behind `flock` or BSD `script` is read, so it MUST block.
+`prevent-secret-leaks` MUST allow a `-c` script behind a wrapper the guard does not peel (`parallel`, `fd -x`/`-X`), like the bare `parallel cat .env ::: a`. A script piped into a shell (`bash -s` with operands) is not read either. A command behind `flock` or BSD `script` is read with its words whole, so a read there MUST block.
 
 #### Scenario: Script the guard does not read
-- **WHEN** a Bash command runs `parallel sh -c 'cat .env' ::: a`, `fd -x sh -c 'cat .env'`, `echo 'cat .env' | bash -s x`, `flock /tmp/l sh -c 'cat .env'` or `script -q /dev/null sh -c 'cat .env'`
+- **WHEN** a Bash command runs `parallel sh -c 'cat .env' ::: a`, `fd -x sh -c 'cat .env'` or `echo 'cat .env' | bash -s x`
 - **THEN** the hook allows
 
 #### Scenario: Bare command behind flock or script
 - **WHEN** a Bash command runs `flock /tmp/l cat .env`, `flock /tmp/l -c 'cat .env'` or `script -q /dev/null cat .env`
+- **THEN** the hook blocks
+
+#### Scenario: Shell script behind flock or script
+- **WHEN** a Bash command runs `flock /tmp/l sh -c 'cat .env'` or `script -q /dev/null sh -c 'cat .env'`
 - **THEN** the hook blocks
 
 ### Requirement: forgectl env is the accepted form
