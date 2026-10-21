@@ -16226,8 +16226,10 @@ pub fn su_command_value<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a
 /// ([`su_command_value`]) — GNU getopt permutes, so `su root -c 'x'` counts
 /// — or, for `runuser -u USER [--] CMD…`, the command it execs directly.
 /// `su`'s other operands are the user and arguments for the user's shell, so
-/// they are no script. The walk stops at a nested `su`/`runuser`, which the
-/// recursion answers for itself.
+/// they are no script; the shell runs a `-c` among them, even after `--`. The
+/// walk stops at a nested `su`/`runuser`, which the recursion answers for
+/// itself, and, after `runuser -u`, at `--`: the words after it are the
+/// command, so a `-c` there is the command's (`head -c 5 .env`).
 fn su_script(verb: &str, operands: &[String]) -> Option<String> {
     let mut user_flag = false;
     for (k, raw) in operands.iter().enumerate() {
@@ -16235,11 +16237,14 @@ fn su_script(verb: &str, operands: &[String]) -> Option<String> {
             break;
         }
         let tok = unescape_word(raw);
+        if user_flag && tok == "--" {
+            break;
+        }
         let next = operands.get(k + 1).map(|w| unescape_word(w).into_owned());
         if let Some(value) = su_command_value(&tok, next.as_deref()) {
             return Some(value.to_string()).filter(|v| !v.trim().is_empty());
         }
-        user_flag |= verb == "runuser" && (tok == "-u" || tok == "--user");
+        user_flag |= verb == "runuser" && runuser_user_option(&tok);
     }
     if !user_flag {
         return None;
@@ -16270,6 +16275,15 @@ fn su_script(verb: &str, operands: &[String]) -> Option<String> {
         i += if takes { 2 } else { 1 };
     }
     None
+}
+
+/// Whether `tok` is runuser's `-u`/`--user`, with the user in the next word
+/// or glued on (`-uapp`, `--user=app`). A getopt_long abbreviation such as
+/// `--us` is not matched.
+fn runuser_user_option(tok: &str) -> bool {
+    tok == "--user"
+        || tok.starts_with("--user=")
+        || (tok.starts_with("-u") && !tok.starts_with("--"))
 }
 
 /// How a `tmux` command's operands become a script.
@@ -25821,6 +25835,16 @@ mod tests {
             ("runuser -l me -c 'cat .env'", "cat .env"),
             ("runuser -u me -- cat .env", "cat .env"),
             ("runuser -u me cat .env", "cat .env"),
+            // After `runuser -u USER --`, a `-c` is the command's own.
+            ("runuser -u me -- head -c 5 .env", "head -c 5 .env"),
+            ("runuser -u me -- grep -c x .env", "grep -c x .env"),
+            ("runuser --user=me -- cat .env", "cat .env"),
+            ("runuser --user me -- cat .env", "cat .env"),
+            ("runuser -ume -- head -c 5 .env", "head -c 5 .env"),
+            ("runuser -ume cat .env", "cat .env"),
+            // su hands the words after `--` to the user's shell, which runs
+            // their `-c`.
+            ("su root -- -c 'cat .env'", "cat .env"),
             // Behind a runner, and nested wrappers.
             ("sudo watch 'cat .env'", "cat .env"),
             ("flock /tmp/l watch -n1 'cat .env'", "cat .env"),
