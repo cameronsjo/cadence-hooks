@@ -773,7 +773,7 @@ fn push_locations_both_readings(
         // `git rebase -x "$CMD"`, a nested `git q` under an outer
         // `-c alias.q=push` — reaches this guard only through the walk above,
         // which reports it as a push it cannot resolve, as it would at the
-        // top level; prevent-secret-push refuses it. Re-placing it per
+        // top level; prevent-secret-push warns on it. Re-placing it per
         // segment adds no verdict, and asking `runs_a_git_exec` of every
         // segment of a 200 KB flood cost the test deadline on the Windows
         // runner.
