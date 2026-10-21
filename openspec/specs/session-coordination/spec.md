@@ -213,7 +213,7 @@ Under `CLAUDE_CODE_REMOTE=true`, `start`, `heartbeat`, `guard`, `end`, `backstop
 - **THEN** its block carries `Machine: cloud`
 
 ### Requirement: Conflicted-merge commit keeps its conflicts block below the trailers
-`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block, and the nudge SHALL advise amending the landed commit before it is pushed, and only where that commit's message still shows the block. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
+`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` finishing a conflicted merge whose MERGE_MSG has a trailer line above git's `# Conflicts:` block. The nudge SHALL advise amending the landed commit before a push, only where HEAD in the commit's directory still shows the block and its last reflog entry is the merge commit. Any other shape MUST draw no conflicts nudge. It MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
 
 #### Scenario: Finishing a conflicted merge with trailers
 - **WHEN** a merge started with a message ending in `Session-Id:` and `Co-Authored-By:` lines stopped on a conflict, and a session runs `git commit --no-edit`
@@ -228,8 +228,8 @@ Under `CLAUDE_CODE_REMOTE=true`, `start`, `heartbeat`, `guard`, `end`, `backstop
 - **THEN** the nudge names no copy of MERGE_MSG and no `git commit --no-edit --cleanup=strip`
 
 #### Scenario: The amend is conditional on HEAD still being the merge
-- **WHEN** the hook nudges for that merge, and a later command in the same call may have moved HEAD (a commit, a branch switch, a merge abort), or the commit ran in another worktree
-- **THEN** the nudge says to run the amend in the directory the commit ran in, and only if `git log -1 --format=%B` there still shows the `# Conflicts:` block, and otherwise to leave HEAD alone
+- **WHEN** the hook nudges for that merge, and a later command in the same call may have moved HEAD (a commit, a branch switch, a merge abort), possibly onto an earlier merge that also kept its block, or the commit ran in another worktree
+- **THEN** the nudge says to run the amend in the directory the commit ran in, and only if `git log -1 --format=%B` there still shows the `# Conflicts:` block and `git reflog -1 --format=%gs` there starts with `commit (merge):`, and otherwise to leave HEAD alone
 
 #### Scenario: The cleanup is already asked for
 - **WHEN** the same session runs `git commit --no-edit --cleanup=strip`

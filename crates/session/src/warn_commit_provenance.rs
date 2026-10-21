@@ -294,17 +294,22 @@ const CONFLICTS_HEADER: &str = "# Conflicts:";
 /// call (another commit, a branch switch, a merge abort) or a commit that ran
 /// in another worktree can leave HEAD on a commit that is not the merge, so
 /// the text says to amend only where `git log -1 --format=%B` still shows the
-/// block. While the merge is still in progress, `git commit --amend` refuses
-/// ("cannot amend"), which the text also says.
+/// block and `git reflog -1 --format=%gs` starts with `commit (merge):`. The
+/// block alone is not enough: HEAD can land on an earlier merge that also kept
+/// its block. Only a commit that finishes a merge writes that reflog entry.
+/// In a repo with no reflog (one made with `core.logAllRefUpdates=false`) the
+/// check fails, so HEAD is left alone. While the merge is still in progress,
+/// `git commit --amend` refuses ("cannot amend"), which the text also says.
 const CONFLICTS_AFTER_TRAILERS_NUDGE: &str = "A merge is waiting on this commit, and its pending \
     message (MERGE_MSG) has git's `# Conflicts:` block below the trailers. `git commit \
     --no-edit` keeps `#` lines under its default cleanup (`whitespace`), so the commit lands \
     with that block after the trailers, and they are no longer the final paragraph; a lint or \
     tool that reads the final paragraph then misses them. The commit runs in this same tool \
     call, so fix it afterwards with an amend, before you push it (a pushed commit needs a \
-    force-push). Run the amend in the directory the commit ran in, and only if `git log -1 \
-    --format=%B` there still shows the `# Conflicts:` block; if it does not, HEAD is not that \
-    merge, so leave it. If no other line of the message starts with `#`, run `git commit \
+    force-push). Run the amend in the directory the commit ran in, and only if two checks pass \
+    there: `git log -1 --format=%B` still shows the `# Conflicts:` block, and `git reflog -1 \
+    --format=%gs` starts with `commit (merge):`. If either fails, HEAD is not that merge, so \
+    leave it. If no other line of the message starts with `#`, run `git commit \
     --amend --no-edit --cleanup=strip`. It keeps both parents and drops the block, but it \
     also drops every line that starts with `#`, an issue reference or a markdown heading \
     included, with no warning. If the message has such lines, run `git log -1 --format=%B > \
@@ -1088,15 +1093,18 @@ mod tests {
 
     /// `git` in `dir` with discovery vars cleared (a concurrent test must not
     /// redirect it) and no exit-code check: a conflicted merge exits 1. The
-    /// comment character, the commit cleanup and the merge shortlog are pinned
-    /// to git's defaults, so a developer's global `core.commentChar`,
-    /// `commit.cleanup` or `merge.log` cannot change what MERGE_MSG or a landed
-    /// commit looks like. Checked with each of `core.commentChar = "%"`,
-    /// `commit.cleanup = scissors`, `commit.cleanup = strip` and
-    /// `merge.log = true` in `GIT_CONFIG_GLOBAL`; other settings are not
-    /// covered. git 2.43's `cherry-pick` rejects `commit.cleanup=default` and
-    /// keeps the global value, so that one call passes `--cleanup=whitespace`.
-    /// `LC_ALL=C` keeps git's messages in English, which the refusal test reads.
+    /// comment character, the commit cleanup, the merge shortlog and the
+    /// reflog are pinned to git's defaults, so a developer's global
+    /// `core.commentChar`, `commit.cleanup`, `merge.log` or
+    /// `core.logAllRefUpdates` cannot change what MERGE_MSG, a landed commit or
+    /// the reflog looks like. Checked with each of `core.commentChar = "%"`,
+    /// `commit.cleanup = scissors`, `commit.cleanup = strip`,
+    /// `merge.log = true` and `core.logAllRefUpdates = false` in
+    /// `GIT_CONFIG_GLOBAL`; other settings are not covered. A later `-c` in
+    /// `args` wins over these. git 2.43's `cherry-pick` rejects
+    /// `commit.cleanup=default` and keeps the global value, so that one call
+    /// passes `--cleanup=whitespace`. `LC_ALL=C` keeps git's messages in
+    /// English, which the refusal test reads.
     fn raw_git(dir: &Path, args: &[&str]) -> std::process::Output {
         let mut cmd = std::process::Command::new("git");
         for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
@@ -1106,6 +1114,7 @@ mod tests {
             .args(["-c", "core.commentChar=#"])
             .args(["-c", "commit.cleanup=default"])
             .args(["-c", "merge.log=false"])
+            .args(["-c", "core.logAllRefUpdates=true"])
             .args(args)
             .env("LC_ALL", "C")
             .current_dir(dir)
@@ -1189,9 +1198,10 @@ mod tests {
         );
         // An amend rewrites HEAD, which a later command in the same call can
         // have moved, so the check comes before either route.
-        let check = "Run the amend in the directory the commit ran in, and only if \
-                     `git log -1 --format=%B` there still shows the `# Conflicts:` block; \
-                     if it does not, HEAD is not that merge, so leave it.";
+        let check = "Run the amend in the directory the commit ran in, and only if two \
+                     checks pass there: `git log -1 --format=%B` still shows the \
+                     `# Conflicts:` block, and `git reflog -1 --format=%gs` starts with \
+                     `commit (merge):`. If either fails, HEAD is not that merge, so leave it.";
         let at = msg.find(check);
         assert!(at.is_some(), "the nudge says to check HEAD first: {msg}");
         assert!(
@@ -1229,6 +1239,24 @@ mod tests {
             // the command word, not a prefix to skip.
             ("1A=x git commit --no-edit", repo.path(), false),
             ("git commit -a --no-edit -S", repo.path(), true),
+            // Shapes that can leave HEAD off the merge after the commit, which
+            // `the_head_check_fails_when_head_is_not_the_merge` runs on git.
+            (
+                "git commit --no-edit || git merge --abort",
+                repo.path(),
+                true,
+            ),
+            ("git commit --no-edit && git switch feat", repo.path(), true),
+            (
+                "git add -A && git commit --no-edit && git commit -am x",
+                repo.path(),
+                true,
+            ),
+            (
+                "git commit --no-edit && echo y > g && git add g && git commit -m next",
+                repo.path(),
+                true,
+            ),
             (
                 &format!("cd {dir} && git commit --no-edit"),
                 Path::new("/"),
@@ -1560,12 +1588,24 @@ mod tests {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    /// The check the nudge asks for before an amend: does the commit at `rev`
-    /// in `dir` still show the `# Conflicts:` block?
+    /// The first half of the check the nudge asks for before an amend: does
+    /// the commit at `rev` in `dir` still show the `# Conflicts:` block?
     fn shows_block(dir: &Path, rev: &str) -> bool {
         body_at(dir, rev)
             .lines()
             .any(|l| l.trim_end() == CONFLICTS_HEADER)
+    }
+
+    /// The second half: does `git reflog -1 --format=%gs` in `dir` start with
+    /// `commit (merge):`? No reflog at all prints nothing, so it fails.
+    fn reflog_says_merge(dir: &Path) -> bool {
+        let out = raw_git(dir, &["reflog", "-1", "--format=%gs"]);
+        String::from_utf8_lossy(&out.stdout).starts_with("commit (merge):")
+    }
+
+    /// The whole check: amend HEAD in `dir` only when both halves pass.
+    fn head_check(dir: &Path) -> bool {
+        shows_block(dir, "HEAD") && reflog_says_merge(dir)
     }
 
     fn parent_count(repo: &Path) -> usize {
@@ -1704,17 +1744,26 @@ mod tests {
 
     /// Why the nudge says to check HEAD before an amend. The hook sees one
     /// command, and the advice runs after it, so HEAD may not be the merge.
-    /// Each shape below got the nudge, and an amend there would rewrite a
-    /// commit that is not the merge; the check ("does `git log -1 --format=%B`
-    /// still show the `# Conflicts:` block, where the commit ran?") fails in
-    /// every one, so following the advice leaves it alone.
+    /// Each shape below gets the nudge (its command is a row in
+    /// `the_conflicts_nudge_finds_the_commit_in_a_chain_or_after_a_cd`), and
+    /// an amend there would rewrite a commit that is not the merge. The check
+    /// (where the commit ran, `git log -1 --format=%B` still shows the
+    /// `# Conflicts:` block and `git reflog -1 --format=%gs` starts with
+    /// `commit (merge):`) fails in every one, so following the advice leaves
+    /// it alone. The reflog half fails in all seven. In the last two, HEAD is
+    /// an earlier merge that also kept its block, so the block half alone
+    /// passes there.
     #[test]
     fn the_head_check_fails_when_head_is_not_the_merge() {
         let msg = TRAILERS_MESSAGE;
+        let ok = |dir: &Path, args: &[&str]| {
+            let out = raw_git(dir, args);
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
 
         // Control: HEAD is the merge, so the check passes and the amend is right.
         let repo = landed_merge(msg);
-        assert!(shows_block(repo.path(), "HEAD"), "control");
+        assert!(head_check(repo.path()), "control");
 
         // `git commit --no-edit || git merge --abort`, with unmerged files: the
         // commit fails and the abort ends the merge, so git no longer refuses
@@ -1722,41 +1771,88 @@ mod tests {
         let repo = conflicted_merge(msg);
         let p = repo.path();
         assert!(!raw_git(p, &["commit", "--no-edit"]).status.success());
-        assert!(raw_git(p, &["merge", "--abort"]).status.success());
+        ok(p, &["merge", "--abort"]);
         assert!(
             !p.join(".git/MERGE_HEAD").exists(),
             "the abort ended the merge"
         );
         assert!(!shows_block(p, "HEAD"), "commit then abort");
+        assert!(!reflog_says_merge(p), "commit then abort");
 
         // `git commit --no-edit && ... && git commit -m next`: HEAD is `next`,
         // and the merge keeps its block one commit down.
         let repo = landed_merge(msg);
         let p = repo.path();
         std::fs::write(p.join("g.txt"), "g").unwrap();
-        assert!(raw_git(p, &["add", "g.txt"]).status.success());
-        assert!(raw_git(p, &["commit", "-q", "-m", "next"]).status.success());
+        ok(p, &["add", "g.txt"]);
+        ok(p, &["commit", "-q", "-m", "next"]);
         assert!(!shows_block(p, "HEAD"), "commit then commit -m");
+        assert!(!reflog_says_merge(p), "commit then commit -m");
         assert!(shows_block(p, "HEAD~1"), "the merge keeps its block");
 
         // `git add -A && git commit --no-edit && git commit -am 'follow-up'`.
         let repo = landed_merge(msg);
         let p = repo.path();
         std::fs::write(p.join("f.txt"), "again").unwrap();
-        assert!(
-            raw_git(p, &["commit", "-q", "-am", "follow-up"])
-                .status
-                .success()
-        );
+        ok(p, &["commit", "-q", "-am", "follow-up"]);
         assert!(!shows_block(p, "HEAD"), "commit then commit -am");
+        assert!(!reflog_says_merge(p), "commit then commit -am");
         assert!(shows_block(p, "HEAD~1"), "the merge keeps its block");
 
         // `git commit --no-edit && git switch feat`: HEAD is feat's tip.
         let repo = landed_merge(msg);
         let p = repo.path();
-        assert!(raw_git(p, &["switch", "-q", "feat"]).status.success());
+        ok(p, &["switch", "-q", "feat"]);
         assert!(!shows_block(p, "HEAD"), "commit then switch");
+        assert!(!reflog_says_merge(p), "commit then switch");
         assert!(shows_block(p, "main"), "the merge keeps its block");
+
+        // An earlier merge on main, M1, landed with its block. A second merge
+        // stops on conflicts, and `git commit --no-edit || git merge --abort`
+        // runs with unmerged files. HEAD is M1 again, so the block half
+        // passes; the reflog half does not.
+        let repo = diverged_repo("feat");
+        let p = repo.path();
+        ok(p, &["switch", "-q", "-c", "feat2", "feat"]);
+        std::fs::write(p.join("f.txt"), "feat2").unwrap();
+        ok(p, &["commit", "-q", "-am", "feat2"]);
+        ok(p, &["switch", "-q", "main"]);
+        let merge = raw_git(p, &["merge", "--no-ff", "-m", msg, "feat"]);
+        assert!(!merge.status.success(), "M1 must stop on a conflict");
+        resolve_and_commit(p, &[]);
+        let merge = raw_git(p, &["merge", "--no-ff", "-m", msg, "feat2"]);
+        assert!(!merge.status.success(), "the second merge must conflict");
+        assert!(!raw_git(p, &["commit", "--no-edit"]).status.success());
+        ok(p, &["merge", "--abort"]);
+        assert!(shows_block(p, "HEAD"), "HEAD is M1, which kept its block");
+        assert!(!reflog_says_merge(p), "earlier merge, then abort");
+        assert!(!head_check(p), "earlier merge, then abort");
+
+        // `git commit --no-edit && git switch feat`, where feat's tip is an
+        // earlier merge that also kept its block.
+        let repo = diverged_repo("feat");
+        let p = repo.path();
+        ok(p, &["switch", "-q", "feat"]);
+        let merge = raw_git(p, &["merge", "--no-ff", "-m", msg, "main"]);
+        assert!(
+            !merge.status.success(),
+            "feat's merge must stop on a conflict"
+        );
+        resolve_and_commit(p, &[]);
+        ok(p, &["switch", "-q", "main"]);
+        std::fs::write(p.join("f.txt"), "main2").unwrap();
+        ok(p, &["commit", "-q", "-am", "main2"]);
+        let merge = raw_git(p, &["merge", "--no-ff", "-m", msg, "feat"]);
+        assert!(
+            !merge.status.success(),
+            "main's merge must stop on a conflict"
+        );
+        resolve_and_commit(p, &[]);
+        assert!(head_check(p), "main's merge, before the switch");
+        ok(p, &["switch", "-q", "feat"]);
+        assert!(shows_block(p, "HEAD"), "feat's tip kept its block");
+        assert!(!reflog_says_merge(p), "commit then switch to a merge");
+        assert!(!head_check(p), "commit then switch to a merge");
 
         // `cd <linked worktree> && git commit --no-edit`, with the amend then
         // run from the primary checkout: the primary's HEAD is not the merge.
@@ -1780,10 +1876,33 @@ mod tests {
         assert!(!merge.status.success(), "the merge must stop on a conflict");
         resolve_and_commit(&wt, &[]);
         assert!(
-            shows_block(&wt, "HEAD"),
-            "the worktree's merge has the block"
+            head_check(&wt),
+            "the check passes in the worktree, run there"
         );
         assert!(!shows_block(primary.path(), "HEAD"), "the primary checkout");
+        assert!(!reflog_says_merge(primary.path()), "the primary checkout");
+    }
+
+    /// In a repo with no reflog, the reflog half of the check fails even where
+    /// HEAD is the merge, so the advice leaves HEAD alone: the safe direction.
+    /// `core.logAllRefUpdates=false` stops git creating a reflog, but git still
+    /// appends to one that exists, so the fixture's reflog is removed first.
+    #[test]
+    fn the_head_check_fails_safe_without_a_reflog() {
+        let repo = conflicted_merge(TRAILERS_MESSAGE);
+        let p = repo.path();
+        std::fs::remove_dir_all(p.join(".git/logs")).unwrap();
+        std::fs::write(p.join("f.txt"), "resolved").unwrap();
+        assert!(raw_git(p, &["add", "f.txt"]).status.success());
+        let commit = raw_git(
+            p,
+            &["-c", "core.logAllRefUpdates=false", "commit", "--no-edit"],
+        );
+        assert!(commit.status.success(), "{commit:?}");
+        assert!(!p.join(".git/logs/HEAD").exists(), "no reflog was written");
+        assert_eq!(parent_count(p), 2, "HEAD is the merge");
+        assert!(shows_block(p, "HEAD"), "HEAD kept its block");
+        assert!(!reflog_says_merge(p) && !head_check(p), "the check fails");
     }
 
     /// Backs the spec scenario "The cleanup is already asked for": finishing
