@@ -1642,10 +1642,12 @@ fn flag_value_is_owned(
 ///   for a command substitution in the globbed reading (`GH_HOST=$(cat h)`
 ///   reads as the host `*`). The [`UNRESOLVED_GH_HOST`] stand-in counts as
 ///   read, though its text holds a `$`: its block names the host fix.
-/// - The owner is non-empty and in GitHub's owner charset (`[A-Za-z0-9-]`).
-///   A `.` or `:` there means a host or scheme landed in the owner slot,
-///   because a variable held the whole `owner/repo` (`github.com/$slug`, or
-///   `https://github.com/$slug`, which gh cannot split). A quote, paren, `$`
+/// - The owner is non-empty and uses only letters, digits, `-` and `_`. A
+///   `_` cannot come from a host, a scheme or an expansion fragment, and
+///   managed-user owners carry one (`mona_acme`). A `.` or `:` there means a
+///   host or scheme landed in the owner slot, because a variable held the
+///   whole `owner/repo` (`github.com/$slug`, or `https://github.com/$slug`,
+///   which gh cannot split). A quote, paren, `$`
 ///   or backtick means quoting or an expansion reached it (a `/` inside
 ///   `$(… | cut -d/ -f4)/$r` leaves ` -f4)` there).
 /// - The allowlist rejects the target. An allowed owner (`cameronsjo/$r`)
@@ -1663,7 +1665,9 @@ fn names_literal_unowned_owner(
         host == UNRESOLVED_GH_HOST || !(repo_has_unexpanded_expansion(host) || host.contains('*'));
     host_is_read
         && !owner.is_empty()
-        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         && !is_allowed(host, repo, allowed_owners, allowed_repos)
 }
 
@@ -3914,8 +3918,18 @@ fn judge_resolution(
                     .unwrap_or("owner");
                 // Reuse the repo *name* under an allowed owner so the fix lands
                 // on the same project — `evil/cool-tool` becomes
-                // `cameronsjo/cool-tool`, not a placeholder.
-                let repo_name = repo.split('/').next_back().unwrap_or(repo.as_str());
+                // `cameronsjo/cool-tool`, not a placeholder. Not for the
+                // `gh repo` verbs that change or remove the repo they name:
+                // their fix is a command that runs, and rerun as written it
+                // would act on the operator's own repo of that name.
+                let repo_name = if matches!(
+                    repo_argument_verb(segment).as_deref(),
+                    Some("edit" | "archive" | "delete")
+                ) {
+                    "<repo>"
+                } else {
+                    repo.split('/').next_back().unwrap_or(repo.as_str())
+                };
                 // An unresolved GH_HOST is not fixed by any `-R` (#548).
                 let fix = if host == UNRESOLVED_GH_HOST {
                     "name the host on the gh command itself (--hostname <host>)".to_string()
@@ -9480,7 +9494,41 @@ mod tests {
             );
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{cwd}");
-            assert_eq!(meta.fix, "gh repo archive cameronsjo/$r", "{cwd}");
+            assert_eq!(meta.fix, "gh repo archive cameronsjo/<repo>", "{cwd}");
+        }
+    }
+
+    #[test]
+    fn unowned_repo_edit_archive_delete_fix_names_no_repo() {
+        // The fix for these verbs is a command that runs. Reusing the name
+        // under an allowed owner would point a rerun at the operator's own
+        // repo of that name (`gh repo edit cameronsjo/thing --visibility
+        // public`), so it names `<repo>`. `gh repo create` keeps the name.
+        for (command, fix) in [
+            (
+                "gh repo edit work-org/thing --visibility public --accept-visibility-change-consequences",
+                "gh repo edit cameronsjo/<repo>",
+            ),
+            (
+                "gh repo archive work-org/thing --yes",
+                "gh repo archive cameronsjo/<repo>",
+            ),
+            (
+                "gh repo delete work-org/thing --yes",
+                "gh repo delete cameronsjo/<repo>",
+            ),
+            (
+                "gh repo create work-org/thing --private",
+                "gh repo create cameronsjo/thing",
+            ),
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(command, cwd, false);
+                assert!(blocks(&result), "{command} in {cwd}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+                assert_eq!(meta.fix, fix, "{command} in {cwd}");
+            }
         }
     }
 
@@ -9499,9 +9547,12 @@ mod tests {
             format!("for r in a b; do {}; done", body.join("; "))
         };
         // (flags, the `Found:` list the block names)
-        let unowned: [(&[&str], &str); 13] = [
+        let unowned: [(&[&str], &str); 15] = [
             (&[r#"-R "evil/$r""#], r#""evil/$r""#),
             (&["-R evil/$r"], "evil/$r"),
+            // Digits and `_` are owner characters too.
+            (&[r#"-R "org42/$r""#], r#""org42/$r""#),
+            (&[r#"-R "my_org/$r""#], r#""my_org/$r""#),
             (&[r#"--repo "evil/$r""#], r#""evil/$r""#),
             (&[r#"-R "github.com/evil/$r""#], r#""github.com/evil/$r""#),
             (
@@ -9549,7 +9600,7 @@ mod tests {
         // owner slot; a variable host; a `/` inside a substitution; and an
         // allowed owner, which the loop gate rejects only because its quotes
         // are still on, so "you don't own" would be false.
-        let unresolvable: [&[&str]; 21] = [
+        let unresolvable: [&[&str]; 24] = [
             &[r#"-R "$r""#],
             &[r#"-R "/$r""#],
             &[r#"-R "$o/$r""#],
@@ -9564,6 +9615,11 @@ mod tests {
             &[r#"-R "$h/cameronsjo/$r""#],
             &[r#"-R "$h/evil/$r""#],
             &[r#"-R "https://$h/cameronsjo/$r""#],
+            &[r#"-R "`cat h`/evil/$r""#],
+            // A variable host with a literal `owner/repo`: the raw value
+            // holds the expansion, though the parsed repo does not.
+            &[r#"-R "$h/evil/x""#],
+            &[r#"-R "https://$h/evil/x""#],
             &[r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#],
             &[r#"-R "cameronsjo/$r""#],
             &["-R 'cameronsjo/$r'"],
@@ -9610,6 +9666,8 @@ mod tests {
         for flag in [
             r#"-R "evil/$r""#,
             "-R evil/$r",
+            r#"-R "org42/$r""#,
+            r#"-R "my_org/$r""#,
             r#"--repo "evil/$r""#,
             r#"-R "github.com/evil/$r""#,
             r#"-R "https://github.com/evil/$r""#,
@@ -9641,6 +9699,7 @@ mod tests {
             r#"-R "$h/cameronsjo/$r""#,
             r#"-R "$h/evil/$r""#,
             r#"-R "https://$h/cameronsjo/$r""#,
+            r#"--hostname "`cat h`" -R "evil/$r""#,
             r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#,
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
