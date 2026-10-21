@@ -19,6 +19,14 @@ if [[ -z "${staged_rs}" ]]; then
   exit 0
 fi
 
+# rustup installs cargo here, and a git hook gets the caller's PATH, which may
+# not include it.
+PATH="${HOME:-}/.cargo/bin:${PATH}"
+if ! command -v cargo > /dev/null; then
+  echo "pre-commit: cargo not found on PATH or in ~/.cargo/bin; cannot run cargo fmt" >&2
+  exit 1
+fi
+
 cargo fmt --all --quiet
 
 # Re-stage only the originally-staged Rust files, picking up any fmt edits.

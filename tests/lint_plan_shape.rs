@@ -35,8 +35,6 @@ fn fixture(name: &str) -> PathBuf {
 
 fn cadence_hooks() -> Command {
     let mut cmd = support::cadence_hooks();
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
     cmd.args(["session", "lint-plan-shape"]);
     cmd

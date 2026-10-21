@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
+
 ### Changed
 
 - **`prevent-secret-leaks` no longer blocks a command for defining a shell function.** Since 0.129.0 (#1409, #1425) any command that defined a function and named a secret anywhere blocked, whatever the function did. So `die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env"` and `f(){ echo hi; }; f; git commit -m '.env'` both blocked. cadence-ecosystem ADR-0046 rule 1 puts function indirection out of scope, so the rule is gone. A literal read still blocks, inside a function body or out (`f(){ cat .env; }; f`). A read through a function argument (`f(){ cat "$1"; }; f .env`) now passes, as the ADR accepts. (Part of cameronsjo/cadence-hooks#1443)

@@ -17,14 +17,10 @@ use std::process::Command;
 /// needs no serialization against other tests in this file.
 fn cadence_hooks(marker_dir: &std::path::Path) -> Command {
     let mut cmd = support::cadence_hooks();
-    // Don't inherit enforcement toggles from the test runner's session.
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
     // PPID is the pre-CP0 session key; remove it so the fallback path is
-    // exercised deterministically. CADENCE_ALLOW_MAIN would silence the nudge.
+    // exercised deterministically.
     cmd.env_remove("PPID");
-    cmd.env_remove("CADENCE_ALLOW_MAIN");
     cmd.env("CADENCE_MARKER_DIR", marker_dir);
     // Same reasoning as CADENCE_MARKER_DIR one line up, for the other thing a
     // spawned hook writes: unpinned, `metrics_dir()` resolves to the operator's
