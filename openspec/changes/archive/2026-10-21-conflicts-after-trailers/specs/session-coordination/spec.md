@@ -18,15 +18,19 @@ On a Bash `git commit` whose message it can read and that lacks `Session-Id:`, `
 ## ADDED Requirements
 
 ### Requirement: Conflicted-merge commit keeps its conflicts block below the trailers
-`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block, naming `git commit --no-edit --cleanup=strip` and the `-F` route for a message with other `#` lines. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
+`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block, and the nudge SHALL advise amending the landed commit before it is pushed. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
 
 #### Scenario: Finishing a conflicted merge with trailers
 - **WHEN** a merge started with a message ending in `Session-Id:` and `Co-Authored-By:` lines stopped on a conflict, and a session runs `git commit --no-edit`
-- **THEN** the hook exits 0 with a nudge naming `git commit --no-edit --cleanup=strip`
+- **THEN** the hook exits 0 with a nudge that says the commit lands with the block below the trailers and names `git commit --amend --no-edit --cleanup=strip`
 
 #### Scenario: The nudge says what strip drops
 - **WHEN** the hook nudges for that merge
-- **THEN** the nudge says `--cleanup=strip` drops every line that starts with `#`, and names `git commit -F` on a copy of MERGE_MSG cut at the `# Conflicts:` line for a message that has other such lines
+- **THEN** the nudge says `--cleanup=strip` drops every line that starts with `#`, and names `git commit --amend -F` on a copy of `git log -1 --format=%B` cut at the `# Conflicts:` line for a message that has other such lines
+
+#### Scenario: The nudge advises an amend, not a second commit
+- **WHEN** the hook nudges for that merge, which is context with no permission decision, so the commit has landed and MERGE_MSG is gone when the nudge is read
+- **THEN** the nudge names no copy of MERGE_MSG and no `git commit --no-edit --cleanup=strip`
 
 #### Scenario: The cleanup is already asked for
 - **WHEN** the same session runs `git commit --no-edit --cleanup=strip`

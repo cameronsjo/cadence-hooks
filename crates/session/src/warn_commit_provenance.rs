@@ -23,7 +23,10 @@
 //!
 //! A second, unrelated nudge rides the same hook (cadence-hooks#1439): a
 //! `git commit --no-edit` that would finish a conflicted merge whose message
-//! carries trailers. See [`conflicts_after_trailers_nudge`].
+//! carries trailers. It is `additionalContext` with no permission decision, so
+//! the commit runs in the same tool call and the model reads the nudge after
+//! it landed; the advice therefore amends the landed commit. See
+//! [`conflicts_after_trailers_nudge`].
 //!
 //! Detection reuses [`crate::branch_drift::is_git_commit`] (the sibling
 //! PreToolUse-Bash-commit check) and `cadence_hooks_core::shell`'s existing
@@ -283,20 +286,30 @@ const CONFLICTS_HEADER: &str = "# Conflicts:";
 
 /// The nudge text. Static: the merge message is untrusted, so none of it is
 /// echoed.
+///
+/// The hook gives no permission decision, so the commit runs in the same tool
+/// call and the model reads this after it landed. By then `MERGE_MSG` is gone
+/// and `git commit --no-edit --cleanup=strip` finds nothing to commit, so both
+/// routes are amends. `git commit --amend` refuses mid-merge ("cannot amend"),
+/// so the advice is safe when the commit did not land either.
 const CONFLICTS_AFTER_TRAILERS_NUDGE: &str = "A merge is waiting on this commit, and its pending \
     message (MERGE_MSG) has git's `# Conflicts:` block below the trailers. `git commit \
-    --no-edit` keeps `#` lines under its default cleanup (`whitespace`), so the commit would \
-    land with that block after the trailers, and they would no longer be the final paragraph; a \
-    lint or tool that reads the final paragraph then misses them. If no other line of the \
-    message starts with `#`, run `git commit --no-edit --cleanup=strip`. It removes the block, \
-    but it drops every line that starts with `#`, an issue reference or a markdown heading \
-    included, with no warning. If the message has such lines, copy the file `git rev-parse \
-    --git-path MERGE_MSG` prints, cut the `# Conflicts:` line and everything after it, and run \
-    `git commit -F <copy>` instead.";
+    --no-edit` keeps `#` lines under its default cleanup (`whitespace`), so the commit lands \
+    with that block after the trailers, and they are no longer the final paragraph; a lint or \
+    tool that reads the final paragraph then misses them. The commit runs in this same tool \
+    call, so fix it afterwards with an amend, before you push it (a pushed commit needs a \
+    force-push). If no other line of the message starts with `#`, run `git commit --amend \
+    --no-edit --cleanup=strip`. It keeps both parents and drops the block, but it also drops \
+    every line that starts with `#`, an issue reference or a markdown heading included, with \
+    no warning. If the message has such lines, run `git log -1 --format=%B > <copy>`, cut the \
+    `# Conflicts:` line and everything after it from <copy>, and run `git commit --amend -F \
+    <copy>`. If the merge did not commit (unmerged files), git refuses an amend mid-merge: \
+    resolve the files, run the commit again, then amend.";
 
 /// Nudge when this command is a `git commit --no-edit` that would finish a
 /// conflicted merge, and the merge message has trailers followed by git's
-/// `# Conflicts:` block.
+/// `# Conflicts:` block. The nudge tells the model to amend the commit that
+/// lands (see [`CONFLICTS_AFTER_TRAILERS_NUDGE`]).
 ///
 /// Every condition has to be read exactly, or the nudge stays silent (the
 /// check never blocks, ADR-0001):
@@ -1068,9 +1081,14 @@ mod tests {
 
     /// `git` in `dir` with discovery vars cleared (a concurrent test must not
     /// redirect it) and no exit-code check: a conflicted merge exits 1. The
-    /// comment character and commit cleanup are pinned to git's defaults, so a
-    /// developer's global `core.commentChar` or `commit.cleanup` cannot change
-    /// what MERGE_MSG or a landed commit looks like.
+    /// comment character, the commit cleanup and the merge shortlog are pinned
+    /// to git's defaults, so a developer's global `core.commentChar`,
+    /// `commit.cleanup` or `merge.log` cannot change what MERGE_MSG or a landed
+    /// commit looks like. Checked with each of `core.commentChar = "%"`,
+    /// `commit.cleanup = scissors`, `commit.cleanup = strip` and
+    /// `merge.log = true` in `GIT_CONFIG_GLOBAL`; other settings are not
+    /// covered. git 2.43's `cherry-pick` rejects `commit.cleanup=default` and
+    /// keeps the global value, so that one call passes `--cleanup=whitespace`.
     fn raw_git(dir: &Path, args: &[&str]) -> std::process::Output {
         let mut cmd = std::process::Command::new("git");
         for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
@@ -1079,6 +1097,7 @@ mod tests {
         cmd.args(["-c", "commit.gpgsign=false"])
             .args(["-c", "core.commentChar=#"])
             .args(["-c", "commit.cleanup=default"])
+            .args(["-c", "merge.log=false"])
             .args(args)
             .current_dir(dir)
             .output()
@@ -1130,21 +1149,41 @@ mod tests {
     }
 
     #[test]
-    fn no_edit_commit_of_a_conflicted_merge_with_trailers_nudges_to_strip_the_block() {
+    fn no_edit_commit_of_a_conflicted_merge_with_trailers_nudges_to_amend_the_landed_commit() {
         let repo = conflicted_merge(TRAILERS_MESSAGE);
         let result = run_in("git commit --no-edit", repo.path());
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap();
-        assert!(
-            msg.contains("git commit --no-edit --cleanup=strip"),
-            "the nudge names the action: {msg}"
-        );
         assert!(msg.contains("# Conflicts:"), "{msg}");
         assert!(
+            msg.contains("the commit lands with that block after the trailers"),
+            "the nudge says the commit lands with the block: {msg}"
+        );
+        assert!(
+            msg.contains("before you push it"),
+            "the nudge says when the amend is safe: {msg}"
+        );
+        assert!(
+            msg.contains("`git commit --amend --no-edit --cleanup=strip`"),
+            "the nudge names the amend: {msg}"
+        );
+        assert!(
             msg.contains("drops every line that starts with `#`")
-                && msg.contains("git rev-parse --git-path MERGE_MSG")
-                && msg.contains("git commit -F <copy>"),
-            "the nudge says what strip drops and gives the safe route: {msg}"
+                && msg.contains("`git log -1 --format=%B > <copy>`")
+                && msg.contains("`git commit --amend -F <copy>`"),
+            "the nudge says what strip drops and gives the file route: {msg}"
+        );
+        assert!(
+            msg.contains("refuses an amend mid-merge"),
+            "the nudge says what an amend does when the commit did not land: {msg}"
+        );
+        // Both of these fail once the commit has landed: MERGE_MSG is gone and
+        // there is nothing left to commit.
+        assert!(
+            !msg.contains("git rev-parse --git-path MERGE_MSG")
+                && !msg.contains("git commit --no-edit --cleanup=strip")
+                && !msg.contains("git commit -F"),
+            "the nudge does not advise a route that fails after the commit landed: {msg}"
         );
         assert!(
             !msg.contains("keeps the rest"),
@@ -1160,20 +1199,30 @@ mod tests {
     fn the_conflicts_nudge_finds_the_commit_in_a_chain_or_after_a_cd() {
         let repo = conflicted_merge(TRAILERS_MESSAGE);
         let dir = repo.path().to_str().unwrap();
-        for (command, cwd) in [
-            ("git add -A && git commit --no-edit", repo.path()),
-            ("GIT_EDITOR=true git commit --no-edit", repo.path()),
-            ("GIT_SSH_COMMAND+=x git commit --no-edit", repo.path()),
-            ("git commit -a --no-edit -S", repo.path()),
-            (&format!("cd {dir} && git commit --no-edit"), Path::new("/")),
+        for (command, cwd, nudges) in [
+            ("git add -A && git commit --no-edit", repo.path(), true),
+            ("GIT_EDITOR=true git commit --no-edit", repo.path(), true),
+            ("GIT_SSH_COMMAND+=x git commit --no-edit", repo.path(), true),
+            // Not an assignment (a name cannot start with a digit), so it is
+            // the command word, not a prefix to skip.
+            ("1A=x git commit --no-edit", repo.path(), false),
+            ("git commit -a --no-edit -S", repo.path(), true),
+            (
+                &format!("cd {dir} && git commit --no-edit"),
+                Path::new("/"),
+                true,
+            ),
         ] {
             let result = run_in(command, cwd);
-            assert!(
+            assert_eq!(
                 is_conflicts_nudge(&result),
+                nudges,
                 "{command}: {:?}",
                 result.message
             );
-            assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+            if nudges {
+                assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+            }
         }
     }
 
@@ -1253,7 +1302,10 @@ mod tests {
         // trailers above git's `# Conflicts:` block, but leaves
         // CHERRY_PICK_HEAD, not MERGE_HEAD. The nudge is for merges only.
         let repo = diverged_repo("feat\n\nSession-Id: 1111\nCo-Authored-By: Claude <n@a>");
-        let pick = raw_git(repo.path(), &["cherry-pick", "feat"]);
+        let pick = raw_git(
+            repo.path(),
+            &["cherry-pick", "--cleanup=whitespace", "feat"],
+        );
         assert!(!pick.status.success(), "the pick must stop on a conflict");
         let git_dir = repo.path().join(".git");
         assert!(git_dir.join("CHERRY_PICK_HEAD").is_file());
@@ -1450,30 +1502,66 @@ mod tests {
         }
     }
 
-    /// The nudge's advice, run for real: `--no-edit` alone leaves the block
-    /// below the trailers, `--no-edit --cleanup=strip` removes it and leaves
-    /// the trailers as the final paragraph.
+    /// A conflicted merge started with `message`, its conflict resolved and
+    /// staged, then finished with a plain `git commit --no-edit`: the state the
+    /// model finds itself in when it reads the nudge, since the commit ran in
+    /// the same tool call.
+    fn landed_merge(message: &str) -> tempfile::TempDir {
+        let repo = conflicted_merge(message);
+        std::fs::write(repo.path().join("f.txt"), "resolved").unwrap();
+        assert!(raw_git(repo.path(), &["add", "f.txt"]).status.success());
+        let out = raw_git(repo.path(), &["commit", "--no-edit"]);
+        assert!(out.status.success(), "{out:?}");
+        repo
+    }
+
+    fn body_of(repo: &Path) -> String {
+        let out = raw_git(repo, &["log", "-1", "--format=%B"]);
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn parent_count(repo: &Path) -> usize {
+        let out = raw_git(repo, &["rev-list", "--parents", "-n1", "HEAD"]);
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .count()
+            - 1
+    }
+
+    /// Why the nudge advises an amend: the plain commit lands the block below
+    /// the trailers and deletes MERGE_MSG, so the earlier advice (a second
+    /// `--no-edit --cleanup=strip`, or a copy of MERGE_MSG) has nothing left
+    /// to work on.
     #[test]
-    fn the_advised_cleanup_strips_the_block_and_the_plain_commit_keeps_it() {
-        let landed = |flags: &[&str]| {
-            let repo = conflicted_merge(TRAILERS_MESSAGE);
-            std::fs::write(repo.path().join("f.txt"), "resolved").unwrap();
-            assert!(raw_git(repo.path(), &["add", "f.txt"]).status.success());
-            let mut args = vec!["commit", "--no-edit"];
-            args.extend_from_slice(flags);
-            let out = raw_git(repo.path(), &args);
-            assert!(out.status.success(), "{args:?}: {out:?}");
-            let body = raw_git(repo.path(), &["log", "-1", "--format=%B"]);
-            String::from_utf8(body.stdout).unwrap()
-        };
-        let plain = landed(&[]);
+    fn a_plain_no_edit_commit_lands_the_block_and_leaves_nothing_to_redo() {
+        let repo = landed_merge(TRAILERS_MESSAGE);
+        let plain = body_of(repo.path());
         let conflicts = plain.find("# Conflicts:").expect("kept without cleanup");
         let last_trailer = plain.find("Co-Authored-By:").unwrap();
         assert!(
             conflicts > last_trailer,
-            "the block sits below the trailers"
+            "the block sits below the trailers: {plain:?}"
         );
-        let stripped = landed(&["--cleanup=strip"]);
+        assert!(!repo.path().join(".git/MERGE_MSG").exists());
+        let again = raw_git(repo.path(), &["commit", "--no-edit", "--cleanup=strip"]);
+        assert!(!again.status.success(), "nothing to commit: {again:?}");
+        assert_eq!(body_of(repo.path()), plain, "the commit did not change");
+    }
+
+    /// The nudge's first route, run for real after the commit landed: the
+    /// amend removes the block, leaves the trailers as the final paragraph and
+    /// keeps both parents.
+    #[test]
+    fn the_amend_route_strips_the_block_and_keeps_both_parents() {
+        let repo = landed_merge(TRAILERS_MESSAGE);
+        assert_eq!(parent_count(repo.path()), 2);
+        let out = raw_git(
+            repo.path(),
+            &["commit", "--amend", "--no-edit", "--cleanup=strip"],
+        );
+        assert!(out.status.success(), "{out:?}");
+        let stripped = body_of(repo.path());
         assert!(!stripped.contains("# Conflicts:"), "{stripped:?}");
         assert!(
             stripped
@@ -1481,29 +1569,23 @@ mod tests {
                 .ends_with("Co-Authored-By: Claude <n@a>"),
             "the trailers are the final paragraph: {stripped:?}"
         );
+        assert_eq!(parent_count(repo.path()), 2, "the merge keeps both parents");
     }
 
-    /// The nudge's warning and its safe route, run for real: `--cleanup=strip`
-    /// also drops body lines that start with `#`, while committing a copy of
-    /// MERGE_MSG cut at the `# Conflicts:` line with `-F` keeps them and
-    /// still leaves the trailers as the final paragraph.
+    /// The nudge's warning and its second route, run for real: the strip amend
+    /// also drops body lines that start with `#`, while amending with `-F` a
+    /// copy of the landed message cut at the `# Conflicts:` line keeps them and
+    /// still leaves the trailers as the final paragraph, with both parents.
     #[test]
-    fn strip_drops_other_hash_lines_and_the_file_route_keeps_them() {
+    fn strip_drops_other_hash_lines_and_the_log_copy_route_keeps_them() {
         let message = "Merge feat\n\n#1439 is the issue this closes.\n## A heading\n\n\
                        Session-Id: 1111\nCo-Authored-By: Claude <n@a>";
-        let resolved = || {
-            let repo = conflicted_merge(message);
-            std::fs::write(repo.path().join("f.txt"), "resolved").unwrap();
-            assert!(raw_git(repo.path(), &["add", "f.txt"]).status.success());
-            repo
-        };
-        let body_of = |repo: &Path| {
-            let out = raw_git(repo, &["log", "-1", "--format=%B"]);
-            String::from_utf8(out.stdout).unwrap()
-        };
 
-        let repo = resolved();
-        let out = raw_git(repo.path(), &["commit", "--no-edit", "--cleanup=strip"]);
+        let repo = landed_merge(message);
+        let out = raw_git(
+            repo.path(),
+            &["commit", "--amend", "--no-edit", "--cleanup=strip"],
+        );
         assert!(out.status.success(), "{out:?}");
         let stripped = body_of(repo.path());
         assert!(!stripped.contains("# Conflicts:"), "{stripped:?}");
@@ -1512,20 +1594,20 @@ mod tests {
             "strip drops every line that starts with `#`: {stripped:?}"
         );
 
-        let repo = resolved();
-        let path = raw_git(repo.path(), &["rev-parse", "--git-path", "MERGE_MSG"]);
-        let path = repo
-            .path()
-            .join(String::from_utf8(path.stdout).unwrap().trim());
-        let merge_msg = std::fs::read_to_string(path).unwrap();
-        let cut: Vec<&str> = merge_msg
+        let repo = landed_merge(message);
+        let landed = body_of(repo.path());
+        let cut: Vec<&str> = landed
             .lines()
             .take_while(|l| l.trim_end() != CONFLICTS_HEADER)
             .collect();
+        assert!(cut.len() < landed.lines().count(), "the block was cut");
         let scratch = tempfile::tempdir().unwrap();
         let copy = scratch.path().join("msg.txt");
         std::fs::write(&copy, format!("{}\n", cut.join("\n"))).unwrap();
-        let out = raw_git(repo.path(), &["commit", "-F", copy.to_str().unwrap()]);
+        let out = raw_git(
+            repo.path(),
+            &["commit", "--amend", "-F", copy.to_str().unwrap()],
+        );
         assert!(out.status.success(), "{out:?}");
         let kept = body_of(repo.path());
         assert!(!kept.contains("# Conflicts:"), "{kept:?}");
@@ -1537,5 +1619,36 @@ mod tests {
             kept.trim_end().ends_with("Co-Authored-By: Claude <n@a>"),
             "the trailers are the final paragraph: {kept:?}"
         );
+        assert_eq!(parent_count(repo.path()), 2, "the merge keeps both parents");
+    }
+
+    /// The nudge is safe when the commit did not land: with unmerged files the
+    /// `--no-edit` commit fails, and git refuses either amend mid-merge, so the
+    /// advice cannot rewrite the commit before the merge.
+    #[test]
+    fn an_amend_refuses_mid_merge_when_the_commit_did_not_land() {
+        let repo = conflicted_merge(TRAILERS_MESSAGE);
+        let head = |dir: &Path| {
+            let out = raw_git(dir, &["rev-parse", "HEAD"]);
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let before = head(repo.path());
+        let commit = raw_git(repo.path(), &["commit", "--no-edit"]);
+        assert!(!commit.status.success(), "unmerged files: {commit:?}");
+        let copy = repo.path().join("msg.txt");
+        std::fs::write(&copy, "Merge feat\n").unwrap();
+        for args in [
+            &["commit", "--amend", "--no-edit", "--cleanup=strip"][..],
+            &["commit", "--amend", "-F", copy.to_str().unwrap()][..],
+        ] {
+            let out = raw_git(repo.path(), args);
+            assert!(!out.status.success(), "{args:?}: {out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("cannot amend"),
+                "{args:?}: {out:?}"
+            );
+        }
+        assert_eq!(head(repo.path()), before, "HEAD did not move");
+        assert!(repo.path().join(".git/MERGE_HEAD").is_file());
     }
 }
