@@ -19,8 +19,6 @@ const TRANSCRIPT: &str = concat!(
 
 fn cadence_hooks() -> Command {
     let mut cmd = support::cadence_hooks();
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
     // Would re-price every figure asserted below.
     cmd.env_remove("CADENCE_METRICS_PRICES");

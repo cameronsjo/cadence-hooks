@@ -23,9 +23,6 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 
 fn cadence_hooks() -> Command {
     let mut cmd = support::cadence_hooks();
-    // Ensure tests don't inherit env vars from the test runner's session
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
     cmd.env("CADENCE_METRICS_DIR", scratch_metrics_dir());
     cmd
