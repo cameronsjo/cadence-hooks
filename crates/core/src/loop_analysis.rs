@@ -613,8 +613,8 @@ pub const MAX_PARSE_BYTES: usize = 12 * 1024;
 /// hook's 5 s timeout, and either one lets the push through unjudged. Past
 /// this the parse counts as failed, and every caller already has a fallback
 /// for that. On a saturated host a command under [`MAX_PARSE_BYTES`] can
-/// still run past it, and then takes that fallback: `guard-push-remote` counts pushes, so a
-/// legitimate two-push chain blocks. Wall clock, not CPU time, because the
+/// still run past it, and then takes that fallback: `guard-push-remote` judges
+/// each push on its own target and nudges. Wall clock, not CPU time, because the
 /// hook timeout it protects is wall clock.
 const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
 
