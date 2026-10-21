@@ -26432,6 +26432,9 @@ mod tests {
             ("ssh host 'cat .env'", "cat .env"),
             ("env -i cat .env", "env -i cat .env"),
             ("flock /tmp/l", "/tmp/l"),
+            // Only `-t` leaves a following option alone: `-O` takes `-c` as
+            // its log file, and util-linux refuses the extra word.
+            ("script -q -O -c 'cat .env' /dev/null", "cat .env"),
             ("su root", "root"),
             ("runuser -l me", "me"),
             ("tmux kill-server", "kill-server"),
