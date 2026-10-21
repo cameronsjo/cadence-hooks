@@ -529,8 +529,9 @@ fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
 }
 
 /// Past [`MAX_PARSE_BYTES`] `guard-push-remote` still judges each push on its
-/// own target (cadence-ecosystem ADR-0046 rule 3): a chain or loop of owned
-/// pushes nudges, and a push to a remote the operator does not own blocks.
+/// own target (cadence-ecosystem ADR-0046 rule 3): a chain of owned pushes
+/// nudges, a loop nudges only when a push names no remote, and a push to a
+/// remote the operator does not own blocks.
 #[test]
 fn padding_past_the_byte_cap_still_judges_each_push() {
     let tmp = tempfile::tempdir().unwrap();
@@ -549,10 +550,12 @@ fn padding_past_the_byte_cap_still_judges_each_push() {
             UNPARSED_PUSHES,
         ),
         (
-            "for b in main feat; do git push origin $b; done",
+            "for b in main feat; do git push; done",
             0,
             "git push in a command with a loop the guard could not parse",
         ),
+        // Every push names `origin`: no nudge.
+        ("for b in main feat; do git push origin $b; done", 0, ""),
         ("git push origin main && git push evil main", 2, ""),
         (
             "for b in main feat; do git push https://github.com/evil/x.git $b; done",
@@ -568,10 +571,11 @@ fn padding_past_the_byte_cap_still_judges_each_push() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(code), "{command}: {stderr}");
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains(nudge),
-            "{command}: {}",
-            String::from_utf8_lossy(&out.stdout)
-        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if nudge.is_empty() {
+            assert!(!stdout.contains("could not parse"), "{command}: {stdout}");
+        } else {
+            assert!(stdout.contains(nudge), "{command}: {stdout}");
+        }
     }
 }

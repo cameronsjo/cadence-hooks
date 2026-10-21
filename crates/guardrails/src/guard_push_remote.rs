@@ -1124,16 +1124,30 @@ fn judge_with_directory_nudge(input: &HookInput, walk: &PushWalk) -> CheckResult
 }
 
 /// The nudge for several pushes in a command the loop parser could not read.
+/// It names why the parse failed, not the chain: the chain is fine.
 const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes in a command the \
      guard could not parse — each push it read was checked on its own target\n   \
-     Verify: run the pushes as their own command, e.g. `git push origin main && git push \
-     origin dev`";
+     Cause: the command is over 12 KB, or holds a heredoc or a syntax error the parser \
+     cannot read\n   \
+     Verify: shorten the command, or run each push as its own command";
 
-/// The nudge for a push in a command whose loop the loop parser could not
-/// read.
+/// The nudge for a push with no remote, or one only the shell resolves, in a
+/// command whose loop the loop parser could not read.
 const UNPARSED_LOOP_NUDGE: &str = "⚠️  git-guardrails: git push in a command with a loop the \
      guard could not parse — each push it read was checked on its own target\n   \
      Verify: give every push in the loop an explicit remote, e.g. `git push origin main`";
+
+/// Whether a push names no repository, or one only the shell resolves (a
+/// `$` or backtick), so its remote is the tracking one or decided at run
+/// time. `words` are the push's arguments, as [`extract_push_targets`]
+/// reads them.
+fn push_lacks_literal_remote(words: &[String]) -> bool {
+    let found = cadence_hooks_core::shell::push_repository_argument(words);
+    found
+        .positional
+        .or(found.repo_flag)
+        .is_none_or(|remote| remote.contains(['$', '`']))
+}
 
 /// A nudge for an allowed push that runs after a directory change the push walk
 /// could not follow — `cd "$VAR"`, `cd -`, `cd $(…)`, `popd`, a bare `cd` —
@@ -1283,7 +1297,19 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
             ));
         }
         LoopAnalysis::ParseFailed => {
-            if LOOP_PATTERN.is_match(&strip_quotes(command)) {
+            // The loop nudge asks for an explicit remote, so it is given only
+            // when a push lacks one: every push named `origin` has nothing to
+            // fix. The pushes are the ones the target check below reads.
+            if LOOP_PATTERN.is_match(&strip_quotes(command))
+                && (push_segments
+                    .iter()
+                    .any(|words| push_lacks_literal_remote(words))
+                    || walk.of(command, &input_cwd(input)).iter().any(|push| {
+                        push_lacks_literal_remote(
+                            &push.repository.clone().into_iter().collect::<Vec<_>>(),
+                        )
+                    }))
+            {
                 walk.unparsed.set(Some(UNPARSED_LOOP_NUDGE));
             }
         }
@@ -3290,6 +3316,70 @@ mod tests {
                 assert_eq!(result.outcome, outcome, "{tail:?}: {:?}", result.message);
             }
         });
+    }
+
+    /// Review of #1470: past the byte cap the loop nudge asks for an explicit
+    /// remote, so it fires only for a push that has none or one only the
+    /// shell resolves; and the chain nudge names why the parse failed rather
+    /// than suggesting the chain it fired on.
+    #[test]
+    fn an_unparsed_command_nudges_only_with_something_to_fix() {
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let pad = format!(
+            "\n# {}",
+            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
+        );
+        let chain_nudge = "⚠️  git-guardrails: several git pushes in a command the guard \
+            could not parse — each push it read was checked on its own target\n   \
+            Cause: the command is over 12 KB, or holds a heredoc or a syntax error the \
+            parser cannot read\n   \
+            Verify: shorten the command, or run each push as its own command";
+        with_env(&owners_only(), || {
+            for (command, outcome, note) in [
+                // Every push names its remote: nothing to fix.
+                (
+                    "for b in main feat; do git push origin $b; done",
+                    Allow,
+                    None,
+                ),
+                (
+                    "for b in main feat; do git push -u origin $b; done",
+                    Allow,
+                    None,
+                ),
+                // No remote, or one only the shell resolves.
+                (
+                    "for b in main feat; do git push; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                (
+                    "for r in origin; do git push $r main; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                (
+                    "git push origin main && git push origin main:feat",
+                    Nudge,
+                    Some(chain_nudge),
+                ),
+            ] {
+                let padded = format!("{command}{pad}");
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&padded, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+                let message = result.message.as_deref().unwrap_or("");
+                match note {
+                    Some(note) => assert!(message.starts_with(note), "{command}: {message}"),
+                    None => assert!(!message.contains("could not parse"), "{command}: {message}"),
+                }
+            }
+        });
+        assert!(
+            !UNPARSED_CHAIN_NUDGE.contains("&&"),
+            "{UNPARSED_CHAIN_NUDGE}"
+        );
     }
 
     /// cadence-hooks#1144 review round 2: the substitution a child script runs
