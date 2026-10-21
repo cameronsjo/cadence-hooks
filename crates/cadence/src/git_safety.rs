@@ -52,6 +52,17 @@ fn is_git_word(token: &str) -> bool {
     token == "git" || token.ends_with("/git")
 }
 
+/// The word after the first `git` word in a normalized segment: the
+/// subcommand, once `normalize_git_command` has dropped the global options.
+fn git_subcommand<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    let git_pos = tokens.iter().position(|t| is_git_word(t))?;
+    tokens.get(git_pos + 1).copied()
+}
+
+/// Appended to the history nudge when a segment rebases: the way back.
+const REBASE_RECOVERY: &str =
+    "\nIf the rebase goes wrong, run `git reflog` to find the commit from before it.";
+
 /// Normalize a single command segment into matchable tokens.
 ///
 /// 1. Quote-aware tokenization ([`tokenize`]): a quoted flag like `"--force"`
@@ -912,6 +923,9 @@ impl Check for GitSafetyGuard {
         // a command hidden in `sh -c '…'` is still seen. Block precedence: any
         // segment blocks → block; else any warns → nudge.
         let mut should_warn = false;
+        // A rebase nudge names the way back (ADR-0046 rule 3: a nudge names
+        // a concrete action).
+        let mut warned_rebase = false;
         // Current-branch resolution for bare-HEAD force pushes (#71): lazy
         // (only when such a segment appears) and memoized across segments.
         let mut resolved_branch: Option<BranchResolution> = None;
@@ -954,12 +968,14 @@ impl Check for GitSafetyGuard {
 
             if self.check_warned(&tokens).is_some() {
                 should_warn = true;
+                warned_rebase |= git_subcommand(&tokens) == Some("rebase");
             }
         }
 
         if should_warn {
+            let action = if warned_rebase { REBASE_RECOVERY } else { "" };
             return CheckResult::nudge(format!(
-                "Git operation may modify history or lose work: {command}"
+                "Git operation may modify history or lose work: {command}{action}"
             ));
         }
 
@@ -1475,6 +1491,8 @@ mod tests {
             "git rebase --onto HEAD~2 main feature",
             "git rebase feature-branch",
             "git rebase feat/maintain-state",
+            "git -C /repo rebase main",
+            "git status && git rebase -i main",
         ] {
             let result = GitSafetyGuard.run(&make_bash_input(command));
             assert_eq!(
@@ -1483,6 +1501,27 @@ mod tests {
                 "{command}: {:?}",
                 result.message
             );
+            // ADR-0046 rule 3: the nudge names the way back.
+            let message = result.message.unwrap_or_default();
+            assert!(message.contains("run `git reflog`"), "{command}: {message}");
+        }
+    }
+
+    #[test]
+    fn only_a_rebase_nudge_names_the_reflog() {
+        for command in [
+            "git reset HEAD~1",
+            "git commit --amend",
+            "git push --force origin feature",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{command}"
+            );
+            let message = result.message.unwrap_or_default();
+            assert!(!message.contains("git reflog"), "{command}: {message}");
         }
     }
 
