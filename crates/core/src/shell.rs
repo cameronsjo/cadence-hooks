@@ -15997,8 +15997,9 @@ fn env_split_string_script(operands: &[String]) -> Option<String> {
 }
 
 /// util-linux `script`'s options that take a value, glued or as the next word
-/// — plus BSD's `-t time`/`-T fmt` (util-linux's `-t` takes only a glued
-/// value, so reading it as value-taking only matters to the BSD operand form).
+/// — plus BSD's `-t time`/`-T fmt`. util-linux's `-t` takes only a glued
+/// value, so `script_command` gives a bare `-t` the next word only when that
+/// word is not an option: `script -q -t -c CMD` runs CMD.
 const SCRIPT_VALUE_SHORT_FLAGS: &str = "EIOBTmot";
 const SCRIPT_VALUE_LONG_FLAGS: &[&str] = &[
     "--echo",
@@ -16059,7 +16060,13 @@ fn script_command(operands: &[String]) -> Option<String> {
                     };
                 }
                 if SCRIPT_VALUE_SHORT_FLAGS.contains(c) {
-                    if glued.is_empty() {
+                    // BSD's `-t time` is never an option word, and
+                    // util-linux's bare `-t` leaves the next word alone.
+                    let timing_without_value = c == 't'
+                        && operands
+                            .get(i + 1)
+                            .is_some_and(|w| unescape_word(w).starts_with('-'));
+                    if glued.is_empty() && !timing_without_value {
                         next += 1;
                     }
                     break;
@@ -25789,6 +25796,10 @@ mod tests {
             ("script --command 'cat .env' /dev/null", "cat .env"),
             ("script /dev/null -c 'cat .env'", "cat .env"),
             ("script -q -O log -c 'cat .env'", "cat .env"),
+            ("script -q -t -c 'cat .env' /dev/null", "cat .env"),
+            ("script -qt -c 'cat .env' /dev/null", "cat .env"),
+            ("script -t -q -c 'cat .env' /dev/null", "cat .env"),
+            ("script -t 0 /dev/null cat .env", "cat .env"),
             // BSD/macOS: every word after the transcript file.
             ("script -q /dev/null cat .env", "cat .env"),
             ("flock /tmp/l -c 'cat .env'", "cat .env"),
