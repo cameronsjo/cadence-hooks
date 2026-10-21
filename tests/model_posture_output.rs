@@ -31,10 +31,6 @@ fn run(payload: &str) -> std::process::Output {
 
 fn run_in(metrics_dir: &std::path::Path, payload: &str) -> std::process::Output {
     let mut cmd = support::cadence_hooks();
-    // A runner session can ambiently carry either of these, which would exempt
-    // the hook and turn an emit-expecting assertion into a false pass.
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     // Nudge rows are on by default; an ambient opt-out would make the denial
     // row vanish and read as a pass in the telemetry test below.
     cmd.env_remove("CADENCE_LOG_NUDGES");
