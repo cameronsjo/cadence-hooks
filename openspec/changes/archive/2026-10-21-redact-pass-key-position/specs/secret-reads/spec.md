@@ -29,4 +29,8 @@ On PostToolUse for Bash, `redact-secret-output` SHALL replace, in place in stdou
 
 #### Scenario: A credential after a bare pass in prose
 - **WHEN** a Bash command prints `DB pass: Zq9vKhunter7Xw`
-- **THEN** the hook masks `Zq9vKhunter7Xw`, because a value shaped like a credential masks after a bare `pass:` wherever it sits
+- **THEN** the hook masks `Zq9vKhunter7Xw`, because the first word of the value is shaped like a credential
+
+#### Scenario: A credential and a note after a bare pass in prose
+- **WHEN** a Bash command prints `Admin pass: Zq9vKhunter7Xw (change on first login)`
+- **THEN** the hook masks `Zq9vKhunter7Xw`, because the first word of the value is shaped like a credential and the value runs to the end of the line, so what follows that word does not change the verdict

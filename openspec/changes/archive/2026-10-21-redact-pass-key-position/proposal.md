@@ -5,7 +5,7 @@
 ## What Changes
 
 - A mid-line bare `pass:` is in key position when two or more blanks or a tab come right before it, or when the word before it ends in `:` (a `file:line:` prefix or a label) or starts with `-` (a flag such as `-passout`, or a dash). A field's value before it counts as before, now also when an opener is glued to the field (`{User:admin`, `&{User:admin`). The other key positions stay: line start after blanks, markers or comment leaders, and after `{ , ; & ? ( [` or a quote.
-- Out of key position, a bare `pass:` is no longer skipped. It is read as a weak name: its value masks only when it looks like a credential (one word of at least 8 characters that is not a plain word, number, duration or identifier). So `DB pass: <secret>` masks, and `the second pass: done` passes through.
+- Out of key position, a bare `pass:` is no longer skipped. It keeps every rule that `origin/main` applies to a bare `pass`, and on top of them its value masks only when the first word of the value looks like a credential (at least 8 characters, not a plain word, number, duration or identifier). The unquoted value runs to the end of the line, so a note or a next field after that word does not change the verdict. So `DB pass: <secret>` and `Admin pass: <secret> (change on first login)` mask, and `the second pass: done` passes through. The rule can only narrow what `origin/main` masks.
 - Every other name, and the `pass=`, quoted and JSON forms, keep their rules.
 
 Surfaces: `redact-secret-output` (PostToolUse, Bash), which values it masks. No hooks.json change in cameronsjo/cadence.
@@ -18,7 +18,7 @@ None.
 
 ### Modified Capabilities
 
-- `secret-reads`: "Mask secrets in Bash output" gains scenarios for a bare `pass:` in prose (kept), behind a `file:line:` prefix (masked), in a map (masked), and after a qualifier word with a credential-shaped value (masked).
+- `secret-reads`: "Mask secrets in Bash output" gains scenarios for a bare `pass:` in prose (kept), behind a `file:line:` prefix (masked), in a map (masked), and after a qualifier word with a credential-shaped first word in the value, with or without a note after it (masked).
 
 ## Impact
 

@@ -32,7 +32,8 @@
 //! runner's status word, and `Token expired` (a name, a space, a word, at the
 //! start of a line outside a `.netrc`/vault table) is prose, not a pair. A
 //! bare `pass:` after an ordinary word on its line (`one record per pass: x`)
-//! is read as a WEAK name ([`pass_key_position`]). A corpus test holds
+//! masks only when the first word of its value looks like a credential
+//! ([`pass_key_position`], [`secret_like`]). A corpus test holds
 //! everyday output (test runners, builds, git over code, listings, error
 //! prose) at zero masks.
 //!
@@ -588,8 +589,9 @@ pub enum Strength {
     /// in a plain `pass=5` / `pass: 5` form, which is a test runner's tally
     /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
     /// string's `&pass=` all mask, as does a longer number. In the mid-line
-    /// colon form, out of key position ([`pass_key_position`]), it is read as
-    /// [`Strength::Weak`].
+    /// colon form, out of key position ([`pass_key_position`]), it masks only
+    /// when, on top of those rules, the first word of the value is
+    /// credential-shaped ([`secret_like`]).
     Tally,
 }
 
@@ -1170,7 +1172,8 @@ fn is_header_name(name: &str) -> bool {
 
 /// For a WEAK name in a prose-shaped form: the value must look like a
 /// credential — one word of at least 8 characters that is not a plain word,
-/// number, duration, or identifier/type expression.
+/// number, duration, or identifier/type expression. A bare `pass:` out of key
+/// position is judged the same way on the first word of its value.
 fn secret_like(value: &str) -> bool {
     let v = value.trim().trim_end_matches([',', ';']);
     if !maskable(v) || v.chars().any(char::is_whitespace) || v.chars().count() < 8 {
@@ -1643,13 +1646,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             continue;
         };
         // A bare `pass:` after another word on its line may be prose ("one
-        // record per pass: x"), so out of key position it is a weak name whose
-        // value must look like a credential ("DB pass: <secret>", #1449).
-        let strength = if strength == Strength::Tally && !pass_key_position(text, name_at) {
-            Strength::Weak
-        } else {
-            strength
-        };
+        // record per pass: x"). It keeps every rule of the strength it has on
+        // `origin/main` and, on top of them, masks only when the value's first
+        // word looks like a credential ("DB pass: <secret> (rotate)", #1449).
+        // The extra test can only narrow what the rules mask.
+        let weak_pass = strength == Strength::Tally && !pass_key_position(text, name_at);
         let eol = line_end(text, start, &mut eol_cache);
         let rest = &text[start..eol];
         if rest.starts_with("//") {
@@ -1685,7 +1686,10 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         {
             false
         } else {
+            // The unquoted value runs to the end of the line, so a note or a
+            // next field after the secret is part of it: judge its first word.
             value_masks(strength, value, true)
+                && (!weak_pass || value.split_whitespace().next().is_some_and(secret_like))
         };
         if masks {
             spans.push(named(start + vs, start + ve));
@@ -1720,7 +1724,8 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
 ///   Go's `{User:admin Pass:x}`).
 ///
 /// After any other word it may be prose, as in "the second pass: done", and
-/// the caller reads it as a weak name. Every other name, and the `pass=` form,
+/// the caller masks it only when the first word of its value looks like a
+/// credential, besides its usual rules. Every other name, and the `pass=` form,
 /// keeps its rules.
 ///
 /// Each scan stops at a newline, a blank or the first byte that does not
@@ -2989,6 +2994,68 @@ mod tests {
         for input in &masks {
             let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
             assert!(!out.contains(&p), "{input:?} -> {out:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1449, second review: out of key position the
+    /// unquoted value of a bare `pass:` runs to the end of the line, so a note,
+    /// a next field or a closing `|` after the secret is part of it. The value
+    /// is judged by its first word, on top of every rule `origin/main` applies
+    /// to a bare `pass`, so the check can only narrow what main masks.
+    #[test]
+    fn issue_1449_pass_value_is_judged_by_its_first_word() {
+        let p = pw();
+        let masks = [
+            // Paired fields: the next field follows the secret.
+            format!("SMTP user: bob, SMTP pass: {p}, port: 587\n"),
+            format!("DB user: app, DB pass: {p}, DB host: db1\n"),
+            format!("user: bob db pass: {p} host: db1\n"),
+            format!("redis pass: {p} db: 0\n"),
+            format!("- Router pass: {p}, admin user: root\n"),
+            // A note after the secret: parenthesis, dash, comment, more words.
+            format!("Admin pass: {p} (change on first login)\n"),
+            format!("Generated admin pass: {p} - store it safely\n"),
+            format!("Created user bob with pass: {p} (expires in 24h)\n"),
+            format!("DB pass: {p}  # rotate monthly\n"),
+            format!("Root pass: {p} for host db1\n"),
+            format!("Your new pass: {p} \u{2014} keep it secret\n"),
+            format!("> Admin pass: {p} <- change this\n"),
+            // Logs.
+            format!("[INFO] admin pass: {p}, expires: 2026-10-22\n"),
+            format!("INFO  Using pass: {p} for user admin\n"),
+            format!("{{\"msg\": \"DB pass: {p}\", \"level\": \"info\"}}\n"),
+            format!("{{\"event\": \"admin pass: {p}\", \"logger\": \"setup\"}}\n"),
+            // Tables and prefixes.
+            format!("| admin | pass: {p} |\n"),
+            format!("| admin pass: {p} |\n"),
+            format!("\u{2502} smtp \u{2502} bob \u{2502} pass: {p} \u{2502}\n"),
+            format!("    12\tAdmin pass: {p} (rotate)\n"),
+            format!("+Admin pass: {p} (rotate)\n"),
+        ];
+        for input in &masks {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(&p), "{input:?} -> {out:?}");
+        }
+        let kept = [
+            // The issue's prose rows, and a multi-word value.
+            "+ // one record per pass: x\n",
+            "+ // the second pass: done\n",
+            "x pass: 5 hunter2\n",
+            "lint pass: ok and the build is green\n",
+            // Code that main keeps: a type, an expression closing a field.
+            "  private pass: string|null;\n",
+            "  readonly pass: string|undefined;\n",
+            "+  public pass: Buffer|null;\n",
+            "src/a.ts:3:  declare pass: string|null;\n",
+            "  static pass: getPass(),\n",
+            "    mail pass: env.SMTP_PASS2,\n",
+            "x pass: config.get('pass'),\n",
+            // A test runner's tally, which main skips before it reads the value.
+            "x pass: 5,fail=0\n",
+            "x pass: 123456,fail=0\n",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), None, "{input:?}");
         }
     }
 

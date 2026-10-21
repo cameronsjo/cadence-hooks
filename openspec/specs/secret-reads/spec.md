@@ -217,7 +217,11 @@ On PostToolUse for Bash, `redact-secret-output` SHALL replace, in place in stdou
 
 #### Scenario: A credential after a bare pass in prose
 - **WHEN** a Bash command prints `DB pass: Zq9vKhunter7Xw`
-- **THEN** the hook masks `Zq9vKhunter7Xw`, because a value shaped like a credential masks after a bare `pass:` wherever it sits
+- **THEN** the hook masks `Zq9vKhunter7Xw`, because the first word of the value is shaped like a credential
+
+#### Scenario: A credential and a note after a bare pass in prose
+- **WHEN** a Bash command prints `Admin pass: Zq9vKhunter7Xw (change on first login)`
+- **THEN** the hook masks `Zq9vKhunter7Xw`, because the first word of the value is shaped like a credential and the value runs to the end of the line, so what follows that word does not change the verdict
 
 ### Requirement: Output masking escape and limits
 `redact-secret-output` SHALL pass output through unmasked when `CADENCE_ALLOW_SECRET_OUTPUT` is truthy (`1`, `true`, `yes`) in the hook's environment, recording a bypass row only when it would have masked something. It SHALL act on the Bash tool only, and a hook failure, a timeout, or a span it cannot map safely MUST leave the raw output in place (fail open).
