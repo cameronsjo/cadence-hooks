@@ -5,7 +5,8 @@
 - [x] 1.3 Keep the nudge text static and leave the once-per-session provenance marker alone
 - [x] 1.4 Pin it on real conflicted merges, and pin that a plain `--no-edit` lands the block and leaves nothing to redo, and that `git commit --amend --no-edit --cleanup=strip` removes the block and keeps both parents
 - [x] 1.5 Say that `--cleanup=strip` also drops other lines starting with `#`, give the `git log -1 --format=%B` copy and `git commit --amend -F` route, and pin both on a real merge
-- [x] 1.6 Advise an amend of the landed commit, not a second commit or a copy of MERGE_MSG, because the commit runs in the same tool call and MERGE_MSG is gone when the nudge is read; pin that git refuses the amend when the commit did not land
+- [x] 1.6 Advise an amend of the landed commit, not a second commit or a copy of MERGE_MSG, because the commit runs in the same tool call and MERGE_MSG is gone when the nudge is read; pin that git refuses the amend while the merge is still in progress
+- [x] 1.7 Say to run the amend in the directory the commit ran in, and only if `git log -1 --format=%B` there still shows the `# Conflicts:` block, because a merge abort, a later commit or branch switch in the same call, or a commit made in another worktree leaves HEAD on a commit that is not the merge; pin on real git that the check fails in each of those five shapes
 
 ## 2. Docs
 

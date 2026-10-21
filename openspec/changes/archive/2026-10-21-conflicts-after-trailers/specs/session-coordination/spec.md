@@ -18,7 +18,7 @@ On a Bash `git commit` whose message it can read and that lacks `Session-Id:`, `
 ## ADDED Requirements
 
 ### Requirement: Conflicted-merge commit keeps its conflicts block below the trailers
-`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block, and the nudge SHALL advise amending the landed commit before it is pushed. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
+`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block, and the nudge SHALL advise amending the landed commit before it is pushed, and only where that commit's message still shows the block. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
 
 #### Scenario: Finishing a conflicted merge with trailers
 - **WHEN** a merge started with a message ending in `Session-Id:` and `Co-Authored-By:` lines stopped on a conflict, and a session runs `git commit --no-edit`
@@ -31,6 +31,10 @@ On a Bash `git commit` whose message it can read and that lacks `Session-Id:`, `
 #### Scenario: The nudge advises an amend, not a second commit
 - **WHEN** the hook nudges for that merge, which is context with no permission decision, so the commit has landed and MERGE_MSG is gone when the nudge is read
 - **THEN** the nudge names no copy of MERGE_MSG and no `git commit --no-edit --cleanup=strip`
+
+#### Scenario: The amend is conditional on HEAD still being the merge
+- **WHEN** the hook nudges for that merge, and a later command in the same call may have moved HEAD (a commit, a branch switch, a merge abort), or the commit ran in another worktree
+- **THEN** the nudge says to run the amend in the directory the commit ran in, and only if `git log -1 --format=%B` there still shows the `# Conflicts:` block, and otherwise to leave HEAD alone
 
 #### Scenario: The cleanup is already asked for
 - **WHEN** the same session runs `git commit --no-edit --cleanup=strip`
