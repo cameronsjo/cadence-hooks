@@ -5,7 +5,9 @@
 //! last informal checkpoint between a committed secret and public history.
 //! This guard is the mechanical replacement: it scans what a push would
 //! publish and refuses when a commit adds a secret-named file or a credential
-//! token, or a commit or tag message carries one.
+//! token, or a commit or tag message carries one. A push it cannot fully read
+//! goes ahead with a warning naming why: only a secret it found blocks
+//! (cameronsjo/cadence-hooks#1373).
 //!
 //! **Trigger and range come from core.** [`push_invocations`] finds every push
 //! the command runs (wrappers, `-C`, substitutions, refspecs). This module owns
@@ -41,61 +43,36 @@
 //! (`diff.relative`), `--no-ext-diff`, `--no-textconv`, `--text`,
 //! `--no-renames`, forced `a/`/`b/` prefixes and `core.quotePath=false`.
 //!
-//! **Fails CLOSED, everywhere a push was detected.** Unlike most guards this one
-//! never reads "git said nothing useful" as "nothing to push": an unresolved
-//! invocation, an unreadable or unsafe source, a source or tag that is not a
-//! commit (a tree or blob publishes content no patch shows), a nested tag, a
-//! submodule push (`--recurse-submodules=on-demand|only`, the same in
+//! **Warns, never blocks, on what it cannot read.** This guard never reads
+//! "git said nothing useful" as "nothing to push", but it does not refuse
+//! either (cameronsjo/cadence-hooks#1373): an unresolved invocation, an
+//! unreadable or unsafe source, a source or tag that is not a commit (a tree
+//! or blob publishes content no patch shows), a nested tag, a submodule push
+//! (`--recurse-submodules=on-demand|only`, the same in
 //! `push.recurseSubmodules`, or `submodule.recurse`) in a repository that has
 //! submodules (a top-level `.gitmodules` or a gitlink in the index), a failed,
 //! unavailable or timed-out git spawn, a range over [`MAX_COMMITS`], a patch
-//! over [`MAX_LOG_BYTES`], too many refspecs, an unparseable diff header —
-//! all block, and the message says which. Only a genuinely empty range
-//! allows. `git send-pack`, `git http-push` and the remote helpers
+//! over [`MAX_LOG_BYTES`], too many refspecs, an unparseable diff header — each
+//! lets the push go ahead with a warning that says which, and the fix when
+//! there is one. `git send-pack`, `git http-push` and the remote helpers
 //! (`git remote-<transport>`, never the builtin `git remote`), with their
-//! `git-<name>` executables, publish without `git push` and always block; so
-//! do a dashed `git-push` executable and an `exec -a` naming a `git`-prefixed
+//! `git-<name>` executables, publish without `git push` and warn; so do a
+//! dashed `git-push` executable and an `exec -a` naming a `git`-prefixed
 //! argv[0] (git dispatches on it), which this does not model. So do a named
 //! source spelled as a full-length object id that a ref is also named like
 //! (git pushes the ref, `rev-parse` would read the object) and an outbound
 //! commit whose `encoding` header is not UTF-8, US-ASCII or ISO-8859-* (a
-//! token in it need not be ASCII bytes).
+//! token in it need not be ASCII bytes). A warning never ends the scan: the
+//! parts of the push that could be read are still scanned, and a later push
+//! in the same command still is, so a secret found anywhere blocks.
 //!
-//! **Aliases.** git runs a builtin before any alias or `git-<name>`, so a
-//! subcommand spelled exactly as one (`BUILTINS`, else, for a plain `git`
-//! in a command that does not name `PATH`, `git --list-cmds=builtins` of
-//! the running git; case-sensitive, as git is: `git STATUS` runs
-//! `alias.status`) is never probed, whatever the env or directory. "Builtin"
-//! here means "not an alias", not "cannot publish": hooks, credential and
-//! other helpers, and fsmonitor commands a builtin runs are outside this
-//! guard's model, and `for-each-repo`, which runs a git command its arguments
-//! name, is probed like any other subcommand, as is `git hook` with any
-//! argument but `list` (`hook run` runs whatever hook the config names). The running git vouches only for
-//! a plain `git` in a command that does not name `PATH`; a `git` swapped
-//! without naming it (`hash -p`, a nameref built from an expansion, a sourced
-//! file) is outside the model. An exec-path script (`submodule`, `bisect`),
-//! which git also runs before any alias, is probed for a real alias, but a
-//! probe that is blind, capped or failing leaves it allowed unless the command
-//! spells out a moved exec path (`GIT_EXEC_PATH`, `--exec-path`). Any other
-//! `git <sub>` is looked up in
-//! the repository's config (`alias.<sub>`, following alias-of-alias, past any
-//! global options an alias value opens with). It blocks as unresolved when:
-//! its value names `push` or `send-pack` or starts with `!`; an alias opens
-//! with an option this cannot follow or holds options only; this same command
-//! writes it with `git config`; the subcommand word carries `$` or a backtick
-//! (except a wrapper function whose body is one plain `git … "$@"` and whose
-//! every call site in the command hands it a literal builtin that cannot
-//! push, cameronsjo/cadence-hooks#1338);
-//! the probe cannot see the config the call reads (a `GIT_CONFIG*`,
-//! `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` or
-//! `XDG_CONFIG_HOME` name, or `HOME=`, anywhere in the command read with its
-//! quotes and backslashes removed, an `include.path`/`includeIf` mention,
-//! `--git-dir`, `--work-tree`, `--config-env`, `-c include*`, or a directory
-//! it cannot resolve); the probe
-//! itself fails or times out; or `help.autocorrect` is set to run a guess
-//! (anything but `0`/`false`/`no`/`off`/`never`/`show`/`prompt`) and the subcommand is
-//! neither an alias, a builtin or exec-path command `git --list-cmds` knows,
-//! nor an executable `git-<name>` in an absolute `PATH` directory.
+//! **Aliases are not followed.** A `git <sub>` the config defines as an alias
+//! that pushes reaches git unread and goes ahead with no warning. The alias
+//! probe that used to refuse every subcommand it could not prove a builtin
+//! (a directory or config it could not see, `help.autocorrect`, a wrapper's
+//! `"$@"`) blocked ordinary commands far more often than it found a push, and
+//! an alias that publishes is a deliberate setup, not the slip this guard is
+//! for.
 //!
 //! **Bounded.** Every git spawn goes through `run_bounded_capped_input`
 //! (process-group kill, stdout cap, shared hook deadline, stdin written from
@@ -134,17 +111,17 @@
 //! every ref, published or not; `--follow-tags` re-reads every annotated tag
 //! reachable from what is pushed, including tags the remote already has. A
 //! submodule-recursing push in a repository whose index is too large to list
-//! (over ~300k entries) is refused as too large to check for submodules.
+//! (over ~300k entries) warns as too large to check for submodules.
 //! A git command that sets, on its own command line, a value git runs as a
 //! command (`-c core.sshCommand=…`, `-c core.pager=…`, `-c credential.helper=…`,
 //! a `GIT_SSH_COMMAND=`/`GIT_PAGER=` prefix, …) reads as a push core cannot
-//! resolve and is refused whatever its subcommand, `GIT_SSH_COMMAND='ssh -i
+//! resolve and warns whatever its subcommand, `GIT_SSH_COMMAND='ssh -i
 //! key' git push` included; the value is not parsed. An empty value and a
 //! pager of `cat` are not counted (cameronsjo/cadence-hooks#1231), and neither
 //! is a prefix that sets both an empty `GIT_CONFIG_PARAMETERS` and a
 //! `GIT_CONFIG_COUNT` of `0` or empty, which gives git no config
 //! (cameronsjo/cadence-hooks#1378); one of the two alone still counts. A push under
-//! any `GIT_CONFIG*` prefix is still refused.
+//! any `GIT_CONFIG*` prefix still warns.
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
 //! `git subtree push`, a `git-<name>` executable on `PATH` other than
@@ -155,11 +132,12 @@
 //! written by the same command through anything but `git config`/`git remote`
 //! (an editor, a redirect into `.git/config`); a pushed commit on another
 //! branch that adds a submodule the index and top-level `.gitmodules` do not
-//! show. The `help.autocorrect` existence check asks git, and searches
-//! `PATH`, with the hook's own `PATH`, which may differ from the command's.
+//! show; a push through an alias; and a push hidden behind a brace word the
+//! parser could not expand (cadence-ecosystem ADR-0046: guards judge what
+//! they read).
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
-//! allows AND records a bypass row.
+//! allows a found secret AND records a bypass row. A warning needs no escape.
 
 use crate::credential_scan;
 use crate::secret_patterns::{
@@ -168,14 +146,13 @@ use crate::secret_patterns::{
 use cadence_hooks_core::deadline::{self, BudgetState};
 use cadence_hooks_core::push::{PushInvocation, is_safe_ref, push_invocations};
 use cadence_hooks_core::shell::{
-    GitSpawn, LocatedSegment, UNRESOLVABLE_DIR, command_segments_with_dirs, command_word,
-    contains_ignoring_ascii_case, executable_tokens, peel_command_runners, resolve_cd_target,
+    GitSpawn, LocatedSegment, command_segments_with_dirs, command_word,
+    contains_ignoring_ascii_case, executable_tokens, peel_command_runners,
     run_bounded_capped_input, segment_work_dirs, skip_git_global_options, strip_group_wrappers,
     unescape_word,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput};
-use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
 
@@ -212,10 +189,6 @@ const SPAWN_CAP: Duration = Duration::from_secs(30);
 /// (`CADENCE_HOOK_DEADLINE_MS=0`). Under an armed deadline a scan spawn takes
 /// whatever the shared budget has left.
 const LONG_CAP: Duration = Duration::from_secs(20);
-/// Most distinct directories probed for aliases in one command.
-const MAX_ALIAS_PROBES: usize = 4;
-/// Deepest alias-of-alias chain followed.
-const MAX_ALIAS_DEPTH: usize = 10;
 
 /// Decides, from the ABSOLUTE path, whether the content scan is skipped.
 type Exempt = fn(&str) -> bool;
@@ -335,27 +308,15 @@ struct CommandHints {
     follow_tags: bool,
     mirror: bool,
     recurse_submodules: bool,
-    /// Aliases a `git config` segment writes, lowercased.
-    aliases: Vec<String>,
 }
 
-/// One `git` invocation the command runs: its directory and the words from
-/// its subcommand on.
+/// One `git` invocation the command runs: the words from its subcommand on.
 struct GitCall {
-    dir: String,
-    /// The directory could not be followed (`cd "$D"`, `-C "$D"`, a
-    /// backtick): `dir` is a stand-in, so an alias probe there proves nothing.
-    dir_unresolved: bool,
-    /// The `-C` value that made [`GitCall::dir_unresolved`] true, when that
-    /// was the cause.
-    dir_token: Option<String>,
     globals: Vec<String>,
     rest: Vec<String>,
     /// git runs under a name that picks its subcommand: a dashed `git-push`
     /// executable, or `exec -a <name>` (git dispatches on argv[0]).
     renamed: bool,
-    /// The command word is plain `git` (found on `PATH`), not a path to one.
-    bare: bool,
 }
 
 /// Plumbing that publishes objects without `git push`.
@@ -399,7 +360,7 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for (segment, dir) in command_segments_with_dirs(command, cwd) {
+    for (segment, _dir) in command_segments_with_dirs(command, cwd) {
         let tokens = executable_tokens(&segment);
         let argv = peel_command_runners(&tokens);
         let Some(first) = argv.first() else { continue };
@@ -413,65 +374,33 @@ fn git_calls(command: &str, cwd: &str) -> Vec<GitCall> {
         if word != "git" && dashed.is_none() && !exec_renamed {
             continue;
         }
-        let mut dir_unresolved = &*dir == UNRESOLVABLE_DIR || dir.contains(['$', '`']);
-        let mut dir_token: Option<String> = None;
-        let mut at = if &*dir == UNRESOLVABLE_DIR {
-            cwd.to_string()
-        } else {
-            dir.to_string()
-        };
         if exec_renamed {
             out.push(GitCall {
-                dir: at,
-                dir_unresolved,
-                dir_token: None,
                 globals: Vec::new(),
                 rest: vec!["exec -a".to_string()],
                 renamed: true,
-                bare: false,
             });
             continue;
         }
         if let Some(sub) = dashed {
             out.push(GitCall {
-                dir: at,
-                dir_unresolved,
-                dir_token: None,
                 globals: Vec::new(),
                 rest: std::iter::once(sub.to_string())
                     .chain(argv[1..].iter().map(|w| unescape_word(w).into_owned()))
                     .collect(),
                 renamed: sub == "push",
-                bare: false,
             });
             continue;
         }
         let rest = skip_git_global_options(&argv[1..]);
         let globals = &argv[1..argv.len() - rest.len()];
-        let mut words = globals.iter();
-        while let Some(word) = words.next() {
-            if unescape_word(word) == "-C"
-                && let Some(value) = words.next()
-            {
-                if value.contains(['$', '`']) {
-                    dir_unresolved = true;
-                    dir_token.get_or_insert_with(|| unescape_word(value).into_owned());
-                } else {
-                    at = resolve_cd_target(value, &at);
-                }
-            }
-        }
         out.push(GitCall {
-            dir: at,
-            dir_unresolved,
-            dir_token,
             globals: globals
                 .iter()
                 .map(|w| unescape_word(w).into_owned())
                 .collect(),
             rest: rest.iter().map(|w| unescape_word(w).into_owned()).collect(),
             renamed: false,
-            bare: unescape_word(first) == "git",
         });
     }
     out
@@ -492,274 +421,8 @@ fn command_hints(calls: &[GitCall]) -> CommandHints {
                 lower.contains("push.recursesubmodules") || lower.contains("submodule.recurse");
             hints.mirror |= lower.contains(".mirror") || lower.starts_with("--mirror");
         }
-        if sub.as_deref() == Some("config") {
-            for word in &call.rest[1..] {
-                let lower = word.to_ascii_lowercase();
-                if let Some(name) = lower.strip_prefix("alias.") {
-                    let name = name.split('=').next().unwrap_or(name);
-                    hints.aliases.push(name.to_string());
-                }
-            }
-        }
     }
     hints
-}
-
-/// Commands compiled into EVERY git from 2.30.0 to the 2026-10 `master`:
-/// git looks a subcommand up in its builtin table before it tries an
-/// exec-path or `PATH` `git-<name>` and before any alias, so `alias.<name>`
-/// and a `git-<name>` executable can never replace one. The table is
-/// independent of env, config and directory, so a call running one needs no
-/// alias probe however blind that probe would be. Sorted (binary search);
-/// the intersection of `commands[]` in git.c at `v2.30.0` and `master`,
-/// minus `pack-redundant` and `whatchanged` (compiled out under
-/// `WITH_BREAKING_CHANGES`, so a git 3 alias can shadow them). Matched
-/// case-sensitively, as git does: `git STATUS` is not the builtin, and runs
-/// `alias.status`. A builtin added since 2.30 is confirmed with the running
-/// git instead ([`is_builtin`]).
-const BUILTINS: &[&str] = &[
-    "add",
-    "am",
-    "annotate",
-    "apply",
-    "archive",
-    "blame",
-    "branch",
-    "bugreport",
-    "bundle",
-    "cat-file",
-    "check-attr",
-    "check-ignore",
-    "check-mailmap",
-    "check-ref-format",
-    "checkout",
-    "checkout-index",
-    "cherry",
-    "cherry-pick",
-    "clean",
-    "clone",
-    "column",
-    "commit",
-    "commit-graph",
-    "commit-tree",
-    "config",
-    "count-objects",
-    "credential",
-    "credential-cache",
-    "credential-cache--daemon",
-    "credential-store",
-    "describe",
-    "diff",
-    "diff-files",
-    "diff-index",
-    "diff-tree",
-    "difftool",
-    "fast-export",
-    "fast-import",
-    "fetch",
-    "fetch-pack",
-    "fmt-merge-msg",
-    "for-each-ref",
-    "for-each-repo",
-    "format-patch",
-    "fsck",
-    "fsck-objects",
-    "gc",
-    "get-tar-commit-id",
-    "grep",
-    "hash-object",
-    "help",
-    "index-pack",
-    "init",
-    "init-db",
-    "interpret-trailers",
-    "log",
-    "ls-files",
-    "ls-remote",
-    "ls-tree",
-    "mailinfo",
-    "mailsplit",
-    "maintenance",
-    "merge",
-    "merge-base",
-    "merge-file",
-    "merge-index",
-    "merge-ours",
-    "merge-recursive",
-    "merge-recursive-ours",
-    "merge-recursive-theirs",
-    "merge-subtree",
-    "merge-tree",
-    "mktag",
-    "mktree",
-    "multi-pack-index",
-    "mv",
-    "name-rev",
-    "notes",
-    "pack-objects",
-    "pack-refs",
-    "patch-id",
-    "pickaxe",
-    "prune",
-    "prune-packed",
-    "pull",
-    "push",
-    "range-diff",
-    "read-tree",
-    "rebase",
-    "receive-pack",
-    "reflog",
-    "remote",
-    "remote-ext",
-    "remote-fd",
-    "repack",
-    "replace",
-    "rerere",
-    "reset",
-    "restore",
-    "rev-list",
-    "rev-parse",
-    "revert",
-    "rm",
-    "send-pack",
-    "shortlog",
-    "show",
-    "show-branch",
-    "show-index",
-    "show-ref",
-    "sparse-checkout",
-    "stage",
-    "stash",
-    "status",
-    "stripspace",
-    "submodule--helper",
-    "switch",
-    "symbolic-ref",
-    "tag",
-    "unpack-file",
-    "unpack-objects",
-    "update-index",
-    "update-ref",
-    "update-server-info",
-    "upload-archive",
-    "upload-archive--writer",
-    "upload-pack",
-    "var",
-    "verify-commit",
-    "verify-pack",
-    "verify-tag",
-    "version",
-    "worktree",
-    "write-tree",
-];
-
-/// Commands every git since 2.30 ships as a builtin or an exec-path script
-/// (`git-bisect` became a builtin later; `git-submodule` is still a script).
-/// git runs an exec-path command before any alias and puts the exec-path ahead
-/// of `PATH`, so only a moved exec path ([`CommandEnv::exec_path_moved`]) lets
-/// an alias or a `PATH` executable stand in for one.
-const EXEC_PATH_COMMANDS: &[&str] = &["bisect", "submodule"];
-
-/// Builtins that run a git command their arguments or config name
-/// (`for-each-repo --config=<key> <subcommand>…`): no alias replaces them, but
-/// they are still probed like an unknown subcommand, so a blind probe fails
-/// closed as it did before builtins were skipped.
-const RUNS_A_GIT_COMMAND: &[&str] = &["for-each-repo"];
-
-/// Is `word` a builtin of git, so no alias can replace it: one in
-/// [`BUILTINS`], or, when `ask_git` (the call runs plain `git` from an
-/// unchanged `PATH`), one the running git lists (`git --list-cmds=builtins`,
-/// a compiled-in table no env or config changes). The query runs at most once
-/// per process, so a long command costs one spawn; if it fails only
-/// [`BUILTINS`] counts (stricter). A [`RUNS_A_GIT_COMMAND`] builtin never
-/// counts.
-fn is_builtin(word: &str, ask_git: bool) -> bool {
-    static RUNNING: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    if RUNS_A_GIT_COMMAND.contains(&word) {
-        return false;
-    }
-    if BUILTINS.binary_search(&word).is_ok() {
-        return true;
-    }
-    if !ask_git || word.is_empty() || word.contains(['/', '\\']) {
-        return false;
-    }
-    RUNNING
-        .get_or_init(|| {
-            let dir = std::env::temp_dir();
-            match git(
-                &dir.to_string_lossy(),
-                &["--list-cmds=builtins"],
-                64 * 1024,
-                Budget::Probe,
-            ) {
-                Git::Ok(list) if !list.trim().is_empty() => {
-                    Some(list.lines().map(|l| l.trim().to_string()).collect())
-                }
-                _ => None,
-            }
-        })
-        .as_ref()
-        .is_some_and(|running| running.contains(word))
-}
-
-/// What a command's whole text says about the environment its git calls run
-/// in, read once per command so a padded command repeating a call costs one
-/// pass over the text, not one per call.
-struct CommandEnv {
-    /// Why no repository probe can see the config ([`command_probe_blind`]).
-    blind: Option<&'static str>,
-    /// The same, for an exec-path script: a moved exec path does not change
-    /// the config, and for a script it is judged by
-    /// [`CommandEnv::exec_path_moved`] instead.
-    script_blind: Option<&'static str>,
-    /// The command names `GIT_EXEC_PATH` (quotes and backslashes removed).
-    exec_path_moved: bool,
-    /// The command names the `PATH` variable other than to expand it
-    /// ([`names_path_variable`]), so another `git` may run.
-    path_moved: bool,
-}
-
-impl CommandEnv {
-    fn of(command: &str) -> Self {
-        let plain: String = command
-            .chars()
-            .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-            .collect();
-        Self {
-            blind: command_probe_blind(command, true),
-            script_blind: command_probe_blind(command, false),
-            exec_path_moved: contains_ignoring_ascii_case(&plain, "GIT_EXEC_PATH"),
-            path_moved: names_path_variable(&plain),
-        }
-    }
-}
-
-/// Does `text` name the shell variable `PATH` other than to expand it: the
-/// word `PATH`, exactly as the shell spells it, not inside a longer name
-/// (`GIT_EXEC_PATH`, `MANPATH`) and not right after `$` or `${`. That catches
-/// `PATH=…`, `PATH+=…`, `export PATH`, `declare -x PATH=…`, `read PATH`,
-/// `printf -v PATH` and `declare -n r=PATH`, and leaves `$PATH`,
-/// `core.hooksPath` and `--git-path` alone.
-fn names_path_variable(text: &str) -> bool {
-    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let bytes = text.as_bytes();
-    text.match_indices("PATH").any(|(at, _)| {
-        let before = &bytes[..at];
-        let after = bytes.get(at + 4).copied();
-        !before.last().copied().is_some_and(ident)
-            && !after.is_some_and(ident)
-            && !before.ends_with(b"$")
-            && !before.ends_with(b"${")
-    })
-}
-
-/// Can this call's own options move git's exec path (`--exec-path=`)?
-fn call_moves_exec_path(call: &GitCall) -> bool {
-    call.globals
-        .iter()
-        .any(|w| w.to_ascii_lowercase().starts_with("--exec-path"))
 }
 
 /// Read `git config -z --get-regexp <regex>` as `(key, value)` pairs. A key
@@ -789,148 +452,31 @@ fn read_config(dir: &str, regex: &str) -> Result<Vec<(String, String)>, Stop> {
     }
 }
 
-/// What the repository's config says about a subcommand that is not a
-/// builtin: its aliases (lowercased name → value) and whether
-/// `help.autocorrect` would run a guessed command.
-#[derive(Default)]
-struct AliasConfig {
-    aliases: HashMap<String, String>,
-    autocorrect: bool,
-}
-
-fn alias_config(dir: &str) -> Result<AliasConfig, Stop> {
-    let mut out = AliasConfig::default();
-    for (key, value) in read_config(dir, "^(alias\\..*|help\\.autocorrect)$")? {
-        if key == "help.autocorrect" {
-            // git: `0`/`false`, `never`, `show` and `prompt` never run a guess
-            // unattended; every other value (a delay, `immediate`, a negative
-            // number, `true`) does. The last value wins.
-            out.autocorrect = !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off" | "never" | "show" | "prompt"
-            );
-        } else if let Some(name) = key.strip_prefix("alias.") {
-            out.aliases.insert(name.to_ascii_lowercase(), value);
-        }
-    }
-    Ok(out)
-}
-
-/// Is `name` a command git knows: a builtin, or a `git-<name>` in git's
-/// exec-path or on `PATH`? git runs one before it would autocorrect, so such a
-/// subcommand is not a guess. Builtins and the exec-path are asked of git
-/// through `git --list-cmds=builtins,main`, which also covers Git for Windows
-/// (dashed builtins are not installed there, and executables carry `.exe`);
-/// `PATH` is searched here rather than through `others`, whose scan of every
-/// `PATH` directory overran the probe budget on a loaded Windows runner. A
-/// probe that fails is not remembered, so the next call asks again; until
-/// git answers, only a `git-<name>` file on `PATH` counts (stricter).
-fn external_subcommand_exists(dir: &str, name: &str) -> bool {
-    static KNOWN: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
-    if name.is_empty() || name.contains(['/', '\\']) {
-        return false;
-    }
-    let known = KNOWN.get().or_else(|| {
-        match git(
-            dir,
-            &["--list-cmds=builtins,main"],
-            256 * 1024,
-            Budget::Probe,
-        ) {
-            Git::Ok(list) if !list.trim().is_empty() => {
-                Some(KNOWN.get_or_init(|| list.lines().map(|l| l.trim().to_string()).collect()))
-            }
-            _ => None,
-        }
-    });
-    if known.is_some_and(|known| known.contains(name)) {
-        return true;
-    }
-    std::env::var_os("PATH").is_some_and(|path| path_runs_git_command(&path, name))
-}
-
-/// Whether `path` (a `PATH` value) holds a `git-<name>` git would run as
-/// `git <name>`: a regular file with the owner execute bit, which is the
-/// one bit git's own `is_executable` tests, in an absolute directory. A non-executable `git-psuh` is not a
-/// command, so git still autocorrects `git psuh` to `push`; a relative or
-/// empty entry resolves against wherever git runs, which is not this hook's
-/// directory, so it is not trusted (stricter).
-fn path_runs_git_command(path: &std::ffi::OsStr, name: &str) -> bool {
-    let file = format!("git-{name}{}", std::env::consts::EXE_SUFFIX);
-    std::env::split_paths(path)
-        .filter(|dir| dir.is_absolute())
-        .any(|dir| is_executable_file(&dir.join(&file)))
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o100 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &std::path::Path) -> bool {
-    path.is_file()
-}
-
-/// Why the alias `name` (following alias-of-alias) may run a push, if it may:
-/// its value names `push`, `send-pack` or `http-push`, runs a shell (`!`),
-/// opens with an option this cannot follow, or reaches a subcommand
-/// `help.autocorrect` would guess at.
-fn alias_runs_push(
-    cfg: &AliasConfig,
-    dir: &str,
-    name: &str,
-    ask_git: bool,
-) -> Option<&'static str> {
-    const PUSHES: &str = "is an alias that can run a push (its value names `push` or \
-                          `send-pack`, or runs a shell command)";
-    let mut name = name.to_string();
-    for _ in 0..MAX_ALIAS_DEPTH {
-        let Some(value) = cfg.aliases.get(&name) else {
-            if cfg.autocorrect && !external_subcommand_exists(dir, &name) {
-                return Some(
-                    "is not a known command, and `help.autocorrect` would run git's guess \
-                     at it (which may be `push`)",
-                );
-            }
-            return None;
+/// Why a `git` call the command makes publishes objects without a `git push`
+/// this guard can read, if one does: raw push plumbing or a remote helper,
+/// or git run under a name that picks its subcommand. Read from the text
+/// only; it warns, never blocks.
+fn unscannable_publisher(calls: &[GitCall]) -> Option<String> {
+    for call in calls {
+        let Some(sub) = call.rest.first() else {
+            continue;
         };
-        // git splits an alias with its own quoting, so `pu\sh` and `p"u"sh`
-        // are `push` to it.
-        let unquoted: String = value
-            .chars()
-            .filter(|c| !matches!(c, '\\' | '"' | '\''))
-            .collect();
-        let plain = unquoted.to_ascii_lowercase();
-        if plain.trim_start().starts_with('!')
-            || plain.contains("push")
-            || plain.contains("send-pack")
-        {
-            return Some(PUSHES);
+        let sub = sub.to_ascii_lowercase();
+        if call.renamed {
+            return Some(format!(
+                "`{}` runs git under a name that picks its subcommand (a dashed `git-push`, or \
+                 `exec -a`), a push this guard cannot scan",
+                if sub == "push" { "git-push" } else { "exec -a" }
+            ));
         }
-        // An alias may open with git's global options (`-c a.b=c x`,
-        // `--paginate x`); its subcommand is the first word after them.
-        // Case kept: the next word is a builtin only as git spells it.
-        let words: Vec<String> = unquoted.split_whitespace().map(str::to_string).collect();
-        let rest = skip_git_global_options(&words);
-        match rest.first() {
-            // Options only: git 2.43 refuses it as empty, but nothing here
-            // vouches for every git, which could take the next word.
-            None => {
-                return Some("is an alias of git options only, with no subcommand of its own");
-            }
-            // An option this walk cannot classify: fail closed.
-            Some(next) if next.starts_with('-') => {
-                return Some("is an alias opening with an option this guard cannot follow");
-            }
-            Some(next) if is_builtin(next, ask_git) => return None,
-            Some(next) => name = next.to_ascii_lowercase(),
+        if unscannable_push(&sub) {
+            return Some(format!(
+                "`git {}` publishes objects without `git push`, which this guard cannot scan",
+                sane(&sub)
+            ));
         }
     }
-    Some("is an alias chain too deep to follow")
+    None
 }
 
 /// The first directory the command changes to through a word only the shell
@@ -966,466 +512,6 @@ fn unreadable_directory_token(command: &str) -> Option<String> {
                 return Some(value.into_owned());
             }
         }
-    }
-    None
-}
-
-/// The spellings of a function's positional parameters a wrapper hands git
-/// as its subcommand: all of them, or the first.
-fn is_positional_parameter(word: &str) -> bool {
-    matches!(word, "$@" | "${@}" | "$*" | "${*}" | "$1" | "${1}")
-}
-
-/// Builtins a wrapper's call site may not hand it for the wrapper to count as
-/// unable to push: the push and fetch families (core reads their
-/// `--exec`/`--upload-pack`/`--receive-pack` values on a direct call), the
-/// builtins that run a command of their own (`rebase -x`, `bisect run`,
-/// `submodule foreach`, `filter-branch`, `difftool -x`), `hook`, and the
-/// config writers [`command_hints`] reads from direct calls only.
-const WRAPPER_UNSAFE_SUBCOMMANDS: &[&str] = &[
-    "archive",
-    "bisect",
-    "clone",
-    "config",
-    "difftool",
-    "fetch",
-    "fetch-pack",
-    "filter-branch",
-    "for-each-repo",
-    "hook",
-    "http-push",
-    "ls-remote",
-    "pull",
-    "push",
-    "rebase",
-    "receive-pack",
-    "remote",
-    "send-pack",
-    "submodule",
-    "submodule--helper",
-    "upload-archive",
-    "upload-pack",
-];
-
-/// Shell functions the command defines: `(name, body)` per definition, the
-/// body the byte range between the opening `{` and its matching `}`. `None`
-/// when a definition's body cannot be delimited (an unbalanced brace or
-/// quote).
-fn function_definitions(command: &str) -> Option<Vec<(String, std::ops::Range<usize>)>> {
-    static HEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?:^|[\s;&|(){}])(?:function\s+([A-Za-z_][\w.-]*)\s*(?:\(\s*\))?|([A-Za-z_][\w.-]*)\s*\(\s*\))\s*\{",
-        )
-        .expect("pattern should compile")
-    });
-    let mut out = Vec::new();
-    for caps in HEAD.captures_iter(command) {
-        let name = caps.get(1).or_else(|| caps.get(2))?.as_str().to_string();
-        let open = caps.get(0)?.end();
-        let close = matching_brace(&command[open..])?;
-        out.push((name, open..open + close));
-    }
-    Some(out)
-}
-
-/// The byte offset of the `}` closing a body that starts right after its `{`,
-/// skipping quoted text and backslash escapes. `None` when it is never closed.
-fn matching_brace(body: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (at, c) in body.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match (quote, c) {
-            (Some('\''), '\'') => quote = None,
-            (Some('\''), _) => {}
-            (_, '\\') => escaped = true,
-            (Some('"'), '"') => quote = None,
-            (Some(_), _) => {}
-            (None, '\'' | '"') => quote = Some(c),
-            (None, '{') => depth += 1,
-            (None, '}') if depth == 0 => return Some(at),
-            (None, '}') => depth -= 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-/// How often `name` stands in `text` as a whole word (bounded by anything a
-/// function name cannot contain).
-fn word_occurrences(text: &str, name: &str) -> usize {
-    let part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
-    text.match_indices(name)
-        .filter(|(at, _)| {
-            !text[..*at].chars().next_back().is_some_and(part)
-                && !text[at + name.len()..].chars().next().is_some_and(part)
-        })
-        .count()
-}
-
-/// Is a function body exactly one plain `git` invocation that hands on its
-/// positional parameters (`git -C "$R" -c k=v --no-pager "$@"`)? Every word
-/// after `git` is a literal of plain characters, a quoted positional
-/// parameter, or the quoted `"$NAME"` value of a `-C`; one trailing `;` and
-/// surrounding whitespace are allowed, nothing else (no second command, no
-/// other quote or expansion), so a body this guard mis-delimited cannot pass
-/// for a wrapper (review C1).
-fn plain_git_wrapper_body(body: &str) -> bool {
-    let text = body.trim();
-    let text = text.strip_suffix(';').unwrap_or(text).trim_end();
-    if text.contains(['\n', '\r']) {
-        return false;
-    }
-    let plain = |w: &str| {
-        !w.is_empty()
-            && w.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,%".contains(c))
-    };
-    let quoted_name = |w: &str| {
-        w.strip_prefix("\"$")
-            .and_then(|w| w.strip_suffix('"'))
-            .is_some_and(|name| {
-                name.chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-    };
-    let quoted_positional = |w: &str| {
-        w.strip_prefix('"')
-            .and_then(|w| w.strip_suffix('"'))
-            .is_some_and(|inner| matches!(inner, "$@" | "$*") || is_positional_parameter(inner))
-    };
-    let mut words = text.split_whitespace();
-    if words.next() != Some("git") {
-        return false;
-    }
-    let mut prev = "git";
-    let mut hands_on = false;
-    for word in words {
-        if quoted_positional(word) {
-            hands_on = true;
-        } else if !((plain(word) && word != "git") || (prev == "-C" && quoted_name(word))) {
-            return false;
-        }
-        prev = word;
-    }
-    hands_on
-}
-
-/// Can no git call that names its subcommand through a function's positional
-/// parameters (`gg() { git -C "$R" "$@"; }`) push? True only when every such
-/// call sits in a function body this command defines, each such body is one
-/// plain git invocation ([`plain_git_wrapper_body`]), the command holds no
-/// `${`, `$(` or backtick, and every mention of those functions' names is
-/// either a definition or a call site whose command word is the bare name and
-/// whose first argument is a literal builtin outside
-/// [`WRAPPER_UNSAFE_SUBCOMMANDS`] (cameronsjo/cadence-hooks#1338). A function
-/// never called runs nothing. Anything else keeps the old verdict.
-fn wrapper_calls_cannot_push(command: &str) -> bool {
-    let positional = |text: &str| {
-        git_calls(text, ".")
-            .iter()
-            .filter(|call| {
-                call.rest
-                    .first()
-                    .is_some_and(|sub| is_positional_parameter(sub))
-            })
-            .count()
-    };
-    // [`matching_brace`] reads quotes and escapes only: a `#` comment
-    // (`# don't page`), an ANSI-C `$'…'` string or a heredoc body can hold a
-    // quote or brace that moves the boundary it finds, and a mis-placed body
-    // can swallow a push outside it (review C1). Keep the old verdict.
-    // Nor does it nest quotes inside `${…}`, `$(…)` or backticks
-    // (`x="${y:-"'"}"`), so the same holds for any of those anywhere in the
-    // command: the body it finds is trusted only when nothing could have
-    // moved it.
-    if command.contains('#')
-        || command.contains("$'")
-        || command.contains("<<")
-        || command.contains("${")
-        || command.contains("$(")
-        || command.contains('`')
-    {
-        return false;
-    }
-    let Some(definitions) = function_definitions(command) else {
-        return false;
-    };
-    let mut wrappers: Vec<&str> = Vec::new();
-    // The command with every function body blanked out: a positional git
-    // call left in it is not a wrapper's (`bash -c 'git "$@"' _ push`,
-    // `set -- push; git "$@"`).
-    let mut outside = command.as_bytes().to_vec();
-    for (name, range) in &definitions {
-        let body = &command[range.clone()];
-        outside[range.clone()].fill(b' ');
-        if positional(body) == 0 {
-            continue;
-        }
-        if !plain_git_wrapper_body(body) {
-            return false;
-        }
-        if !wrappers.contains(&name.as_str()) {
-            wrappers.push(name);
-        }
-    }
-    let outside = String::from_utf8_lossy(&outside);
-    if wrappers.is_empty() || positional(&outside) != 0 {
-        return false;
-    }
-    let segments = cadence_hooks_core::shell::command_segments(command);
-    // Text run in this shell that the command does not spell out (`eval
-    // "$CMD"`, a sourced file, a trap, a command word built by an expansion)
-    // can call the wrapper without naming it here.
-    if segments.iter().any(|segment| {
-        let tokens = executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
-        tokens.first().is_some_and(|first| {
-            first.contains(['$', '`'])
-                || matches!(
-                    unescape_word(first).as_ref(),
-                    "eval" | "source" | "." | "trap" | "builtin" | "command"
-                )
-        })
-    }) {
-        return false;
-    }
-    for name in wrappers {
-        let defined = definitions.iter().filter(|(n, _)| n == name).count();
-        let mut calls = 0;
-        for segment in &segments {
-            let tokens =
-                executable_tokens(cadence_hooks_core::shell::strip_group_wrappers(segment));
-            if tokens.first().map(|w| unescape_word(w)).as_deref() != Some(name) {
-                continue;
-            }
-            if tokens
-                .get(1)
-                .is_some_and(|w| w == "()" || w.starts_with('('))
-            {
-                continue;
-            }
-            calls += 1;
-            let Some(first) = tokens.get(1) else {
-                continue;
-            };
-            let sub = unescape_word(first);
-            if first.contains(['$', '`', '*', '?', '['])
-                || sub.starts_with('-')
-                || WRAPPER_UNSAFE_SUBCOMMANDS.contains(&sub.as_ref())
-                || unscannable_push(&sub)
-                || !is_builtin(&sub, false)
-            {
-                return false;
-            }
-        }
-        if word_occurrences(command, name) != defined + calls {
-            return false;
-        }
-    }
-    true
-}
-
-/// Why a `git` call the command makes may publish objects this guard cannot
-/// scan, if one may: a raw push command, a subcommand word it cannot read, or
-/// an alias (or autocorrected guess) that can push.
-fn hidden_alias_push(command: &str, calls: &[GitCall], hints: &CommandHints) -> Option<String> {
-    let mut probed: HashMap<String, Result<AliasConfig, String>> = HashMap::new();
-    let mut env: Option<CommandEnv> = None;
-    let mut judged: std::collections::HashSet<(String, String)> = Default::default();
-    let mut wrapper_resolved: Option<bool> = None;
-    for call in calls {
-        let Some(sub) = call.rest.first() else {
-            continue;
-        };
-        // git matches its builtins case-sensitively but alias names
-        // case-insensitively, so `git STATUS` runs `alias.status`.
-        let exact = sub.as_str();
-        let sub = sub.to_ascii_lowercase();
-        if call.renamed {
-            return Some(format!(
-                "`{}` runs git under a name that picks its subcommand (a dashed `git-push`, or \
-                 `exec -a`), a push this guard cannot scan",
-                if sub == "push" { "git-push" } else { "exec -a" }
-            ));
-        }
-        if unscannable_push(&sub) {
-            return Some(format!(
-                "`git {sub}` publishes objects without `git push`, which this guard cannot scan"
-            ));
-        }
-        if sub.contains(['$', '`']) {
-            // A wrapper function's `git … "$@"` names its subcommand at its
-            // call sites (cameronsjo/cadence-hooks#1338): resolved once for
-            // the whole command, and skipped only when every call site hands
-            // it a builtin that publishes nothing.
-            if is_positional_parameter(&sub)
-                && *wrapper_resolved.get_or_insert_with(|| wrapper_calls_cannot_push(command))
-            {
-                continue;
-            }
-            return Some(format!(
-                "`git {}` names its subcommand through an expansion this guard cannot \
-                 resolve",
-                sane(&sub)
-            ));
-        }
-        if sub.starts_with('-') || (exact != "hook" && is_builtin(exact, false)) {
-            continue;
-        }
-        let env = env.get_or_insert_with(|| CommandEnv::of(command));
-        let ask_git = call.bare && !env.path_moved;
-        // `git hook run` runs whatever hook the config names: probed like an
-        // unknown subcommand, so a blind or failed probe fails closed as it
-        // did before. Only bare `git hook` and `git hook list` run nothing.
-        let runs_hook = exact == "hook" && call.rest.get(1).is_some_and(|w| w.as_str() != "list");
-        if !runs_hook && is_builtin(exact, ask_git) {
-            continue;
-        }
-        // An exec-path script is probed for a real alias like any other
-        // subcommand; where that probe cannot run or see, it stays exempt
-        // unless the command spells out a moved exec path.
-        let script_exempt = EXEC_PATH_COMMANDS.contains(&exact)
-            && !env.exec_path_moved
-            && !call_moves_exec_path(call);
-        if hints.aliases.contains(&sub) {
-            return Some(format!(
-                "`git {}` runs an alias this same command writes",
-                sane(&sub)
-            ));
-        }
-        let script = EXEC_PATH_COMMANDS.contains(&exact);
-        let blind = if script { env.script_blind } else { env.blind };
-        if let Some(why) = alias_probe_blind(blind, call) {
-            if script_exempt {
-                continue;
-            }
-            // Only the directory is unknown: name the token that hides it
-            // rather than suggest an alias (cameronsjo/cadence-hooks#1337).
-            if blind.is_none()
-                && call.dir_unresolved
-                && let Some(token) = call
-                    .dir_token
-                    .clone()
-                    .or_else(|| unreadable_directory_token(command))
-            {
-                return Some(format!(
-                    "`git {}` runs in a directory named by `{}`, which this guard cannot \
-                     resolve to check whether `{}` is an alias that pushes (use a literal path)",
-                    sane(&sub),
-                    sane(&token),
-                    sane(&sub)
-                ));
-            }
-            return Some(format!(
-                "`git {}` may be an alias this guard cannot resolve ({why})",
-                sane(&sub)
-            ));
-        }
-        if !probed.contains_key(&call.dir) && probed.len() >= MAX_ALIAS_PROBES {
-            if script_exempt {
-                continue;
-            }
-            return Some(format!(
-                "`git {}` may be an alias, in more directories than this guard will probe",
-                sane(&sub)
-            ));
-        }
-        let cfg = probed.entry(call.dir.clone()).or_insert_with(|| {
-            alias_config(&call.dir).map_err(|stop| match stop {
-                Stop::Refused(why) | Stop::Advised { why, .. } => why,
-                Stop::Found(_) => String::new(),
-            })
-        });
-        let cfg = match cfg {
-            Ok(cfg) => cfg,
-            Err(_) if script_exempt => continue,
-            Err(why) => {
-                return Some(format!("`git {}` may be an alias, and {why}", sane(&sub)));
-            }
-        };
-        // One verdict per (directory, subcommand): a long command repeating
-        // one call costs one walk, not one per repetition.
-        if !judged.insert((call.dir.clone(), sub.clone())) {
-            continue;
-        }
-        if let Some(why) = alias_runs_push(cfg, &call.dir, &sub, ask_git) {
-            return Some(format!("`git {}` {why}", sane(&sub)));
-        }
-    }
-    None
-}
-
-/// Why no repository probe can see the config this command's git calls
-/// read, judged once from the whole text: the name of an env variable that
-/// moves git's config, repository or exec path (set by an assignment, or by
-/// `read`, `printf -v`, `declare` and an `export`, so the bare name counts),
-/// `HOME=`, or a config include. Plain substrings of the text with quotes and
-/// backslashes removed (`GIT_"DIR"=` is `GIT_DIR=` to the shell), so a
-/// mention anywhere counts — stricter, never looser.
-fn command_probe_blind(command: &str, exec_path_blinds: bool) -> Option<&'static str> {
-    const ENV: &[&str] = &[
-        "GIT_CONFIG",
-        "GIT_DIR",
-        "GIT_COMMON_DIR",
-        "GIT_WORK_TREE",
-        "GIT_EXEC_PATH",
-        "XDG_CONFIG_HOME",
-        "HOME=",
-    ];
-    let plain: String = command
-        .chars()
-        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-        .collect();
-    if ENV
-        .iter()
-        .filter(|name| exec_path_blinds || **name != "GIT_EXEC_PATH")
-        .any(|name| plain.contains(name))
-    {
-        return Some("the command sets git's config or repository environment");
-    }
-    if contains_ignoring_ascii_case(&plain, "include.path")
-        || contains_ignoring_ascii_case(&plain, "includeif")
-    {
-        return Some("the command names a config include");
-    }
-    // Set by `-c` or an earlier `git config` in the same command, autocorrect
-    // is invisible to the on-disk probe but turns `git psuh` into a push.
-    if contains_ignoring_ascii_case(&plain, "help.autocorrect") {
-        return Some("the command sets `help.autocorrect`");
-    }
-    None
-}
-
-/// Why the repository probe cannot see the config a `git` call reads, if it
-/// cannot: the command redirects git's config or repository through env or
-/// options the probe does not carry, or the call's directory is unknown.
-fn alias_probe_blind(command_blind: Option<&'static str>, call: &GitCall) -> Option<&'static str> {
-    if command_blind.is_some() {
-        return command_blind;
-    }
-    let mut globals = call.globals.iter();
-    while let Some(word) = globals.next() {
-        let lower = word.to_ascii_lowercase();
-        let redirects = ["--git-dir", "--work-tree", "--config-env"]
-            .iter()
-            .any(|opt| lower == *opt || lower.starts_with(&format!("{opt}=")));
-        let include = lower == "-c"
-            && globals
-                .clone()
-                .next()
-                .is_some_and(|v| v.to_ascii_lowercase().starts_with("include"));
-        if redirects || include {
-            return Some("a git option redirects its config or repository");
-        }
-    }
-    if call.dir_unresolved {
-        return Some("its directory cannot be resolved");
     }
     None
 }
@@ -1706,7 +792,7 @@ fn describe(range: &Range) -> String {
             range
                 .sources
                 .iter()
-                .map(|s| sane(s))
+                .map(|s| shown(s))
                 .collect::<Vec<_>>()
                 .join("`, `")
         )
@@ -1741,6 +827,20 @@ fn sources_are_commits(work_dir: &str, range: &Range) -> Result<(), Stop> {
             describe(range)
         ))),
     }
+}
+
+/// Does `source` peel to a commit? A failed or timed-out probe reads as no.
+fn peels_to_commit(work_dir: &str, source: &str) -> bool {
+    let peeled = format!("{source}^{{commit}}");
+    matches!(
+        git(
+            work_dir,
+            &["rev-parse", "-q", "--verify", &peeled],
+            4096,
+            Budget::Probe
+        ),
+        Git::Ok(_)
+    )
 }
 
 /// git push matches a refspec source against ref NAMES before reading it as
@@ -2263,8 +1363,26 @@ fn list_refs(
 /// Every ref and tag object the push publishes beyond its commits, and every
 /// ref name it writes: each tag object is read raw (header and message) and
 /// must peel straight to a commit; a ref naming anything but a commit or a
-/// tag is refused; each name goes through the text scanner.
+/// tag warns; each name goes through the text scanner.
 fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
+    // A listing or read that fails still leaves the written ref names to
+    // read, so a secret in one blocks rather than warns.
+    scan_refs_and_tags_listed(work_dir, range).or_else(|stop| {
+        let hits: Vec<Hit> = range
+            .names
+            .iter()
+            .filter_map(|name| scan_text(name))
+            .map(|what| Hit {
+                sha: "ref".into(),
+                path: "(pushed ref name)".into(),
+                what,
+            })
+            .collect();
+        if hits.is_empty() { Err(stop) } else { Ok(hits) }
+    })
+}
+
+fn scan_refs_and_tags_listed(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
     let mut refs: Vec<PublishedRef> = Vec::new();
     // Named sources, by the object each one resolves to — whatever the ref's
     // path, or a raw sha: its UNPEELED type decides.
@@ -2333,6 +1451,8 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
             });
         }
     }
+    // A ref or tag this cannot scan warns, unless a secret was found too.
+    let mut unscannable: Option<String> = None;
     let mut tags: Vec<(String, String)> = Vec::new();
     for r in &refs {
         match r.kind.as_str() {
@@ -2342,18 +1462,24 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
                     tags.push((r.name.clone(), r.sha.clone()));
                 }
             }
-            other => hits.push(Hit {
-                sha: "ref".into(),
-                path: shown(&r.name),
-                what: format!("points at a {}, which this guard cannot scan", sane(other)),
-            }),
+            other => {
+                unscannable.get_or_insert_with(|| {
+                    format!(
+                        "the ref `{}` points at a {}, which this guard cannot scan",
+                        shown(&r.name),
+                        sane(other)
+                    )
+                });
+            }
         }
     }
     let shas: Vec<String> = tags.iter().map(|(_, sha)| sha.clone()).collect();
-    for ((name, _), object) in tags
-        .iter()
-        .zip(read_objects(work_dir, &shas, "tag objects")?)
-    {
+    let objects = match read_objects(work_dir, &shas, "tag objects") {
+        Ok(objects) => objects,
+        Err(stop) if hits.is_empty() => return Err(stop),
+        Err(_) => return Ok(hits),
+    };
+    for ((name, _), object) in tags.iter().zip(objects) {
         // The header's `type` line: a tag of a tag carries a second message
         // this read never sees, a tag of a tree or blob publishes content no
         // patch shows.
@@ -2363,13 +1489,12 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
             .take_while(|l| !l.is_empty())
             .find_map(|l| l.strip_prefix("type "));
         if target != Some("commit") {
-            hits.push(Hit {
-                sha: "tag".into(),
-                path: shown(name),
-                what: format!(
-                    "tags a {}, which this guard cannot scan",
+            unscannable.get_or_insert_with(|| {
+                format!(
+                    "the tag `{}` tags a {}, which this guard cannot scan",
+                    shown(name),
                     sane(target.unwrap_or("unreadable object"))
-                ),
+                )
             });
         }
         if let Some(what) = scan_text(&object.body) {
@@ -2380,17 +1505,23 @@ fn scan_refs_and_tags(work_dir: &str, range: &Range) -> Result<Vec<Hit>, Stop> {
             });
         }
     }
-    Ok(hits)
+    match unscannable {
+        Some(why) if hits.is_empty() => Err(Stop::Refused(why)),
+        _ => Ok(hits),
+    }
 }
 
-fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
+/// Every reason the command's pushes stop short of a clean scan: a
+/// [`Stop::Found`] for each push that carries a secret, and a warning for
+/// each it could not fully read. A warning never ends the walk, so a later
+/// push still has its secrets found.
+fn judge(command: &str, cwd: &str, exempt: Exempt) -> Vec<Stop> {
+    let mut stops = Vec::new();
     let calls = git_calls(command, cwd);
     let hints = command_hints(&calls);
     let writer = ref_writer_before_push(&calls);
-    if let Some(why) = hidden_alias_push(command, &calls, &hints) {
-        return Err(Stop::Refused(format!(
-            "{why}, so what it publishes could not be resolved"
-        )));
+    if let Some(why) = unscannable_publisher(&calls) {
+        stops.push(Stop::Refused(why));
     }
     for inv in push_invocations_every_dir(command, cwd) {
         if inv.dry_run {
@@ -2415,15 +1546,16 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
                      repository's own directory"
                 );
                 if !inv.repository_unresolved {
-                    return Err(Stop::Advised {
+                    stops.push(Stop::Advised {
                         why: format!(
                             "the push runs in a directory named by `{token}`, which this guard \
                              cannot resolve, so what it publishes could not be read"
                         ),
                         fix,
                     });
+                    continue;
                 }
-                return Err(Stop::Advised {
+                stops.push(Stop::Advised {
                     why: format!(
                         "could not resolve which repository or refs this push publishes: it runs \
                          in a directory named by `{token}`, which this guard cannot resolve, and \
@@ -2434,14 +1566,19 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
                          push"
                     ),
                 });
+                continue;
             }
-            return Err(Stop::Refused(
+            stops.push(Stop::Refused(
                 "could not resolve which repository or refs this push publishes (a directory \
                  change, config override or environment it cannot follow)"
                     .into(),
             ));
+            continue;
         }
-        judge_invocation(&inv, &hints, writer.as_deref(), exempt).map_err(|stop| match stop {
+        let Err(stop) = judge_invocation(&inv, &hints, writer.as_deref(), exempt) else {
+            continue;
+        };
+        stops.push(match stop {
             // A directory an earlier command in the same line creates (`git
             // worktree add <p> … && git -C <p> push`) does not exist yet, so
             // every probe there fails: say so rather than blame whatever
@@ -2453,9 +1590,9 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
                 Stop::Refused(missing_directory(&inv.work_dir))
             }
             stop => stop,
-        })?;
+        });
     }
-    Ok(())
+    stops
 }
 
 /// Every push [`push_invocations`] finds, plus every push it places nowhere
@@ -2471,8 +1608,8 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Result<(), Stop> {
 /// (cameronsjo/cadence-hooks#1393 review). A push both readings place alike
 /// is judged once; one they place apart is judged in each, and any finding
 /// blocks — this can add a verdict, never remove one. A directory the walk
-/// cannot say is [`UNRESOLVABLE_DIR`], where every probe fails and the push
-/// is refused.
+/// cannot say is `UNRESOLVABLE_DIR`, where every probe fails and the push
+/// goes ahead with a warning.
 fn push_invocations_every_dir(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut pushes = push_invocations(command, cwd);
     if !contains_ignoring_ascii_case(command, "push") {
@@ -2612,75 +1749,146 @@ fn judge_invocation(
     writer: Option<&str>,
     exempt: Exempt,
 ) -> Result<(), Stop> {
-    let Some(range) = range_of(inv, hints)? else {
+    let Some(mut range) = range_of(inv, hints)? else {
         return Ok(());
     };
-    let explain = |stop| explain_unresolved_range(&inv.work_dir, &range, writer, stop);
-    sources_are_commits(&inv.work_dir, &range).map_err(explain)?;
-    hex_sources_are_not_ref_names(&inv.work_dir, &range)?;
-    let (shas, over) = outbound(&inv.work_dir, &range).map_err(explain)?;
-    let mut hits = if shas.is_empty() {
-        Vec::new()
-    } else {
-        let mut hits = scan_commits(&inv.work_dir, &range, exempt)?;
-        if hits.len() <= MAX_HITS {
-            hits.extend(scan_messages(&inv.work_dir, &shas)?);
+    // A part that cannot be scanned does not stop the others: a secret found
+    // anywhere still blocks, and only an otherwise clean push is let through
+    // with the warning.
+    let mut unscanned: Option<Stop> = None;
+    let mut early: Vec<Hit> = Vec::new();
+    if let Err(stop) = sources_are_commits(&inv.work_dir, &range) {
+        // A source that does not peel to a commit (a tree or blob tag, a
+        // missing ref) warns, and the sources that do are still scanned, so
+        // `git push origin main treetag` still finds a secret on `main`.
+        unscanned = Some(explain_unresolved_range(
+            &inv.work_dir,
+            &range,
+            writer,
+            stop,
+        ));
+        let (kept, dropped): (Vec<String>, Vec<String>) = std::mem::take(&mut range.sources)
+            .into_iter()
+            .partition(|s| s == "HEAD" || peels_to_commit(&inv.work_dir, s));
+        range.sources = kept;
+        // A dropped source that is a tag object (a tag of a tree or blob)
+        // still has a readable message.
+        for name in &dropped {
+            let Ok(objects) = read_objects(&inv.work_dir, std::slice::from_ref(name), "tag") else {
+                continue;
+            };
+            for object in objects.into_iter().filter(|o| o.kind == "tag") {
+                if let Some(what) = scan_text(&object.body) {
+                    early.push(Hit {
+                        sha: "tag".into(),
+                        path: shown(name),
+                        what,
+                    });
+                }
+            }
         }
-        hits
+    }
+    if let Err(stop) = hex_sources_are_not_ref_names(&inv.work_dir, &range) {
+        // The object-id-looking sources warn; the others are still scanned.
+        unscanned.get_or_insert(stop);
+        range
+            .sources
+            .retain(|s| !(matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())));
+    }
+    let (shas, over) = match outbound(&inv.work_dir, &range) {
+        Ok(found) => found,
+        Err(stop) => {
+            let stop = explain_unresolved_range(&inv.work_dir, &range, writer, stop);
+            // Nothing to walk, but the ref names the push writes are still
+            // read for a secret.
+            if let Some(what) = range.names.iter().find_map(|n| scan_text(n)) {
+                early.push(Hit {
+                    sha: "ref".into(),
+                    path: "(pushed ref name)".into(),
+                    what,
+                });
+            }
+            if !early.is_empty() {
+                return Err(Stop::Found(early));
+            }
+            return Err(unscanned.unwrap_or(stop));
+        }
     };
+    let mut hits = early;
+    let mut keep = |part: Result<Vec<Hit>, Stop>, hits: &mut Vec<Hit>| match part {
+        Ok(found) => hits.extend(found),
+        Err(Stop::Found(found)) => hits.extend(found),
+        Err(stop) => {
+            unscanned.get_or_insert(stop);
+        }
+    };
+    if !shas.is_empty() {
+        keep(scan_commits(&inv.work_dir, &range, exempt), &mut hits);
+        if hits.len() <= MAX_HITS {
+            keep(scan_messages(&inv.work_dir, &shas), &mut hits);
+        }
+    }
     if hits.len() <= MAX_HITS {
-        hits.extend(scan_refs_and_tags(&inv.work_dir, &range)?);
+        keep(scan_refs_and_tags(&inv.work_dir, &range), &mut hits);
     }
     if !hits.is_empty() {
         return Err(Stop::Found(hits));
     }
+    if let Some(stop) = unscanned {
+        return Err(stop);
+    }
     if over {
         return Err(Stop::Refused(format!(
             "the range is too large to fully scan (over {MAX_COMMITS} commits; the newest \
-                 {MAX_COMMITS} were clean) — push blocked rather than partly scanned"
+                 {MAX_COMMITS} were clean)"
         )));
     }
     Ok(())
 }
 
-fn render(stop: &Stop) -> String {
+/// The block for a push that would publish a secret.
+fn render_found(hits: &[Hit]) -> String {
     const ACK: &str = "If this is a false positive, set CADENCE_ALLOW_SECRET_PUSH=1 in the hook's \
         environment (`.claude/settings.local.json` env block or `~/.claude/settings.json`, \
         never the shared settings; it applies from the next session, an inline `VAR=1 git push` \
         is not read). The allow is recorded as a bypass.";
-    match stop {
-        Stop::Refused(why) => format!(
-            "BLOCKED: git push refused — {why}.\n\
-             This guard fails closed: a push it cannot fully scan is not allowed. Narrow the \
-             push (push fewer commits or name one branch), or acknowledge it.\n{ACK}"
-        ),
-        Stop::Advised { why, fix } => format!(
-            "BLOCKED: git push refused — {why}.\n\
-             This guard fails closed: a push it cannot fully scan is not allowed.\n\
-             Fix: {fix}.\n{ACK}"
-        ),
-        Stop::Found(hits) => {
-            let mut out =
-                String::from("BLOCKED: this push would publish a secret. Commits carrying one:\n");
-            for h in hits.iter().take(MAX_HITS) {
-                out.push_str(&format!(
-                    "  {}  {}  ({})\n",
-                    h.sha,
-                    sane(&h.path),
-                    sane(&h.what)
-                ));
-            }
-            if hits.len() > MAX_HITS {
-                out.push_str("  ...and more\n");
-            }
-            out.push_str(
-                "If the secret is real, rotate it and rewrite the commit before pushing: \
-                 removing it in a later commit does not help, the history is what is published.\n",
-            );
-            out.push_str(ACK);
-            out
-        }
+    let mut out =
+        String::from("BLOCKED: this push would publish a secret. Commits carrying one:\n");
+    for h in hits.iter().take(MAX_HITS) {
+        out.push_str(&format!(
+            "  {}  {}  ({})\n",
+            h.sha,
+            sane(&h.path),
+            sane(&h.what)
+        ));
     }
+    if hits.len() > MAX_HITS {
+        out.push_str("  ...and more\n");
+    }
+    out.push_str(
+        "If the secret is real, rotate it and rewrite the commit before pushing: \
+         removing it in a later commit does not help, the history is what is published.\n",
+    );
+    out.push_str(ACK);
+    out
+}
+
+/// The warning for a push this guard let through without a full scan: the
+/// first reason, with its fix when it has one.
+fn render_unscanned(stop: &Stop) -> String {
+    let (why, fix) = match stop {
+        Stop::Refused(why) => (why.as_str(), None),
+        Stop::Advised { why, fix } => (why.as_str(), Some(fix.as_str())),
+        Stop::Found(_) => ("", None),
+    };
+    let mut out = format!(
+        "prevent-secret-push: this push goes ahead without a full secret scan — {why}.\n\
+         What it publishes was not fully checked for credentials."
+    );
+    if let Some(fix) = fix {
+        out.push_str(&format!(" To have it scanned next time: {fix}."));
+    }
+    out
 }
 
 /// PreToolUse Bash guard on `git push`.
@@ -2708,15 +1916,32 @@ impl PreventSecretPushGuard {
             return CheckResult::allow();
         };
         let cwd = input.cwd.as_deref().unwrap_or(".");
-        let Err(stop) = judge(command, cwd, exempt) else {
-            return CheckResult::allow();
-        };
+        let stops = judge(command, cwd, exempt);
+        let mut hits = Vec::new();
+        let mut unscanned = None;
+        for stop in stops {
+            match stop {
+                Stop::Found(found) => hits.extend(found),
+                stop => {
+                    unscanned.get_or_insert(stop);
+                }
+            }
+        }
+        if hits.is_empty() {
+            // A push this guard cannot read goes ahead with a warning naming
+            // why (cameronsjo/cadence-hooks#1373): only a secret it found
+            // blocks.
+            return match unscanned {
+                Some(stop) => CheckResult::nudge(render_unscanned(&stop)),
+                None => CheckResult::allow(),
+            };
+        }
         // Evaluated only once the guard WOULD block, so a standing setting does
         // not write a bypass row for every unrelated push.
         if is_truthy(escape) {
             return CheckResult::allow_bypassed(BypassProvenance::env_switch(ESCAPE_ENV));
         }
-        CheckResult::block(render(&stop))
+        CheckResult::block(render_found(&hits))
     }
 }
 
@@ -2859,6 +2084,7 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn assert_blocks(r: &CheckResult, needles: &[&str]) {
         assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
         let msg = r.message.as_deref().unwrap_or("");
@@ -2867,8 +2093,81 @@ mod tests {
         }
     }
 
+    /// The push goes ahead unscanned, with a warning naming why.
+    #[track_caller]
+    fn assert_warns(r: &CheckResult, needles: &[&str]) {
+        assert_eq!(r.outcome, Outcome::Nudge, "{:?}", r.message);
+        let msg = r.message.as_deref().unwrap_or("");
+        assert!(msg.contains("without a full secret scan"), "{msg}");
+        for n in needles {
+            assert!(msg.contains(n), "missing {n:?} in {msg}");
+        }
+    }
+
+    #[track_caller]
     fn assert_allows(r: &CheckResult) {
         assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+    }
+
+    /// cameronsjo/cadence-hooks#1373: a push this guard cannot read goes
+    /// ahead with a warning; the escape is not consulted and records no
+    /// bypass, since nothing was blocked.
+    #[test]
+    fn an_unscannable_push_warns_and_records_no_bypass() {
+        let fx = Fx::new("warn-unscanned");
+        for escape in [None, Some("1")] {
+            let r = fx.run_escape("git -C \"$VAR\" push origin main", escape);
+            assert_warns(&r, &["`$VAR`", "literal path"]);
+            assert!(r.bypass.is_none(), "{:?}", r.bypass);
+            let msg = r.message.as_deref().unwrap();
+            assert!(!msg.contains("BLOCKED"), "{msg}");
+            assert!(!msg.contains(ESCAPE_ENV), "{msg}");
+        }
+    }
+
+    /// A warning for one push never ends the walk: a later push in the same
+    /// command that carries a secret still blocks.
+    #[test]
+    fn a_secret_in_a_later_push_blocks_past_an_unscannable_one() {
+        let fx = Fx::new("warn-then-secret");
+        fx.commit("src/cfg.txt", &format!("key={}\n", aws_key()), "add cfg");
+        for command in [
+            "git -C \"$VAR\" push origin main; git push origin main",
+            "git send-pack origin main; git push origin main",
+        ] {
+            assert_blocks(&fx.run(command), &["src/cfg.txt", "would publish a secret"]);
+        }
+    }
+
+    /// A source that does not peel to a commit warns, and the other sources
+    /// of the same push are still scanned.
+    #[test]
+    fn a_tree_tag_source_beside_a_secret_branch_still_blocks() {
+        let fx = Fx::new("treetag-beside");
+        fx.git(&["tag", "-a", "treetag", "-m", "t", "HEAD^{tree}"]);
+        fx.commit("src/cfg.txt", &format!("key={}\n", aws_key()), "add cfg");
+        for command in [
+            "git push origin main treetag",
+            "git push origin main refs/tags/treetag:refs/tags/z",
+            "git push origin treetag main",
+        ] {
+            assert_blocks(&fx.run(command), &["src/cfg.txt"]);
+        }
+        let name = format!("refs/tags/x-{}", gh_token());
+        assert_blocks(
+            &fx.run(&format!("git push origin treetag:{name}")),
+            &["ref name"],
+        );
+        // The tag of a tree is not walked, but its own message is read.
+        fx.git(&[
+            "tag",
+            "-a",
+            "secrettree",
+            "-m",
+            &format!("t {}", gh_token()),
+            "HEAD^{tree}",
+        ]);
+        assert_blocks(&fx.run("git push origin secrettree"), &["GitHub token"]);
     }
 
     #[test]
@@ -3052,7 +2351,7 @@ mod tests {
 
     /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
     /// own exec argument publishes the same commits, so it is scanned — or,
-    /// where git runs it somewhere this guard cannot follow, refused.
+    /// where git runs it somewhere this guard cannot follow, let through with a warning.
     #[test]
     fn a_push_nested_in_a_git_exec_argument_is_scanned() {
         let fx = Fx::new("gitexec");
@@ -3080,7 +2379,7 @@ mod tests {
             "git submodule foreach 'shift; eval \"$@\" #' x 'git push origin main'",
             "GIT_EDITOR='$(echo git push origin main)' git commit",
         ] {
-            assert_blocks(&fx.run(command), &["could not resolve"]);
+            assert_warns(&fx.run(command), &["could not resolve"]);
         }
         // Review 10: a dashed git program reached by path is read, and its
         // nested push scanned.
@@ -3092,9 +2391,9 @@ mod tests {
         }
         // Its raw text names the subcommand through `$@`, which the block
         // says in its own words.
-        assert_blocks(
+        assert_warns(
             &fx.run("git submodule foreach 'git \"$@\" #' push origin main"),
-            &["cannot resolve"],
+            &["resolve"],
         );
         // Nothing nested pushes: nothing to scan.
         for command in [
@@ -3202,8 +2501,7 @@ mod tests {
             .unwrap();
         assert!(child.wait().unwrap().success());
         let r = fx.run("git push origin main");
-        assert_blocks(&r, &["too large"]);
-        assert_blocks(&r, &[ESCAPE_ENV]);
+        assert_warns(&r, &["too large", "newest 2000 were clean"]);
     }
 
     #[test]
@@ -3212,18 +2510,18 @@ mod tests {
         // Several MiB over the cap, so the cap — not the clock — decides.
         let big = "xxxxxxxxxxxxxxx\n".repeat((MAX_LOG_BYTES + (4 << 20)) / 16);
         fx.commit("big.txt", &big, "big");
-        assert_blocks(&fx.run("git push origin main"), &["too large"]);
+        assert_warns(&fx.run("git push origin main"), &["too large"]);
     }
 
     #[test]
     fn unresolvable_range_blocks_never_allows() {
         let fx = Fx::new("unresolved");
         // Source ref does not exist: git errors, and error is not "nothing to push".
-        assert_blocks(&fx.run("git push origin nosuchbranch"), &["nosuchbranch"]);
+        assert_warns(&fx.run("git push origin nosuchbranch"), &["nosuchbranch"]);
         // A source the guard will not hand to git.
-        assert_blocks(&fx.run("git push origin HEAD~1:main"), &["HEAD~1"]);
+        assert_warns(&fx.run("git push origin HEAD~1:main"), &["HEAD~1"]);
         // A directory the walk cannot follow.
-        assert_blocks(
+        assert_warns(
             &fx.run("cd \"$SOMEWHERE\" && git push origin main"),
             &["resolve"],
         );
@@ -3233,10 +2531,7 @@ mod tests {
     fn broken_repository_blocks() {
         let fx = Fx::new("broken");
         std::fs::remove_dir_all(fx.work.join(".git/objects")).unwrap();
-        assert_blocks(
-            &fx.run("git push origin main"),
-            &["git could not", ESCAPE_ENV],
-        );
+        assert_warns(&fx.run("git push origin main"), &["git could not"]);
     }
 
     #[test]
@@ -3451,44 +2746,6 @@ mod tests {
         assert_blocks(&fx.run("git push --tags origin"), &["v9", "GitHub token"]);
     }
 
-    #[test]
-    fn config_aliases_that_push_are_not_invisible() {
-        let fx = Fx::new("alias");
-        fx.commit("s.txt", "clean\n", "clean");
-        // Persistent alias to push, and an alias of that alias.
-        fx.git(&["config", "alias.pp", "push"]);
-        fx.git(&["config", "alias.p2", "pp"]);
-        fx.git(&["config", "alias.sh", "!git push origin main"]);
-        fx.git(&["config", "alias.lg", "log --oneline"]);
-        for cmd in ["git pp origin main", "git p2", "git sh", "git -C . pp"] {
-            assert_blocks(&fx.run(cmd), &["alias"]);
-        }
-        // An alias that does not push is untouched, as is a builtin.
-        assert_allows(&fx.run("git lg -1"));
-        assert_allows(&fx.run("git status"));
-        // Probing is bounded: past the cap an unknown subcommand is refused.
-        let dirs: Vec<PathBuf> = (0..=MAX_ALIAS_PROBES)
-            .map(|i| {
-                let d = fx.work.join(format!("d{i}"));
-                std::fs::create_dir_all(&d).unwrap();
-                d
-            })
-            .collect();
-        let many = dirs
-            .iter()
-            .map(|d| format!("git -C {} zz", d.display()))
-            .collect::<Vec<_>>()
-            .join("; ");
-        assert_blocks(&fx.run(&many), &["more directories"]);
-        // An alias this same command writes is refused before the probe could
-        // see it.
-        let fresh = Fx::new("alias-inline");
-        assert_blocks(
-            &fresh.run("git config alias.qq push; git qq origin main"),
-            &["qq", "alias"],
-        );
-    }
-
     /// cadence-hooks#1284: git runs a builtin before any alias, so no env,
     /// config or directory state can make one a push. Every row of the issue's
     /// table, and the comment's `merge-tree` with an unresolved directory.
@@ -3563,223 +2820,6 @@ mod tests {
         }
     }
 
-    /// The other side of #1284: only an exact builtin is skipped. git matches
-    /// builtins case-sensitively and aliases case-insensitively (`git STATUS`
-    /// runs `alias.status`), an exec-path script yields to an alias once the
-    /// exec path moves, and a genuine unknown still fails closed.
-    #[test]
-    fn only_an_exact_builtin_skips_the_alias_probe() {
-        let fx = Fx::new("builtin-exact");
-        fx.git(&["config", "alias.status", "push"]);
-        fx.git(&["config", "alias.credential", "push"]);
-        fx.git(&["config", "alias.submodule", "push"]);
-        fx.git(&["config", "alias.up", "STATUS"]);
-        for (command, needle) in [
-            ("git STATUS", "alias"),
-            ("git Credential fill", "alias"),
-            ("git up", "alias"),
-            ("git -c alias.q=Status q", "alias"),
-            ("git --exec-path=/nonexistent submodule", "alias"),
-            ("GIT_EXEC_PATH=/nonexistent git submodule", "alias"),
-            ("HOME=/tmp/x git mycustomalias", "cannot resolve"),
-            ("HOME=/tmp/x git Credential fill", "cannot resolve"),
-            ("git -C \"$W\" mycustomalias", "cannot resolve"),
-        ] {
-            assert_blocks(&fx.run(command), &[needle]);
-        }
-        // Raw push plumbing is a builtin too, and still refused.
-        assert_blocks(&fx.run("HOME=/tmp/x git send-pack r main"), &["send-pack"]);
-        // An exec-path script is probed for a real alias where the probe can
-        // see; a blind probe leaves it allowed while the exec path stays.
-        assert_blocks(&fx.run("git submodule"), &["submodule", "alias"]);
-        assert_allows(&fx.run("HOME=/tmp/x git submodule update"));
-    }
-
-    /// Gate 2 C1: a padded command repeating `git submodule` reads its text
-    /// once, not once per call. Quadratic, a 300 KB flood ran past the hook
-    /// deadline, which fails open, and the push after it went unscanned. The
-    /// bound is loose so a loaded test machine does not fail it; the release
-    /// timings are the measurement.
-    #[test]
-    fn a_submodule_flood_reads_the_command_text_once() {
-        let fx = Fx::new("submodule-flood");
-        fx.commit("s.txt", &format!("{}\n", aws_key()), "s");
-        let flood = "git submodule; ".repeat(20_000);
-        let calls = git_calls(&flood, fx.work.to_str().unwrap());
-        assert_eq!(calls.len(), 20_000);
-        let started = std::time::Instant::now();
-        let hints = command_hints(&calls);
-        assert_eq!(hidden_alias_push(&flood, &calls, &hints), None);
-        cadence_hooks_core::test_builders::assert_elapsed_under(
-            &format!("took {:?}", started.elapsed()),
-            started.elapsed(),
-            std::time::Duration::from_secs(5),
-        );
-        let padded = format!("if false; then {flood}fi; git push origin main");
-        assert_blocks(&fx.run(&padded), &["s.txt"]);
-    }
-
-    /// Gate 2 I1: `for-each-repo` is a builtin no alias replaces, but it runs
-    /// the git command its arguments name (`push` among them), so it keeps
-    /// the probe an unknown subcommand gets and a blind one fails closed.
-    #[test]
-    fn for_each_repo_is_probed_like_an_unknown_subcommand() {
-        let fx = Fx::new("for-each-repo");
-        for command in [
-            "HOME=/tmp/x git -c r.x=. for-each-repo --config=r.x push origin main",
-            "cd \"$W\" && git -c r.x=. for-each-repo --config=r.x push origin main",
-            "GIT_DIR=/tmp/x git for-each-repo --config=r.x status",
-        ] {
-            assert_blocks(&fx.run(command), &["for-each-repo", "cannot resolve"]);
-        }
-        assert!(!is_builtin("for-each-repo", true));
-    }
-
-    /// Gate 2 M2 and round 2 I-1: an exec-path script is probed for a real
-    /// alias whenever the probe can see the config, so an alias reached
-    /// through any exec-path move is found, while a repository with no such
-    /// alias allows every everyday form. A blind probe keeps it allowed
-    /// unless the command spells out a moved exec path.
-    #[test]
-    fn an_exec_path_script_is_judged_by_its_real_alias() {
-        let fx = Fx::new("exec-alias");
-        fx.git(&["config", "alias.submodule", "push"]);
-        for command in [
-            "G=GIT_EXEC; export ${G}_PATH=/nonexistent; git submodule",
-            "export $(printf 'GIT_EXEC_%s' PATH)=/nonexistent; git submodule",
-            "G=GIT_EXEC; set -a; printf -v \"${G}_PATH\" /nonexistent; git submodule",
-            "G=GIT_EXEC; declare -n r=\"${G}_PATH\"; export r=/nonexistent; git submodule",
-            "env GIT_EXEC_$'\\x50'ATH=/nonexistent git submodule",
-            "BASH_ENV=.envf bash -c 'git submodule'",
-            ". ./.envf; git submodule",
-            "GIT_EXEC_PATH=/nonexistent git submodule",
-            "git --exec-path=/nonexistent submodule",
-        ] {
-            assert_blocks(&fx.run(command), &["submodule"]);
-        }
-        // Blind, with the exec path spelled out as moved: refused.
-        assert_blocks(
-            &fx.run("HOME=/tmp/x git --exec-path=/nonexistent submodule"),
-            &["submodule", "cannot resolve"],
-        );
-        assert_blocks(
-            &fx.run("cd \"$W\" && GIT_EXEC_PATH=/nonexistent git submodule"),
-            &["submodule"],
-        );
-        // Blind with the exec path left alone: allowed, as before.
-        assert_allows(&fx.run("cd \"$W\" && GIT_DIR=x git submodule"));
-        let clean = Fx::new("exec-clean");
-        for command in [
-            "eval \"$(direnv export bash)\"; git submodule update",
-            "cd \"$W\" && eval \"$(ssh-agent -s)\" && git submodule update --init",
-            "source .venv/bin/activate && cd \"$W\" && git submodule update",
-            "for d in a b; do eval \"x_$d=1\"; done; git submodule status",
-            "GIT_EXEC_PATH=/usr/lib/git-core git bisect start",
-            "GIT_EXEC_PATH=/usr/lib/git-core git submodule update",
-            "git submodule update --init",
-        ] {
-            assert_allows(&clean.run(command));
-        }
-    }
-
-    /// Gate 2 M3: the running git vouches only for the `git` it is: a call
-    /// through a path, or under a command that mentions `PATH`, may run a
-    /// different git, so a builtin missing from [`BUILTINS`] (`diagnose`, added
-    /// in 2.38) is probed again and fails closed when blind.
-    #[test]
-    fn the_running_git_vouches_only_for_a_plain_git_on_an_unchanged_path() {
-        let fx = Fx::new("ask-git");
-        assert!(!BUILTINS.contains(&"diagnose"));
-        assert_allows(&fx.run("HOME=/tmp/x git diagnose -o /tmp/x"));
-        for command in [
-            "HOME=/tmp/x /usr/bin/git diagnose -o /tmp/x",
-            "HOME=/tmp/x ./git diagnose -o /tmp/x",
-            "PATH=/opt/old/bin:$PATH HOME=/tmp/x git diagnose -o /tmp/x",
-            "export PATH=/opt/old/bin; HOME=/tmp/x git diagnose -o /tmp/x",
-            "PATH+=:/opt; HOME=/tmp/x git diagnose -o /tmp/x",
-            "declare -n r=PATH; r=/opt; HOME=/tmp/x git diagnose -o /tmp/x",
-        ] {
-            assert_blocks(&fx.run(command), &["diagnose", "cannot resolve"]);
-        }
-        // A static builtin needs no vouching.
-        assert_allows(&fx.run("PATH=/x HOME=/tmp/x /usr/bin/git credential fill"));
-        // Round 2 m4: only the `PATH` variable itself counts, not an
-        // expansion of it or a longer name.
-        for command in [
-            "HOME=/tmp/x git diagnose -o /tmp/x; echo $PATH ${PATH}",
-            "HOME=/tmp/x MANPATH=/x git diagnose -o /tmp/x",
-            "cd \"$W\" && git -c core.hooksPath=.h diagnose -o /tmp/x",
-            "HOME=/tmp/x git diagnose -o /tmp/x --git-path x",
-        ] {
-            assert_allows(&fx.run(command));
-        }
-    }
-
-    /// Gate 2 rounds 3-4: `git hook run` runs whatever hook the config
-    /// names, and a config can set `core.hooksPath` in more ways than a text
-    /// check can follow, so any `hook` call but bare `git hook` and
-    /// `git hook list` takes main's alias probe: blind fails closed, a
-    /// readable config with no `alias.hook` allows.
-    #[test]
-    fn hook_run_takes_the_alias_probe() {
-        let fx = Fx::new("hookrun");
-        for command in [
-            "HOME=/tmp/x git -c core.hooksPath=.h hook run pre-push",
-            "cd \"$W\" && git -c core.hooksPath=.h hook run pre-push",
-            "K=core.hooks; HOME=/tmp/x git -c ${K}Path=.h hook run pre-push",
-            "GIT_CONFIG_GLOBAL=/tmp/x/g git hook run pre-push",
-            "HOME=/tmp/x git hook run pre-push",
-            "git -c include.path=/tmp/x/g hook run pre-push",
-            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooks$'P'ath \
-             GIT_CONFIG_VALUE_0=.h git hook run pre-push",
-            "cd \"$W\" && git hook run pre-commit",
-            "HOME=/tmp/x git hook Run pre-push",
-        ] {
-            assert_blocks(&fx.run(command), &["hook", "cannot resolve"]);
-        }
-        for command in [
-            "HOME=/tmp/fakehome git hook",
-            "HOME=/tmp/x git hook list pre-push",
-            "cd \"$W\" && git hook list pre-commit",
-            // A readable config with no `alias.hook`.
-            "git hook run pre-push",
-            "git -c core.hooksPath=.h hook run pre-push",
-        ] {
-            assert_allows(&fx.run(command));
-        }
-        // A readable config whose `alias.hook` pushes: git runs the builtin,
-        // but main's probe refuses it, and so does this.
-        fx.git(&["config", "alias.hook", "push"]);
-        assert_blocks(&fx.run("git hook run pre-push"), &["hook", "alias"]);
-    }
-
-    /// [`BUILTINS`] is sorted for its binary search, and every entry is a
-    /// builtin of the git running the tests (git 2.30 or later).
-    #[test]
-    fn builtins_list_is_sorted_and_names_real_git_builtins() {
-        assert!(
-            BUILTINS.windows(2).all(|w| w[0] < w[1]),
-            "BUILTINS unsorted"
-        );
-        let out = std::process::Command::new("git")
-            .arg("--list-cmds=builtins")
-            .output()
-            .expect("git runs");
-        let running: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
-        for name in BUILTINS {
-            assert!(
-                running.iter().any(|r| r == name),
-                "{name} is not a git builtin"
-            );
-        }
-        for name in ["pack-redundant", "whatchanged", "submodule", "STATUS"] {
-            assert!(!BUILTINS.contains(&name), "{name} must not be listed");
-        }
-    }
-
     #[test]
     fn remote_mirror_config_widens_a_bare_push() {
         let fx = Fx::new("mirrorcfg");
@@ -3804,18 +2844,18 @@ mod tests {
         std::fs::write(&file, format!("{}\n", aws_key())).unwrap();
         let blob = git_out(&fx.work, &["hash-object", "-w", file.to_str().unwrap()]);
         fx.git(&["tag", "blobtag", &blob]);
-        assert_blocks(&fx.run("git push origin blobtag"), &["blobtag"]);
-        assert_blocks(&fx.run("git push --tags origin"), &["blobtag", "blob"]);
+        assert_warns(&fx.run("git push origin blobtag"), &["blobtag"]);
+        assert_warns(&fx.run("git push --tags origin"), &["blobtag", "blob"]);
         let fx = Fx::new("treetag");
         fx.git(&["tag", "-a", "treetag", "-m", "t", "HEAD^{tree}"]);
-        assert_blocks(&fx.run("git push origin treetag"), &["treetag"]);
-        assert_blocks(&fx.run("git push --tags origin"), &["treetag", "tree"]);
+        assert_warns(&fx.run("git push origin treetag"), &["treetag"]);
+        assert_warns(&fx.run("git push --tags origin"), &["treetag", "tree"]);
         // A tag of a tag hides a second message.
         let fx = Fx::new("nestedtag");
         fx.git(&["tag", "-a", "inner", "-m", &format!("x {}", gh_token())]);
         fx.git(&["tag", "-a", "outer", "-m", "outer", "inner"]);
         fx.git(&["tag", "-d", "inner"]);
-        assert_blocks(&fx.run("git push origin outer"), &["outer", "tag"]);
+        assert_warns(&fx.run("git push origin outer"), &["outer", "tag"]);
     }
 
     #[test]
@@ -3896,7 +2936,7 @@ mod tests {
             "git push --recurse-submodules=only origin main",
             "git -c push.recurseSubmodules=on-demand push origin main",
         ] {
-            assert_blocks(&fx.run(cmd), &["submodules"]);
+            assert_warns(&fx.run(cmd), &["submodules"]);
         }
         for cmd in [
             "git push --recurse-submodules=check origin main",
@@ -3905,11 +2945,11 @@ mod tests {
             assert_allows(&fx.run(cmd));
         }
         fx.git(&["config", "push.recurseSubmodules", "on-demand"]);
-        assert_blocks(&fx.run("git push origin main"), &["submodules"]);
+        assert_warns(&fx.run("git push origin main"), &["submodules"]);
         assert_allows(&fx.run("git push --recurse-submodules=check origin main"));
         fx.git(&["config", "--unset", "push.recurseSubmodules"]);
         fx.git(&["config", "submodule.recurse", "true"]);
-        assert_blocks(&fx.run("git push origin main"), &["submodules"]);
+        assert_warns(&fx.run("git push origin main"), &["submodules"]);
     }
 
     #[test]
@@ -3967,118 +3007,6 @@ mod tests {
     }
 
     // --- review round 2 (cadence-hooks#890) --------------------------------
-
-    #[test]
-    fn alias_values_opening_with_global_options_are_followed() {
-        let fx = Fx::new("aliasopts");
-        fx.git(&["config", "alias.y", "push"]);
-        fx.git(&["config", "alias.x", "-c a.b=c y"]);
-        fx.git(&["config", "alias.pp", "push"]);
-        fx.git(&["config", "alias.p2", "--paginate pp"]);
-        // Options only: git 2.43 refuses it ("empty alias"), so refusing it
-        // too costs nothing, and an older git may splice the next word in.
-        fx.git(&["config", "alias.opts", "-c a.b=c"]);
-        fx.git(&["config", "alias.lg2", "-c color.ui=never log --oneline"]);
-        for cmd in [
-            "git x origin main",
-            "git p2 origin main",
-            "git opts push origin main",
-        ] {
-            assert_blocks(&fx.run(cmd), &["alias"]);
-        }
-        assert_allows(&fx.run("git lg2 -1"));
-    }
-
-    #[test]
-    fn alias_probe_refuses_config_and_env_it_cannot_see() {
-        let fx = Fx::new("aliasredirect");
-        for cmd in [
-            "GIT_CONFIG_GLOBAL=/tmp/x git zz origin main",
-            "GIT_CONFIG_COUNT=1 git zz",
-            "HOME=/tmp/x git zz",
-            "XDG_CONFIG_HOME=/tmp/x git zz",
-            "GIT_DIR=/tmp/x/.git git zz",
-            "GIT_WORK_TREE=/tmp/x git zz",
-            "GIT_COMMON_DIR=/tmp/x git zz",
-            "git -c help.autocorrect=immediate psuh origin main",
-            "git config help.autocorrect 1 && git psuh origin main",
-            "git --git-dir=/tmp/x/.git zz",
-            "git --work-tree /tmp/x zz",
-            "git --config-env=alias.zz=V zz",
-            "git -c include.path=/tmp/x zz",
-            "git -c includeIf.onbranch:main.path=/tmp/x zz",
-            "git -c INCLUDE.PATH=/tmp/x zz",
-            "cd \"$D\" && git zz",
-            "git -C \"$D\" zz",
-            "git -C `pwd` zz",
-            "GIT_EXEC_PATH=/tmp/x git zz",
-            "export GIT_\"DIR\"=/tmp/x; git zz",
-            "export 'GIT_DIR'=/tmp/x; git zz",
-            "export GIT_DIR\\=/tmp/x; git zz",
-            "export H\"OME\"=/tmp/x; git zz",
-            "read GIT_DIR <<< /tmp/x; export GIT_DIR; git zz",
-            "printf -v GIT_WORK_TREE /tmp/x; export GIT_WORK_TREE; git zz",
-            "declare -x XDG_CONFIG_HOME=/tmp/x; git zz",
-        ] {
-            assert_blocks(&fx.run(cmd), &["alias"]);
-        }
-        // Builtins are unaffected.
-        for cmd in [
-            "HOME=/tmp/x git status",
-            "GIT_DIR=.git git log -1",
-            "git -c include.path=/tmp/x status",
-            "git -c help.autocorrect=1 status",
-            "cd \"$D\" && git status",
-            "GIT_EXEC_PATH=/tmp/x git status",
-            "read GIT_DIR <<< /tmp/x; export GIT_DIR; git log -1",
-        ] {
-            assert_allows(&fx.run(cmd));
-        }
-    }
-
-    /// cameronsjo/cadence-hooks#1287: `W=/abs; git -C "$W" …` names its
-    /// directory, read at the dispatch seam
-    /// ([`cadence_hooks_core::with_resolved_dir_variables`]). Unix-only: a
-    /// Windows fixture path carries a backslash, which is never spliced.
-    #[cfg(unix)]
-    #[test]
-    fn a_directory_bound_to_a_literal_earlier_in_the_command_is_resolved() {
-        let fx = Fx::new("vardir");
-        let work = fx.work.display().to_string();
-        let run = |cmd: &str| {
-            let input = make_bash_with_cwd(cmd, &work);
-            let input = cadence_hooks_core::with_resolved_dir_variables(&input);
-            PreventSecretPushGuard.run_with(&input, None, |_| false)
-        };
-        for cmd in [
-            format!(r#"W={work}; git -C "$W" fetch origin --quiet; git -C "$W" zz"#),
-            format!(r#"W={work} && cd "$W" && git zz"#),
-        ] {
-            assert_allows(&run(&cmd));
-        }
-        for cmd in [
-            r#"W=$(pwd); git -C "$W" zz"#.to_string(),
-            format!(r#"true || W={work}; git -C "$W" zz"#),
-            format!(r#"W={work} git -C "$W" zz"#),
-            format!(r#"(W={work}); git -C "$W" zz"#),
-            format!(r#"W={work}; unset W; git -C "$W" zz"#),
-        ] {
-            assert_blocks(&run(&cmd), &["alias"]);
-        }
-    }
-
-    #[test]
-    fn unresolvable_subcommand_word_blocks() {
-        let fx = Fx::new("subvar");
-        for cmd in [
-            "git $X origin main",
-            "git ${X} origin main",
-            "git `echo push` origin main",
-            "git \"$(echo pu)sh\" origin main",
-        ] {
-            assert_blocks(&fx.run(cmd), &["resolve"]);
-        }
-    }
 
     /// Write a raw commit object on top of HEAD and move `main` to it.
     fn raw_commit(fx: &Fx, extra_header: &str, message: &str) {
@@ -4176,7 +3104,7 @@ mod tests {
         let tag = git_out(&fx.work, &["rev-parse", "refs/tags/tt"]);
         fx.git(&["tag", "-d", "tt"]);
         force_ref(&fx, "refs/heads/tt", &tag);
-        assert_blocks(&fx.run("git push --all origin"), &["tree"]);
+        assert_warns(&fx.run("git push --all origin"), &["tree"]);
     }
 
     #[test]
@@ -4189,10 +3117,12 @@ mod tests {
             format!("git-send-pack {remote} main"),
             "git http-push https://example.invalid/r.git main".to_string(),
         ] {
-            assert_blocks(&fx.run(&cmd), &["publishes objects without `git push`"]);
+            assert_warns(&fx.run(&cmd), &["publishes objects without `git push`"]);
         }
+        // An alias is not followed: it reaches git unread, and goes ahead
+        // (cameronsjo/cadence-hooks#1373).
         fx.git(&["config", "alias.sp", &format!("send-pack {remote}")]);
-        assert_blocks(&fx.run("git sp main"), &["alias"]);
+        assert_allows(&fx.run("git sp main"));
     }
 
     #[test]
@@ -4255,81 +3185,6 @@ mod tests {
         assert_allows(&fx.run("git push --no-follow origin main"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_git_command_on_path_must_be_executable_in_an_absolute_directory() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let shim = dir.path().join("git-psuh");
-        std::fs::write(&shim, "").unwrap();
-        let path = std::env::join_paths([dir.path()]).unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            !path_runs_git_command(&path, "psuh"),
-            "a 0644 file is not a command"
-        );
-        // git tests the owner bit alone: group/other execute is not enough.
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o011)).unwrap();
-        assert!(
-            !path_runs_git_command(&path, "psuh"),
-            "0011 is not a command"
-        );
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o100)).unwrap();
-        assert!(path_runs_git_command(&path, "psuh"));
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(path_runs_git_command(&path, "psuh"));
-        // A relative or empty entry is not trusted, even when it holds one.
-        let cwd = std::env::current_dir().unwrap();
-        let rel = pathdiff_relative(dir.path(), &cwd);
-        for entry in [rel.as_os_str(), std::ffi::OsStr::new("")] {
-            let path = std::env::join_paths([entry]).unwrap();
-            assert!(!path_runs_git_command(&path, "psuh"), "{entry:?}");
-        }
-    }
-
-    /// `target` spelled relative to `base` (via `..`), for a relative PATH
-    /// entry that really reaches it.
-    #[cfg(unix)]
-    fn pathdiff_relative(target: &std::path::Path, base: &std::path::Path) -> std::path::PathBuf {
-        let mut rel = std::path::PathBuf::new();
-        for _ in base.components().skip(1) {
-            rel.push("..");
-        }
-        rel.join(target.strip_prefix("/").unwrap())
-    }
-
-    #[test]
-    fn help_autocorrect_refuses_an_unknown_subcommand() {
-        let fx = Fx::new("autocorrect");
-        for value in ["1", "immediate", "-1", "true", "10"] {
-            fx.git(&["config", "help.autocorrect", value]);
-            assert_blocks(&fx.run("git psuh origin main"), &["autocorrect"]);
-            // A real command outside the builtin list is not a guess.
-            assert_allows(&fx.run("git hash-object README.md"));
-        }
-        for value in ["0", "false", "never", "show", "prompt"] {
-            fx.git(&["config", "help.autocorrect", value]);
-            assert_allows(&fx.run("git psuh origin main"));
-        }
-    }
-
-    #[test]
-    fn a_failed_alias_probe_blocks() {
-        let fx = Fx::new("probefail");
-        let missing = fx._scratch.path().join("no-such-dir");
-        assert_blocks(
-            &fx.run(&format!("git -C {} zz", missing.display())),
-            &["config"],
-        );
-        // A config git cannot parse.
-        let config = fx.work.join(".git/config");
-        let mut text = std::fs::read_to_string(&config).unwrap();
-        text.push_str("\n[broken\n");
-        std::fs::write(&config, text).unwrap();
-        assert_blocks(&fx.run("git zz"), &["config"]);
-        assert_allows(&fx.run("echo hi"));
-    }
-
     #[test]
     fn recursion_without_submodules_allows_and_with_a_gitlink_blocks() {
         let fx = Fx::new("nosubs");
@@ -4347,7 +3202,7 @@ mod tests {
             "--cacheinfo",
             &format!("160000,{head},sub"),
         ]);
-        assert_blocks(&fx.run("git push origin main"), &["submodules"]);
+        assert_warns(&fx.run("git push origin main"), &["submodules"]);
     }
 
     #[test]
@@ -4364,7 +3219,7 @@ mod tests {
             "exec -agit-push git origin main",
             "exec -a git-status git origin main",
         ] {
-            assert_blocks(&fx.run(cmd), &["cannot scan"]);
+            assert_warns(&fx.run(cmd), &["cannot scan"]);
         }
         // A plain `exec`, and an `exec -a` naming anything but git, are not.
         assert_allows(&fx.run("exec git push origin main"));
@@ -4398,7 +3253,7 @@ mod tests {
             ),
         ] {
             fx.git(&["update-ref", &made, "leak"]);
-            assert_blocks(&fx.run(&cmd), &["named like an object id"]);
+            assert_warns(&fx.run(&cmd), &["named like an object id"]);
             fx.git(&["update-ref", "-d", &made]);
         }
         // With no such ref, the object id is what git pushes.
@@ -4417,7 +3272,7 @@ mod tests {
             "git-remote-https origin https://example.invalid/r.git",
             "/usr/lib/git-core/git-remote-http origin http://example.invalid/r.git",
         ] {
-            assert_blocks(&fx.run(cmd), &["cannot scan"]);
+            assert_warns(&fx.run(cmd), &["cannot scan"]);
         }
         for cmd in ["git remote", "git remote -v", "git remote add up /tmp/x"] {
             assert_allows(&fx.run(cmd));
@@ -4432,7 +3287,7 @@ mod tests {
         ] {
             let fx = Fx::new(tag);
             raw_commit(&fx, header, "clean");
-            assert_blocks(&fx.run("git push origin main"), &["encoding"]);
+            assert_warns(&fx.run("git push origin main"), &["encoding"]);
         }
         // Recorded by git itself from `i18n.commitEncoding`.
         let fx = Fx::new("encgit");
@@ -4445,7 +3300,7 @@ mod tests {
             "-m",
             "clean",
         ]);
-        assert_blocks(&fx.run("git push origin main"), &["encoding"]);
+        assert_warns(&fx.run("git push origin main"), &["encoding"]);
         // Encodings the scanner reads as-is.
         let fx = Fx::new("encok");
         for header in [
@@ -4460,71 +3315,6 @@ mod tests {
             raw_commit(&fx, header, "clean");
         }
         assert_allows(&fx.run("git push origin main"));
-    }
-
-    /// A shell function wrapping `git … "$@"` names its subcommand at its
-    /// call sites. When every call site in the same command hands it a
-    /// literal builtin that publishes nothing, the wrapper cannot push
-    /// (cameronsjo/cadence-hooks#1338).
-    #[test]
-    fn a_git_wrapper_function_is_judged_by_its_call_sites() {
-        let fx = Fx::new("wrapper-fn");
-        for command in [
-            // The issue's shape.
-            "gg() { git -C \"$REPO\" -c core.fsmonitor=false --no-optional-locks \"$@\"; }\n\
-             gg diff --name-only \"$base\" > \"$FILES_F\"\n\
-             gg log --oneline \"$base\"..HEAD",
-            "gg() { git \"$@\"; }; gg status",
-            "function gg { git \"$@\"; }; gg log -1 && gg diff",
-            "gg () {\n  git --no-pager \"$@\"\n}\ngg show HEAD",
-            "gg() {\n  git -C \"$R\" \"$@\"\n}\ngg status\ngg log -3",
-            "g1() { git \"$1\" --stat; }; g1 diff",
-            // Defined, never called: nothing runs.
-            "gg() { git \"$@\"; }",
-        ] {
-            assert_allows(&fx.run(command));
-        }
-        // The old verdict wherever a call site could push or cannot be read.
-        for command in [
-            "gg() { git \"$@\"; }; gg push origin main",
-            "gg() { git \"$@\"; }; gg status; gg push origin main",
-            "gg() { git \"$@\"; }; gg \"$sub\" origin main",
-            "gg() { git \"$@\"; }; gg -C . push origin main",
-            "gg() { git \"$@\"; }; eval gg push origin main",
-            "gg() { git \"$@\"; }; x=gg; $x push origin main",
-            "gg() { shift; git \"$@\"; }; gg x push origin main",
-            "gg() { git \"$@\"; }; gg rebase -x 'git push origin main' HEAD~1",
-            "gg() { git \"$@\"; }; gg pu origin main",
-            "gg() { git \"$@\"; }; echo gg push | bash",
-            "gg() { git \"$@\"; }; gg status; eval \"$CMD\"",
-            "gg() { git \"$@\"; }; gg status; . ./steps.sh",
-            // A comment or an ANSI-C string can carry a quote or brace that
-            // mis-delimits the body, and so hide a later push: the old
-            // block whenever the boundary is unsure (review C1).
-            "gg() {\n  git \"$@\"  # don't page\n}\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
-            "gg() { git \"$@\"; echo $'\\''; }\nbash -c 'git \"$@\"' _ push origin main\necho '}'",
-            "gg() { git \"$@\"; } # wrapper\ngg status",
-            // A body that is more than one plain git invocation.
-            "gg() { git \"$@\"; git push origin main; }; gg status",
-            "gg() { cd /tmp && git \"$@\"; }; gg status",
-            "gg() { git \"$@\" | cat; }; gg status",
-            "gg() { git -c \"$K\" \"$@\"; }; gg status",
-            // Not a function's positional parameters at all.
-            "bash -c 'git \"$@\"' _ push origin main",
-            "set -- push origin main; git \"$@\"",
-        ] {
-            let r = fx.run(command);
-            assert_eq!(r.outcome, Outcome::Block, "{command}: {:?}", r.message);
-            assert_blocks(&r, &["cannot resolve"]);
-        }
-        // A quote nested in `${…}` can mis-delimit the body the same way, so
-        // the wrapper reading refuses any command holding one. (The guard as
-        // a whole allows this command on main as well: the shell reader in
-        // core does not see its `git` calls at all, which is not this
-        // exemption's doing.)
-        assert!(!wrapper_calls_cannot_push(
-            "gg() { x=\"${y:-\"'\"}\"; git \"$@\"; }; bash -c 'git \"$@\"' _ push origin main; echo '}'"
-        ));
     }
 
     /// A push into a directory an earlier command in the same line creates
@@ -4542,7 +3332,7 @@ mod tests {
         let r = fx.run(&format!(
             "git worktree add -q {wt} -b nb main && git -C {wt} push -q -u origin nb"
         ));
-        assert_blocks(&r, &[wt, "does not exist", "as its own command"]);
+        assert_warns(&r, &[wt, "does not exist", "as its own command"]);
         assert!(
             !r.message
                 .as_deref()
@@ -4567,11 +3357,9 @@ mod tests {
             ),
             ("git -C \"$VAR\" push origin main", "$VAR"),
             ("cd $D && git push origin main", "$D"),
-            ("git -C \"$VAR\" st", "$VAR"),
-            ("cd \"$(cat /tmp/dir)\" && git st", "$(cat /tmp/dir)"),
         ] {
             let r = fx.run(command);
-            assert_blocks(&r, &[token, "literal path"]);
+            assert_warns(&r, &[token, "literal path"]);
             let msg = r.message.as_deref().unwrap();
             assert!(!msg.contains("may be an alias"), "{command}: {msg}");
             assert!(!msg.contains("which repository"), "{command}: {msg}");
@@ -4629,7 +3417,7 @@ mod tests {
             "GIT_CONFIG_PARAMETERS= git clone u /tmp/d",
             "GIT_CONFIG_PARAMETERS= GIT_CONFIG_COUNT=0 git push origin main",
         ] {
-            assert_blocks(&fx.run(command), &["could not resolve"]);
+            assert_warns(&fx.run(command), &["could not resolve"]);
         }
     }
 
@@ -4644,20 +3432,20 @@ mod tests {
         let r = fx.run(
             "echo x > f; git add f; git commit -q -m first; git push origin HEAD:refs/heads/main2",
         );
-        assert_blocks(&r, &["`git commit`", "has not run", "next call"]);
+        assert_warns(&r, &["`git commit`", "has not run", "next call"]);
         assert_not_narrow(&r);
         // No commit in the command: the branch is unborn, and the message
         // says so.
         let r = fx.run("git push origin HEAD:refs/heads/main2");
-        assert_blocks(&r, &["has no commit yet", "commit first"]);
+        assert_warns(&r, &["has no commit yet", "commit first"]);
         assert_not_narrow(&r);
         // A branch the same call creates.
         fx.git(&["switch", "-q", "main"]);
         let r = fx.run("git switch -q -c fresh && git push origin fresh");
-        assert_blocks(&r, &["`git switch`", "has not run", "next call"]);
+        assert_warns(&r, &["`git switch`", "has not run", "next call"]);
         // A read-only form names no writer, so a typo is not blamed on it.
         let r = fx.run("git branch --show-current && git push origin nosuch");
-        assert_blocks(&r, &["nosuch"]);
+        assert_warns(&r, &["nosuch"]);
         assert!(
             !r.message.as_deref().unwrap_or("").contains("next call"),
             "{:?}",
@@ -4687,7 +3475,7 @@ mod tests {
             r#"cd "$VAR" && GIT_DIR=.git git push origin main"#,
         ] {
             let r = fx.run(command);
-            assert_blocks(&r, &["`$VAR`", "literal path"]);
+            assert_warns(&r, &["`$VAR`", "literal path"]);
             assert_not_narrow(&r);
         }
     }
@@ -4697,7 +3485,7 @@ mod tests {
         // cameronsjo/cadence-hooks#1386: the pinned form the git-workflow
         // rules recommend is a literal 40-hex source, which is scanned like a
         // branch. A `$SHA` source cannot be read before the command runs and
-        // stays refused, with the literal SHA as the fix.
+        // warns, with the literal SHA as the fix.
         let fx = Fx::new("pinsha");
         fx.commit("src/a.txt", "fine\n", "add a");
         let sha = git_out(&fx.work, &["rev-parse", "HEAD"]);
@@ -4713,7 +3501,7 @@ mod tests {
         let r = fx.run(
             r#"SHA=$(git rev-parse HEAD) && git push --no-follow-tags origin "$SHA:refs/heads/feat""#,
         );
-        assert_blocks(&r, &["`$SHA`", "literal", "git rev-parse HEAD"]);
+        assert_warns(&r, &["`$SHA`", "literal", "git rev-parse HEAD"]);
         assert_not_narrow(&r);
     }
 }

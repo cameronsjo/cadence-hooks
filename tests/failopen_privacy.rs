@@ -38,8 +38,6 @@ fn run(args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> (Output, tempfile:
     let tmp = tempfile::tempdir().unwrap();
     let mut cmd = support::cadence_hooks();
     cmd.args(args)
-        .env_remove("CADENCE_DISABLE")
-        .env_remove("CADENCE_BYPASS")
         .env("CADENCE_METRICS_DIR", tmp.path())
         .envs(envs.iter().copied())
         .stdin(Stdio::piped())
