@@ -4596,7 +4596,8 @@ mod tests {
     }
 
     /// The third cap in "How many pushes the push guard checks": over four
-    /// remotes a `-c` config value names across a command's pushes blocks.
+    /// directory and remote pairs that a `-c` config value names across a
+    /// command's pushes block.
     #[test]
     fn over_four_config_named_remotes_block() {
         use cadence_hooks_core::Outcome::{Allow, Block};
@@ -4626,6 +4627,49 @@ mod tests {
                     .as_deref()
                     .is_some_and(|m| m.contains("too many push remotes to verify")),
                 "five: {:?}",
+                result.message
+            );
+        });
+    }
+
+    /// "Literal `git -C` push loops": the loop reader takes only a command
+    /// that begins with `for`, so a comment line before the loop sends it to
+    /// the general loop checks and their remote cap.
+    // Embeds a native path in a POSIX shell string.
+    #[cfg(unix)]
+    #[test]
+    fn a_comment_before_a_literal_loop_meets_the_loop_cap() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        for n in 1..=5 {
+            let url = format!("https://github.com/cameronsjo/r{n}.git");
+            cadence_hooks_core::git_fixtures::git_in(
+                owned.path(),
+                &["remote", "add", &format!("r{n}"), &url],
+            );
+        }
+        let dir = owned.path().to_string_lossy().to_string();
+        let pushes = (1..=5)
+            .map(|n| format!("git -C $d push r{n} main"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let lp = format!("for d in {dir}; do {pushes}; done");
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&lp, &dir));
+            assert_eq!(result.outcome, Allow, "literal loop: {:?}", result.message);
+            let commented = format!("# push all\n{lp}");
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&commented, &dir));
+            assert_eq!(
+                result.outcome, Block,
+                "after a comment: {:?}",
+                result.message
+            );
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too many push-loop remotes to verify")),
+                "after a comment: {:?}",
                 result.message
             );
         });

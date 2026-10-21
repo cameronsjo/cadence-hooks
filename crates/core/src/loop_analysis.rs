@@ -1109,11 +1109,14 @@ mod tests {
         ] {
             assert_eq!(literal_loop_pushes(command), None, "{command}");
         }
-        let padded = format!(
-            "for d in /a; do git -C \"$d\" push origin main; done\n# {}",
-            "x".repeat(LITERAL_LOOP_MAX_LEN)
-        );
-        assert_eq!(literal_loop_pushes(&padded), None, "over 4 KB");
+        // The cap is 4096 bytes, spelled out so a change to the constant
+        // turns this red: 4096 reads, 4097 does not.
+        let padded = |len: usize| {
+            let lp = "for d in /a; do git -C \"$d\" push origin main; done\n# ";
+            format!("{lp}{}", "x".repeat(len - lp.len()))
+        };
+        assert!(literal_loop_pushes(&padded(4096)).is_some(), "4096 bytes");
+        assert_eq!(literal_loop_pushes(&padded(4097)), None, "4097 bytes");
         assert!(
             literal_loop_pushes("for d in /a; do git -C \"$d\" push origin main; done # all")
                 .is_some(),
