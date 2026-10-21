@@ -1104,9 +1104,21 @@ mod tests {
             "for d in /a; do git -C \"$d\" push origin \"$(git -C \"$d\" config remote.origin.pushurl x)\"; done",
             "for d in /a; do echo `git -C /a remote set-url origin x`; git -C \"$d\" push origin main; done",
             "for d in /a /b /c /d /e /f /g /h /i; do git -C \"$d\" push origin main; done",
+            "# push all\nfor d in /a; do git -C \"$d\" push origin main; done",
+            "echo start; for d in /a; do git -C \"$d\" push origin main; done",
         ] {
             assert_eq!(literal_loop_pushes(command), None, "{command}");
         }
+        let padded = format!(
+            "for d in /a; do git -C \"$d\" push origin main; done\n# {}",
+            "x".repeat(LITERAL_LOOP_MAX_LEN)
+        );
+        assert_eq!(literal_loop_pushes(&padded), None, "over 4 KB");
+        assert!(
+            literal_loop_pushes("for d in /a; do git -C \"$d\" push origin main; done # all")
+                .is_some(),
+            "a comment after the loop is fine"
+        );
     }
 
     // --- analyze_gh_loops ---

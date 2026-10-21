@@ -4595,6 +4595,42 @@ mod tests {
         });
     }
 
+    /// The third cap in "How many pushes the push guard checks": over four
+    /// remotes a `-c` config value names across a command's pushes blocks.
+    #[test]
+    fn over_four_config_named_remotes_block() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        for n in 1..=5 {
+            let url = format!("https://github.com/cameronsjo/r{n}.git");
+            cadence_hooks_core::git_fixtures::git_in(
+                owned.path(),
+                &["remote", "add", &format!("r{n}"), &url],
+            );
+        }
+        let cwd = owned.path().to_string_lossy().to_string();
+        let pushes = |count: usize| {
+            (1..=count)
+                .map(|n| format!("git -c remote.pushDefault=r{n} push"))
+                .collect::<Vec<_>>()
+                .join(" && ")
+        };
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(4), &cwd));
+            assert_eq!(result.outcome, Allow, "four: {:?}", result.message);
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(5), &cwd));
+            assert_eq!(result.outcome, Block, "five: {:?}", result.message);
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too many push remotes to verify")),
+                "five: {:?}",
+                result.message
+            );
+        });
+    }
+
     /// cadence-hooks#1144 item 3: a push in a child script run somewhere
     /// else, with no top-level push segment and no literal `git push`, was
     /// allowed at the gate before the directory check ran.
