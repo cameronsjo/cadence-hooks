@@ -15895,9 +15895,10 @@ pub fn git_command_line_aliases(globals: &[String]) -> Vec<(String, String)> {
 /// wrapper that execs its operands (`flock FILE CMD…`, BSD `script FILE
 /// CMD…`, `watch -x`, `runuser -u USER CMD…`, `env`'s words after `-S
 /// STRING`, and a tmux shell command given as several words in
-/// [`tmux_command_script`]) hands each word over whole, so [`quoted_script`]
-/// keeps it whole: `flock L sh -c 'cat .env'` surfaces as `sh -c 'cat .env'`,
-/// which reads `.env`, and `flock L echo 'x; cat .env'` as one `echo`.
+/// [`tmux_command_script`], except `run-shell` and `pipe-pane`) hands each
+/// word over whole, so [`quoted_script`] keeps it whole: `flock L sh -c
+/// 'cat .env'` surfaces as `sh -c 'cat .env'`, which reads `.env`, and
+/// `flock L echo 'x; cat .env'` as one `echo`.
 /// Stripping the quotes there once hid the first read and made the second a
 /// false block (cadence-hooks#1468). A misread option can still put the
 /// wrong word first and hide a read; see [`skip_simple_options`].
@@ -16110,54 +16111,57 @@ const WATCH_VALUE_LONG_FLAGS: &[&str] = &["--interval", "--equexit"];
 /// The command `watch [opts] CMD…` runs: its operands joined with spaces and
 /// handed to `sh -c`, or, with `-x`/`--exec`, exec'd word for word.
 fn watch_command(operands: &[String]) -> Option<String> {
-    let at = skip_simple_options(operands, WATCH_VALUE_SHORT_FLAGS, WATCH_VALUE_LONG_FLAGS);
+    let (at, execs) = watch_options(operands);
     let words = operands.get(at..)?;
-    if watch_execs(operands.get(..at).unwrap_or(&[])) {
+    if execs {
         quoted_script(words)
     } else {
         joined_script(words)
     }
 }
 
-/// Whether `watch`'s leading options include `-x`/`--exec` (getopt_long
-/// takes `--ex` as the shortest unique prefix). A short cluster is walked up
-/// to its first value-taking letter, whose value is the rest of the word or,
-/// for `-n`/`-q` at the end of one, the next word (`-n -x` is an interval of
-/// `-x`). `-d` takes only a glued value, so `-dx` is not exec.
-fn watch_execs(options: &[String]) -> bool {
+/// Where `watch`'s command starts, and whether its options include
+/// `-x`/`--exec` (getopt_long takes `--ex` as the shortest unique prefix).
+/// getopt stops at `--` or at the first word that is not an option. In a
+/// short cluster, `-n`/`-q` take the rest of the word or, at its end, the
+/// next word (`-n -x` is an interval of `-x`). `-d` takes only a glued value,
+/// so `-dx` is not exec, and in `-dn 1 -x CMD` the command is `1 -x CMD`.
+fn watch_options(operands: &[String]) -> (usize, bool) {
+    let mut execs = false;
     let mut i = 0;
-    while let Some(raw) = options.get(i) {
-        i += 1;
+    while let Some(raw) = operands.get(i) {
         let tok = unescape_word(raw);
+        if tok == "--" {
+            return (i + 1, execs);
+        }
         if let Some(long) = tok.strip_prefix("--") {
             let name = long.split_once('=').map_or(long, |(name, _)| name);
-            if name.len() >= 2 && "exec".starts_with(name) {
-                return true;
-            }
-            if !long.contains('=') && WATCH_VALUE_LONG_FLAGS.contains(&tok.as_ref()) {
-                i += 1;
-            }
+            execs |= name.len() >= 2 && "exec".starts_with(name);
+            let takes = !long.contains('=') && WATCH_VALUE_LONG_FLAGS.contains(&tok.as_ref());
+            i += if takes { 2 } else { 1 };
             continue;
         }
-        let Some(cluster) = tok.strip_prefix('-') else {
-            continue;
+        let Some(cluster) = tok.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            return (i, execs);
         };
+        i += 1;
         for (at, c) in cluster.char_indices() {
             if c == 'x' {
-                return true;
+                execs = true;
+                continue;
             }
             if c == 'd' {
                 break;
             }
             if WATCH_VALUE_SHORT_FLAGS.contains(c) {
-                if cluster[at + c.len_utf8()..].is_empty() {
+                if at + c.len_utf8() == cluster.len() {
                     i += 1;
                 }
                 break;
             }
         }
     }
-    false
+    (i, execs)
 }
 
 /// Index of the first operand after a utility's leading options (stopping at,
@@ -25889,8 +25893,10 @@ mod tests {
         }
         // Without `-x`, `watch` hands its words to `sh -c` as one string,
         // which splits them again; `-dx` is `-d` with the glued value `x`.
-        // `-nx` and `-n -x` give `-n` a bad interval, so watch runs nothing,
-        // and the join keeps main's reading. So does tmux with a single word,
+        // `-nx`, `-n -x` and `--interval -x` give a bad interval, so watch
+        // runs nothing, and the join keeps main's reading. In `-dn 1 -x` and
+        // `-dn 'cat .env'`, `n` is `-d`'s value, so the command starts at the
+        // next word, run under `sh -c`. So does tmux with a single word,
         // and `run-shell` and `pipe-pane`, which tmux never execs: it runs
         // their first word under `sh -c` and refuses more than two words
         // (`run-shell`) or one (`pipe-pane`).
@@ -25901,6 +25907,10 @@ mod tests {
             ("watch -n -x sh -c 'cat .env'", "sh -c cat .env"),
             ("watch -dx sh -c 'cat .env'", "sh -c cat .env"),
             ("watch -dx echo 'x; cat .env'", "cat .env"),
+            ("watch -dn 1 -x echo 'x; cat .env'", "cat .env"),
+            ("watch -dn 1 -x sh -c 'cat .env'", "1 -x sh -c cat .env"),
+            ("watch -dn 'cat .env'", "cat .env"),
+            ("watch --interval -x sh -c 'cat .env'", "sh -c cat .env"),
             ("watch echo 'x; cat .env'", "cat .env"),
             ("tmux run-shell 'cat .env' x", "cat .env x"),
             ("tmux run -b sh -c 'cat .env'", "sh -c cat .env"),

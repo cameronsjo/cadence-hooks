@@ -7180,6 +7180,10 @@ mod tests {
                 // Without `-x`, `watch`'s `sh -c` splits the words again.
                 "watch echo 'x; cat .env'",
                 "watch -dx echo 'x; cat .env'",
+                // `n` is `-d`'s value, so watch runs `1 -x echo x; cat .env`
+                // and `cat .env`.
+                "watch -dn 1 -x echo 'x; cat .env'",
+                "watch -dn 'cat .env'",
                 // tmux runs `run-shell`'s first word under `sh -c` and
                 // ignores a second.
                 "tmux run-shell 'cat .env' x",
@@ -7204,10 +7208,14 @@ mod tests {
                 // string: that shell runs `sh -c cat .env`, a script of
                 // `cat` with `$0` set to `.env`, which reads no file. `-dx`
                 // is `-d` with the value `x`, so it does not exec; `-n -x`
-                // gives `-n` a bad interval, and watch runs nothing.
+                // gives `-n` a bad interval, and watch runs nothing, as
+                // does `--interval -x`. In `-dn 1 -x`, `n` is `-d`'s value,
+                // so watch's `sh -c` runs `1 -x sh -c cat .env`.
                 "watch sh -c 'cat .env'",
                 "watch -dx sh -c 'cat .env'",
                 "watch -n -x sh -c 'cat .env'",
+                "watch --interval -x sh -c 'cat .env'",
+                "watch -dn 1 -x sh -c 'cat .env'",
                 // tmux refuses three words for `run-shell` and two for
                 // `pipe-pane`, so these run nothing; read joined, as before.
                 "tmux run-shell sh -c 'cat .env'",
@@ -7215,6 +7223,13 @@ mod tests {
             ],
             cadence_hooks_core::Outcome::Allow,
             "a quoted `;` behind a wrapper that execs its words",
+        );
+        // `-d` takes only a glued value, so in `-dn 1` the `n` is its value
+        // and watch's command is `1 cat .env`, which reads no file.
+        assert_bash(
+            &["watch -dn 1 cat .env", "watch -xdn 1 cat .env"],
+            cadence_hooks_core::Outcome::Allow,
+            "a watch command that starts at `-d`'s next word",
         );
     }
 
