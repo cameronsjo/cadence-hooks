@@ -549,6 +549,13 @@ fn padding_past_the_byte_cap_still_judges_each_push() {
             0,
             UNPARSED_PUSHES,
         ),
+        // The bare push may go to `other`'s remote, not the one it was
+        // checked against: the nudge says which branch it read.
+        (
+            "git push origin main && git checkout other && git push",
+            0,
+            "a bare one against the branch checked out now",
+        ),
         (
             "for b in main feat; do git push; done",
             0,
