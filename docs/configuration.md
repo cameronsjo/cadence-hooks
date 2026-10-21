@@ -247,10 +247,7 @@ so the write blocks:
   builtin next to a `GH_HOST` mention or a non-literal `NAME=`. This rule
   fails closed wherever the command position is not recognized.
 - A `trap` action or an `eval` string that sets it. Both are read like a
-  command. An `eval` or `trap` whose command word comes from an expansion is
-  text the guard cannot read, so it also blocks: `eval "$X"`, `eval "$(…)"`,
-  `` eval `…` ``. That includes `eval "$(direnv export bash)"` and
-  `eval "$(ssh-agent -s)"` in front of a `-R` write.
+  command.
 - A `source` or `.` fed by a heredoc, stdin, or `<(…)`, when the command text
   names `GH_HOST` or declares a non-literal name.
 - An `env -S`/`--split-string` prefix before gh, or a `BASH_ENV=`/`ENV=`
@@ -261,6 +258,11 @@ so the write blocks:
 - A value that is still a `$` expansion.
 - An assignment inside `${GH_HOST:=...}` or `$((GH_HOST=...))`.
 
+An `eval` or `trap` whose command word comes from an expansion (`eval "$X"`,
+`eval "$(…)"`, `` eval `…` ``) is text the guard cannot read. It is skipped, and
+the write is judged on the hosts the guard did read. So `eval "$(direnv export
+bash)"` or `eval "$(ssh-agent -s)"` in front of a `-R` write does not block it.
+
 A plain mention changes nothing: `rg GH_HOST`, a commit message, or a gh
 command's own `--title` or `--body`. A gh segment runs as a child process, so it
 is never read for changes. A `source`d file is not read. That includes a file
@@ -269,14 +271,14 @@ written earlier in the same command, the same class as `source
 
 **Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` only for an owned remote; an unowned upstream is left for the user to write to themselves.
 
-**Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, parse failures, forks, unowned directories) still blocks.
+**Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, forks, unowned directories) still blocks. A loop the parser cannot read at all (a command over 12 KB, say) is not refused for that: each gh write in it is judged on its own, as outside a loop. So a write to a repo you do not own still blocks, and so does a write without `-R` after a `cd "$d"` the guard cannot follow, as it would outside a loop. A write with no `-R`, `GH_REPO` or literal `repos/<owner>/<repo>/…` path gets a nudge to give each one `-R owner/repo`.
 
 Looped `gh api` calls use the API-specific verdict rather than the generic
 missing-`-R` message. GraphQL reads and the safe review-thread metadata
 mutations remain allowed; other GraphQL or non-repository API mutations block
 when their target cannot be ownership-verified.
 
-Set `CADENCE_GH_STRICT_LOOPS=1` to disable the relaxation and block every looped gh write that lacks `-R` (the pre-0.12 behavior). Block messages include the resolved `-R owner/repo` fix when the working directory is owned.
+Set `CADENCE_GH_STRICT_LOOPS=1` to disable the relaxation and block every looped gh write that lacks `-R` (the pre-0.12 behavior), in a loop the parser cannot read as well. Block messages include the resolved `-R owner/repo` fix when the working directory is owned.
 
 ### The `configure` subcommand under Claude Code
 

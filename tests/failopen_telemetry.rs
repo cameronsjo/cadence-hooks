@@ -512,12 +512,12 @@ fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
         (
             "guard-gh-write",
             "for i in 1 2; do gh issue close $i -R other/r; done",
-            "gh command in loop",
+            "repo you don't own",
         ),
         (
             "guard-gh-write",
             "while read i; do gh pr merge $i -R other/r; done < prs",
-            "gh command in loop",
+            "repo you don't own",
         ),
     ] {
         let padded = format!("{command}{pad}");
