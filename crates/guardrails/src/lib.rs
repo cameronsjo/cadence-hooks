@@ -179,28 +179,31 @@ pub mod warn_untracked;
 mod tests {
     use super::with_env;
 
-    /// Read and set by no other test, so this test can pin it without taking
-    /// part in the races `with_env` exists to prevent.
-    const OWN_VAR: &str = "CADENCE_TEST_WITH_ENV_OWN_VAR";
+    // One var per test, read and set by no other test, so each test can
+    // check it after `with_env` releases the lock without racing a sibling.
+    const VALUE_VAR: &str = "CADENCE_TEST_WITH_ENV_VALUE_VAR";
+    const PANIC_VAR: &str = "CADENCE_TEST_WITH_ENV_PANIC_VAR";
 
     #[test]
     fn with_env_hands_back_the_value_and_restores_the_var() {
-        let seen = with_env(&[(OWN_VAR, Some("a"))], || std::env::var(OWN_VAR).unwrap());
+        let seen = with_env(&[(VALUE_VAR, Some("a"))], || {
+            std::env::var(VALUE_VAR).unwrap()
+        });
         assert_eq!(seen, "a");
-        assert!(std::env::var_os(OWN_VAR).is_none());
+        assert!(std::env::var_os(VALUE_VAR).is_none());
     }
 
     #[test]
     fn with_env_restores_after_a_panic_and_leaves_the_lock_usable() {
         let caught = std::panic::catch_unwind(|| {
-            with_env(&[(OWN_VAR, Some("b"))], || -> () { panic!("boom") })
+            with_env(&[(PANIC_VAR, Some("b"))], || -> () { panic!("boom") })
         });
         assert!(caught.is_err(), "the panic must propagate");
         assert!(
-            std::env::var_os(OWN_VAR).is_none(),
+            std::env::var_os(PANIC_VAR).is_none(),
             "a panic inside must not leak the var"
         );
         // A poisoned lock would block or panic here.
-        with_env(&[(OWN_VAR, Some("c"))], || ());
+        with_env(&[(PANIC_VAR, Some("c"))], || ());
     }
 }
