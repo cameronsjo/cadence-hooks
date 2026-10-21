@@ -52,6 +52,17 @@ fn is_git_word(token: &str) -> bool {
     token == "git" || token.ends_with("/git")
 }
 
+/// The word after the first `git` word in a normalized segment: the
+/// subcommand, once `normalize_git_command` has dropped the global options.
+fn git_subcommand<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    let git_pos = tokens.iter().position(|t| is_git_word(t))?;
+    tokens.get(git_pos + 1).copied()
+}
+
+/// Appended to the history nudge when a segment rebases: the way back.
+const REBASE_RECOVERY: &str =
+    "\nIf the rebase goes wrong, run `git reflog` to find the commit from before it.";
+
 /// Normalize a single command segment into matchable tokens.
 ///
 /// 1. Quote-aware tokenization ([`tokenize`]): a quoted flag like `"--force"`
@@ -348,7 +359,6 @@ impl GitSafetyGuard {
             "reflog" => self.check_reflog_blocked(normalized),
             "gc" => self.check_gc_blocked(normalized),
             "branch" => self.check_branch_blocked(args),
-            "rebase" => self.check_rebase_blocked(args),
             sub @ ("filter-branch" | "filter-repo") => {
                 // Mass history rewrite — no benign form; same family as the
                 // reflog-expire / gc --prune blocks (#84).
@@ -552,25 +562,6 @@ impl GitSafetyGuard {
             if targets_protected {
                 return Some("Delete protected branch".into());
             }
-        }
-        None
-    }
-
-    fn check_rebase_blocked(&self, args: &[&str]) -> Option<String> {
-        // `--onto <newbase>` names a rebase DESTINATION, not a ref being
-        // rewritten — replaying commits onto main never modifies main, so the
-        // single token following `--onto` is exempt (#74, a documented
-        // stacked-PR restack workflow). A protected branch named anywhere else
-        // still relocates/rewrites a protected ref and stays blocked: plain
-        // `git rebase main`, or `main`/`master` as the rewritten <branch> in
-        // `git rebase --onto X Y main`.
-        let onto_newbase = args.iter().position(|a| *a == "--onto").map(|i| i + 1);
-        let targets_protected = args
-            .iter()
-            .enumerate()
-            .any(|(i, a)| Some(i) != onto_newbase && !a.starts_with('-') && is_protected_branch(a));
-        if targets_protected {
-            return Some("Rebase onto protected branch".into());
         }
         None
     }
@@ -932,6 +923,9 @@ impl Check for GitSafetyGuard {
         // a command hidden in `sh -c '…'` is still seen. Block precedence: any
         // segment blocks → block; else any warns → nudge.
         let mut should_warn = false;
+        // A rebase nudge names the way back (ADR-0046 rule 3: a nudge names
+        // a concrete action).
+        let mut warned_rebase = false;
         // Current-branch resolution for bare-HEAD force pushes (#71): lazy
         // (only when such a segment appears) and memoized across segments.
         let mut resolved_branch: Option<BranchResolution> = None;
@@ -974,12 +968,14 @@ impl Check for GitSafetyGuard {
 
             if self.check_warned(&tokens).is_some() {
                 should_warn = true;
+                warned_rebase |= git_subcommand(&tokens) == Some("rebase");
             }
         }
 
         if should_warn {
+            let action = if warned_rebase { REBASE_RECOVERY } else { "" };
             return CheckResult::nudge(format!(
-                "Git operation may modify history or lose work: {command}"
+                "Git operation may modify history or lose work: {command}{action}"
             ));
         }
 
@@ -1478,52 +1474,55 @@ mod tests {
     }
 
     #[test]
-    fn rebase_main_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase main"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-    }
-
-    #[test]
-    fn rebase_onto_main_destination_allowed() {
-        // #74: `--onto main` names main as the DESTINATION (never rewritten);
-        // the rewritten ref is `feature`. Must not hard-block (rebase still
-        // nudges as a history-rewriting op).
-        let result =
-            GitSafetyGuard.run(&make_bash_input("git rebase --onto main feature~3 feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
-    }
-
-    #[test]
-    fn rebase_onto_main_newbase_only_allowed() {
-        // `--onto main` with no upstream/branch rebases the CURRENT branch onto
-        // main — main is still only the destination, so it is not blocked.
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase --onto main"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
-    }
-
-    #[test]
-    fn rebase_onto_with_main_as_branch_blocked() {
-        // #74 regression: main as the trailing <branch> IS rewritten — stays blocked.
-        let result = GitSafetyGuard.run(&make_bash_input(
+    fn every_rebase_nudges() {
+        // cadence-ecosystem ADR-0046 rule 2: a rebase rewrites local history
+        // the reflog can restore, so no form blocks, a protected branch
+        // included. Force-pushing the result to main still blocks.
+        for command in [
+            "git rebase main",
+            "git rebase master",
+            "git rebase -i master",
+            "git rebase origin/main",
+            "git rebase -i origin/main",
+            "git rebase --onto main feature~3 feature",
+            "git rebase --onto main",
             "git rebase --onto refactor feature~3 main",
-        ));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+            "git rebase --onto main feature master",
+            "git rebase --onto HEAD~2 main feature",
+            "git rebase feature-branch",
+            "git rebase feat/maintain-state",
+            "git -C /repo rebase main",
+            "git status && git rebase -i main",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{command}: {:?}",
+                result.message
+            );
+            // ADR-0046 rule 3: the nudge names the way back.
+            let message = result.message.unwrap_or_default();
+            assert!(message.contains("run `git reflog`"), "{command}: {message}");
+        }
     }
 
     #[test]
-    fn rebase_onto_main_with_master_branch_blocked() {
-        // #74 regression: only the token after --onto is exempt; master as
-        // <branch> is rewritten and stays blocked.
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase --onto main feature master"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-    }
-
-    #[test]
-    fn rebase_onto_with_main_upstream_blocked() {
-        // #74: main as <upstream> is not rewritten, but the minimal fix keeps
-        // this blocked (a deliberate, documented over-block — not a hole).
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase --onto HEAD~2 main feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    fn only_a_rebase_nudge_names_the_reflog() {
+        for command in [
+            "git reset HEAD~1",
+            "git commit --amend",
+            "git push --force origin feature",
+        ] {
+            let result = GitSafetyGuard.run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{command}"
+            );
+            let message = result.message.unwrap_or_default();
+            assert!(!message.contains("git reflog"), "{command}: {message}");
+        }
     }
 
     #[test]
@@ -1595,12 +1594,6 @@ mod tests {
     #[test]
     fn branch_delete_master_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git branch -D master"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-    }
-
-    #[test]
-    fn rebase_master_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase master"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
@@ -1695,12 +1688,6 @@ mod tests {
     }
 
     #[test]
-    fn rebase_master_interactive_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase -i master"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-    }
-
-    #[test]
     fn case_insensitive_force_push_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("GIT PUSH --FORCE ORIGIN MAIN"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -1709,12 +1696,6 @@ mod tests {
     #[test]
     fn reset_soft_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git reset HEAD~1"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
-    }
-
-    #[test]
-    fn rebase_feature_warned() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase feature-branch"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
@@ -2058,25 +2039,6 @@ mod tests {
     // ---------------------------------------------------------------
     // Bug fix #9: False positive on branch names containing "main"
     // ---------------------------------------------------------------
-
-    #[test]
-    fn rebase_maintain_state_not_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase feat/maintain-state"));
-        // Should be warned (rebase) but NOT blocked (maintain != main)
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
-    }
-
-    #[test]
-    fn rebase_domain_main_not_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase fix/domain-maintenance"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
-    }
-
-    #[test]
-    fn rebase_mainly_not_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git rebase mainly-refactor"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
-    }
 
     #[test]
     fn branch_delete_main_feature_warned_not_blocked() {

