@@ -24,7 +24,7 @@ Guards on Bash commands that run git: `cadence-hooks cadence git-safety` blocks 
 - **THEN** the hook exits 2
 
 ### Requirement: Protected branches
-`git-safety` SHALL treat `main` and `master` as protected and block: a force push naming a protected destination; a `+` refspec to a protected branch; a force push of bare `HEAD` while on a protected branch or when git cannot name the branch; deleting a protected branch by `git push --delete`, a `:main` refspec, `git branch -d`/`-D` or `git update-ref -d`; repointing a protected ref with `git update-ref`; and `git rebase` naming a protected branch except as the `--onto` value.
+`git-safety` SHALL treat `main` and `master` as protected and block: a force push naming a protected destination; a `+` refspec to a protected branch; a force push of bare `HEAD` while on a protected branch or when git cannot name the branch; deleting a protected branch by `git push --delete`, a `:main` refspec, `git branch -d`/`-D` or `git update-ref -d`; and repointing a protected ref with `git update-ref`. A `git rebase` naming a protected branch MUST NOT block.
 
 #### Scenario: Force push to main
 - **WHEN** a Bash command is `git push --force origin main`
@@ -34,6 +34,10 @@ Guards on Bash commands that run git: `cadence-hooks cadence git-safety` blocks 
 - **WHEN** a Bash command is `git rebase --onto main old-base feature`
 - **THEN** the command is not blocked
 
+#### Scenario: Force push of the rebased branch
+- **WHEN** a Bash command is `git rebase main && git push --force origin main`
+- **THEN** the hook exits 2 naming a force push to a protected branch
+
 ### Requirement: Force push of other branches nudges
 A force push (a force flag or a `+` refspec) to a branch other than `main` or `master` MUST NOT block; `git-safety` SHALL nudge instead.
 
@@ -42,7 +46,7 @@ A force push (a force flag or a `+` refspec) to a branch other than `main` or `m
 - **THEN** the hook exits 0 with a nudge that the git operation may modify history
 
 ### Requirement: Milder history edits nudge
-`git-safety` SHALL nudge (exit 0 with a message beginning `Git operation may modify history or lose work:`) when no segment blocks and some segment runs: `git reset` without `--hard`; `git rebase`; `git commit --amend`; `git stash drop` or `clear`; `git branch -d` of a non-protected branch; `git remote remove`/`rm`; `git restore` or `git checkout -- <named paths>` that overwrite local edits; `git update-ref -d` of a non-protected ref; or `git update-ref --stdin`.
+`git-safety` SHALL nudge (exit 0 with a message beginning `Git operation may modify history or lose work:`) when no segment blocks and some segment runs: `git reset` without `--hard`; any `git rebase`; `git commit --amend`; `git stash drop` or `clear`; `git branch -d` of a non-protected branch; `git remote remove`/`rm`; `git restore` or `git checkout -- <named paths>` that overwrite local edits; `git update-ref -d` of a non-protected ref; or `git update-ref --stdin`.
 
 #### Scenario: Soft reset
 - **WHEN** a Bash command is `git reset HEAD~1`
@@ -50,6 +54,10 @@ A force push (a force flag or a `+` refspec) to a branch other than `main` or `m
 
 #### Scenario: Named-path checkout
 - **WHEN** a Bash command is `git checkout -- src/lib.rs`
+- **THEN** the hook exits 0 with the history nudge, not a block
+
+#### Scenario: Rebase naming a protected branch
+- **WHEN** a Bash command is `git rebase -i main`
 - **THEN** the hook exits 0 with the history nudge, not a block
 
 ### Requirement: Normalization before matching
@@ -137,3 +145,14 @@ In a primary checkout where `enforce-worktree` would block, `warn-branch-base` S
 #### Scenario: Branch in the primary
 - **WHEN** `git checkout -b feat/y main` runs in the primary checkout of a branch-mode repo
 - **THEN** the hook exits 0 with the worktree-first nudge
+
+### Requirement: A rebase nudge names the way back
+When a segment runs `git rebase`, the history nudge SHALL add a line telling the agent to run `git reflog` to find the commit from before the rebase. A nudge with no rebase segment MUST NOT carry that line.
+
+#### Scenario: Rebase onto main
+- **WHEN** a Bash command is `git rebase main`
+- **THEN** the hook exits 0 with the history nudge and a line naming `git reflog`
+
+#### Scenario: Amend
+- **WHEN** a Bash command is `git commit --amend`
+- **THEN** the hook exits 0 with the history nudge and no `git reflog` line

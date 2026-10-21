@@ -125,16 +125,13 @@
 //!
 //! **Not covered:** pushes core does not detect — `gh repo create --push`,
 //! `git subtree push`, a `git-<name>` executable on `PATH` other than
-//! `send-pack`/`http-push`/`push`/`remote-*`, a push inside a script file, a
-//! push nested in another git command's exec string (`git rebase -x`,
-//! `git bisect run`, `git submodule foreach`, `git filter-branch` filters;
-//! the git-safety hook blocks `git rebase` in sessions); a git config key
-//! written by the same command through anything but `git config`/`git remote`
-//! (an editor, a redirect into `.git/config`); a pushed commit on another
-//! branch that adds a submodule the index and top-level `.gitmodules` do not
-//! show; a push through an alias; and a push hidden behind a brace word the
-//! parser could not expand (cadence-ecosystem ADR-0046: guards judge what
-//! they read).
+//! `send-pack`/`http-push`/`push`/`remote-*`, and a push inside a script file;
+//! a git config key written by the same command through anything but
+//! `git config`/`git remote` (an editor, a redirect into `.git/config`); a
+//! pushed commit on another branch that adds a submodule the index and
+//! top-level `.gitmodules` do not show; a push through an alias; and a push
+//! hidden behind a brace word the parser could not expand (cadence-ecosystem
+//! ADR-0046: guards judge what they read).
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
 //! allows a found secret AND records a bypass row. A warning needs no escape.
