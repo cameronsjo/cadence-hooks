@@ -463,8 +463,14 @@ mod tests {
     #[test]
     fn the_worktree_env_helper_holds_the_one_crate_env_lock() {
         with_worktree_env(None, None, || {
+            // `WouldBlock` only: a poisoned but free lock also returns `Err`, and
+            // another test poisons it on purpose, so `is_err()` could not fail in
+            // a full run.
             assert!(
-                crate::CADENCE_ENV_TEST_LOCK.try_lock().is_err(),
+                matches!(
+                    crate::CADENCE_ENV_TEST_LOCK.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
                 "the helper must hold the lock every other env-mutating test takes"
             );
         });
