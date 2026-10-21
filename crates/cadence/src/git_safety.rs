@@ -2859,6 +2859,8 @@ mod tests {
             // An option's value is skipped; the file after it is still read.
             "bash -euo pipefail check.sh",
             "bash -O extglob check.sh",
+            // zsh's `-O` is a plain flag, so zsh runs `check.sh`.
+            "zsh -O check.sh",
         ] {
             let result = GitSafetyGuard.run(&make_bash_input(command));
             assert_eq!(result.outcome, nudge, "{command}");
