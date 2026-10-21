@@ -43,8 +43,6 @@ fn post_tool_use(repo: &Path, config: &Path, metrics: &Path) {
     .to_string();
     let mut child = support::cadence_hooks()
         .args(["session", "persist-plan-approval"])
-        .env_remove("CADENCE_BYPASS")
-        .env_remove("CADENCE_DISABLE")
         .env_remove("CADENCE_SESSION_STALE_MINUTES")
         .env_remove("CLAUDECODE")
         .env("CLAUDE_CONFIG_DIR", config)
