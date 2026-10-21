@@ -2048,8 +2048,20 @@ fn unresolvable_message(work_dir: &str, fix: &str) -> String {
     format!(
         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
          Directory: {work_dir}\n   \
-         Fix: add `{fix}` to target a repo explicitly"
+         Fix: {}",
+        fix_wording(fix)
     )
+}
+
+/// The `Fix:` clause of [`unresolvable_message`]. A `gh repo` verb in
+/// [`REPO_ARGUMENT_VERBS`] takes the repo as its argument, so its fix says to
+/// name it there rather than to "add" a whole command (#1491).
+fn fix_wording(fix: &str) -> String {
+    if fix.starts_with("gh repo ") {
+        format!("name the repo as the argument: `{fix}`")
+    } else {
+        format!("add `{fix}` to target a repo explicitly")
+    }
 }
 
 /// Build the block message for a disallowed target, including a host-scoping
@@ -2375,9 +2387,9 @@ fn api_orgs_owner(endpoint: &str) -> Option<String> {
 /// after it is read as the positional, resolving a target that then faces the
 /// allowlist. Mistaking a boolean for value-taking is the dangerous direction —
 /// it would step OVER the real positional and fall through to the cwd remote —
-/// so `--template` is deliberately ABSENT: it takes a value under
-/// `gh repo create` but is boolean under `gh repo edit`, and only the boolean
-/// reading is safe when the two disagree.
+/// so `--template` is ABSENT here: it is boolean under `gh repo edit`. Under
+/// `gh repo create` it takes a value, and [`gh_repo_positional_target`] steps
+/// over it there (see [`CREATE_TEMPLATE_FLAG`]).
 const REPO_VERB_VALUE_FLAGS: &[&str] = &[
     "--add-topic",
     "--default-branch",
@@ -2402,6 +2414,17 @@ const REPO_VERB_VALUE_FLAGS: &[&str] = &[
 /// `-s` source, `-u` upstream-remote-name). `-p` (`--template` on create) is
 /// omitted for the same reason its long form is.
 const REPO_VERB_VALUE_SHORTS: &str = "dhtglrsu";
+
+/// `gh repo create`'s `--template repository`, which takes a value there and
+/// is boolean under `gh repo edit` (gh 2.89.0 `--help`). Reading it as a
+/// boolean under `create` took the template for the target, so
+/// `gh repo create --template cameronsjo/tpl work-org/x` judged
+/// `cameronsjo/tpl` and created `work-org/x` unchecked.
+const CREATE_TEMPLATE_FLAG: &str = "--template";
+
+/// [`REPO_VERB_VALUE_SHORTS`] plus `-p`, the short form of
+/// [`CREATE_TEMPLATE_FLAG`], for `gh repo create` only.
+const CREATE_VALUE_SHORTS: &str = "dhtglrsup";
 
 /// The `(verb, target)` of a `gh repo <verb> … <target>` invocation whose
 /// positional names the repo, per [`REPO_TARGET_VERBS`]. `None` when the
@@ -2434,6 +2457,12 @@ fn gh_repo_positional_target(segment: &str) -> Option<(String, Option<String>, S
     if !REPO_TARGET_VERBS.contains(&verb.as_str()) {
         return None;
     }
+    let creates = verb == "create";
+    let value_shorts = if creates {
+        CREATE_VALUE_SHORTS
+    } else {
+        REPO_VERB_VALUE_SHORTS
+    };
     let mut i = 3;
     while i < argv.len() {
         let word = argv[i].as_str();
@@ -2444,13 +2473,15 @@ fn gh_repo_positional_target(segment: &str) -> Option<(String, Option<String>, S
         }
         if word.starts_with("--") {
             // `--flag=value` carries its value inline, so nothing to step over.
-            i += long_flag_stride(word, REPO_VERB_VALUE_FLAGS.contains(&word));
+            let takes_value =
+                REPO_VERB_VALUE_FLAGS.contains(&word) || (creates && word == CREATE_TEMPLATE_FLAG);
+            i += long_flag_stride(word, takes_value);
             continue;
         }
         if let Some(cluster) = word.strip_prefix('-')
             && !cluster.is_empty()
         {
-            i += if cluster_consumes_next(cluster, REPO_VERB_VALUE_SHORTS) {
+            i += if cluster_consumes_next(cluster, value_shorts) {
                 2
             } else {
                 1
@@ -3785,11 +3816,16 @@ fn judge_resolution(
         RepoResolution::Resolved { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 None
-            } else if repo_has_unexpanded_expansion(&repo) {
-                // The target is a shell expansion this guard never sees the
+            } else if repo_has_unexpanded_expansion(
+                repo.split_once('/')
+                    .map_or(repo.as_str(), |(owner, _)| owner),
+            ) {
+                // The owner is a shell expansion this guard never sees the
                 // value of, so it is UNRESOLVABLE, not unowned — and the
                 // unowned template's `-R <owner>/<name>` fix would graft an
-                // owner the caller never chose onto `$1` (#757).
+                // owner the caller never chose onto `$1` (#757). A literal
+                // owner with an expanded name (`evil/$r`) is judged by its
+                // owner and gets the unowned message (#1491).
                 let literal = target_spelling(segment, "owner/repo");
                 Some(CheckResult::block_structured(
                     format!(
@@ -9333,7 +9369,9 @@ mod tests {
         let repo_verbs = r#"for r in a b; do gh repo create "cameronsjo/$r" --private; gh repo edit cameronsjo/$r --enable-issues; gh repo delete "cameronsjo/${r}" --yes; done"#;
         // Beside a `-R` command the loop is judged as a loop of `-R` commands.
         let with_dash_r = r#"for r in a b; do gh repo create "cameronsjo/$r" --private; gh issue create -R cameronsjo/$r --title t --body b; done"#;
-        for command in [ISSUE_1491_LOOP, cd_loop, repo_verbs, with_dash_r] {
+        // A read beside the write needs no target of its own.
+        let with_read = r#"for r in alpha beta; do gh repo view "cameronsjo/$r"; gh repo archive "cameronsjo/$r" --yes; done"#;
+        for command in [ISSUE_1491_LOOP, cd_loop, repo_verbs, with_dash_r, with_read] {
             for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
                 let result = run_1491(command, cwd, strict);
                 assert_eq!(
@@ -9348,12 +9386,86 @@ mod tests {
 
     #[test]
     fn looped_archive_under_an_unowned_literal_owner_still_blocks() {
+        // The owner `evil-corp` is literal, so the block names it as unowned
+        // rather than calling the target unresolvable.
         let command = r#"for r in alpha beta; do gh repo archive "evil-corp/$r" --yes; done"#;
         for cwd in ["/tmp", OWNED_DIR] {
             let result = run_1491(command, cwd, false);
             assert!(blocks(&result), "{cwd}");
             assert!(!msg(&result).contains("`-R "), "{cwd}: {}", msg(&result));
+            assert!(
+                !msg(&result).contains("unexpanded shell expansion"),
+                "{cwd}: {}",
+                msg(&result)
+            );
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{cwd}");
+            assert_eq!(meta.fix, "gh repo archive cameronsjo/$r", "{cwd}");
         }
+    }
+
+    #[test]
+    fn looped_create_from_an_owned_template_is_judged_by_its_name() {
+        // Under `gh repo create`, `--template` and `-p` take a value, so the
+        // template is not the target. Read as a boolean, the owned template
+        // stood in for the unowned new repo and the loop allowed anywhere.
+        for command in [
+            r#"for r in a b; do gh repo create --template cameronsjo/tpl "work-org/$r" --private; done"#,
+            r#"for r in a b; do gh repo create -p cameronsjo/tpl "work-org/$r" --private; done"#,
+            r#"for r in a b; do gh repo new --private --template cameronsjo/tpl "work-org/$r"; done"#,
+        ] {
+            for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
+                let result = run_1491(command, cwd, strict);
+                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+            }
+        }
+        // An unowned template copied into an owned repo writes only there.
+        let owned = r#"for r in a b; do gh repo create --template work-org/tpl "cameronsjo/$r" --private; done"#;
+        let result = run_1491(owned, "/tmp", false);
+        assert_eq!(
+            result.outcome,
+            cadence_hooks_core::Outcome::Allow,
+            "{:?}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn create_template_takes_a_value_and_edit_template_does_not() {
+        for command in [
+            "gh repo create --template cameronsjo/tpl work-org/x --private",
+            "gh repo create -p cameronsjo/tpl work-org/x",
+            "gh repo create -cp cameronsjo/tpl work-org/x",
+            "gh repo new --private --template cameronsjo/tpl work-org/x",
+            // `--template` is a boolean under `gh repo edit`.
+            "gh repo edit --template work-org/x",
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                assert!(blocks(&run_1491(command, cwd, false)), "{command} in {cwd}");
+            }
+        }
+        for command in [
+            "gh repo create --template work-org/tpl cameronsjo/x --private",
+            "gh repo create -p work-org/tpl cameronsjo/x",
+            "gh repo create --template=work-org/tpl cameronsjo/x",
+            "gh repo create -pwork-org/tpl cameronsjo/x",
+        ] {
+            let result = run_1491(command, "/tmp", false);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command}: {:?}",
+                result.message
+            );
+        }
+        assert_eq!(
+            gh_repo_positional_target("gh repo create -p cameronsjo/tpl work-org/x"),
+            Some(("create".to_string(), None, "work-org/x".to_string()))
+        );
+        assert_eq!(
+            gh_repo_positional_target("gh repo edit --template work-org/x"),
+            Some(("edit".to_string(), None, "work-org/x".to_string()))
+        );
     }
 
     #[test]
@@ -9456,6 +9568,12 @@ mod tests {
         // Outside a loop the same verbs get the same advice: `gh repo edit`
         // with no argument, from a directory with no remote.
         let result = run_1491("gh repo edit --enable-issues", "/tmp", false);
+        assert!(
+            msg(&result)
+                .contains("Fix: name the repo as the argument: `gh repo edit cameronsjo/<repo>`"),
+            "{}",
+            msg(&result)
+        );
         let meta = result.block_metadata.expect("structured block");
         assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
         assert_eq!(meta.fix, "gh repo edit cameronsjo/<repo>");

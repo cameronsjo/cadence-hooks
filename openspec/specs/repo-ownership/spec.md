@@ -121,6 +121,10 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **WHEN** the command is `gh pr view 5 -R someone/else` or `gh repo clone someone/else`
 - **THEN** the hook allows
 
+#### Scenario: Repo created from an owned template
+- **WHEN** the command is `gh repo create --template cameronsjo/tpl work-org/x --private`
+- **THEN** the hook exits 2 naming `work-org/x`, because under `gh repo create` `--template` and `-p` take the template as their value and the argument is the new repository
+
 ### Requirement: What counts as a gh write
 `guard-gh-write` SHALL treat as writes: `gh pr|issue|release|label|repo|gist|workflow` with a mutating verb (`create`, `merge`, `close`, `comment`, `edit`, `delete`, `review`, `ready`, `reopen`, `lock`, `archive`, `rename`, `transfer`, `fork`, `run`, `enable`, `disable`), `gh secret|variable set|delete`, `gh release upload`, `gh label clone`, and `gh api` with a mutating `-X`/`--method`, a field flag or `--input`, unless an explicit `GET` method is given.
 
@@ -291,6 +295,10 @@ In a loop the loop parser reads, `guard-gh-write` MUST block a gh write that nam
 #### Scenario: Loop of repo archives with a variable owner
 - **WHEN** the command is `for r in a b; do gh repo archive "$o/$r" --yes; done` in a directory with no git remote
 - **THEN** the hook exits 2 and the reason names the repository argument (`gh repo archive owner/<repo>`), not `-R`
+
+#### Scenario: Loop of repo creates from an owned template
+- **WHEN** the command is `for r in a b; do gh repo create --template cameronsjo/tpl "work-org/$r" --private; done` in a directory with no git remote
+- **THEN** the hook exits 2, because the template is not the target and the new repository's owner `work-org` is not allowed
 
 ### Requirement: Strict loops the parser cannot read
 With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop parser cannot read when it shows a `for … in` or `while …; do` loop and holds a write judged for ownership that has no `-R`, `gh repo` positional `owner/repo` or literal `repos/<owner>/<repo>/…` path; a `GH_REPO` does not count. A write allowed without an ownership check stays allowed.

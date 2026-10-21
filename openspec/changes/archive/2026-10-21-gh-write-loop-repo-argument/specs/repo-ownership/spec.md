@@ -37,3 +37,26 @@ In a loop the loop parser reads, `guard-gh-write` MUST block a gh write that nam
 #### Scenario: Loop of repo archives with a variable owner
 - **WHEN** the command is `for r in a b; do gh repo archive "$o/$r" --yes; done` in a directory with no git remote
 - **THEN** the hook exits 2 and the reason names the repository argument (`gh repo archive owner/<repo>`), not `-R`
+
+#### Scenario: Loop of repo creates from an owned template
+- **WHEN** the command is `for r in a b; do gh repo create --template cameronsjo/tpl "work-org/$r" --private; done` in a directory with no git remote
+- **THEN** the hook exits 2, because the template is not the target and the new repository's owner `work-org` is not allowed
+
+### Requirement: gh write to a repository the operator does not own
+`guard-gh-write` (PreToolUse, Bash) SHALL block (exit 2, `gh write targets repo you don't own`) a `gh` write on a repository outside the allowlist, judging each segment of a chain on its own target. The target SHALL be read from `-R`/`--repo`, a `GH_REPO` assignment, a `gh repo` verb's positional `owner/repo`, a `gh api repos/<owner>/<repo>/...` path, and otherwise the git remotes of the directory the segment runs in. Reads SHALL be allowed whatever the target.
+
+#### Scenario: Ordinary write with an owned target
+- **WHEN** the command is `gh pr create -R cameronsjo/tool --title t --body-file b.md` and `cameronsjo` is allowed
+- **THEN** the hook allows
+
+#### Scenario: Unowned write after an owned one
+- **WHEN** the command is `gh issue comment 1 -R cameronsjo/tool --body ok && gh issue comment 2 -R evil/repo --body x`
+- **THEN** the hook exits 2 naming `evil/repo` and the allowed entries
+
+#### Scenario: Read on an unowned repo
+- **WHEN** the command is `gh pr view 5 -R someone/else` or `gh repo clone someone/else`
+- **THEN** the hook allows
+
+#### Scenario: Repo created from an owned template
+- **WHEN** the command is `gh repo create --template cameronsjo/tpl work-org/x --private`
+- **THEN** the hook exits 2 naming `work-org/x`, because under `gh repo create` `--template` and `-p` take the template as their value and the argument is the new repository
