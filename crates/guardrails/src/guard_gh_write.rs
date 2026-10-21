@@ -1628,34 +1628,69 @@ fn flag_value_is_owned(
     }
 }
 
+/// For a blocked target that carries a shell expansion: true when it still
+/// names a literal owner this guard can read, and the allowlist rejects that
+/// owner. Only then does the block say "targets repo you don't own" rather
+/// than "cannot resolve" (#757, #1491). `host` and `repo` are the target as
+/// [`flag_value_resolution`] split it. Both block arms use it, after their own
+/// test for an expansion: the loop's `-R` arm
+/// ([`loop_target_is_unresolvable`]) and [`judge_resolution`].
+///
+/// All three must hold:
+///
+/// - The host has no expansion: no `$` or backtick, and no `*`, which stands
+///   for a command substitution in the globbed reading (`GH_HOST=$(cat h)`
+///   reads as the host `*`). The [`UNRESOLVED_GH_HOST`] stand-in counts as
+///   read, though its text holds a `$`: its block names the host fix.
+/// - The owner is non-empty and in GitHub's owner charset (`[A-Za-z0-9-]`).
+///   A `.` or `:` there means a host or scheme landed in the owner slot,
+///   because a variable held the whole `owner/repo` (`github.com/$slug`, or
+///   `https://github.com/$slug`, which gh cannot split). A quote, paren, `$`
+///   or backtick means quoting or an expansion reached it (a `/` inside
+///   `$(… | cut -d/ -f4)/$r` leaves ` -f4)` there).
+/// - The allowlist rejects the target. An allowed owner (`cameronsjo/$r`)
+///   is not a repo you don't own.
+///
+/// Message only: every caller has already decided to block.
+fn names_literal_unowned_owner(
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> bool {
+    let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
+    let host_is_read =
+        host == UNRESOLVED_GH_HOST || !(repo_has_unexpanded_expansion(host) || host.contains('*'));
+    host_is_read
+        && !owner.is_empty()
+        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !is_allowed(host, repo, allowed_owners, allowed_repos)
+}
+
 /// True when a looped `-R` value the ownership check rejected is
 /// unresolvable rather than unowned, so the loop gate says "cannot resolve"
 /// and not "targets repo you don't own".
 ///
-/// It reads the OWNER part only, as [`judge_resolution`] does for a single
-/// command: `evil/$r` has a literal owner the allowlist can judge, so it is
-/// unowned; `$o/$r` and `"$r"` have an owner only the shell knows. The loop
-/// value is the raw `-R` text, so quotes are trimmed before it is split (a
-/// bare `split_once('/')` on `"https://github.com/$o/$r"` would read `https:`
-/// as the owner) and a host is read the way gh reads it.
-///
-/// A literal owner on the allowlist (`"cameronsjo/$r"`) stays unresolvable:
-/// the loop gate rejected it only because the quotes were still on, and "you
-/// don't own" would be false. Message only: the caller has already decided to
-/// block.
+/// Only a value with an expansion in it can be unresolvable; one without
+/// keeps the unowned message (#1337). With one, the value is
+/// unresolvable unless [`names_literal_unowned_owner`] reads a literal owner
+/// the allowlist rejects. The loop value is the raw `-R` text, so both quote
+/// kinds are dropped before gh's split (`'cameronsjo/$r'` and
+/// `"cameronsjo"/"$r"` name the allowed owner `cameronsjo`).
 fn loop_target_is_unresolvable(
     value: &str,
     dh: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
-    match flag_value_resolution(value.trim_matches('"'), dh) {
+    match flag_value_resolution(&value.replace(['"', '\''], ""), dh) {
         RepoResolution::Resolved { host, repo } => {
-            let owner = repo.split_once('/').map_or(repo.as_str(), |(o, _)| o);
-            repo_has_unexpanded_expansion(owner)
-                || is_allowed(&host, &repo, allowed_owners, allowed_repos)
+            repo_has_unexpanded_expansion(value)
+                && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos)
         }
-        _ => repo_has_unexpanded_expansion(value),
+        // A value with a `$` or backtick always resolves, so this one has
+        // no expansion to be unresolvable.
+        _ => false,
     }
 }
 
@@ -3847,16 +3882,16 @@ fn judge_resolution(
         RepoResolution::Resolved { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 None
-            } else if repo_has_unexpanded_expansion(
-                repo.split_once('/')
-                    .map_or(repo.as_str(), |(owner, _)| owner),
-            ) {
-                // The owner is a shell expansion this guard never sees the
-                // value of, so it is UNRESOLVABLE, not unowned — and the
-                // unowned template's `-R <owner>/<name>` fix would graft an
-                // owner the caller never chose onto `$1` (#757). A literal
-                // owner with an expanded name (`evil/$r`) is judged by its
-                // owner and gets the unowned message (#1491).
+            } else if repo_has_unexpanded_expansion(&repo)
+                && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos)
+            {
+                // The target holds a shell expansion this guard never sees the
+                // value of, and no literal owner can be read past it, so it is
+                // UNRESOLVABLE, not unowned — and the unowned template's
+                // `-R <owner>/<name>` fix would graft an owner the caller never
+                // chose onto `$1` (#757). A literal owner with an expanded
+                // name (`evil/$r`) is judged by its owner and gets the unowned
+                // message (#1491).
                 let literal = target_spelling(segment, "owner/repo");
                 Some(CheckResult::block_structured(
                     format!(
@@ -4040,8 +4075,8 @@ impl Check for GhWriteGuard {
                 // runs is unresolvable, not unowned. When every blocked target
                 // is such an expansion, say that and name it, as the
                 // single-command arm does (#757); the verdict is unchanged.
-                // As there, only the owner part counts: `evil/$r` is unowned
-                // (#1491).
+                // As there, a literal owner the allowlist rejects is unowned
+                // (`evil/$r`, #1491); see [`names_literal_unowned_owner`].
                 if !unowned_write_targets.is_empty()
                     && unowned_write_targets.iter().all(|t| {
                         loop_target_is_unresolvable(t, &dh, &allowed_owners, &allowed_repos)
@@ -4090,13 +4125,25 @@ impl Check for GhWriteGuard {
                         .chain(allowed_repos.iter())
                         .map(|e| e.to_string())
                         .collect();
+                    // Name only the targets judged unowned. An unresolvable
+                    // one beside them (`"$o/$r"`, the allowed
+                    // `"cameronsjo/$r"`) is no repo you don't own. At least
+                    // one is left: the arm above took the all-unresolvable
+                    // case.
+                    let found: Vec<&str> = unowned_write_targets
+                        .iter()
+                        .copied()
+                        .filter(|t| {
+                            !loop_target_is_unresolvable(t, &dh, &allowed_owners, &allowed_repos)
+                        })
+                        .collect();
                     return CheckResult::block(format!(
                         "🚫 git-guardrails: gh loop targets repo you don't own\n   \
                          Found: {}\n   \
                          Allowed: {}\n   \
                          Fix: use `-R owner/repo` to target an owned repo (`gh api` has no -R: name \
                          an owned repo in its literal `repos/<owner>/<repo>/…` path)",
-                        unowned_write_targets.join(", "),
+                        found.join(", "),
                         all_entries.join(" "),
                     ));
                 }
@@ -9438,11 +9485,11 @@ mod tests {
     }
 
     #[test]
-    fn looped_dash_r_reads_only_the_owner_for_the_expansion_message() {
+    fn looped_dash_r_is_unowned_only_with_a_literal_owner() {
         // The loop's `-R` value is the raw text, quotes and host included.
-        // Only an owner the shell expands is unresolvable. A literal owner is
-        // judged by the allowlist, as the single-command arm judges it
-        // (#1491), so `evil/$r` is an unowned target in a loop too.
+        // With an expansion in it, the block says "you don't own" only when a
+        // literal owner can be read past it and the allowlist rejects that
+        // owner, as the single-command arm judges it (#1491).
         // Each entry is one `gh issue create` per element, in one loop body.
         let loop_of = |flags: &[&str]| {
             let body: Vec<String> = flags
@@ -9451,18 +9498,36 @@ mod tests {
                 .collect();
             format!("for r in a b; do {}; done", body.join("; "))
         };
-        let unowned: [&[&str]; 8] = [
-            &[r#"-R "evil/$r""#],
-            &["-R evil/$r"],
-            &[r#"--repo "evil/$r""#],
-            &[r#"-R "github.com/evil/$r""#],
-            &[r#"-R "https://github.com/evil/$r""#],
-            // One literal unowned owner decides the message for the loop.
-            &[r#"-R "evil/$r""#, r#"-R "$o/$r""#],
-            &[r#"-R "$o/$r""#, r#"-R "evil/$r""#],
-            &[r#"-R "evil/$r""#, r#"-R "$r""#],
+        // (flags, the `Found:` list the block names)
+        let unowned: [(&[&str], &str); 13] = [
+            (&[r#"-R "evil/$r""#], r#""evil/$r""#),
+            (&["-R evil/$r"], "evil/$r"),
+            (&[r#"--repo "evil/$r""#], r#""evil/$r""#),
+            (&[r#"-R "github.com/evil/$r""#], r#""github.com/evil/$r""#),
+            (
+                &[r#"-R "https://github.com/evil/$r""#],
+                r#""https://github.com/evil/$r""#,
+            ),
+            (
+                &[r#"-R "git@github.com:evil/$r.git""#],
+                r#""git@github.com:evil/$r.git""#,
+            ),
+            // Both quote kinds come off before the owner is read.
+            (&["-R 'evil/$r'"], "'evil/$r'"),
+            (&[r#"-R "evil"/"$r""#], r#""evil"/"$r""#),
+            // No expansion at all: the unowned message, as before.
+            (&[r#"-R "evil""#], r#""evil""#),
+            // One literal unowned owner decides the message for the loop, and
+            // only it is named: the others are not repos you don't own.
+            (&[r#"-R "evil/$r""#, r#"-R "$o/$r""#], r#""evil/$r""#),
+            (&[r#"-R "$o/$r""#, r#"-R "evil/$r""#], r#""evil/$r""#),
+            (&[r#"-R "evil/$r""#, r#"-R "$r""#], r#""evil/$r""#),
+            (
+                &[r#"-R "cameronsjo/$r""#, r#"-R "evil/$r""#],
+                r#""evil/$r""#,
+            ),
         ];
-        for flags in unowned {
+        for (flags, found) in unowned {
             for cwd in ["/tmp", OWNED_DIR] {
                 let result = run_1491(&loop_of(flags), cwd, false);
                 assert!(blocks(&result), "{flags:?} in {cwd}");
@@ -9471,22 +9536,38 @@ mod tests {
                     message.contains("gh loop targets repo you don't own"),
                     "{flags:?} in {cwd}: {message}"
                 );
+                assert!(
+                    message.contains(&format!("Found: {found}\n")),
+                    "{flags:?} in {cwd}: {message}"
+                );
                 assert!(!message.contains("cannot resolve"), "{flags:?}: {message}");
             }
         }
-        // An owner only the shell knows stays unresolvable, whatever host or
-        // scheme comes first. An allowed literal owner does too: the loop gate
-        // rejects `"cameronsjo/$r"` only because its quotes are still on, so
-        // "you don't own" would be false.
-        let unresolvable: [&[&str]; 11] = [
+        // Otherwise an expanded value stays unresolvable: an owner only the
+        // shell knows, behind any host or scheme; a variable holding the whole
+        // `owner/repo` behind a host, which leaves a host or scheme in the
+        // owner slot; a variable host; a `/` inside a substitution; and an
+        // allowed owner, which the loop gate rejects only because its quotes
+        // are still on, so "you don't own" would be false.
+        let unresolvable: [&[&str]; 21] = [
             &[r#"-R "$r""#],
+            &[r#"-R "/$r""#],
             &[r#"-R "$o/$r""#],
             &[r#"-R "${o}/${r}""#],
             &[r#"-R "github.com/$o/$r""#],
             &[r#"-R "https://github.com/$o/$r""#],
             &[r#"-R "https://evil.example/$o/$r""#],
             &[r#"-R "$o-x/$r""#],
+            &[r#"-R "github.com/$slug""#],
+            &[r#"-R "https://github.com/$slug""#],
+            &[r#"-R "https://github.com/${slug}.git""#],
+            &[r#"-R "$h/cameronsjo/$r""#],
+            &[r#"-R "$h/evil/$r""#],
+            &[r#"-R "https://$h/cameronsjo/$r""#],
+            &[r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#],
             &[r#"-R "cameronsjo/$r""#],
+            &["-R 'cameronsjo/$r'"],
+            &[r#"-R "cameronsjo"/"$r""#],
             &[r#"-R "https://github.com/cameronsjo/$r""#],
             &[r#"-R "cameronsjo/$r""#, r#"-R "$o/$r""#],
             &[r#"-R "$o/$r""#, r#"-R "$r""#],
@@ -9505,6 +9586,127 @@ mod tests {
                 assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{flags:?}");
             }
         }
+        // A quoted literal has no expansion, so it keeps the unowned message
+        // and never says it cannot resolve a shell parameter. That it blocks
+        // at all is #1504.
+        for cwd in ["/tmp", OWNED_DIR] {
+            let result = run_1491(&loop_of(&[r#"-R "cameronsjo/tool""#]), cwd, false);
+            assert!(blocks(&result), "{cwd}");
+            let message = msg(&result);
+            assert!(
+                message.contains("Found: \"cameronsjo/tool\"\n"),
+                "{cwd}: {message}"
+            );
+            assert!(!message.contains("cannot resolve"), "{cwd}: {message}");
+        }
+    }
+
+    #[test]
+    fn single_dash_r_is_unowned_only_with_a_literal_owner() {
+        // The same rule outside a loop. There the value reaches the check
+        // without its quotes, so `'cameronsjo/$r'` names the allowed owner
+        // and allows.
+        let single = |flag: &str| format!("gh issue create {flag} --title t --body b");
+        for flag in [
+            r#"-R "evil/$r""#,
+            "-R evil/$r",
+            r#"--repo "evil/$r""#,
+            r#"-R "github.com/evil/$r""#,
+            r#"-R "https://github.com/evil/$r""#,
+            r#"-R "git@github.com:evil/$r.git""#,
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(&single(flag), cwd, false);
+                assert!(blocks(&result), "{flag} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh write targets repo you don't own"),
+                    "{flag} in {cwd}: {message}"
+                );
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{flag}");
+                assert_eq!(meta.fix, "-R cameronsjo/$r", "{flag}");
+            }
+        }
+        // No literal owner to name, so no `Fix: -R cameronsjo/…` that drops
+        // the host or reads `https:` as the owner.
+        for flag in [
+            r#"-R "$r""#,
+            r#"-R "$o/$r""#,
+            r#"-R "github.com/$o/$r""#,
+            r#"-R "https://github.com/$o/$r""#,
+            r#"-R "github.com/$slug""#,
+            r#"-R "https://github.com/$slug""#,
+            r#"-R "https://github.com/${slug}.git""#,
+            r#"-R "$h/cameronsjo/$r""#,
+            r#"-R "$h/evil/$r""#,
+            r#"-R "https://$h/cameronsjo/$r""#,
+            r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#,
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(&single(flag), cwd, false);
+                assert!(blocks(&result), "{flag} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("Cannot determine target repo"),
+                    "{flag} in {cwd}: {message}"
+                );
+                assert!(!message.contains("don't own"), "{flag}: {message}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{flag}");
+                assert!(!meta.fix.contains("cameronsjo/"), "{flag}: {}", meta.fix);
+            }
+        }
+        for flag in [
+            "-R 'cameronsjo/$r'",
+            r#"-R "cameronsjo"/"$r""#,
+            r#"-R "cameronsjo/$r""#,
+        ] {
+            let result = run_1491(&single(flag), "/tmp", false);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{flag}: {:?}",
+                result.message
+            );
+        }
+        // A `GH_HOST` from a command substitution reads as the host `*` in the
+        // globbed reading: no host to judge the owner on.
+        let result = run_1491(
+            &format!(
+                "export GH_HOST=$(cat h); {}",
+                single(r#"-R "cameronsjo/$r""#)
+            ),
+            "/tmp",
+            false,
+        );
+        assert!(blocks(&result), "{:?}", result.message);
+        assert!(
+            msg(&result).contains("Cannot determine target repo"),
+            "{}",
+            msg(&result)
+        );
+        assert!(!msg(&result).contains("don't own"), "{}", msg(&result));
+        // A `GH_HOST` this guard cannot read lands on the stand-in host. Its
+        // text holds a `$`, but it is no expansion in the value: the literal
+        // owner is judged there, and the fix names the host (#548).
+        let result = run_1491(
+            &format!("export GH_HOST=$h; {}", single(r#"-R "cameronsjo/$r""#)),
+            "/tmp",
+            false,
+        );
+        assert!(blocks(&result), "{:?}", result.message);
+        assert!(
+            msg(&result).contains(UNRESOLVED_GH_HOST),
+            "{}",
+            msg(&result)
+        );
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        assert_eq!(
+            meta.fix,
+            "name the host on the gh command itself (--hostname <host>)"
+        );
     }
 
     #[test]
