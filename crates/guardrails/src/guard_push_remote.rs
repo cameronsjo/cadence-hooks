@@ -1131,11 +1131,12 @@ const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes i
      cannot read, or took too long to parse\n   \
      Verify: shorten the command, or run each push as its own command";
 
-/// The nudge for a push with no remote, or one only the shell resolves, in a
-/// command whose loop the loop parser could not read.
+/// The nudge for a command whose loop the loop parser could not read, when a
+/// push in the command has no remote or one only the shell resolves. It reads
+/// every push in the command, not only those in the loop, so it says so.
 const UNPARSED_LOOP_NUDGE: &str = "⚠️  git-guardrails: git push in a command with a loop the \
      guard could not parse — each push it read was checked on its own target\n   \
-     Verify: give every push in the loop an explicit remote, e.g. `git push origin main`";
+     Verify: give every push in the command an explicit remote, e.g. `git push origin main`";
 
 /// Whether a push names no repository, or one only the shell resolves (a
 /// `$` or backtick), so its remote is the tracking one or decided at run

@@ -552,7 +552,7 @@ fn padding_past_the_byte_cap_still_judges_each_push() {
         (
             "for b in main feat; do git push; done",
             0,
-            "git push in a command with a loop the guard could not parse",
+            "give every push in the command an explicit remote",
         ),
         // Every push names `origin`: no nudge.
         ("for b in main feat; do git push origin $b; done", 0, ""),
