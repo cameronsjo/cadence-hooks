@@ -8,6 +8,7 @@ Thank you for your interest in cadence-hooks. This project is currently maintain
 git clone https://github.com/cameronsjo/cadence-hooks.git
 cd cadence-hooks
 make ci    # Run fmt check, clippy, and tests
+scripts/openspec.sh validate --all --strict --no-interactive   # specs; needs Node 20.19+ or 22.13+
 ```
 
 Requires Rust 2024 edition (1.85+).
@@ -61,7 +62,7 @@ it). Build a release binary with
 
 ## Development Workflow
 
-1. Create a feature branch from `main`
+1. Create a feature branch from `main`. A behavior change starts as an OpenSpec change under `openspec/changes/` (see CLAUDE.md, "Specs and changes")
 2. Write tests first — each check should have both happy-path and edge-case coverage
 3. Run `make ci` before pushing
 4. Open a PR against `main`
@@ -101,6 +102,7 @@ stable with `cargo uninstall cadence-hooks` followed by
    for loggers). The `registry_matches_clap_dispatch` test fails until the
    registry and dispatch agree
 6. Write tests covering: allow, warn, block, edge cases, and bypass scenarios
+7. Add the hook's requirements to its capability spec in `openspec/specs/` through an OpenSpec change
 
 New hooks inherit the interactive-terminal guard and `cadence-hooks try`
 support automatically — both come from `run_check_from_stdin` /

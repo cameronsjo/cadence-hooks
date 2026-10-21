@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
+
 ### Fixed
 
 - **`cadence-hooks try` reads a payload piped to stdin.** It ignored stdin and always ran the generated sample unless `--payload FILE` was given, so `… | cadence-hooks try <ns> <hook>` tested `git status` and could report ALLOW for a payload that blocks. A piped payload now runs; `--payload` still wins, and empty stdin (`/dev/null`) runs the sample as before. Stdin that sends nothing for 2 s runs the sample with a warning; once bytes arrive, `try` reads to the end however slow the producer. Stdin that is not UTF-8 exits 1.
