@@ -24,8 +24,6 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 fn run(bypass_value: Option<&str>, disable_value: Option<&str>) -> Output {
     let mut cmd = support::cadence_hooks();
     cmd.args(["guardrails", "enforcement-status"])
-        .env_remove("CADENCE_BYPASS")
-        .env_remove("CADENCE_DISABLE")
         .env("CADENCE_METRICS_DIR", scratch_metrics_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

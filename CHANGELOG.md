@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
+
 ### Changed
 
 - **`guard-gh-write` counts a loop with a comment or non-ASCII text as plain.** A plain loop's literal `gh api` paths count as its targets, but any `#` or byte outside printable ASCII refused that shape. So `for n in 1 2; do gh api -X POST repos/<owner>/<repo>/issues/$n/comments -f body=x; done # ping both`, or the same loop with `body=café`, blocked from an unowned directory. That refusal worked around a comment-stripper bug that #1390 fixed. Now only `|` and `&` refuse the shape. (Part of cameronsjo/cadence-hooks#1443)
