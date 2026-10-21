@@ -6966,11 +6966,14 @@ mod tests {
         });
     }
 
-    fn owners_env_212() -> [(&'static str, Option<&'static str>); 5] {
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // CDPATH changes where a `cd` lands, so an exported one moves the
+            // directory the guard judges the write from.
+            ("CDPATH", None),
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
@@ -7045,11 +7048,14 @@ mod tests {
     // so it exercises the cwd-remote fallback the bypass relied on.
     const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-    fn owners_env() -> [(&'static str, Option<&'static str>); 5] {
+    fn owners_env() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // CDPATH changes where a `cd` lands, so an exported one moves the
+            // directory the guard judges the write from.
+            ("CDPATH", None),
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
