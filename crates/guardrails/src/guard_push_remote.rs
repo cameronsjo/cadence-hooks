@@ -1127,8 +1127,8 @@ fn judge_with_directory_nudge(input: &HookInput, walk: &PushWalk) -> CheckResult
 /// It names why the parse failed, not the chain: the chain is fine.
 const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes in a command the \
      guard could not parse — each push it read was checked on its own target\n   \
-     Cause: the command is over 12 KB, or holds a heredoc or a syntax error the parser \
-     cannot read\n   \
+     Cause: the command is over 12 KB, holds a heredoc or a syntax error the parser \
+     cannot read, or took too long to parse\n   \
      Verify: shorten the command, or run each push as its own command";
 
 /// The nudge for a push with no remote, or one only the shell resolves, in a
@@ -3333,8 +3333,8 @@ mod tests {
         );
         let chain_nudge = "⚠️  git-guardrails: several git pushes in a command the guard \
             could not parse — each push it read was checked on its own target\n   \
-            Cause: the command is over 12 KB, or holds a heredoc or a syntax error the \
-            parser cannot read\n   \
+            Cause: the command is over 12 KB, holds a heredoc or a syntax error the \
+            parser cannot read, or took too long to parse\n   \
             Verify: shorten the command, or run each push as its own command";
         with_env(&owners_only(), || {
             for (command, outcome, note) in [
