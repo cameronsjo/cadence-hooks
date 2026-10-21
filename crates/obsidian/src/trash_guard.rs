@@ -9,8 +9,9 @@
 use cadence_hooks_core::shell::{
     UNRESOLVABLE_DIR, carries_substitution, child_scripts, clobber_redirect_targets,
     command_segments, command_word, executable_tokens, executable_tokens_marked, looks_absolute,
-    peel_command_runners, redirect_operator_span, redirect_targets, segment_work_dirs,
-    skip_git_global_options, strip_verbatim_prefix, substitution_bodies, tokenize,
+    peel_command_runners, redirect_operator_span, redirect_targets, segment_scripts,
+    segment_work_dirs, skip_git_global_options, strip_verbatim_prefix, substitution_bodies,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -567,18 +568,104 @@ fn is_inert_segment(argv: &[String], segment: &str) -> bool {
         && redirect_targets(segment).is_empty()
 }
 
+/// Verbs that run a command string they were handed in a child of their own and
+/// delete nothing themselves: a shell's `-c`, `env -S`, `script -c`, `flock`,
+/// `watch`, and `su`/`runuser`. These are the wrappers core reads a script out
+/// of ([`segment_scripts`]) that are not also a deletion or a re-pointing
+/// shape: `find -exec`, `git`, `tmux`, `eval` and `trap` are left out.
+const SCRIPT_WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "env", "script", "flock", "watch", "su", "runuser",
+];
+
+/// The segments of the command being judged, with the lookup
+/// [`is_script_wrapper`] asks of them, built on first use.
+struct ListedSegments<'a> {
+    segments: &'a [String],
+    set: std::cell::OnceCell<std::collections::HashSet<&'a str>>,
+}
+
+impl<'a> ListedSegments<'a> {
+    fn new(segments: &'a [String]) -> Self {
+        ListedSegments {
+            segments,
+            set: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn contains(&self, segment: &str) -> bool {
+        self.set
+            .get_or_init(|| self.segments.iter().map(String::as_str).collect())
+            .contains(segment)
+    }
+}
+
+/// Is this non-deleting segment a wrapper that does no more than run the script
+/// core read out of it (cadence-hooks#1443)? [`command_segments`] lists that
+/// script's own segments beside the wrapper's, so each is judged on its own in
+/// the same walk and the wrapper adds nothing to judge: `flock /tmp/l rm
+/// /tmp/x` is `rm /tmp/x`, and `sh -c 'rm note.md'` is `rm note.md`.
+///
+/// That holds only while the list really holds them, so each script is read
+/// afresh and every segment of it must already be listed. Past the nesting
+/// [`command_segments`] expands, the deepest commands are not listed (`flock a
+/// flock b flock c flock d flock e rm note.md`), and a variable the command
+/// assigned first is listed resolved (`X=note.md; sh -c 'rm $X'`): both keep
+/// the verdict. So does a wrapper core read no script out of (`sh script.sh`,
+/// `watch` with no command, an option it could not classify), and a wrapper
+/// behind `xargs`, whose stdin words land on the end of the command the
+/// wrapper runs.
+fn is_script_wrapper(
+    tokens: &[String],
+    argv: &[String],
+    segment: &str,
+    listed: &ListedSegments,
+) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    if !SCRIPT_WRAPPERS.contains(&command_word(first).as_ref()) {
+        return false;
+    }
+    let runners = &tokens[..tokens.len() - argv.len()];
+    if runners.iter().any(|t| command_word(t) == "xargs") {
+        return false;
+    }
+    let scripts = segment_scripts(segment);
+    !scripts.is_empty()
+        && scripts.iter().all(|script| {
+            rescan(script)
+                && command_segments(script)
+                    .iter()
+                    .all(|inner| listed.contains(inner))
+        })
+}
+
+/// Could this text move the shell's directory? A substring test, so a path
+/// that merely contains `cd` also reads as a move, which keeps a verdict and
+/// never lifts one. The directory walk places a wrapper's whole script where
+/// the wrapper starts, so a `cd` inside the script would put its deletions
+/// somewhere the walk does not look: `cd /tmp && sh -c 'cd /vault; rm x.md'`.
+fn may_move_directory(text: &str) -> bool {
+    ["cd", "pushd", "popd"]
+        .iter()
+        .any(|word| text.contains(word))
+}
+
 /// With the shell standing inside the vault, is every deletion the command
 /// makes provably aimed outside it (cadence-hooks#839)? The cwd names where
 /// the shell stands, not what `rm` is handed, so `rm /tmp/scratch.py` issued
 /// from the vault is not the trash guard's business.
 ///
 /// Only a plain deletion verb (`rm`, `unlink`, `shred`, `truncate`) at a
-/// segment head is judged operand by operand. Every other destructive shape
-/// keeps the cwd verdict: `git rm` (pathspecs, `--pathspec-from-file`),
-/// `xargs` (operands arrive on stdin), and every command that sits beside the
-/// deletion unless it is inert ([`is_inert_segment`]) — so `find`, `eval`, a
-/// shell wrapper, and anything that could re-point an operand (`ln`, `mv`,
-/// `cd`) keep the block. Options are skipped only before the
+/// segment head is judged operand by operand, and so is the deletion a script
+/// wrapper runs (`sh -c 'rm /tmp/x'`, `flock /tmp/l rm /tmp/x`,
+/// [`is_script_wrapper`]): its script is a segment of its own. Every other
+/// destructive shape keeps the cwd verdict: `git rm` (pathspecs,
+/// `--pathspec-from-file`), `xargs` (operands arrive on stdin), and every
+/// command that sits beside the deletion unless it is inert
+/// ([`is_inert_segment`]) — so `find`, `eval`, a wrapper core read no script
+/// out of, and anything that could re-point an operand (`ln`, `mv`, `cd`) keep
+/// the block. Options are skipped only before the
 /// first operand or `--`, so a `-f` a strict-POSIX `rm` would treat as a file
 /// is judged as one. A redirection is skipped only when its operator is
 /// unquoted — a quoted `'>note.md'` is a file `rm` deletes.
@@ -590,16 +677,21 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
     if segments.len() > MAX_JUDGED_SEGMENTS {
         return false;
     }
+    let listed = ListedSegments::new(&segments);
     let mut judged = 0;
-    for segment in segments {
-        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+    for segment in &segments {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
         let argv = peel_command_runners(&tokens);
         if !head_deletes(argv) {
             // Every other segment must be provably inert. The physical check
             // reads the disk at hook time, so a sibling that reshapes it first
             // — `ln -s <vault> /tmp/l; rm -rf /tmp/l/`, a `mv`, a `cd` — would
-            // walk an operand into the vault after the check passed it.
-            if !is_inert_segment(argv, &segment) {
+            // walk an operand into the vault after the check passed it. A
+            // script wrapper is its script's segments, judged in this same
+            // walk, so it is passed over.
+            if !is_inert_segment(argv, segment)
+                && !is_script_wrapper(&tokens, argv, segment, &listed)
+            {
                 return false;
             }
             continue;
@@ -649,8 +741,9 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// The [`deletions_all_outside_vault`] rules hold otherwise: only a plain
 /// deletion verb at a segment head is judged (not `git rm`, `xargs`,
 /// `find`), every operand must pass [`operand_outside_vault`] as the path it
-/// lands on, and every other segment must be a directory move or inert. A
-/// deletion the walk leaves in `cwd`, or cannot place, keeps the block.
+/// lands on, and every other segment must be a directory move, inert, or a
+/// script wrapper ([`is_script_wrapper`]). A deletion the walk leaves in
+/// `cwd`, or cannot place, keeps the block.
 fn placed_deletions_all_outside_vault(
     command: &str,
     cwd: &str,
@@ -665,6 +758,7 @@ fn placed_deletions_all_outside_vault(
     if segments.len() > MAX_JUDGED_SEGMENTS {
         return false;
     }
+    let listed = ListedSegments::new(&segments);
     for segment in segments.iter() {
         let tokens = executable_tokens(segment);
         let argv = peel_command_runners(&tokens);
@@ -679,6 +773,7 @@ fn placed_deletions_all_outside_vault(
             }
         } else if !matches!(verb.as_ref(), "cd" | "pushd" | "popd")
             && !is_inert_segment(argv, segment)
+            && !(is_script_wrapper(&tokens, argv, segment, &listed) && !may_move_directory(segment))
         {
             return false;
         }
@@ -1635,8 +1730,9 @@ mod tests {
             ("eval rm /tmp/a", Block),
             ("sh -c 'eval rm /tmp/a'", Block),
             (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
-            // A wrapper is not inert, whatever its script says.
-            ("sh -c 'rm /tmp/a'", Block),
+            // A script wrapper is its script's segments, judged like a bare
+            // deletion (cameronsjo/cadence-hooks#1443).
+            ("sh -c 'rm /tmp/a'", Allow),
             ("sh -c 'rm note.md'", Block),
             ("bash -c 'rm \"$1\"' _ note.md", Block),
             ("bash -c 'cd /tmp && rm a'", Block),
@@ -1671,6 +1767,153 @@ mod tests {
         let result =
             check_destructive_in_vault("rm /tmp/a", "/vault/notes", "/vault", &FakeFs::default());
         assert_eq!(result.outcome, Allow);
+    }
+
+    /// cameronsjo/cadence-hooks#1443: from a vault cwd, a deletion a script
+    /// wrapper runs is judged operand by operand, as the bare one is. Each
+    /// wrapper spelling takes the same deletions: one aimed outside the vault
+    /// allows, one the guard reads as aimed into it (a vault path, a relative
+    /// name, a mix, an operand it cannot place) still blocks.
+    #[test]
+    fn a_deletion_behind_a_wrapper_is_judged_like_a_bare_one() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let wrappers = [
+            "flock /tmp/l {}",
+            "script -q -c '{}' /dev/null",
+            "script -q -t -c '{}' /dev/null",
+            "sh -c '{}'",
+            "bash -c '{}'",
+            "watch -x {}",
+            "runuser -u app -- {}",
+            "env -S 'A=1' {}",
+            "env -S 'A=1 {}'",
+            "su -c '{}'",
+            "sudo sh -c '{}'",
+            "flock /tmp/l sh -c '{}'",
+        ];
+        let deletions: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("rm -f /tmp/x", Allow),
+            ("rm -rf /tmp/build /home/me/out", Allow),
+            ("unlink /tmp/x", Allow),
+            ("truncate -s0 /tmp/log", Allow),
+            ("rm -f /vault/note.md", Block),
+            ("rm -rf /vault", Block),
+            ("rm -f note.md", Block),
+            ("rm -f ./note.md", Block),
+            ("rm -f /tmp/x note.md", Block),
+            ("rm -f /tmp/x /vault/note.md", Block),
+            ("rm -f /tmp/../vault/note.md", Block),
+            ("rm -f /tmp/$X", Block),
+            ("rm -f /tmp/*", Block),
+            ("rm -rf /", Block),
+        ];
+        let fs = FakeFs::with(&["/tmp"]);
+        for wrapper in wrappers {
+            for &(deletion, expected) in deletions {
+                let command = wrapper.replace("{}", deletion);
+                for cwd in ["/vault", "/vault/notes"] {
+                    let result = check_destructive_in_vault(&command, cwd, "/vault", &fs);
+                    assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
+                }
+            }
+        }
+        // The same wrappers from outside the vault were already judged by the
+        // operands; they stay so.
+        for wrapper in wrappers {
+            for (deletion, expected) in [("rm -f /tmp/x", Allow), ("rm -f /vault/note.md", Block)] {
+                let command = wrapper.replace("{}", deletion);
+                let result = check_destructive_in_vault(&command, "/home/me", "/vault", &fs);
+                assert_eq!(result.outcome, expected, "cwd=/home/me: {command}");
+            }
+        }
+
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // A wrapper in a chain, a subshell, or beside other deletions.
+            ("sh -c 'rm /tmp/a' && flock /tmp/l rm /tmp/b", Allow),
+            ("sh -c 'rm /tmp/a'; rm /tmp/b", Allow),
+            ("(sh -c 'rm /tmp/x')", Allow),
+            ("sh -c 'rm /tmp/a; rm /tmp/b'", Allow),
+            ("sh -c 'rm /tmp/a; rm note.md'", Block),
+            ("sh -c 'rm /tmp/a' && rm note.md", Block),
+            ("flock /tmp/l rm /tmp/a; sh -c 'rm note.md'", Block),
+            // Wrappers nest, and past the depth core expands they still block.
+            ("sh -c \"sh -c 'rm /tmp/x'\"", Allow),
+            ("sh -c \"sh -c 'rm note.md'\"", Block),
+            ("flock /tmp/l sh -c 'flock /tmp/m rm /tmp/x'", Allow),
+            ("flock /tmp/l sh -c 'flock /tmp/m rm note.md'", Block),
+            // Past the nesting the walk expands, the deepest command is not
+            // listed, so a wrapper above it keeps the verdict.
+            (
+                "rm /tmp/a; flock /tmp/a flock /tmp/b flock /tmp/c flock /tmp/d flock /tmp/e rm note.md",
+                Block,
+            ),
+            (
+                "rm /tmp/a; sh -c \"sh -c \\\"sh -c 'sh -c \\\\\\\"rm note.md\\\\\\\"'\\\"\"",
+                Block,
+            ),
+            // A variable assigned first is listed resolved, not as written.
+            ("X=note.md; sh -c 'rm $X'", Block),
+            ("X=/tmp/a Y=note.md; sh -c 'rm $Y'", Block),
+            (
+                "sh -c \"sh -c \\\"sh -c 'sh -c \\\\\\\"rm note.md\\\\\\\"'\\\"\"",
+                Block,
+            ),
+            // A positional parameter the wrapper was handed is not a path.
+            ("bash -c 'rm \"$1\"' _ /tmp/x", Block),
+            ("bash -c 'rm -f \"$@\"' _ /tmp/x", Block),
+            ("flock /tmp/l sh -c 'rm $0' /tmp/x", Block),
+            // A sibling that could re-point an operand keeps the block, ahead
+            // of the wrapper or inside it.
+            ("ln -s /vault /tmp/l; sh -c 'rm -rf /tmp/l/note.md'", Block),
+            ("ln -s /vault /tmp/l; flock /tmp/k rm /tmp/l/note.md", Block),
+            ("ln -s /vault /tmp/l && watch -x rm /tmp/l/note.md", Block),
+            ("mv /vault/note.md /tmp/y; sh -c 'rm /tmp/y'", Block),
+            ("cp -r /vault /tmp/v; runuser -u app -- rm -r /tmp/v", Block),
+            ("cd /tmp && sh -c 'rm /tmp/y'", Block),
+            ("sh -c 'ln -s /vault /tmp/l; rm -rf /tmp/l/note.md'", Block),
+            ("sh -c 'mv /vault/note.md /tmp/y; rm /tmp/y'", Block),
+            ("sh -c 'cd /tmp && rm /tmp/y'", Block),
+            ("sh -c 'cd /vault; rm /tmp/y'", Block),
+            // A wrapper's substitution runs in the parent, and is judged.
+            ("sh -c 'true' \"$(rm note.md)\"", Block),
+            ("sh -c 'rm /tmp/a' \"$(rm note.md)\"", Block),
+            ("flock /tmp/l rm /tmp/a $(echo note.md)", Block),
+            // Shapes that are never judged operand by operand keep the cwd
+            // verdict inside a wrapper, or behind one.
+            ("sh -c 'git rm /tmp/a'", Block),
+            ("flock /tmp/l git rm /tmp/a", Block),
+            ("sh -c 'find /tmp -delete'", Block),
+            ("flock /tmp/l find /tmp -delete", Block),
+            (r"sh -c 'find /tmp -exec rm {} \;'", Block),
+            ("sh -c 'eval rm /tmp/a'", Block),
+            ("watch -x eval rm /tmp/a", Block),
+            ("echo /vault/note.md | xargs flock /tmp/l rm", Block),
+            ("xargs sh -c 'rm /tmp/a'", Block),
+            (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
+            (r"find /tmp -delete -exec flock /tmp/l rm /tmp/a \;", Block),
+            // A wrapper core read no script out of keeps the verdict.
+            ("rm /tmp/a; sh clean.sh", Block),
+            ("rm /tmp/a; bash ./clean.sh /tmp/b", Block),
+            ("rm /tmp/a; watch", Block),
+            ("rm /tmp/a; nice --bogus sh -c 'rm /tmp/b'", Block),
+            // Only the wrappers core reads a script out of are passed over.
+            ("rm /tmp/a; ssh host rm /tmp/b", Block),
+            ("rm /tmp/a; my_wrapper rm /tmp/b", Block),
+            ("tmux new-session 'rm /tmp/a'", Block),
+        ];
+        for &(command, expected) in cases {
+            let result = check_destructive_in_vault(command, "/vault", "/vault", &fs);
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
+        }
+        // A redirect on the wrapper still truncates an existing vault file.
+        let fs = FakeFs::with(&["/tmp", "/vault/note.md"]);
+        for command in [
+            "sh -c 'rm /tmp/a' > note.md",
+            "flock /tmp/l rm /tmp/a >| note.md",
+        ] {
+            let result = check_destructive_in_vault(command, "/vault", "/vault", &fs);
+            assert_eq!(result.outcome, Block, "{command}");
+        }
     }
 
     #[test]
@@ -2051,6 +2294,67 @@ mod tests {
             (vault, "cd /tmp && ln -s $HOME/vault l && rm -rf l/", Block),
             (vault, "echo $(cd /tmp; rm -f a)", Allow),
             (vault, "echo $(cd /tmp; ls); rm -f a", Block),
+            // A script wrapper runs where the `cd` put it, and is judged
+            // there like a bare deletion (cameronsjo/cadence-hooks#1443).
+            (vault, "cd /tmp && sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && flock /tmp/l rm -rf build", Allow),
+            (vault, "cd /tmp && watch -x rm -f a b", Allow),
+            (
+                vault,
+                "cd $HOME/proj && runuser -u app -- rm -rf build",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build'; sh -c 'rm -f x.md'",
+                Allow,
+            ),
+            (vault, "cd /tmp && sh -c 'rm -rf *'", Block),
+            (vault, "cd /tmp && sh -c 'rm -rf ../vault/x'", Block),
+            (vault, "cd Runbooks && sh -c 'rm x.md'", Block),
+            // A `cd` inside the wrapper moves it off the directory the walk
+            // placed it in.
+            (vault, "cd /tmp && sh -c 'cd -; rm x.md'", Block),
+            (vault, "cd /tmp && sh -c 'cd /vault; rm x.md'", Block),
+            (
+                vault,
+                "cd /tmp && sh -c 'cd $OBSIDIAN_VAULT && rm x.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && bash -c 'pushd /vault; rm x.md'", Block),
+            (
+                vault,
+                "cd /tmp && flock /tmp/l sh -c 'cd /vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -S 'A=1' sh -c 'cd /vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build; cd /vault; rm x.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && sh -c 'find . -delete'", Block),
+            (vault, "cd /tmp && flock /tmp/l git rm -r x", Block),
+            (vault, "cd /tmp && xargs sh -c 'rm a'", Block),
+            (
+                vault,
+                "cd /tmp && sh -c 'ln -s $HOME/vault l && rm -rf l/'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && ln -s $HOME/vault l && sh -c 'rm -rf l/'",
+                Block,
+            ),
+            (
+                vault,
+                "sh -c 'rm -f x.md'; cd /tmp && sh -c 'rm -rf build'",
+                Block,
+            ),
             // A `cd` that fails leaves the deletion where the shell started:
             // into a directory that is not there, or with a `||` that runs
             // the deletion when it fails.
