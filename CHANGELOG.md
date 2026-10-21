@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`guard-gh-write` counts a loop with a comment or non-ASCII text as plain.** A plain loop's literal `gh api` paths count as its targets, but any `#` or byte outside printable ASCII refused that shape. So `for n in 1 2; do gh api -X POST repos/<owner>/<repo>/issues/$n/comments -f body=x; done # ping both`, or the same loop with `body=café`, blocked from an unowned directory. That refusal worked around a comment-stripper bug that #1390 fixed. Now only `|` and `&` refuse the shape. (Part of cameronsjo/cadence-hooks#1443)
 
+- **`prevent-secret-push` warns instead of blocking a push it cannot fully read; a secret it finds still blocks.** Every refusal of the form "this push cannot be scanned" (a `cd "$D"` or `git -C "$VAR"` it cannot follow, a `$SHA` source, a commit made in the same call as the push, an unborn branch, a directory an earlier command creates, a submodule-recursing push, a range over 2000 commits or a patch over 32 MiB, a failed or timed-out git spawn, `git send-pack`/`http-push`/remote helpers, a dashed `git-push`) now lets the push go ahead with a warning that names the cause and its fix. These refusals made up most of the guard's friction reports (cameronsjo/cadence-hooks#1378, #1381, #1384, #1386) and almost never stood between a secret and a remote. A warning never ends the scan: the parts of the push it could read are still scanned, and so is every later push in the same command, so a secret found anywhere blocks as before. The alias probe is gone: a `git <sub>` is no longer looked up in the config to prove it is not an alias that pushes, so the refusals for an unresolved directory, a config redirect, `help.autocorrect` or a wrapper's `"$@"` no longer fire, and a push through a config alias goes ahead unscanned. `CADENCE_ALLOW_SECRET_PUSH` now applies only to a found secret; a warning needs no escape and writes no bypass row. (cameronsjo/cadence-hooks#1373)
+
+### Fixed
+
+- **`cadence-hooks try` reads a payload piped to stdin.** It ignored stdin and always ran the generated sample unless `--payload FILE` was given, so `… | cadence-hooks try <ns> <hook>` tested `git status` and could report ALLOW for a payload that blocks. A piped payload now runs; `--payload` still wins, and empty stdin (`/dev/null`) runs the sample as before. Stdin that sends nothing for 2 s runs the sample with a warning; once bytes arrive, `try` reads to the end however slow the producer. Stdin that is not UTF-8 exits 1.
+
 ## [0.130.1] - 2026-10-20
 
 ### Fixed
