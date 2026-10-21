@@ -109,68 +109,67 @@ A push with `--dry-run` or `-n`, and a push that only deletes remote refs, MUST 
 - **WHEN** the command deletes one remote branch and pushes a branch carrying a token
 - **THEN** the hook blocks
 
-### Requirement: A detected push it cannot fully scan blocks
-Once a push is detected, the guard SHALL block rather than allow when it cannot scan the push completely, and only a genuinely empty range SHALL allow. The message MUST begin `BLOCKED: git push refused`, say why, and say the guard fails closed.
+### Requirement: A detected push it cannot fully scan warns
+Once a push is detected and the guard cannot scan it completely, it SHALL let the push go ahead with a warning, and only a secret it found SHALL block (cameronsjo/cadence-hooks#1373). The warning MUST begin `prevent-secret-push: this push goes ahead without a full secret scan`, say why, and name the fix when one exists. A genuinely empty range SHALL allow silently.
 
 #### Scenario: Limits
 - **WHEN** a push would publish more than 2000 new commits, a patch over 32 MiB, or more than 16 refspec sources
-- **THEN** the hook blocks, for the commit cap with `the range is too large to fully scan` even when the newest 2000 are clean
+- **THEN** the hook warns, for the commit cap with `the range is too large to fully scan` even when the newest 2000 are clean
 
 #### Scenario: Unresolvable or non-commit sources
 - **WHEN** a push names a source it cannot resolve, a tag or ref pointing at a tree or blob, a nested tag, or a full-length hex source that a ref is also named like
-- **THEN** the hook blocks
+- **THEN** the hook warns
 
 #### Scenario: Broken git
 - **WHEN** a git process the guard runs fails, is missing, or times out
-- **THEN** the hook blocks
+- **THEN** the hook warns
 
 #### Scenario: Unscannable encoding
 - **WHEN** an outbound commit's `encoding` header is not UTF-8, US-ASCII, or ISO-8859
-- **THEN** the hook blocks
+- **THEN** the hook warns
 
-### Requirement: Pushes outside the model block
-The guard SHALL block `git send-pack`, `git http-push`, `git remote-<transport>` (never the builtin `git remote`), a dashed `git-push`, and `exec -a` naming a git argv[0]. It SHALL block a submodule-recursing push only in a repository that has submodules. A value git runs as a command, set on the git command's own line, SHALL be read as a nested script when fully literal, and MUST block when it is not literal or cannot be read.
+### Requirement: A warning does not end the scan
+When part of a push cannot be scanned, the parts it could read, and every later push in the same command, SHALL still be scanned, and a secret found in any of them SHALL block.
+
+#### Scenario: A later push still blocks
+- **WHEN** a Bash command runs a push the guard cannot scan, then a second push whose outbound commit carries a token
+- **THEN** the hook blocks on the second push
+
+### Requirement: Pushes outside the model warn
+The guard SHALL warn on `git send-pack`, `git http-push`, `git remote-<transport>` (never the builtin `git remote`), a dashed `git-push`, and `exec -a` naming a git argv[0], read from the command text only. It SHALL warn on a submodule-recursing push only in a repository that has submodules. A value git runs as a command, set on the git command's own line, SHALL be read as a nested script when fully literal, and MUST warn when it is not literal or cannot be read.
 
 #### Scenario: Unscannable transport
 - **WHEN** a Bash command runs `git send-pack origin main`
-- **THEN** the hook blocks, while `git remote -v` allows
+- **THEN** the hook warns, while `git remote -v` allows
 
 #### Scenario: Command-valued config
 - **WHEN** a Bash command runs `git -c core.sshCommand="$S" push origin main` or `GIT_PAGER="$P" git log`
-- **THEN** the hook blocks, while `GIT_SSH_COMMAND='ssh -i key' git push` of a clean range allows
+- **THEN** the hook warns, while `GIT_SSH_COMMAND='ssh -i key' git push` of a clean range allows
 
 #### Scenario: Submodule push without submodules
 - **WHEN** a Bash command runs `git push --recurse-submodules=on-demand` in a repository with no `.gitmodules` and no gitlinks
 - **THEN** the hook judges it as an ordinary push
 
 ### Requirement: A commit made in the same call names the split
-Because the guard reads the repository before the command runs, a push whose source a same-call `git commit` or `git switch -c` has not created yet SHALL block with advice that names that command, says it `has not run`, and says to push in the next call. A push of an unborn branch with no writer in the command SHALL say it `has no commit yet`. Split into two calls, the commit MUST be scanned like any other.
+Because the guard reads the repository before the command runs, a push whose source a same-call `git commit` or `git switch -c` has not created yet SHALL warn with advice that names that command, says it `has not run`, and says to push in the next call. A push of an unborn branch with no writer in the command SHALL say it `has no commit yet`. Split into two calls, the commit MUST be scanned like any other.
 
 #### Scenario: Commit and push together
 - **WHEN** a Bash command runs `git add f; git commit -m first; git push origin HEAD:refs/heads/main2` on an orphan branch
-- **THEN** the hook blocks naming `git commit` and the next call
+- **THEN** the hook warns naming `git commit` and the next call
 
-### Requirement: Aliases that could push are not invisible
-A `git <sub>` spelled exactly as a git builtin SHALL never be probed as an alias. Any other subcommand MUST be looked up in the repository's config, following alias-of-alias, and SHALL block as unresolved when the alias pushes or starts with `!`, the same command writes it, the subcommand word carries `$` or a backtick, the command names config the probe cannot see, the probe fails, or `help.autocorrect` would run a guess.
+### Requirement: Aliases are not probed
+The guard SHALL NOT look up a `git <sub>` in the repository's config to prove it is not an alias that pushes. A push run through a config alias MUST go ahead unscanned and without a warning: it needs deliberate setup and is not the slip this guard is for.
 
 #### Scenario: Alias that pushes
 - **WHEN** the repository config sets `alias.pp = push` and the command is `git pp origin main`
-- **THEN** the hook blocks naming the alias
-
-#### Scenario: Alias that does not push
-- **WHEN** the config sets `alias.lg = log --oneline` and the command is `git lg -1`
 - **THEN** the hook allows
 
 #### Scenario: Builtin is not probed
 - **WHEN** the command is `git status`
 - **THEN** the hook allows without probing an alias
 
-#### Scenario: Config the probe cannot see
-- **WHEN** the command is `GIT_CONFIG_GLOBAL=/x git zz`
-- **THEN** the hook blocks
-
 ### Requirement: The acknowledgement escape
-When `CADENCE_ALLOW_SECRET_PUSH` is truthy (`1`, `true`, `yes`) in the hook's environment, a push the guard would block SHALL be allowed and a bypass row recorded. The escape MUST be read only once a block is decided, so a clean push records no row, and falsy values MUST NOT open it. An inline `CADENCE_ALLOW_SECRET_PUSH=1 git push` prefix MUST NOT count, and every block message SHALL say where to set it.
+When `CADENCE_ALLOW_SECRET_PUSH` is truthy (`1`, `true`, `yes`) in the hook's environment, a push carrying a secret the guard found SHALL be allowed and a bypass row recorded. The escape MUST be read only once a block is decided, so a clean push and a push that only warns record no row, and falsy values MUST NOT open it. An inline `CADENCE_ALLOW_SECRET_PUSH=1 git push` prefix MUST NOT count, and every block message SHALL say where to set it.
 
 #### Scenario: Acknowledged push
 - **WHEN** `CADENCE_ALLOW_SECRET_PUSH=1` is in the hook's environment and the outbound commit carries a token
@@ -183,6 +182,10 @@ When `CADENCE_ALLOW_SECRET_PUSH` is truthy (`1`, `true`, `yes`) in the hook's en
 #### Scenario: Escape set with nothing to block
 - **WHEN** the escape is set and the push is clean
 - **THEN** the hook allows and records no bypass row
+
+#### Scenario: Escape set with only a warning
+- **WHEN** the escape is set and the guard cannot fully scan a push that carries no found secret
+- **THEN** the hook warns and records no bypass row
 
 ### Requirement: Documented allowances
 The guard SHALL exempt from the content scan every file of a repository whose top-level path has a `cadence-hooks` component, still checking names and messages, and MUST NOT exempt a `cadence-hooks/` directory inside another repository. It SHALL trust any remote-tracking ref as published and SHALL NOT scan Git LFS object content. Pushes it does not detect (`gh repo create --push`, `git subtree push`, a push inside a script file) MUST be allowed.
