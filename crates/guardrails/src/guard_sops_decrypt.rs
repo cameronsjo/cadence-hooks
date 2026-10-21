@@ -843,8 +843,9 @@ mod tests {
                 "sops -d secrets.sops.yaml | zsh -O scripts/other.sh scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | zsh -O extglob scripts/secret-keys.sh",
                 // Under `-s` stdin is the script: bash runs the plaintext as
-                // commands, and each line's first word reaches stderr in a
-                // "command not found" error (`-x` traces the whole line).
+                // commands, and a line's first word reaches stderr when that
+                // line fails as a command (only the first failing line's
+                // under `-e`). `-x` traces the whole line.
                 "sops -d secrets.sops.yaml | bash -s scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | bash -so pipefail scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | bash -euo pipefail -s scripts/secret-keys.sh",
