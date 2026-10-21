@@ -7029,6 +7029,11 @@ mod tests {
                 "runuser --user=app -- head -c 5 .env",
                 "runuser -uapp -- cat .env",
                 "runuser -uapp cat .env",
+                // A user named with a `c`, and `-u` at the end of a cluster.
+                "runuser -ucarol cat .env",
+                "runuser -uapache -- cat .env",
+                "runuser -ucarol -- head -c 5 .env",
+                "runuser -mu app -- cat .env",
                 // su hands the words after `--` to the user's shell, which
                 // runs their `-c`.
                 "su root -- -c 'cat .env'",
@@ -7039,7 +7044,10 @@ mod tests {
         // Without `--`, getopt permutes, takes `head`'s `-c` as runuser's
         // own and refuses it beside `-u`: nothing runs.
         assert_bash(
-            &["runuser -u app head -c 5 .env"],
+            &[
+                "runuser -u app head -c 5 .env",
+                "runuser -ucarol cat README.md",
+            ],
             cadence_hooks_core::Outcome::Allow,
             "a runuser command line runuser refuses",
         );
