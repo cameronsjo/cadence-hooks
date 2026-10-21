@@ -70,6 +70,18 @@ pub(crate) fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
     }
 }
 
+/// The env `gh_context::render_from_env` reads, all cleared: the allowlists,
+/// the extra hosts and the default host. For a test whose assertion does not
+/// turn on the allowlist but whose code path reads it, so the read happens
+/// under [`with_env`]'s lock and an exported value cannot decide it.
+#[cfg(test)]
+pub(crate) const GH_CONTEXT_ENV_CLEARED: [(&str, Option<&str>); 4] = [
+    ("CADENCE_ALLOWED_OWNERS", None),
+    ("CADENCE_ALLOWED_REPOS", None),
+    ("CADENCE_EXTRA_HOSTS", None),
+    ("GH_HOST", None),
+];
+
 /// A single-commit repo whose `origin` has stable GitHub owner/repo identity.
 ///
 /// Tests that assert ownership or repo-name behavior must not read the
