@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
+
 ### Changed
 
 - **`git-safety` nudges on every `git rebase`, including onto `main` or `master`.** `git rebase origin/main` already nudged, but `git rebase main`, `git rebase -i master` and `git rebase --onto X Y main` blocked as "Rebase onto protected branch". A rebase rewrites local history that the reflog restores, which cadence-ecosystem ADR-0046 rule 2 does not count as a costly harm. Every form now gets the existing "may modify history or lose work" nudge. A force-push of the result to `main` still blocks. (Part of cameronsjo/cadence-hooks#1443)

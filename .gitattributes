@@ -12,3 +12,7 @@
 # two files rather than set repo-wide: a blanket policy would rewrite every
 # source file on a Windows checkout to no purpose.
 crates/metrics/testdata/grading/* -text
+
+# Shell scripts run under bash on every platform; a CRLF checkout breaks
+# `set -euo pipefail` on a Windows Git Bash with core.autocrlf=true.
+*.sh text eol=lf
