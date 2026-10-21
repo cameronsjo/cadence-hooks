@@ -247,10 +247,7 @@ so the write blocks:
   builtin next to a `GH_HOST` mention or a non-literal `NAME=`. This rule
   fails closed wherever the command position is not recognized.
 - A `trap` action or an `eval` string that sets it. Both are read like a
-  command. An `eval` or `trap` whose command word comes from an expansion is
-  text the guard cannot read, so it also blocks: `eval "$X"`, `eval "$(…)"`,
-  `` eval `…` ``. That includes `eval "$(direnv export bash)"` and
-  `eval "$(ssh-agent -s)"` in front of a `-R` write.
+  command.
 - A `source` or `.` fed by a heredoc, stdin, or `<(…)`, when the command text
   names `GH_HOST` or declares a non-literal name.
 - An `env -S`/`--split-string` prefix before gh, or a `BASH_ENV=`/`ENV=`
@@ -260,6 +257,11 @@ so the write blocks:
   (`GH_HOS${X}T=...`, `GH_HOS{T,}=...`).
 - A value that is still a `$` expansion.
 - An assignment inside `${GH_HOST:=...}` or `$((GH_HOST=...))`.
+
+An `eval` or `trap` whose command word comes from an expansion (`eval "$X"`,
+`eval "$(…)"`, `` eval `…` ``) is text the guard cannot read. It is skipped, and
+the write is judged on the hosts the guard did read. So `eval "$(direnv export
+bash)"` or `eval "$(ssh-agent -s)"` in front of a `-R` write does not block it.
 
 A plain mention changes nothing: `rg GH_HOST`, a commit message, or a gh
 command's own `--title` or `--body`. A gh segment runs as a child process, so it
