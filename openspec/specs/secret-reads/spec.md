@@ -102,24 +102,35 @@ Before judging, `prevent-secret-leaks` SHALL peel command runners (`sudo`, `env`
 - **WHEN** a Bash command runs `cat .e*` or `cat package*.json`
 - **THEN** the hook allows, while `cat .env*` blocks
 
-### Requirement: Secret names in untraced command shapes block
-When a Bash command sets positional parameters (`set --`, an `sh -c` script with words after it), `prevent-secret-leaks` SHALL block if any word in it names a secret file, because the guard does not trace how such a command uses its arguments. The stderr reason MUST name the secret and the shape. The same shapes with no secret name SHALL be allowed. Defining a shell function MUST NOT change the verdict: the reader rules judge the command as they would without it.
+### Requirement: A literal read blocks whatever the command's shape
+`prevent-secret-leaks` SHALL judge a Bash command by the reads the reader rules find, so a literal read SHALL block whether or not the command defines a shell function or sets positional parameters, including one in a `-c` script behind a shell option cluster. A secret named only as an argument (`$1`, `"$@"`, `$0`) MUST be allowed.
 
-#### Scenario: Positional argument
-- **WHEN** a Bash command runs `bash -c 'cat "$1"' _ .env`
-- **THEN** the hook blocks and stderr says the command `sets positional parameters`
-
-#### Scenario: Literal read in a function body
-- **WHEN** a Bash command runs `f(){ cat .env; }; f`
+#### Scenario: Script behind an option cluster
+- **WHEN** a Bash command runs `bash -eo pipefail -c 'cat .env'`
 - **THEN** the hook blocks
 
-#### Scenario: Function argument
-- **WHEN** a Bash command runs `f(){ cat "$1"; }; f .env`
+#### Scenario: Literal read beside a shape
+- **WHEN** a Bash command runs `f(){ cat .env; }; f` or `set -- a b; cat .env`
+- **THEN** the hook blocks
+
+#### Scenario: Secret passed as an argument
+- **WHEN** a Bash command runs `bash -c 'cat "$1"' _ .env`, `set -- .env; cat "$1"` or `f(){ cat "$1"; }; f .env`
 - **THEN** the hook allows, since a read through an argument is indirection the guard does not trace
 
-#### Scenario: Function with no secret
-- **WHEN** a Bash command defines a function and names no secret file
+#### Scenario: Shapes with no secret
+- **WHEN** a Bash command defines a function or sets positional parameters and names no secret file
 - **THEN** the hook allows
+
+### Requirement: A script the guard does not read is allowed
+`prevent-secret-leaks` MUST allow a `-c` script behind a wrapper the guard does not peel, or whose operands it re-joins without their quotes (`parallel`, `fd -x`/`-X`, `bash -s` with operands, `flock FILE CMD…`, BSD `script FILE CMD…`), like the bare `parallel cat .env ::: a`. A script piped into a shell is not read either. A bare command behind `flock` or BSD `script` is read, so it MUST block.
+
+#### Scenario: Script the guard does not read
+- **WHEN** a Bash command runs `parallel sh -c 'cat .env' ::: a`, `fd -x sh -c 'cat .env'`, `echo 'cat .env' | bash -s x`, `flock /tmp/l sh -c 'cat .env'` or `script -q /dev/null sh -c 'cat .env'`
+- **THEN** the hook allows
+
+#### Scenario: Bare command behind flock or script
+- **WHEN** a Bash command runs `flock /tmp/l cat .env`, `flock /tmp/l -c 'cat .env'` or `script -q /dev/null cat .env`
+- **THEN** the hook blocks
 
 ### Requirement: forgectl env is the accepted form
 `forgectl env` subcommands (`keys`, `check`, `get`, `set`) are not readers, and `prevent-secret-leaks` MUST allow them whatever `--file` they name. When a block names a dotenv-shaped file and `forgectl` is on PATH, the block message SHALL gain one line beginning `Or: forgectl env keys --file` that names value-free alternatives. A block on `.envrc`, a key, or a credential file MUST keep its message unchanged.

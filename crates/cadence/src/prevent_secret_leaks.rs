@@ -4,8 +4,7 @@
 //! On Bash, blocks a literal secret file name handed to an ENUMERATED reader
 //! or sender (`READERS`: `cat`, `grep`, `base64`, `curl -d @`, `gh --input`,
 //! `source`, …), or redirected into one's standard input
-//! (cameronsjo/cadence-hooks#1303), or named anywhere the reader scan reads a
-//! word in a command that sets positional parameters (#1422).
+//! (cameronsjo/cadence-hooks#1303).
 //! Unknown commands, variables, URL and API paths, regex patterns, and globs
 //! that only share letters with a secret name are not judged. Safe templates
 //! (.env.example, .env.test) are always allowed. Environment dumps nudge.
@@ -2988,10 +2987,6 @@ struct SegmentReads {
     reads: Vec<(String, String)>,
     /// Command texts the segment runs that were not expanded.
     children: Vec<String>,
-    /// The first secret-like word in any position, when asked for.
-    secret_word: Option<String>,
-    /// The segment sets positional parameters ([`sets_positionals`]).
-    sets_positionals: bool,
 }
 
 /// The options of a shell invocation `argv` (`argv[0]` is the shell), read
@@ -3000,8 +2995,6 @@ struct SegmentReads {
 struct ShellOptions {
     /// `-c`: the first operand is the script.
     command: bool,
-    /// `-s`: the script is standard input, every operand a parameter.
-    stdin: bool,
     /// The index of the first operand, at most `argv.len()`.
     operands: usize,
 }
@@ -3011,7 +3004,6 @@ struct ShellOptions {
 fn shell_options(argv: &[String]) -> ShellOptions {
     let mut options = ShellOptions {
         command: false,
-        stdin: false,
         operands: argv.len(),
     };
     let mut i = 1;
@@ -3025,7 +3017,6 @@ fn shell_options(argv: &[String]) -> ShellOptions {
             i += 1;
         } else if let Some(cluster) = t.strip_prefix(['-', '+']).filter(|c| !c.is_empty()) {
             options.command |= cluster.contains('c');
-            options.stdin |= cluster.contains('s');
             i += 1 + cluster.chars().filter(|c| matches!(c, 'o' | 'O')).count();
         } else {
             break;
@@ -3035,177 +3026,14 @@ fn shell_options(argv: &[String]) -> ShellOptions {
     options
 }
 
-/// Does a shell invocation `argv` take positional parameters: words after
-/// its `-c` script, operands to `-s`, or (when `run_by_another`, as under
-/// `xargs` or `find -exec`) any `-c` or `-s` script, which that program hands
-/// its own arguments. Also returns where its options end.
-fn shell_takes_positionals(argv: &[String], run_by_another: bool) -> (bool, usize) {
-    let options = shell_options(argv);
-    let operands = argv.len() - options.operands;
-    let takes = if options.command {
-        operands > 0 && (run_by_another || operands > 1)
-    } else {
-        options.stdin && (run_by_another || operands > 0)
-    };
-    (takes, options.operands)
-}
-
-/// Does `set` with these operands replace the positional parameters? Any
-/// operand or `--` does, and `-` with words after it; options alone
-/// (`set -euo pipefail`, `set -`) do not.
-fn set_takes_positionals(args: &[String]) -> bool {
-    let mut args = args.iter();
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--" => return true,
-            "-" => return args.next().is_some(),
-            option if option.len() > 1 && option.starts_with(['-', '+']) => {
-                for _ in option.chars().filter(|c| matches!(c, 'o' | 'O')) {
-                    args.next();
-                }
-            }
-            _ => return true,
-        }
-    }
-    false
-}
-
-/// Builtins whose operands are assignments (`typeset -a argv=(…)`).
-const DECLARATION_BUILTINS: &[&str] = &[
-    "typeset", "declare", "local", "export", "readonly", "integer", "float",
-];
-
-/// `find`'s actions and `fd`'s options that run the next word as a command
-/// with arguments it did not list.
-const FIND_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
-const FD_EXEC_OPTIONS: &[&str] = &["-x", "-X", "--exec", "--exec-batch"];
-
-/// Does a word assign zsh's positional parameters: `argv=`, `argv+=`,
-/// `argv[…]=`, or a digit name (`1=.env`)?
-fn assigns_positionals(word: &str) -> bool {
-    let name = word.split_once(['=', '[']).map_or("", |(name, _)| name);
-    let name = name.strip_suffix('+').unwrap_or(name);
-    name == "argv" || (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// `parallel`'s input-source separators; its command ends at the first.
-const PARALLEL_SOURCES: &[&str] = &[":::", "::::", ":::+", "::::+"];
-
-/// Where the command a `find` action or `fd` exec option at `action` runs
-/// begins, after the shared runner peel (`-exec env sh -c …`). The peel reads
-/// at most [`PEEL_WORD_LIMIT`] words, so a run of actions stays linear.
-fn exec_command_start(words: &[String], action: usize) -> usize {
-    let from = action + 1;
-    let window = &words[from.min(words.len())..(from + PEEL_WORD_LIMIT).min(words.len())];
-    let start = from + window.len() - peel_command_runners(window).len();
-    // `busybox sh` runs the applet named by its first operand.
-    match words.get(start) {
-        Some(w) if MULTICALL.contains(&command_word(w).as_ref()) => start + 1,
-        _ => start,
-    }
-}
-
-/// Can `word` resolve to a [`SHELL_HEADS`] name or `$SHELL`? Every such
-/// name ends in `h`, so a word that does not (after a `.exe`), holds no
-/// backslash and starts with no `$` is skipped before [`command_word`]
-/// resolves it: the check runs on every word of every segment.
-fn may_name_a_shell(word: &str) -> bool {
-    let bytes = word.as_bytes();
-    let stem = if bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
-        &bytes[..bytes.len() - 4]
-    } else {
-        bytes
-    };
-    matches!(stem.last(), Some(b'h' | b'H'))
-        || bytes.first() == Some(&b'$')
-        || bytes.contains(&b'\\')
-}
-
-/// Does a segment whose dequoted words are `words`, running the command
-/// `words[head..]`, set positional parameters: a shell `-c` script with words
-/// after it (or run by `xargs`, `parallel` or `find -exec`), a shell `-s`
-/// with operands, `set` with operands, or an assignment to zsh's `argv`
-/// (#1422). What the script does with them is not read. One pass: a shell
-/// word inside another shell's options is that option's value, not a shell.
-fn sets_positionals(words: &[String], head: usize) -> bool {
-    let head_verb = words.get(head).map(|w| command_word(w));
-    let declares = head_verb
-        .as_deref()
-        .is_some_and(|v| DECLARATION_BUILTINS.contains(&v));
-    let head_is = |names: &[&str]| head_verb.as_deref().is_some_and(|v| names.contains(&v));
-    // A shell is handed arguments it did not list when it is the command
-    // `xargs` (peeled off as a runner, so the segment's command), `parallel`
-    // (its first shell before an input source), or a `find` action or `fd`
-    // exec option (behind the shared runner peel) runs.
-    let through_xargs = words[..head.min(words.len())]
-        .iter()
-        .any(|w| command_word(w) == "xargs");
-    let mut parallel_slot = head_is(&["parallel"]);
-    let exec_options: &[&str] = if head_is(&["find"]) {
-        FIND_ACTIONS
-    } else if head_is(&["fd", "fdfind"]) {
-        FD_EXEC_OPTIONS
-    } else {
-        &[]
-    };
-    let mut exec_start = None;
-    let mut options_end = 0;
-    for (i, w) in words.iter().enumerate() {
-        if i < options_end {
-            continue;
-        }
-        if i > head && PARALLEL_SOURCES.contains(&w.as_str()) {
-            parallel_slot = false;
-        }
-        if i > head && exec_options.contains(&w.as_str()) {
-            exec_start = Some(exec_command_start(words, i));
-        }
-        if may_name_a_shell(w)
-            && (SHELL_HEADS.contains(&command_word(w).as_ref())
-                || matches!(w.as_str(), "$SHELL" | "${SHELL}"))
-        {
-            let handed = (i == head && through_xargs)
-                || (i > head && parallel_slot)
-                || exec_start == Some(i);
-            parallel_slot = parallel_slot && i <= head;
-            let (takes, end) = shell_takes_positionals(&words[i..], handed);
-            if takes {
-                return true;
-            }
-            options_end = i + end;
-        }
-        if (i == head
-            && head_verb.as_deref() == Some("set")
-            && set_takes_positionals(&words[i + 1..]))
-            || ((i <= head || declares) && assigns_positionals(w))
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// One segment's `(verb, secret word)` reads — a literal secret name handed
 /// to an enumerated reader or sender as a file, or redirected into one's
 /// standard input (cameronsjo/cadence-hooks#1303) — and the command texts it
 /// runs that [`command_segments`] did not expand (process substitutions, a
-/// shell `-c` script behind options it does not walk), and, when
-/// `find_secret`, the segment's first secret-like word in any position, and,
-/// when `find_positionals`, whether it sets positional parameters.
-fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> SegmentReads {
+/// shell `-c` script behind options it does not walk).
+fn segment_reads(segment: &str) -> SegmentReads {
     let (outer, mut children) = split_process_substitutions(segment);
     let (words, stdin) = words_and_stdin(&outer);
-    // Any secret-like word, for the positional rule: read here so the rule
-    // reuses this segmentation instead of walking the command again (#1425).
-    let secret_word = find_secret
-        .then(|| {
-            words
-                .iter()
-                .chain(&stdin)
-                .find(|w| names_a_secret(w, Filename::Known))
-                .cloned()
-        })
-        .flatten();
     let mut argv = if words.len() > PEEL_WORD_LIMIT {
         linear_peel(&words)
     } else {
@@ -3218,19 +3046,12 @@ fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> Se
             .filter(|w| names_a_secret(w, Filename::Known))
             .map(|w| ("<".to_string(), w))
             .collect();
-        return SegmentReads {
-            reads,
-            children,
-            secret_word,
-            sets_positionals: find_positionals && sets_positionals(&words, words.len()),
-        };
+        return SegmentReads { reads, children };
     };
     if head.starts_with('#') {
         return SegmentReads {
             reads: Vec::new(),
             children,
-            secret_word,
-            sets_positionals: false,
         };
     }
     let mut verb = command_word(head).into_owned();
@@ -3295,12 +3116,7 @@ fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> Se
         );
     }
     let reads = found.into_iter().map(|w| (verb.clone(), w)).collect();
-    SegmentReads {
-        reads,
-        children,
-        secret_word,
-        sets_positionals: find_positionals && sets_positionals(&words, words.len() - argv.len()),
-    }
+    SegmentReads { reads, children }
 }
 
 /// `command` with the bodies of heredocs no shell runs left out, for a
@@ -3324,33 +3140,6 @@ fn without_data_heredocs(command: &str) -> Cow<'_, str> {
 /// Most levels of command text [`segment_reads`] hands back for re-scanning.
 const NESTED_SCAN_DEPTH: usize = 8;
 
-/// The shape [`shape_block`] names: a `sh -c` script with words after it,
-/// `set --` and the like (#1422).
-const POSITIONAL_SHAPE: &str = "sets positional parameters";
-
-/// The block for a secret-like name in a command of a `shape` whose reads
-/// are not traced, such as one that sets positional parameters:
-/// `bash -c 'cat "$1"' _ .env` makes bash read `.env`, yet the name never
-/// sits where a reader takes a file (cameronsjo/cadence-hooks#1422).
-fn shape_block(secret: &str, shape: &str, detect: fn() -> bool) -> CheckResult {
-    CheckResult::block(with_forgectl_hint(
-        format!(
-            "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
-             Found: `{secret}` in a command that {shape}\n\
-             Fix: secrets are available to programs via direnv (`direnv allow`) — \
-             run the program directly instead of reading its secret file, or keep \
-             the secret name out of a command that {shape}.\n\
-             Allowed: a command that {shape} and names no secret file, and a \
-             secret name in a command that does neither (judged by the reader \
-             rules)."
-        ),
-        HintKind::Read,
-        None,
-        secret,
-        detect,
-    ))
-}
-
 /// Check if a bash command would put a secret file's contents in front of
 /// the model or send it off the machine.
 ///
@@ -3369,36 +3158,21 @@ fn bash_leaks_secrets(
     // Segmented from the ORIGINAL command (#508): `command_segments` expands
     // `bash -c` scripts, substitutions, and visible assignments, so a wrapped
     // or `F=.env; cat $F` read is a segment of its own.
-    let mut sets_positional_parameters = false;
-    let mut secret_word: Option<String> = None;
     let mut scripts = vec![(command.to_string(), 0)];
     while let Some((script, depth)) = scripts.pop() {
         for segment in command_segments(&script) {
-            let SegmentReads {
-                reads,
-                children,
-                secret_word: secret,
-                sets_positionals,
-            } = segment_reads(&segment, secret_word.is_none(), !sets_positional_parameters);
-            sets_positional_parameters = sets_positional_parameters || sets_positionals;
+            let SegmentReads { reads, children } = segment_reads(&segment);
             for (verb, token) in reads {
                 if envrc_bash_read_allowed(&token, cwd, || *command_has_cd, || *envrc_replaceable) {
                     continue;
                 }
                 return Some(read_block(&verb, &token, detect));
             }
-            secret_word = secret_word.or(secret);
             if depth < NESTED_SCAN_DEPTH {
                 scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
             }
         }
     }
-    if let Some(secret) = secret_word
-        && sets_positional_parameters
-    {
-        return Some(shape_block(&secret, POSITIONAL_SHAPE, detect));
-    }
-
     // Warn: env dump commands. Must appear as the executed command at the
     // start of a segment (or after a chain operator), not as a substring of
     // an argument, path, or compound binary name like `direnv`/`envoy`/`gh env`.
@@ -7243,9 +7017,12 @@ mod tests {
     }
 
     #[test]
-    fn positional_parameters_with_a_secret_word_blocked() {
-        // cameronsjo/cadence-hooks#1422: each reads `.env` through `$1` with
-        // no function, and the name never sits where a reader takes a file.
+    fn positional_parameters_do_not_change_the_verdict() {
+        // cadence-ecosystem ADR-0046 rule 1: a read through a positional
+        // parameter is out of scope, so setting them no longer blocks a
+        // command that names a secret anywhere (the #1422 rule is gone).
+        // Each of these reads `.env` through `$1` or blocked as the rule's
+        // cost; none names it where a reader takes a file.
         assert_bash(
             &[
                 r#"bash -c 'cat "$1"' _ .env"#,
@@ -7259,13 +7036,9 @@ mod tests {
                 r#"bash -o pipefail -c 'cat "$1"' _ .env"#,
                 r#"echo .env | xargs -I{} sh -c 'cat "$1"' _ {}"#,
                 r#"echo .env | xargs sh -c 'cat "$0"'"#,
-                // Was a #1303 accepted miss: the secret word is in the
-                // command, and `xargs` hands `sh -c` its arguments.
                 r#"find . -name .env | xargs sh -c 'cat "$@"' _"#,
                 r#"echo .env | parallel sh -c 'cat "$0"'"#,
                 r#"find . -name .env -exec sh -c 'cat "$0"' {} +"#,
-                // Fix round 1: an option or a runner between the hander and
-                // the shell.
                 r#"echo .env | parallel -j4 sh -c 'cat "$0"'"#,
                 r#"echo .env | parallel -k sh -c 'cat "$0"'"#,
                 r#"echo .env | parallel --will-cite sh -c 'cat "$0"'"#,
@@ -7287,8 +7060,6 @@ mod tests {
                 r#"echo 'cat "$1"' | bash -s .env"#,
                 "argv=(.env); cat $1",
                 "argv[1]=.env; cat $1",
-                // Polish review: a value inside an option cluster, zsh's
-                // other spellings, and `$SHELL`.
                 r#"bash -eo pipefail -c 'cat "$1"' _ .env"#,
                 r#"bash -euo pipefail -c 'cat "$1"' _ .env"#,
                 r#"bash -c -e 'cat "$1"' _ .env"#,
@@ -7297,16 +7068,35 @@ mod tests {
                 "typeset -a argv=(.env); cat $1",
                 r#""$SHELL" -c 'cat "$1"' _ .env"#,
                 r#"fd -H env -x sh -c 'cat "$0"'; echo .env"#,
-                // The accepted cost: what the script does is not read.
+                // Its accepted false-block cost.
                 r"bash -c 'echo hi' _ x; git commit -m 'mention .env'",
                 r"set -- a b; git commit -m 'mention .env'",
                 "docker run --env-file .env img sh -c 'x' _ y",
-                // The shared option reader also finds the reader scan's
-                // child script behind a cluster value.
-                "bash -eo pipefail -c 'cat .env'",
+                // An accepted cost of removing the rule: a literal read in a
+                // `-c` script that a wrapper runs was caught only by it when
+                // the guard does not peel the wrapper (`parallel`, `fd
+                // -x`/`-X`), or when core re-joins its operands without their
+                // quotes (`flock FILE CMD…`, BSD `script FILE CMD…`: `sh -c
+                // 'cat .env'` reaches the reader as `sh -c cat .env`, a
+                // script of `cat` with `$0` set to `.env`). So is a script
+                // piped to `bash -s` with an operand. The direct forms
+                // (`parallel cat .env ::: a`, `fd -x cat .env`) already
+                // passed; peeling the first pair and quoting the re-join are
+                // separate changes.
+                "parallel sh -c 'cat .env' ::: a b",
+                "parallel sh -c 'cat {}/.env' ::: dir1 dir2",
+                "fd -t d -x sh -c 'cat {}/.env'",
+                "fd -x sh -c 'cat .env'",
+                "fd -H x -X sh -c 'cat .env'",
+                "echo 'cat .env' | bash -s x",
+                "flock /tmp/l sh -c 'cat .env'",
+                "flock -n /tmp/l sh -c 'cat .env'",
+                "flock /tmp/l bash -c 'source .env && env'",
+                "script -q /dev/null sh -c 'cat .env'",
+                "script -q /dev/null bash -c 'source .env && env'",
             ],
-            cadence_hooks_core::Outcome::Block,
-            "positional parameters and a secret name",
+            cadence_hooks_core::Outcome::Allow,
+            "positional parameters beside a secret name",
         );
         assert_bash(
             &[
@@ -7350,6 +7140,33 @@ mod tests {
             cadence_hooks_core::Outcome::Allow,
             "no positional parameters, or no secret name",
         );
+        // A literal read is judged by the reader rules, a `-c` script behind
+        // a shell option cluster included.
+        assert_bash(
+            &[
+                "bash -eo pipefail -c 'cat .env'",
+                "bash -euo pipefail -c 'cat .env.local'",
+                "set -- a b; cat .env",
+                r#"bash -c 'cat "$1"' _ x; cat .env"#,
+                // The runners the reader peels still reach a `-c` script's
+                // read, with or without words after it.
+                r"find . -exec sh -c 'cat .env' \;",
+                "echo x | xargs sh -c 'cat .env'",
+                "env FOO=1 bash -c 'cat .env'",
+                "bash -c 'cat .env' _ x",
+                "timeout 5 bash -c 'cat .env'",
+                "sudo -u app bash -c 'cat .env'",
+                "nohup sh -c 'cat .env'",
+                // A bare command behind `flock` or BSD `script`, and `flock`'s
+                // `-c` script (one word, kept whole), have no quote to lose
+                // in the re-join.
+                "flock /tmp/l cat .env",
+                "flock /tmp/l -c 'cat .env'",
+                "script -q /dev/null cat .env",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a literal read beside positional parameters",
+        );
     }
 
     #[test]
@@ -7358,19 +7175,8 @@ mod tests {
         // scanned again from the start, quadratic in `sh -o sh -o …`.
         assert_fast_block(&format!(": {}; cat .env", "sh -o ".repeat(20_000)), 3000);
         assert_fast_block(
-            &format!("bash {}-c 'cat \"$1\"' _ .env", "-o sh ".repeat(20_000)),
+            &format!("bash {}-c 'cat .env'", "-o sh ".repeat(20_000)),
             3000,
-        );
-    }
-
-    #[test]
-    fn positional_parameters_block_names_the_secret() {
-        let result =
-            SecretLeaksGuard::default().run(&make_bash_input(r#"bash -c 'cat "$1"' _ .env"#));
-        let message = result.message.unwrap_or_default();
-        assert!(
-            message.contains("`.env` in a command that sets positional parameters"),
-            "{message}"
         );
     }
 
