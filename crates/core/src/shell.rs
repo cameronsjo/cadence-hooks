@@ -15888,8 +15888,15 @@ pub fn git_command_line_aliases(globals: &[String]) -> Vec<(String, String)> {
 /// judge a remote `cat .env` or `git push` by the local checkout's state, and
 /// no guard here can know what the remote side holds.
 ///
-/// Surfacing only ever ADDS segments to inspect, so a misread option costs at
-/// most a false block on a script that never runs — never a hidden one.
+/// Surfacing adds segments to inspect, so a misread option costs a false block
+/// on a script that never runs. It can also hide a read. The wrappers that
+/// exec their operands (`flock FILE CMD…`, BSD `script FILE CMD…`) hand the
+/// command over as separate words, and [`joined_script`] re-joins them with
+/// their quotes stripped: `flock L sh -c 'cat .env'` comes out as `sh -c cat
+/// .env`, a script of `cat` with `$0` set to `.env`, and the reader finds no
+/// read in it. The same join runs `echo 'x; cat .env'` behind `flock` as two
+/// commands, a false block. `prevent-secret-leaks` records the hidden read as
+/// an accepted cost (`positional_parameters_do_not_change_the_verdict`).
 fn wrapper_utility_script(verb: &str, operands: &[String]) -> Option<String> {
     match verb {
         "env" => env_split_string_script(operands),
