@@ -25897,6 +25897,7 @@ mod tests {
                 "runuser --user me --whitelist-environment PATH -- cat .env",
                 "cat .env",
             ),
+            ("runuser -u me --supp-group wheel -- cat .env", "cat .env"),
             // su hands the words after `--` to the user's shell, which runs
             // their `-c`.
             ("su root -- -c 'cat .env'", "cat .env"),
