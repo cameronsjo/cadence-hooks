@@ -40,7 +40,7 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **THEN** the hook allows, each push judged on its own target
 
 ### Requirement: Push shapes the push guard refuses
-`guard-push-remote` SHALL block a push whose target it read as uncertain. In a command the loop parser reads: a looped push with no remote, a bare push in a push chain that switches branch or tracking, or over four non-URL loop remotes. In any command: a URL with no `owner/repo`, a repository moved by `eval`, `trap`, `GIT_DIR`, `--git-dir` or `--work-tree`, a push URL the command rewrites, over four directory and remote pairs behind `git -C` or a subshell `cd`, or a remote git cannot resolve.
+`guard-push-remote` SHALL block a push whose target it read as uncertain. In a command the loop parser reads: a looped push with no remote, a bare push in a push chain that switches branch or tracking, or over four non-URL loop remotes. In any command: a URL with no `owner/repo`, a repository moved by `eval`, `trap`, `GIT_DIR`, `--git-dir` or `--work-tree`, a push URL the command rewrites, over four directory and remote pairs outside the command's last directory, or a remote git cannot resolve.
 
 #### Scenario: Loop with no remote
 - **WHEN** the command is `for b in a b; do git push; done`
@@ -266,7 +266,7 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 - **THEN** the hook allows
 
 ### Requirement: Pushes in a chain or loop the parser cannot read
-`guard-push-remote` MUST NOT block a chain of pushes or a loop holding a push for that alone when the loop parser cannot read the command (past its 12 KB cap, a heredoc or syntax error it cannot parse, or its 1 s parse budget). It SHALL judge each push it can read on its own target, as outside a chain or loop, and a push to a remote the operator does not own SHALL still block.
+`guard-push-remote` MUST NOT block a chain of pushes or a loop holding a push for that alone when the loop parser cannot read the command (past its 12 KB cap, a heredoc or syntax error it cannot parse, or its 1 s parse budget). It SHALL judge each push it can read as it would judge that push alone, a bare one against the branch checked out now, and a push to a remote the operator does not own SHALL still block.
 
 #### Scenario: Unreadable chain of owned pushes
 - **WHEN** a comment takes `git push origin main && git push origin main:feat` past 12 KB, in an owned checkout
@@ -299,7 +299,7 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 - **WHEN** a comment takes `for b in main feat; do git push origin $b; done` past 12 KB, in an owned checkout
 - **THEN** the hook allows with no output
 
-### Requirement: Unparsed push nudges name the branch a bare push was checked on
+### Requirement: Unparsed push nudges say which branch a bare push was checked on
 `guard-push-remote`'s nudges for a command the loop parser cannot read SHALL say that a bare push was checked against the branch checked out before the command runs, since a `git checkout` in the same command can send it to another remote.
 
 #### Scenario: Unreadable chain with a branch switch

@@ -561,6 +561,11 @@ fn padding_past_the_byte_cap_still_judges_each_push() {
             0,
             "give every push in the command an explicit remote",
         ),
+        (
+            "for b in main feat; do git push; done",
+            0,
+            "a bare one against the branch checked out now",
+        ),
         // Every push names `origin`: no nudge.
         ("for b in main feat; do git push origin $b; done", 0, ""),
         ("git push origin main && git push evil main", 2, ""),

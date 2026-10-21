@@ -1256,7 +1256,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 .collect();
             return CheckResult::block(format!(
                 "🚫 git-guardrails: chained git push without explicit remotes\n   \
-                 Found: {} after a branch switch or tracking change in the same command\n   \
+                 Found: {} in a chain that also switches branch or changes tracking\n   \
                  Fix: add explicit remote, e.g. `git push origin main`",
                 bare.join(", "),
             ));

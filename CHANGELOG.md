@@ -34,6 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`prevent-secret-leaks` no longer blocks a command for defining a shell function.** Since 0.129.0 (#1409, #1425) any command that defined a function and named a secret anywhere blocked, whatever the function did. So `die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env"` and `f(){ echo hi; }; f; git commit -m '.env'` both blocked. cadence-ecosystem ADR-0046 rule 1 puts function indirection out of scope, so the rule is gone. A literal read still blocks, inside a function body or out (`f(){ cat .env; }; f`). A read through a function argument (`f(){ cat "$1"; }; f .env`) now passes, as the ADR accepts. (Part of cameronsjo/cadence-hooks#1443)
 
+- **`guard-push-remote`'s chain block no longer says the bare push came after the branch switch.** The block for a chain of pushes with a bare one that also switches branch or changes tracking said it found the push "after a branch switch or tracking change". The switch can sit anywhere in the chain (`git push && git checkout main && git push origin feat` blocks too), so the text now says "in a chain that also switches branch or changes tracking". The verdict is unchanged. (Part of cameronsjo/cadence-hooks#1443)
+
 ## [0.130.1] - 2026-10-20
 
 ### Fixed
