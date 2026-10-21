@@ -25883,6 +25883,20 @@ mod tests {
             ("runuser -ucarol cat .env", "cat .env"),
             ("runuser -uapache -- cat .env", "cat .env"),
             ("runuser -mu me -- head -c 5 .env", "head -c 5 .env"),
+            // A value option after `-u` takes its value, so the command
+            // starts after `--`, not at the value.
+            ("runuser -u me -g wheel -- cat .env", "cat .env"),
+            ("runuser -u me -G wheel -- cat .env", "cat .env"),
+            ("runuser -u me -mg wheel -- cat .env", "cat .env"),
+            ("runuser -u me -w HOME -- cat .env", "cat .env"),
+            ("runuser -u me -Pw HOME -- cat .env", "cat .env"),
+            ("runuser -u me --group wheel -- cat .env", "cat .env"),
+            ("runuser -g wheel -u me -- cat .env", "cat .env"),
+            ("runuser --group wheel --user me -- cat .env", "cat .env"),
+            (
+                "runuser --user me --whitelist-environment PATH -- cat .env",
+                "cat .env",
+            ),
             // su hands the words after `--` to the user's shell, which runs
             // their `-c`.
             ("su root -- -c 'cat .env'", "cat .env"),
