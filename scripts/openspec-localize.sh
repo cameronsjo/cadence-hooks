@@ -24,7 +24,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 marker='<!-- cadence-hooks: pinned openspec CLI -->'
-ALLOWED='allowed-tools: Bash(scripts/openspec.sh list:*), Bash(scripts/openspec.sh status:*), Bash(scripts/openspec.sh instructions:*), Bash(scripts/openspec.sh context:*), Bash(scripts/openspec.sh new change:*), Bash(scripts/openspec.sh show:*), Bash(scripts/openspec.sh validate:*), Bash(scripts/openspec.sh schemas:*), Bash(scripts/openspec.sh store list:*)'
+ALLOWED='allowed-tools: Bash(scripts/openspec.sh list:*), Bash(scripts/openspec.sh status:*), Bash(scripts/openspec.sh instructions:*), Bash(scripts/openspec.sh context:*), Bash(scripts/openspec.sh new change:*), Bash(scripts/openspec.sh show:*), Bash(scripts/openspec.sh validate:*), Bash(scripts/openspec.sh schemas:*)'
 note="$marker
 **In this repo, run every \`openspec ...\` command below as \`scripts/openspec.sh ...\`** (same arguments). It runs the pinned CLI from \`scripts/openspec/package-lock.json\`. Never run \`npx openspec\`: that npm name is an unrelated package."
 
@@ -81,5 +81,5 @@ while IFS= read -r -d '' f; do
     printf 'openspec-localize: %s: %s\n' "$f" "$report" >&2
     status=1
   fi
-done < <(find "$root"/.claude "$root"/.agents -name '*.md' -print0 2>/dev/null)
+done < <(find "$root"/.claude "$root"/.agents -path "$root/.claude/worktrees" -prune -o -name '*.md' -print0 2>/dev/null)
 exit "$status"
