@@ -528,8 +528,9 @@ fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
     }
 }
 
-/// Past [`MAX_PARSE_BYTES`] `guard-push-remote` still judges each push on its
-/// own target (cadence-ecosystem ADR-0046 rule 3): a chain of owned pushes
+/// Past [`MAX_PARSE_BYTES`] `guard-push-remote` still checks each push it can
+/// read, a bare one against the branch checked out now (cadence-ecosystem
+/// ADR-0046 rule 3): a chain of owned pushes
 /// nudges, a loop nudges only when a push names no remote, and a push to a
 /// remote the operator does not own blocks.
 #[test]
@@ -549,10 +550,22 @@ fn padding_past_the_byte_cap_still_judges_each_push() {
             0,
             UNPARSED_PUSHES,
         ),
+        // The bare push may go to `other`'s remote, not the one it was
+        // checked against: the nudge says which branch it read.
+        (
+            "git push origin main && git checkout other && git push",
+            0,
+            "a bare one against the branch checked out now",
+        ),
         (
             "for b in main feat; do git push; done",
             0,
             "give every push in the command an explicit remote",
+        ),
+        (
+            "for b in main feat; do git push; done",
+            0,
+            "a bare one against the branch checked out now",
         ),
         // Every push names `origin`: no nudge.
         ("for b in main feat; do git push origin $b; done", 0, ""),

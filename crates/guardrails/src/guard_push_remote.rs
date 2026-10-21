@@ -1124,9 +1124,13 @@ fn judge_with_directory_nudge(input: &HookInput, walk: &PushWalk) -> CheckResult
 }
 
 /// The nudge for several pushes in a command the loop parser could not read.
-/// It names why the parse failed, not the chain: the chain is fine.
+/// It names why the parse failed, not the chain: the chain is fine. A bare
+/// push is checked against the branch checked out before the command runs,
+/// so after a `git checkout` in the same command it may push elsewhere; the
+/// nudge says which branch it was checked against.
 const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes in a command the \
-     guard could not parse — each push it read was checked on its own target\n   \
+     guard could not parse — each push it read was checked, a bare one against the \
+     branch checked out now\n   \
      Cause: the command is over 12 KB, holds a heredoc or a syntax error the parser \
      cannot read, or took too long to parse\n   \
      Verify: shorten the command, or run each push as its own command";
@@ -1135,7 +1139,8 @@ const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes i
 /// push in the command has no remote or one only the shell resolves. It reads
 /// every push in the command, not only those in the loop, so it says so.
 const UNPARSED_LOOP_NUDGE: &str = "⚠️  git-guardrails: git push in a command with a loop the \
-     guard could not parse — each push it read was checked on its own target\n   \
+     guard could not parse — each push it read was checked, a bare one against the \
+     branch checked out now\n   \
      Verify: give every push in the command an explicit remote, e.g. `git push origin main`";
 
 /// Whether a push names no repository, or one only the shell resolves (a
@@ -1251,7 +1256,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 .collect();
             return CheckResult::block(format!(
                 "🚫 git-guardrails: chained git push without explicit remotes\n   \
-                 Found: {} after a branch switch or tracking change in the same command\n   \
+                 Found: {} in a chain that may switch branch or change tracking\n   \
                  Fix: add explicit remote, e.g. `git push origin main`",
                 bare.join(", "),
             ));
@@ -1260,8 +1265,9 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         | ChainAnalysis::DifferentRemotes(_)
         | ChainAnalysis::MissingRemotes(_) => {}
         ChainAnalysis::ParseFailed => {
-            // Fall back to counting, for the nudge: every push is still
-            // judged on its own target below. The substring count alone misses a
+            // Fall back to counting, for the nudge: every push it can read is
+            // still checked below, a bare one against the branch checked out
+            // now. The substring count alone misses a
             // push carrying a git global (`git -C . push …`), which is
             // exactly the shape #554 was about — so take the larger of the
             // two counts rather than trusting either on its own.
@@ -2696,6 +2702,19 @@ mod tests {
                     result.message
                 );
             }
+            // The block names the chain, not the push's place in it: the
+            // switch can come before or after the bare push.
+            for command in [
+                "git push origin feat && git checkout main && git push",
+                "git push && git checkout main && git push origin feat",
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                let msg = result.message.as_deref().unwrap_or("");
+                assert!(
+                    msg.contains("in a chain that may switch branch or change tracking"),
+                    "{command}: {msg}"
+                );
+            }
         });
     }
 
@@ -3333,7 +3352,8 @@ mod tests {
             "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
         );
         let chain_nudge = "⚠️  git-guardrails: several git pushes in a command the guard \
-            could not parse — each push it read was checked on its own target\n   \
+            could not parse — each push it read was checked, a bare one against the \
+            branch checked out now\n   \
             Cause: the command is over 12 KB, holds a heredoc or a syntax error the \
             parser cannot read, or took too long to parse\n   \
             Verify: shorten the command, or run each push as its own command";
