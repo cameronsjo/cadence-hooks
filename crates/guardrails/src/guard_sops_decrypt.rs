@@ -92,8 +92,8 @@
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, brace_expansion_overflows, child_scripts, command_segments,
-    command_word, peel_command_runners, resolved_readings, skip_transparent_prefixes,
-    split_segments_with_ops, strip_group_wrappers, tokenize,
+    command_word, peel_command_runners, resolved_readings, shell_option_takes_value,
+    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
@@ -435,14 +435,38 @@ fn consumer_is_allowed(segment: &str, vouched: &Vouch) -> bool {
         return curl_reads_config_from_stdin(argv);
     }
 
-    // `bash scripts/secret-keys.sh` runs the script named by its first non-flag
-    // operand; anything else runs itself.
+    // `bash scripts/secret-keys.sh` runs the script named by its first operand;
+    // anything else runs itself.
     let target = if SHELL_WRAPPERS.contains(&word.as_ref()) {
-        argv[1..].iter().find(|token| !token.starts_with('-'))
+        shell_first_operand(&word, &argv[1..])
     } else {
         Some(first)
     };
     target.is_some_and(|path| KEY_NAME_TOOLS.contains(&basename(path)) || vouched.vouches(path))
+}
+
+/// The first word of a shell's `words` that is not an option or an option's
+/// value. `pipefail` in `bash -euo pipefail scripts/secret-keys.sh` is the
+/// value of `-o` ([`shell_option_takes_value`]), and `+e` is an option, so
+/// neither is the script the shell runs. `None` under `-s`: stdin is then the
+/// script, so the shell runs the decrypted text as commands.
+fn shell_first_operand<'a>(shell: &str, words: &'a [String]) -> Option<&'a String> {
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        if !word.starts_with(['-', '+']) {
+            return Some(word);
+        }
+        // Under `-s` (`-s`, `-es`, `-so pipefail`) stdin is the script, so no
+        // file is the consumer. A cluster that also holds `c` blocks too, the
+        // safe side. A long option such as `--posix` is not a cluster.
+        if word.starts_with('-') && !word.starts_with("--") && word.contains('s') {
+            return None;
+        }
+        if shell_option_takes_value(shell, word) {
+            words.next();
+        }
+    }
+    None
 }
 
 /// This `curl` reads its configuration — and therefore the secret — from
@@ -789,6 +813,48 @@ mod tests {
                 outcome("sops -d secrets.sops.yaml | bash scripts/secret-keys.sh"),
                 Outcome::Allow
             )
+        });
+    }
+
+    #[test]
+    fn decrypt_piped_to_key_lister_behind_shell_options_allowed() {
+        // `pipefail` is the value of `-o` and `+e` is an option, so each row
+        // runs `scripts/secret-keys.sh`. The first word without a `-` was read
+        // as the script, so the first four rows blocked. The last two allowed
+        // before too: the first word without a `-` there is the lister itself.
+        without_escape(|| {
+            for command in [
+                "sops -d secrets.sops.yaml | bash -euo pipefail scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -o pipefail scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash +e scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | zsh -euo pipefail scripts/secret-keys.sh",
+                // zsh's `-O` is a plain flag, so zsh runs the file after it.
+                "sops -d secrets.sops.yaml | zsh -O scripts/secret-keys.sh",
+                // A long option holding an `s` is not `-s`: bash runs the file.
+                "sops -d secrets.sops.yaml | bash --posix scripts/secret-keys.sh",
+            ] {
+                assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
+            }
+            // Only the value is skipped: the script after it is still judged.
+            for command in [
+                "sops -d secrets.sops.yaml | bash -euo pipefail scripts/other.sh",
+                "sops -d secrets.sops.yaml | bash -euo pipefail",
+                // zsh runs `other.sh` and `extglob`, not the key lister.
+                "sops -d secrets.sops.yaml | zsh -O scripts/other.sh scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | zsh -O extglob scripts/secret-keys.sh",
+                // Under `-s` stdin is the script: bash runs the plaintext as
+                // commands, and a line's first word reaches stderr when that
+                // line fails as a command (only the first failing line's
+                // under `-e`). `-x` traces the whole line.
+                "sops -d secrets.sops.yaml | bash -s scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -so pipefail scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -euo pipefail -s scripts/secret-keys.sh",
+                // `s` after another letter in the cluster.
+                "sops -d secrets.sops.yaml | bash -es scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -xs scripts/secret-keys.sh",
+            ] {
+                assert_eq!(outcome(command), Outcome::Block, "{command:?}");
+            }
         });
     }
 
