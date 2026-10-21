@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
+
 ### Changed
 
 - **`guard-gh-write` nudges, not blocks, on a loop it cannot parse.** The loop parser reads at most 12 KB (since 0.128.0), and on a parse failure the guard blocked any `gh` command in a loop, reads included. So a long heredoc or comment in front of `for i in 1 2; do gh pr view $i -R <owner>/<repo>; done` blocked. Under cadence-ecosystem ADR-0046 rule 3 the guard now judges each gh write it read on its own, as it does outside a loop, so a write to a repo you do not own still blocks. A loop holding a gh write gets a nudge to give each one `-R owner/repo`; a read-only loop passes. (Part of cameronsjo/cadence-hooks#1443)
