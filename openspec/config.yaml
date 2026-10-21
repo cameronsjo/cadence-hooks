@@ -1,0 +1,39 @@
+schema: spec-driven
+
+# Constraints an agent cannot infer from the code. Everything else (layout,
+# commands, gotchas) is in CLAUDE.md, CONTRIBUTING.md and docs/; keep it
+# there, not here.
+context: |
+  cadence-hooks is one Rust binary that Claude Code runs as its hooks. A hook
+  reads the event JSON on stdin and answers with an exit code and stdout or
+  stderr: exit 0 allows, exit 2 blocks, and a hook's own failure never blocks
+  (fail open, docs/adr/0001-fail-open.md).
+  Guards stop accidents by a cooperative model, not deliberate evasion
+  (cadence-ecosystem ADR-0046, the five rules in CLAUDE.md). A guard blocks
+  only when it read the command exactly and the harm is costly to undo; when
+  it cannot resolve a shape it judges what it read and allows the rest. A
+  change that adds a block names its cost on the everyday-command corpus.
+  A hook only fires if the plugin wires it: the hooks.json entries live in the
+  cameronsjo/cadence monorepo, so a new or renamed hook needs a PR there too.
+  docs/plans/ is frozen history (no new plans after 2026-10-20). Read a done
+  plan as background, never as a requirement. ADRs in docs/adr/ stay: the
+  spec says what the behavior is, the ADR says why.
+  Run the OpenSpec CLI as scripts/openspec.sh (the pinned version), not a
+  bare `openspec` or `npx`.
+  Commits and PR titles are Conventional Commits. Each PR stages its
+  CHANGELOG.md bullet under [Unreleased]; the release PR is automated.
+
+rules:
+  proposal:
+    - Link the GitHub issue the change implements (cameronsjo/cadence-hooks#N). Every change has one.
+    - Name every surface the change touches (subcommand, hook event, exit code, message text a user reads, env var, config key, ledger or marker file) and whether a hooks.json change in cameronsjo/cadence must ship with it.
+    - A change that adds or widens a block states which ADR-0046 harm it prevents.
+  specs:
+    - Spec observable behavior (subcommand, event, verdict, message, files and env vars a user relies on), never internal module or type names.
+  tasks:
+    - End with tasks for the CHANGELOG.md bullet under [Unreleased] and, when a hook's verdicts or wiring change, docs/hooks.md.
+
+operations:
+  archive:
+    guidance:
+      - Archive only after the implementing PR has merged to main.

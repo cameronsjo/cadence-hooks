@@ -19,8 +19,6 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
 fn run(ns: &str, hook: &str, stdin: &str, remote: bool, extra: &[(&str, &str)]) -> Output {
     let mut cmd = support::cadence_hooks();
     cmd.args([ns, hook])
-        .env_remove("CADENCE_BYPASS")
-        .env_remove("CADENCE_DISABLE")
         .env_remove("CADENCE_ALLOWED_OWNERS")
         .env("CADENCE_METRICS_DIR", scratch_metrics_dir())
         .stdin(Stdio::piped())

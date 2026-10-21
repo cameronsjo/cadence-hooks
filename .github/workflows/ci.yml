@@ -72,3 +72,37 @@ jobs:
         env:
           CADENCE_TIMING_TESTS: '1'
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
+
+  openspec:
+    # openspec/ holds the capability specs and the change proposals (#1446).
+    # A spec or change that the CLI cannot parse is silently skipped by
+    # `openspec list` and by an agent's /opsx commands, so a malformed file
+    # must fail here instead.
+    name: OpenSpec
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate specs and changes
+        # The runner image's Node is enough (the CLI needs >= 20.19). The CLI
+        # itself comes from scripts/openspec/package-lock.json, integrity
+        # hashes included, with install scripts off.
+        run: |
+          node --version
+          scripts/openspec.sh validate --all --strict --no-interactive
+
+      - name: Generated skills use the pinned CLI
+        # `openspec update` resets the generated skills to a bare, unpinned
+        # `openspec` grant that covers every subcommand. Rerunning the
+        # localize script must change nothing, and it fails on a grant it
+        # does not recognize.
+        run: |
+          set -euo pipefail
+          bash scripts/openspec-localize.sh
+          if ! git diff --exit-code -- .claude .agents/skills; then
+            echo "::error::generated OpenSpec skills are not localized to the pinned CLI; run scripts/openspec-localize.sh and commit the result"
+            exit 1
+          fi

@@ -8,3 +8,10 @@ updates:
     # the estate label rollout folds into kind:chore (cadence-ecosystem#553).
     labels:
       - "kind:chore"
+  # The pinned OpenSpec CLI behind scripts/openspec.sh (#1446).
+  - package-ecosystem: "npm"
+    directory: "/scripts/openspec"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "kind:chore"
