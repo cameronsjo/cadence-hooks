@@ -861,7 +861,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "warn-commit-provenance",
-        description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message",
+        description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message, or when a conflicted merge's Conflicts block would land below the trailers",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
         // Remote: runs, but the Machine: field becomes the fixed value `cloud` (#1197).
@@ -1120,7 +1120,10 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ),
         // warn-commit-provenance early-exits unless the command is a git
         // commit carrying an extractable message — the generic PreToolUse
-        // sample (`git status`) would never reach the Session-Id: check.
+        // sample (`git status`) would never reach the Session-Id: check. The
+        // other nudge (a conflicted merge's Conflicts block below the
+        // trailers) needs a `--no-edit` commit in a repo mid-merge, which a
+        // sample payload cannot carry, so it is not exercised here.
         ("session", "warn-commit-provenance") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
         ),

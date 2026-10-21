@@ -33,7 +33,7 @@
 use crate::identity;
 use crate::provenance;
 use cadence_hooks_core::paths;
-use cadence_hooks_core::shell::{strip_quotes, tokenize};
+use cadence_hooks_core::shell::{is_assignment_word, strip_quotes, tokenize};
 use cadence_hooks_core::transcript;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
@@ -334,7 +334,7 @@ fn conflicts_after_trailers_nudge(command: &str, cwd: Option<&str>) -> Option<St
 /// The arguments after `commit` when `tokens` is a plain `git commit` (leading
 /// `VAR=value` words allowed, no git options before the subcommand).
 fn no_edit_commit_args(tokens: &[String]) -> Option<Vec<String>> {
-    let mut words = tokens.iter().skip_while(|t| is_env_assignment(t));
+    let mut words = tokens.iter().skip_while(|t| is_assignment_word(t));
     if words.next().map(String::as_str) != Some("git") {
         return None;
     }
@@ -342,16 +342,6 @@ fn no_edit_commit_args(tokens: &[String]) -> Option<Vec<String>> {
         return None;
     }
     Some(words.cloned().collect())
-}
-
-/// `NAME=value` with a shell-variable name — the prefix words of a command.
-fn is_env_assignment(token: &str) -> bool {
-    token.split_once('=').is_some_and(|(name, _)| {
-        name.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
 }
 
 /// True when `args` (after `git commit`) ask for `--no-edit` and name no
@@ -1077,22 +1067,28 @@ mod tests {
         "Merge feat\n\nSession-Id: 1111\nModel: m\nCo-Authored-By: Claude <n@a>";
 
     /// `git` in `dir` with discovery vars cleared (a concurrent test must not
-    /// redirect it) and no exit-code check: a conflicted merge exits 1.
+    /// redirect it) and no exit-code check: a conflicted merge exits 1. The
+    /// comment character and commit cleanup are pinned to git's defaults, so a
+    /// developer's global `core.commentChar` or `commit.cleanup` cannot change
+    /// what MERGE_MSG or a landed commit looks like.
     fn raw_git(dir: &Path, args: &[&str]) -> std::process::Output {
         let mut cmd = std::process::Command::new("git");
         for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
             cmd.env_remove(var);
         }
         cmd.args(["-c", "commit.gpgsign=false"])
+            .args(["-c", "core.commentChar=#"])
+            .args(["-c", "commit.cleanup=default"])
             .args(args)
             .current_dir(dir)
             .output()
             .unwrap()
     }
 
-    /// A repo stopped mid-merge on a conflict in `f.txt`, the merge started
-    /// with `git merge --no-ff -m <merge_message> feat`.
-    fn conflicted_merge(merge_message: &str) -> tempfile::TempDir {
+    /// A repo on `main` with a `feat` branch that changes `f.txt` the other
+    /// way, so merging or cherry-picking `feat` conflicts. `feat`'s tip commit
+    /// carries `feat_message`.
+    fn diverged_repo(feat_message: &str) -> tempfile::TempDir {
         use cadence_hooks_core::git_fixtures::init_repo;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -1103,10 +1099,18 @@ mod tests {
         };
         ok(&["switch", "-q", "-c", "feat"]);
         std::fs::write(p.join("f.txt"), "feat").unwrap();
-        ok(&["commit", "-q", "-am", "feat"]);
+        ok(&["commit", "-q", "-am", feat_message]);
         ok(&["switch", "-q", "main"]);
         std::fs::write(p.join("f.txt"), "main").unwrap();
         ok(&["commit", "-q", "-am", "main change"]);
+        dir
+    }
+
+    /// A repo stopped mid-merge on a conflict in `f.txt`, the merge started
+    /// with `git merge --no-ff -m <merge_message> feat`.
+    fn conflicted_merge(merge_message: &str) -> tempfile::TempDir {
+        let dir = diverged_repo("feat");
+        let p = dir.path();
         let merge = raw_git(p, &["merge", "--no-ff", "-m", merge_message, "feat"]);
         assert!(!merge.status.success(), "the merge must stop on a conflict");
         assert!(p.join(".git/MERGE_HEAD").is_file());
@@ -1159,6 +1163,7 @@ mod tests {
         for (command, cwd) in [
             ("git add -A && git commit --no-edit", repo.path()),
             ("GIT_EDITOR=true git commit --no-edit", repo.path()),
+            ("GIT_SSH_COMMAND+=x git commit --no-edit", repo.path()),
             ("git commit -a --no-edit -S", repo.path()),
             (&format!("cd {dir} && git commit --no-edit"), Path::new("/")),
         ] {
@@ -1243,6 +1248,108 @@ mod tests {
     }
 
     #[test]
+    fn the_conflicts_nudge_needs_a_merge_head_not_just_a_conflicted_message() {
+        // A conflicted cherry-pick writes MERGE_MSG with the picked commit's
+        // trailers above git's `# Conflicts:` block, but leaves
+        // CHERRY_PICK_HEAD, not MERGE_HEAD. The nudge is for merges only.
+        let repo = diverged_repo("feat\n\nSession-Id: 1111\nCo-Authored-By: Claude <n@a>");
+        let pick = raw_git(repo.path(), &["cherry-pick", "feat"]);
+        assert!(!pick.status.success(), "the pick must stop on a conflict");
+        let git_dir = repo.path().join(".git");
+        assert!(git_dir.join("CHERRY_PICK_HEAD").is_file());
+        assert!(!git_dir.join("MERGE_HEAD").exists());
+        let merge_msg = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap();
+        assert!(
+            conflicts_block_follows_trailers(&merge_msg),
+            "the fixture must hold trailers above the block: {merge_msg:?}"
+        );
+        let result = run_in("git commit --no-edit", repo.path());
+        assert!(!is_conflicts_nudge(&result), "{:?}", result.message);
+    }
+
+    #[test]
+    fn the_conflicts_nudge_stays_silent_without_a_cwd() {
+        // With no `cwd` in the payload the hook cannot say which repo the
+        // command runs in. The `cd` names an absolute conflicted repo, so a
+        // fallback to "." would find it and nudge.
+        let repo = conflicted_merge(TRAILERS_MESSAGE);
+        let command = format!("cd {} && git commit --no-edit", repo.path().display());
+        let with_cwd = run_in(&command, Path::new("/"));
+        assert!(is_conflicts_nudge(&with_cwd), "{:?}", with_cwd.message);
+        let input = bash_input(&command, Some("sid"), None, None);
+        let result = run_warn_commit_provenance(&input, "host");
+        assert!(!is_conflicts_nudge(&result), "{:?}", result.message);
+    }
+
+    /// MERGE_MSG is read under the 64 KB cap and without following a symlink,
+    /// and a FIFO there must not stall the hook. Each swap leaves a message
+    /// that would nudge if it were read, so silence means the read refused it.
+    #[test]
+    fn the_conflicts_nudge_reads_merge_msg_under_the_cap_and_without_following_links() {
+        let repo = conflicted_merge(TRAILERS_MESSAGE);
+        let merge_msg = repo.path().join(".git/MERGE_MSG");
+        let original = std::fs::read_to_string(&merge_msg).unwrap();
+        assert!(
+            is_conflicts_nudge(&run_in("git commit --no-edit", repo.path())),
+            "control: the untouched MERGE_MSG nudges"
+        );
+
+        // Over the cap, with trailers above the block.
+        let (subject, rest) = original.split_once("\n\n").unwrap();
+        let oversized = format!(
+            "{subject}\n\n{}\n\n{rest}",
+            "x".repeat(MAX_MESSAGE_FILE_BYTES as usize + 1)
+        );
+        assert!(oversized.len() as u64 > MAX_MESSAGE_FILE_BYTES);
+        assert!(conflicts_block_follows_trailers(&oversized));
+        std::fs::write(&merge_msg, &oversized).unwrap();
+        let result = run_in("git commit --no-edit", repo.path());
+        assert!(
+            !is_conflicts_nudge(&result),
+            "an oversized MERGE_MSG is not read: {:?}",
+            result.message
+        );
+
+        #[cfg(unix)]
+        {
+            // A symlink to a valid trailers+block message.
+            let real = repo.path().join(".git/MERGE_MSG.real");
+            std::fs::write(&real, &original).unwrap();
+            std::fs::remove_file(&merge_msg).unwrap();
+            std::os::unix::fs::symlink(&real, &merge_msg).unwrap();
+            let result = run_in("git commit --no-edit", repo.path());
+            assert!(
+                !is_conflicts_nudge(&result),
+                "a symlinked MERGE_MSG is not followed: {:?}",
+                result.message
+            );
+
+            // A FIFO with no writer: opening it for reading blocks forever.
+            // The hook runs on a thread so a regression fails the test rather
+            // than hanging it.
+            std::fs::remove_file(&merge_msg).unwrap();
+            let made = std::process::Command::new("mkfifo")
+                .arg(&merge_msg)
+                .status()
+                .unwrap();
+            assert!(made.success(), "mkfifo");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dir = repo.path().to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(run_in("git commit --no-edit", &dir));
+            });
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("a FIFO at MERGE_MSG must not stall the hook");
+            assert!(
+                !is_conflicts_nudge(&result),
+                "a FIFO MERGE_MSG is not read: {:?}",
+                result.message
+            );
+        }
+    }
+
+    #[test]
     fn the_conflicts_nudge_does_not_spend_the_provenance_marker() {
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
@@ -1279,6 +1386,23 @@ mod tests {
                 format!("Merge x\n\nResolved the clash by hand.\n\n{block}"),
                 false,
             ),
+            // Lines with a colon that are not trailers: a URL (no whitespace
+            // after the colon), a token with spaces, a token that starts with
+            // a digit.
+            (
+                format!("Merge x\n\nhttps://example.com/x\n\n{block}"),
+                false,
+            ),
+            (
+                format!("Merge x\n\nResolved by hand: kept both.\n\n{block}"),
+                false,
+            ),
+            (format!("Merge x\n\n1st: thing\n\n{block}"), false),
+            // One trailer line is enough in a paragraph that also has prose.
+            (
+                format!("Merge x\n\nResolved the clash by hand.\nSession-Id: 1\n\n{block}"),
+                true,
+            ),
             // The header but nothing above it, and no header at all.
             (block.to_string(), false),
             ("Merge x\n\nSession-Id: 1\n".to_string(), false),
@@ -1314,6 +1438,7 @@ mod tests {
             ("--no-edit -c HEAD", false),
             ("--no-edit --cleanup=strip", false),
             ("--no-edit --message x", false),
+            ("--no-edit --reuse-message HEAD", false),
             ("--no-edit --file f", false),
             ("--no-edit --reedit-message HEAD", false),
             ("--no-edit --reedit-message=HEAD", false),
