@@ -293,7 +293,7 @@ id.
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths | self-disable |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time | run |
 | `warn-branch-intent` | PreToolUse (Edit, Write) | Nudge once per session when new work starts on a stale feature branch whose name shares nothing with the declared intent | run |
-| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one | run |
+| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one; also nudge `git commit --no-edit --cleanup=strip` when a plain `git commit --no-edit` would land a conflicted merge's `# Conflicts:` block below the message's trailers | run |
 | `persist-plan-approval` | PostToolUse (every tool) | On `ExitPlanMode`, persist the approved plan into the repo's plans dir, merging its frontmatter and nudging when it carries no settled `Panel:` line (`CADENCE_NO_PERSIST_PLAN` opts out); on every call, refresh this session's liveness heartbeat, throttled | self-disable |
 | `backstop-warn` | SessionStart | Warn once when the last session left loose ends, then clear the marker | self-disable |
 | `backstop-record` | SessionEnd | Record loose ends (uncommitted changes, unpushed commits, stashes, other worktrees with unpushed work) for the next `session start` to surface, only when no live peer remains in the checkout | self-disable |

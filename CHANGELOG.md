@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`warn-commit-provenance` nudges when a conflicted merge's `# Conflicts:` block would land below the trailers.** After `git merge -m "<message with trailers>"` stops on conflicts, git ends the pending message (MERGE_MSG) with a `# Conflicts:` block. `git commit --no-edit` keeps `#` lines, so the commit landed with that block after its trailers. They were then no longer the final paragraph, and a lint that reads the final paragraph missed them. The hook now nudges, naming `git commit --no-edit --cleanup=strip` (checked on a real conflicted merge: it drops the block and keeps the rest), when a `git commit --no-edit` runs in a repo with a `MERGE_HEAD` and a MERGE_MSG that has a trailer line above the block. It reads only the plain shape: no git option before `commit`, and no `-m`, `-F`, `-C`, `-c` or `--cleanup`; any other shape stays silent. A subject shaped like a trailer (`fix: thing`) does not count. It never blocks, and it does not use up the once-per-session provenance nudge. (cameronsjo/cadence-hooks#1439)
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
