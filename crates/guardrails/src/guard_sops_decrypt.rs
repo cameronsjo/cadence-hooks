@@ -820,7 +820,8 @@ mod tests {
     fn decrypt_piped_to_key_lister_behind_shell_options_allowed() {
         // `pipefail` is the value of `-o` and `+e` is an option, so each row
         // runs `scripts/secret-keys.sh`. The first word without a `-` was read
-        // as the script, so these blocked.
+        // as the script, so the first four rows blocked. The last two allowed
+        // before too: the first word without a `-` there is the lister itself.
         without_escape(|| {
             for command in [
                 "sops -d secrets.sops.yaml | bash -euo pipefail scripts/secret-keys.sh",
