@@ -528,8 +528,9 @@ fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
     }
 }
 
-/// Past [`MAX_PARSE_BYTES`] `guard-push-remote` still judges each push on its
-/// own target (cadence-ecosystem ADR-0046 rule 3): a chain of owned pushes
+/// Past [`MAX_PARSE_BYTES`] `guard-push-remote` still checks each push it can
+/// read, a bare one against the branch checked out now (cadence-ecosystem
+/// ADR-0046 rule 3): a chain of owned pushes
 /// nudges, a loop nudges only when a push names no remote, and a push to a
 /// remote the operator does not own blocks.
 #[test]

@@ -1256,7 +1256,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 .collect();
             return CheckResult::block(format!(
                 "🚫 git-guardrails: chained git push without explicit remotes\n   \
-                 Found: {} in a chain that also switches branch or changes tracking\n   \
+                 Found: {} in a chain that may switch branch or change tracking\n   \
                  Fix: add explicit remote, e.g. `git push origin main`",
                 bare.join(", "),
             ));
@@ -1265,8 +1265,9 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         | ChainAnalysis::DifferentRemotes(_)
         | ChainAnalysis::MissingRemotes(_) => {}
         ChainAnalysis::ParseFailed => {
-            // Fall back to counting, for the nudge: every push is still
-            // judged on its own target below. The substring count alone misses a
+            // Fall back to counting, for the nudge: every push it can read is
+            // still checked below, a bare one against the branch checked out
+            // now. The substring count alone misses a
             // push carrying a git global (`git -C . push …`), which is
             // exactly the shape #554 was about — so take the larger of the
             // two counts rather than trusting either on its own.
@@ -2699,6 +2700,19 @@ mod tests {
                     blocks,
                     "{command}: {:?}",
                     result.message
+                );
+            }
+            // The block names the chain, not the push's place in it: the
+            // switch can come before or after the bare push.
+            for command in [
+                "git push origin feat && git checkout main && git push",
+                "git push && git checkout main && git push origin feat",
+            ] {
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(command, &cwd));
+                let msg = result.message.as_deref().unwrap_or("");
+                assert!(
+                    msg.contains("in a chain that may switch branch or change tracking"),
+                    "{command}: {msg}"
                 );
             }
         });
