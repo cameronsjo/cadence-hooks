@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`doctor` notes a wired `markdown-lint` hook whose `markdownlint` CLI is missing.** The hook allows every file without a word when the CLI is not on `PATH`, so a successful Write was no sign the file was linted. A full `doctor` run now prints a note naming the install command (`npm install -g markdownlint-cli`). It is a note, not a warning: the exit code and `doctor --quiet` are unchanged, and the hook still allows. On Windows the hook now runs npm's `markdownlint.cmd`; it used to look only for `markdownlint.exe` and skip every file. The hook and `doctor` share one PATH lookup, so they agree on whether the CLI is installed.
 
+### Fixed
+
+- **`cadence-hooks try` reads a payload piped to stdin.** It ignored stdin and always ran the generated sample unless `--payload FILE` was given, so `… | cadence-hooks try <ns> <hook>` tested `git status` and could report ALLOW for a payload that blocks. A piped payload now runs; `--payload` still wins, and empty stdin (`/dev/null`) runs the sample as before. Stdin that sends nothing for 2 s runs the sample with a warning; once bytes arrive, `try` reads to the end however slow the producer. Stdin that is not UTF-8 exits 1.
+
 ## [0.130.1] - 2026-10-20
 
 ### Fixed

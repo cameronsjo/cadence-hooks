@@ -140,7 +140,10 @@ enum Commands {
     #[command(subcommand)]
     Session(SessionCommands),
 
-    /// Run a hook against a generated sample payload (manual testing)
+    /// Run a hook against a payload and report the outcome (manual testing)
+    ///
+    /// The payload is the --payload file, else JSON piped to stdin, else a
+    /// generated sample for the hook's event.
     Try {
         /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, session
         /// — see `registry_matches_clap_dispatch` in this file for the derived
@@ -148,7 +151,7 @@ enum Commands {
         namespace: String,
         /// Hook name (see `cadence-hooks list`)
         subcommand: String,
-        /// Read the payload from a file instead of generating a sample
+        /// Read the payload from a file (wins over a payload piped to stdin)
         #[arg(long, value_name = "FILE")]
         payload: Option<std::path::PathBuf>,
         /// Echo user-supplied payloads in full (default: bounded preview)

@@ -185,8 +185,9 @@ check-author's debugging loop.
 5. Once the failure is understood, add the payload as a unit test in the
    check's `#[cfg(test)]` block
 
-Use `try` when you want to see what a hook does; use raw `printf | cadence-hooks ...`
-when you need to control the exact payload — `try` always generates its own.
+Use `try` when you want a decoded report of what a hook does; it takes your
+payload from `--payload FILE` or piped stdin. Use raw `printf | cadence-hooks ...`
+when you want the bare exit code and output, exactly as Claude Code sees them.
 
 ### Tool shapes
 
