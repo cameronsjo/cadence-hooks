@@ -3361,6 +3361,45 @@ mod tests {
                     Nudge,
                     Some(UNPARSED_LOOP_NUDGE),
                 ),
+                // The loop nudge is the OR of two readings of the pushes, and
+                // each catches a push the other misses (review of #1470).
+                // `bash -c` and `sh -c` hide the push from the segment
+                // reading; the push walk reads into the child script.
+                (
+                    "for b in a b; do bash -c 'git push'; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                (
+                    "for b in a b; do sh -c 'git push'; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                // A heredoc fed to the shell hides the push from the walk;
+                // the segment reading finds it.
+                (
+                    "for b in a b; do bash <<'Z'\ngit push\nZ\ndone",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                // The same two shapes with a remote named: nothing to fix.
+                (
+                    "for b in a b; do bash -c 'git push origin'; done",
+                    Allow,
+                    None,
+                ),
+                (
+                    "for b in a b; do bash <<'Z'\ngit push origin\nZ\ndone",
+                    Allow,
+                    None,
+                ),
+                // The nudge reads every push in the command, not only those
+                // in the loop: the bare push after it is the one to fix.
+                (
+                    "for b in a b; do git push origin $b; done; git push",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
                 (
                     "git push origin main && git push origin main:feat",
                     Nudge,
