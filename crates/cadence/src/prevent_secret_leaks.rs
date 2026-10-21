@@ -7179,6 +7179,7 @@ mod tests {
                 "tmux display-popup sh -c 'cat .env'",
                 // Without `-x`, `watch`'s `sh -c` splits the words again.
                 "watch echo 'x; cat .env'",
+                "watch -dx echo 'x; cat .env'",
                 // tmux runs `run-shell`'s first word under `sh -c` and
                 // ignores a second.
                 "tmux run-shell 'cat .env' x",
@@ -7202,8 +7203,8 @@ mod tests {
                 // Without `-x`, `watch` hands its words to `sh -c` as one
                 // string: that shell runs `sh -c cat .env`, a script of
                 // `cat` with `$0` set to `.env`, which reads no file. `-dx`
-                // is `-d` with the value `x`, and `-n -x` an interval of
-                // `-x`, so neither execs.
+                // is `-d` with the value `x`, so it does not exec; `-n -x`
+                // gives `-n` a bad interval, and watch runs nothing.
                 "watch sh -c 'cat .env'",
                 "watch -dx sh -c 'cat .env'",
                 "watch -n -x sh -c 'cat .env'",

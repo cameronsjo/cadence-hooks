@@ -25887,9 +25887,10 @@ mod tests {
                 "{command:?} must surface {inner:?}, got {segments:?}"
             );
         }
-        // Without `-x` (and with `-n`'s value `x`, `-n`'s value `-x`, or
-        // `-d`'s glued value `x`), `watch` hands its words to `sh -c` as one
-        // string, which splits them again. So does tmux with a single word,
+        // Without `-x`, `watch` hands its words to `sh -c` as one string,
+        // which splits them again; `-dx` is `-d` with the glued value `x`.
+        // `-nx` and `-n -x` give `-n` a bad interval, so watch runs nothing,
+        // and the join keeps main's reading. So does tmux with a single word,
         // and `run-shell` and `pipe-pane`, which tmux never execs: it runs
         // their first word under `sh -c` and refuses more than two words
         // (`run-shell`) or one (`pipe-pane`).
@@ -25899,6 +25900,7 @@ mod tests {
             ("watch -nx sh -c 'cat .env'", "sh -c cat .env"),
             ("watch -n -x sh -c 'cat .env'", "sh -c cat .env"),
             ("watch -dx sh -c 'cat .env'", "sh -c cat .env"),
+            ("watch -dx echo 'x; cat .env'", "cat .env"),
             ("watch echo 'x; cat .env'", "cat .env"),
             ("tmux run-shell 'cat .env' x", "cat .env x"),
             ("tmux run -b sh -c 'cat .env'", "sh -c cat .env"),
