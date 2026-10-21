@@ -133,8 +133,8 @@
 //! (an editor, a redirect into `.git/config`); a pushed commit on another
 //! branch that adds a submodule the index and top-level `.gitmodules` do not
 //! show; a push through an alias; and a push hidden behind a brace word the
-//! dispatch seam could not expand (this guard is not one of the checks that
-//! refuse an unread command, cameronsjo/cadence-hooks#1279).
+//! parser could not expand (cadence-ecosystem ADR-0046: guards judge what
+//! they read).
 //!
 //! The one escape is [`ESCAPE_ENV`], read from the hook's environment, which
 //! allows a found secret AND records a bypass row. A warning needs no escape.
