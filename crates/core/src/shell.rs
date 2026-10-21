@@ -16276,10 +16276,10 @@ fn su_script(verb: &str, operands: &[String]) -> Option<String> {
             continue;
         }
         let cluster = &tok[1..];
-        if let Some(at) = cluster.find(|c| RUNUSER_VALUE_SHORT_FLAGS.contains(c)) {
-            if at + 1 == cluster.len() {
-                i += 1;
-            }
+        if let Some(at) = cluster.find(|c| RUNUSER_VALUE_SHORT_FLAGS.contains(c))
+            && at + 1 == cluster.len()
+        {
+            i += 1;
         }
     }
     None
