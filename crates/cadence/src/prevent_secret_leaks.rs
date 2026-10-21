@@ -7073,17 +7073,27 @@ mod tests {
                 r"set -- a b; git commit -m 'mention .env'",
                 "docker run --env-file .env img sh -c 'x' _ y",
                 // An accepted cost of removing the rule: a literal read in a
-                // `-c` script that `parallel` or `fd -x`/`-X` runs, or in a
-                // script piped to `bash -s` with an operand, was caught only
-                // by it. The guard does not peel `parallel` or `fd`, so
-                // `parallel cat .env ::: a` and `fd -x cat .env` already
-                // passed; peeling them is a separate change.
+                // `-c` script that a wrapper runs was caught only by it when
+                // the guard does not peel the wrapper (`parallel`, `fd
+                // -x`/`-X`), or when core re-joins its operands without their
+                // quotes (`flock FILE CMD…`, BSD `script FILE CMD…`: `sh -c
+                // 'cat .env'` reaches the reader as `sh -c cat .env`, a
+                // script of `cat` with `$0` set to `.env`). So is a script
+                // piped to `bash -s` with an operand. The direct forms
+                // (`parallel cat .env ::: a`, `fd -x cat .env`) already
+                // passed; peeling the first pair and quoting the re-join are
+                // separate changes.
                 "parallel sh -c 'cat .env' ::: a b",
                 "parallel sh -c 'cat {}/.env' ::: dir1 dir2",
                 "fd -t d -x sh -c 'cat {}/.env'",
                 "fd -x sh -c 'cat .env'",
                 "fd -H x -X sh -c 'cat .env'",
                 "echo 'cat .env' | bash -s x",
+                "flock /tmp/l sh -c 'cat .env'",
+                "flock -n /tmp/l sh -c 'cat .env'",
+                "flock /tmp/l bash -c 'source .env && env'",
+                "script -q /dev/null sh -c 'cat .env'",
+                "script -q /dev/null bash -c 'source .env && env'",
             ],
             cadence_hooks_core::Outcome::Allow,
             "positional parameters beside a secret name",
@@ -7147,6 +7157,12 @@ mod tests {
                 "timeout 5 bash -c 'cat .env'",
                 "sudo -u app bash -c 'cat .env'",
                 "nohup sh -c 'cat .env'",
+                // A bare command behind `flock` or BSD `script`, and `flock`'s
+                // `-c` script (one word, kept whole), have no quote to lose
+                // in the re-join.
+                "flock /tmp/l cat .env",
+                "flock /tmp/l -c 'cat .env'",
+                "script -q /dev/null cat .env",
             ],
             cadence_hooks_core::Outcome::Block,
             "a literal read beside positional parameters",
