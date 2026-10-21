@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.131.0] - 2026-10-21
+
 ### Added
 
 - **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
