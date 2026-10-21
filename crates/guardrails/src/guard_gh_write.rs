@@ -3263,8 +3263,10 @@ enum LoopedWriteKind {
 ///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
 ///   word or one of `/ - , @ + =`.
 ///
-/// The command must also hold no `|` or `&`, so segments are joined by `;`
-/// and newlines only. Comments are dropped as the shell drops them.
+/// Segments must be joined by `;` and newlines only: no pipe, `&&`/`||` or
+/// background `&` between commands. A comment is dropped as the shell drops
+/// it, so a `|` or `&` inside one does not count. One inside a word (a quote,
+/// `2>&1`, `>|`) fails the plain-word test.
 ///
 /// Those two forms are the only ones neither bash nor zsh rewrites: the value
 /// is a plain header word, so the expansion is that word, cannot split into a
