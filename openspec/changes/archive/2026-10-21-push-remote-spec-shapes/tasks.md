@@ -5,7 +5,7 @@
 
 ## 2. Spec
 
-- [x] 2.1 Name the chain of pushes and the `git -C` or subshell `cd` directories in "Push shapes the push guard refuses"
+- [x] 2.1 Name the push chain, the non-URL loop remotes, and the directory and remote pairs behind `git -C` or a subshell `cd` in "Push shapes the push guard refuses"
 - [x] 2.2 Add the nudge requirement with its scenario
 
 ## 3. Docs

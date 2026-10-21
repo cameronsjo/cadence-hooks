@@ -40,7 +40,7 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **THEN** the hook allows, each push judged on its own target
 
 ### Requirement: Push shapes the push guard refuses
-`guard-push-remote` SHALL block a push whose destination it read as uncertain. In a command the loop parser reads: a looped push with no remote, a bare push in a chain of pushes that switches branch or changes tracking, or over four loop remotes. In any command: a URL with no `owner/repo`, a repository moved by `eval`, `trap`, `GIT_DIR`, `--git-dir` or `--work-tree`, a push URL the command rewrites, pushes in over four `git -C` or subshell `cd` directories, or a remote git cannot resolve.
+`guard-push-remote` SHALL block a push whose target it read as uncertain. In a command the loop parser reads: a looped push with no remote, a bare push in a push chain that switches branch or tracking, or over four non-URL loop remotes. In any command: a URL with no `owner/repo`, a repository moved by `eval`, `trap`, `GIT_DIR`, `--git-dir` or `--work-tree`, a push URL the command rewrites, over four directory and remote pairs behind `git -C` or a subshell `cd`, or a remote git cannot resolve.
 
 #### Scenario: Loop with no remote
 - **WHEN** the command is `for b in a b; do git push; done`
