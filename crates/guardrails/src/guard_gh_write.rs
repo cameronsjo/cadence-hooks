@@ -1628,6 +1628,37 @@ fn flag_value_is_owned(
     }
 }
 
+/// True when a looped `-R` value the ownership check rejected is
+/// unresolvable rather than unowned, so the loop gate says "cannot resolve"
+/// and not "targets repo you don't own".
+///
+/// It reads the OWNER part only, as [`judge_resolution`] does for a single
+/// command: `evil/$r` has a literal owner the allowlist can judge, so it is
+/// unowned; `$o/$r` and `"$r"` have an owner only the shell knows. The loop
+/// value is the raw `-R` text, so quotes are trimmed before it is split (a
+/// bare `split_once('/')` on `"https://github.com/$o/$r"` would read `https:`
+/// as the owner) and a host is read the way gh reads it.
+///
+/// A literal owner on the allowlist (`"cameronsjo/$r"`) stays unresolvable:
+/// the loop gate rejected it only because the quotes were still on, and "you
+/// don't own" would be false. Message only: the caller has already decided to
+/// block.
+fn loop_target_is_unresolvable(
+    value: &str,
+    dh: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> bool {
+    match flag_value_resolution(value.trim_matches('"'), dh) {
+        RepoResolution::Resolved { host, repo } => {
+            let owner = repo.split_once('/').map_or(repo.as_str(), |(o, _)| o);
+            repo_has_unexpanded_expansion(owner)
+                || is_allowed(&host, &repo, allowed_owners, allowed_repos)
+        }
+        _ => repo_has_unexpanded_expansion(value),
+    }
+}
+
 /// The last non-empty `GH_REPO=` in the assignment prefix of the segment's gh
 /// invocation. gh treats an empty one as unset.
 fn inline_gh_repo(command: &str) -> Option<String> {
@@ -4009,10 +4040,12 @@ impl Check for GhWriteGuard {
                 // runs is unresolvable, not unowned. When every blocked target
                 // is such an expansion, say that and name it, as the
                 // single-command arm does (#757); the verdict is unchanged.
+                // As there, only the owner part counts: `evil/$r` is unowned
+                // (#1491).
                 if !unowned_write_targets.is_empty()
-                    && unowned_write_targets
-                        .iter()
-                        .all(|t| repo_has_unexpanded_expansion(t))
+                    && unowned_write_targets.iter().all(|t| {
+                        loop_target_is_unresolvable(t, &dh, &allowed_owners, &allowed_repos)
+                    })
                 {
                     // Only a short value in the charset `prevent-secret-writes`
                     // prints (`unresolved_parameter_cause`) is echoed: the
@@ -9401,6 +9434,76 @@ mod tests {
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{cwd}");
             assert_eq!(meta.fix, "gh repo archive cameronsjo/$r", "{cwd}");
+        }
+    }
+
+    #[test]
+    fn looped_dash_r_reads_only_the_owner_for_the_expansion_message() {
+        // The loop's `-R` value is the raw text, quotes and host included.
+        // Only an owner the shell expands is unresolvable. A literal owner is
+        // judged by the allowlist, as the single-command arm judges it
+        // (#1491), so `evil/$r` is an unowned target in a loop too.
+        // Each entry is one `gh issue create` per element, in one loop body.
+        let loop_of = |flags: &[&str]| {
+            let body: Vec<String> = flags
+                .iter()
+                .map(|f| format!("gh issue create {f} --title t --body b"))
+                .collect();
+            format!("for r in a b; do {}; done", body.join("; "))
+        };
+        let unowned: [&[&str]; 8] = [
+            &[r#"-R "evil/$r""#],
+            &["-R evil/$r"],
+            &[r#"--repo "evil/$r""#],
+            &[r#"-R "github.com/evil/$r""#],
+            &[r#"-R "https://github.com/evil/$r""#],
+            // One literal unowned owner decides the message for the loop.
+            &[r#"-R "evil/$r""#, r#"-R "$o/$r""#],
+            &[r#"-R "$o/$r""#, r#"-R "evil/$r""#],
+            &[r#"-R "evil/$r""#, r#"-R "$r""#],
+        ];
+        for flags in unowned {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(&loop_of(flags), cwd, false);
+                assert!(blocks(&result), "{flags:?} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh loop targets repo you don't own"),
+                    "{flags:?} in {cwd}: {message}"
+                );
+                assert!(!message.contains("cannot resolve"), "{flags:?}: {message}");
+            }
+        }
+        // An owner only the shell knows stays unresolvable, whatever host or
+        // scheme comes first. An allowed literal owner does too: the loop gate
+        // rejects `"cameronsjo/$r"` only because its quotes are still on, so
+        // "you don't own" would be false.
+        let unresolvable: [&[&str]; 11] = [
+            &[r#"-R "$r""#],
+            &[r#"-R "$o/$r""#],
+            &[r#"-R "${o}/${r}""#],
+            &[r#"-R "github.com/$o/$r""#],
+            &[r#"-R "https://github.com/$o/$r""#],
+            &[r#"-R "https://evil.example/$o/$r""#],
+            &[r#"-R "$o-x/$r""#],
+            &[r#"-R "cameronsjo/$r""#],
+            &[r#"-R "https://github.com/cameronsjo/$r""#],
+            &[r#"-R "cameronsjo/$r""#, r#"-R "$o/$r""#],
+            &[r#"-R "$o/$r""#, r#"-R "$r""#],
+        ];
+        for flags in unresolvable {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(&loop_of(flags), cwd, false);
+                assert!(blocks(&result), "{flags:?} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh loop: cannot resolve"),
+                    "{flags:?} in {cwd}: {message}"
+                );
+                assert!(!message.contains("don't own"), "{flags:?}: {message}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{flags:?}");
+            }
         }
     }
 
