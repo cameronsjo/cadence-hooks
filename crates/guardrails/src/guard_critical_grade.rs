@@ -463,8 +463,16 @@ mod tests {
 
     #[test]
     fn the_message_says_a_human_applies_it() {
-        let r = GuardCriticalGrade.run(&make_bash("gh issue edit 12 --add-label impact:critical"));
-        let m = r.message.unwrap_or_default();
+        // `run` reads the ruling from process env, and
+        // `run_reads_the_ruling_from_process_env_only` sets it to `1` on
+        // another thread. Hold the env lock with the ruling unset.
+        let mut r = None;
+        crate::with_env(&[(RULING_ENV, None)], || {
+            r = Some(
+                GuardCriticalGrade.run(&make_bash("gh issue edit 12 --add-label impact:critical")),
+            );
+        });
+        let m = r.and_then(|r| r.message).unwrap_or_default();
         assert!(m.contains("impact:critical") && m.contains("human"), "{m}");
         assert!(m.contains("issue-labels.md"), "{m}");
     }
