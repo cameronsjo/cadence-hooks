@@ -13,7 +13,7 @@ use cadence_hooks_core::shell::{
     brace_expansion_overflows, carries_substitution, command_segments, command_segments_with_dirs,
     command_word, contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
     host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
-    split_segments, strip_quotes, tokenize,
+    split_segments_with_ops, strip_quotes, tokenize,
 };
 use cadence_hooks_core::shell::{
     UNRESOLVABLE_DIR, apply_cd_target, executable_tokens, skip_env_assignment_operands,
@@ -3367,10 +3367,17 @@ fn loop_targets_are_literal(command: &str) -> bool {
         Some(out)
     }
     // A plain loop is joined by `;` and newlines only, never a pipe,
-    // `&&`/`||`, or a background job. A comment is fine: `split_segments`
-    // drops it the way the shell does, ending a word only at a shell blank
-    // (#1390), so the command after it is still a segment here.
-    if command.contains(['|', '&']) {
+    // `&&`/`||`, or a background job. The operators are the splitter's, not
+    // the raw text's, so a `&` or `|` inside a comment does not count: the
+    // splitter drops a comment the way the shell does, ending a word only at
+    // a shell blank (#1390), so the command after it is still a segment
+    // here. A `|` or `&` the splitter keeps inside a word (a quote, `2>&1`,
+    // `>|`) fails `plain` below.
+    let segments = split_segments_with_ops(command);
+    if segments
+        .iter()
+        .any(|(_, op)| op.is_some_and(|op| !matches!(op, ";" | "\n")))
+    {
         return false;
     }
     fn is_checkout_verb(word: &str) -> bool {
@@ -3390,7 +3397,7 @@ fn loop_targets_are_literal(command: &str) -> bool {
     // The raw segments, not `command_segments`: that one expands parameters
     // it can read statically and treats a loop variable as unset, so
     // `${b:-x}` would reach this check as plain `x`.
-    for segment in split_segments(command) {
+    for (segment, _) in &segments {
         let segment = segment.trim();
         let segment = segment.strip_prefix("do ").unwrap_or(segment).trim();
         if matches!(segment, "do" | "done") {
@@ -6056,6 +6063,9 @@ mod tests {
             "# drop the stale branches\nfor b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done",
             "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b # stale\ndone",
             "for n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=café; done",
+            // A `&` or `|` inside a comment is not an operator.
+            "for n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=x; done # close both & report",
+            "# a|b follow-up\nfor n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=x; done",
         ] {
             assert!(
                 loop_targets_are_literal(command),
@@ -6326,6 +6336,13 @@ mod tests {
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b && gh pr list; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b || gh pr list; done",
             "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b & done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; done | cat",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; done &",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b &>/dev/null; done",
+            // Kept inside a word by the splitter, and refused there.
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b 2>&1; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b -f body='a|b'; done",
+            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b -f body=a\\&b; done",
         ]);
     }
 
