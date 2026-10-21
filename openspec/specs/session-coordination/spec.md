@@ -213,14 +213,22 @@ Under `CLAUDE_CODE_REMOTE=true`, `start`, `heartbeat`, `guard`, `end`, `backstop
 - **THEN** its block carries `Machine: cloud`
 
 ### Requirement: Conflicted-merge commit keeps its conflicts block below the trailers
-`session warn-commit-provenance` SHALL nudge, naming `git commit --no-edit --cleanup=strip`, on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
+`session warn-commit-provenance` SHALL nudge on a `git commit --no-edit` that would finish a conflicted merge whose pending message (MERGE_MSG) has a trailer line above git's `# Conflicts:` block, naming `git commit --no-edit --cleanup=strip` and the `-F` route for a message with other `#` lines. It MUST read only that plain shape and otherwise stay silent, MUST NOT echo the message, MUST NOT block, and MUST NOT use up the once-per-session provenance nudge.
 
 #### Scenario: Finishing a conflicted merge with trailers
 - **WHEN** a merge started with a message ending in `Session-Id:` and `Co-Authored-By:` lines stopped on a conflict, and a session runs `git commit --no-edit`
 - **THEN** the hook exits 0 with a nudge naming `git commit --no-edit --cleanup=strip`
 
+#### Scenario: The nudge says what strip drops
+- **WHEN** the hook nudges for that merge
+- **THEN** the nudge says `--cleanup=strip` drops every line that starts with `#`, and names `git commit -F` on a copy of MERGE_MSG cut at the `# Conflicts:` line for a message that has other such lines
+
 #### Scenario: The cleanup is already asked for
 - **WHEN** the same session runs `git commit --no-edit --cleanup=strip`
+- **THEN** the hook adds no conflicts nudge
+
+#### Scenario: An editor opens
+- **WHEN** the same session runs `git commit --no-edit --edit`
 - **THEN** the hook adds no conflicts nudge
 
 #### Scenario: The command names its own message

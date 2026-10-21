@@ -285,10 +285,14 @@ const CONFLICTS_HEADER: &str = "# Conflicts:";
 /// echoed.
 const CONFLICTS_AFTER_TRAILERS_NUDGE: &str = "A merge is waiting on this commit, and its pending \
     message (MERGE_MSG) has git's `# Conflicts:` block below the trailers. `git commit \
-    --no-edit` keeps `#` lines (its default cleanup is `whitespace`), so the commit would land \
-    with that block after the trailers, and they would no longer be the final paragraph; a lint \
-    or tool that reads the final paragraph then misses them. Run `git commit --no-edit \
-    --cleanup=strip` instead: it drops the block and keeps the rest of the message.";
+    --no-edit` keeps `#` lines under its default cleanup (`whitespace`), so the commit would \
+    land with that block after the trailers, and they would no longer be the final paragraph; a \
+    lint or tool that reads the final paragraph then misses them. If no other line of the \
+    message starts with `#`, run `git commit --no-edit --cleanup=strip`. It removes the block, \
+    but it drops every line that starts with `#`, an issue reference or a markdown heading \
+    included, with no warning. If the message has such lines, copy the file `git rev-parse \
+    --git-path MERGE_MSG` prints, cut the `# Conflicts:` line and everything after it, and run \
+    `git commit -F <copy>` instead.";
 
 /// Nudge when this command is a `git commit --no-edit` that would finish a
 /// conflicted merge, and the merge message has trailers followed by git's
@@ -300,8 +304,9 @@ const CONFLICTS_AFTER_TRAILERS_NUDGE: &str = "A merge is waiting on this commit,
 /// - the command has a segment that is `git commit` with nothing between the
 ///   two words (`git -C dir commit` names a repo this does not resolve) and
 ///   `--no-edit`, and none of `-m`/`--message`, `-F`/`--file`, `-C`/`-c`
-///   (reuse a message) or `--cleanup` — each of those names the message or
-///   how it is cleaned, so MERGE_MSG's block is not what lands;
+///   (reuse a message), `--cleanup` or `-e`/`--edit` — each of those names the
+///   message or how it is cleaned, or opens an editor whose default cleanup
+///   strips the block, so MERGE_MSG's block is not what lands;
 /// - the directory the command runs in (after any `cd` chain) is in a git
 ///   repository with a `MERGE_HEAD`;
 /// - that repository's MERGE_MSG reads under the size cap and passes
@@ -356,7 +361,8 @@ fn finishes_with_merge_msg(args: &[String]) -> bool {
     for arg in args {
         match arg.as_str() {
             "--no-edit" => no_edit = true,
-            "--message" | "--file" | "--cleanup" | "--reuse-message" | "--reedit-message" => {
+            "--message" | "--file" | "--cleanup" | "--reuse-message" | "--reedit-message"
+            | "--edit" => {
                 return false;
             }
             long if long.starts_with("--message=")
@@ -367,8 +373,8 @@ fn finishes_with_merge_msg(args: &[String]) -> bool {
             {
                 return false;
             }
-            // A short-option cluster (`-m`, `-am`, `-F`, `-C`, `-c`) that
-            // carries a message or reuse flag. A value word never starts with
+            // A short-option cluster (`-m`, `-am`, `-F`, `-C`, `-c`, `-e`) that
+            // carries a message, reuse or edit flag. A value word never starts with
             // a dash that is a lone `-`.
             short
                 if short.starts_with('-')
@@ -377,7 +383,7 @@ fn finishes_with_merge_msg(args: &[String]) -> bool {
                     && short
                         .chars()
                         .skip(1)
-                        .any(|c| matches!(c, 'm' | 'F' | 'C' | 'c')) =>
+                        .any(|c| matches!(c, 'm' | 'F' | 'C' | 'c' | 'e')) =>
             {
                 return false;
             }
@@ -1131,6 +1137,16 @@ mod tests {
         );
         assert!(msg.contains("# Conflicts:"), "{msg}");
         assert!(
+            msg.contains("drops every line that starts with `#`")
+                && msg.contains("git rev-parse --git-path MERGE_MSG")
+                && msg.contains("git commit -F <copy>"),
+            "the nudge says what strip drops and gives the safe route: {msg}"
+        );
+        assert!(
+            !msg.contains("keeps the rest"),
+            "strip does not keep the rest of the message: {msg}"
+        );
+        assert!(
             !msg.contains("1111") && !msg.contains("Co-Authored-By"),
             "the merge message is untrusted and never echoed: {msg}"
         );
@@ -1175,6 +1191,9 @@ mod tests {
             "git commit --no-edit -C HEAD",
             "git commit --no-edit --reuse-message=HEAD",
             from_file.as_str(),
+            // The editor's default cleanup strips the block.
+            "git commit --no-edit --edit",
+            "git commit --no-edit -e",
             // No `--no-edit`: git would open an editor, not reuse the block.
             "git commit",
             "git commit -a",
@@ -1294,6 +1313,13 @@ mod tests {
             ("--no-edit --file=f", false),
             ("--no-edit -c HEAD", false),
             ("--no-edit --cleanup=strip", false),
+            ("--no-edit --message x", false),
+            ("--no-edit --file f", false),
+            ("--no-edit --reedit-message HEAD", false),
+            ("--no-edit --reedit-message=HEAD", false),
+            ("--no-edit --edit", false),
+            ("--no-edit -e", false),
+            ("--no-edit -ae", false),
         ] {
             assert_eq!(finishes_with_merge_msg(&args(flags)), want, "{flags}");
         }
@@ -1329,6 +1355,62 @@ mod tests {
                 .trim_end()
                 .ends_with("Co-Authored-By: Claude <n@a>"),
             "the trailers are the final paragraph: {stripped:?}"
+        );
+    }
+
+    /// The nudge's warning and its safe route, run for real: `--cleanup=strip`
+    /// also drops body lines that start with `#`, while committing a copy of
+    /// MERGE_MSG cut at the `# Conflicts:` line with `-F` keeps them and
+    /// still leaves the trailers as the final paragraph.
+    #[test]
+    fn strip_drops_other_hash_lines_and_the_file_route_keeps_them() {
+        let message = "Merge feat\n\n#1439 is the issue this closes.\n## A heading\n\n\
+                       Session-Id: 1111\nCo-Authored-By: Claude <n@a>";
+        let resolved = || {
+            let repo = conflicted_merge(message);
+            std::fs::write(repo.path().join("f.txt"), "resolved").unwrap();
+            assert!(raw_git(repo.path(), &["add", "f.txt"]).status.success());
+            repo
+        };
+        let body_of = |repo: &Path| {
+            let out = raw_git(repo, &["log", "-1", "--format=%B"]);
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        let repo = resolved();
+        let out = raw_git(repo.path(), &["commit", "--no-edit", "--cleanup=strip"]);
+        assert!(out.status.success(), "{out:?}");
+        let stripped = body_of(repo.path());
+        assert!(!stripped.contains("# Conflicts:"), "{stripped:?}");
+        assert!(
+            !stripped.contains("#1439") && !stripped.contains("## A heading"),
+            "strip drops every line that starts with `#`: {stripped:?}"
+        );
+
+        let repo = resolved();
+        let path = raw_git(repo.path(), &["rev-parse", "--git-path", "MERGE_MSG"]);
+        let path = repo
+            .path()
+            .join(String::from_utf8(path.stdout).unwrap().trim());
+        let merge_msg = std::fs::read_to_string(path).unwrap();
+        let cut: Vec<&str> = merge_msg
+            .lines()
+            .take_while(|l| l.trim_end() != CONFLICTS_HEADER)
+            .collect();
+        let scratch = tempfile::tempdir().unwrap();
+        let copy = scratch.path().join("msg.txt");
+        std::fs::write(&copy, format!("{}\n", cut.join("\n"))).unwrap();
+        let out = raw_git(repo.path(), &["commit", "-F", copy.to_str().unwrap()]);
+        assert!(out.status.success(), "{out:?}");
+        let kept = body_of(repo.path());
+        assert!(!kept.contains("# Conflicts:"), "{kept:?}");
+        assert!(
+            kept.contains("#1439 is the issue this closes.") && kept.contains("## A heading"),
+            "the file route keeps the other `#` lines: {kept:?}"
+        );
+        assert!(
+            kept.trim_end().ends_with("Co-Authored-By: Claude <n@a>"),
+            "the trailers are the final paragraph: {kept:?}"
         );
     }
 }
