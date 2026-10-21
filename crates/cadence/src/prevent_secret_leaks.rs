@@ -6983,6 +6983,27 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_c_script_after_an_option_value_is_read() {
+        // Core reads past a shell option's value (`-o pipefail`), so each
+        // script reaches this guard as a segment of its own. Each allowed
+        // before: core read the value as the script or stopped at it, which
+        // also kept this guard's own option walk from running. Each runs
+        // `cat .env` on the real shell.
+        assert_bash(
+            &[
+                "bash -co pipefail 'cat .env'",
+                "bash -ceuo pipefail 'cat .env'",
+                "bash -co pipefail -- 'cat .env'",
+                "bash -cO extglob 'cat .env'",
+                "zsh +O -c 'cat .env'",
+                "bash -euo pipefail <<< 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a shell script behind an option value",
+        );
+    }
+
+    #[test]
     fn a_function_definition_does_not_change_the_verdict() {
         // cadence-ecosystem ADR-0046 rule 1: a read through a shell function
         // is out of scope, so a definition no longer blocks a command that
@@ -7177,11 +7198,6 @@ mod tests {
             &[
                 "bash -eo pipefail -c 'cat .env'",
                 "bash -euo pipefail -c 'cat .env.local'",
-                // Core reads past the `-o` value now, so these reach the
-                // guard as segments of their own. `-co pipefail` did not
-                // block before: core read `pipefail` as its script.
-                "bash -euo pipefail -c 'cat .env'",
-                "bash -co pipefail 'cat .env'",
                 "set -- a b; cat .env",
                 r#"bash -c 'cat "$1"' _ x; cat .env"#,
                 // The runners the reader peels still reach a `-c` script's

@@ -13084,7 +13084,7 @@ fn parameter_word_end(
 /// or a path (`/bin/sh`). The `-c` may stand alone or appear in a short cluster
 /// such as `-lc` (login shell + command); the script is the token following the
 /// flag that carries `c`, or its value (`-co pipefail`). An option value before
-/// it (`-o pipefail`) is skipped, see [`takes_option_value`].
+/// it (`-o pipefail`) is skipped, see [`shell_option_takes_value`].
 ///
 /// The segment goes through [`executable_tokens`], not a bare [`tokenize`]:
 /// [`tokenize`] glues `(` onto the word behind it and `)` onto the word in
@@ -13993,7 +13993,7 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
         if carries_c {
             // `bash -co pipefail 'x'` takes the option's value first, then
             // the script.
-            let i = i + usize::from(takes_option_value(&verb, tok));
+            let i = i + usize::from(shell_option_takes_value(&verb, tok));
             // `--` ends the shell's own option parsing, so with it present the
             // script is one token further along. Returning the `--` handed
             // guards a segment of two dashes and left the real script inside a
@@ -14013,7 +14013,7 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
             // literal survives this one unescape (cameronsjo/cadence-hooks#1231).
             return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
-        if takes_option_value(&verb, tok) {
+        if shell_option_takes_value(&verb, tok) {
             option_value = true;
             continue;
         }
@@ -14032,21 +14032,25 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
 }
 
 /// Whether `shell`'s option `word` takes the next word as its value, so that
-/// word is neither the script nor a script file.
+/// word is neither the script nor a script file. `shell` is the command word
+/// as [`command_word`] gives it (`bash`, not `/bin/bash`).
 ///
-/// `bash -euo pipefail -c 'rm note.md'` runs `rm note.md`, but the walk above
-/// read `pipefail` as the first operand and returned no script, so no guard
-/// saw the `rm`. Measured on bash 5.2, dash 0.5.12 and zsh 5.9:
+/// `bash -euo pipefail -c 'rm note.md'` runs `rm note.md`, but the `-c` walk
+/// in [`shell_c_argument_tokens`] read `pipefail` as the first operand and
+/// returned no script, so no guard saw the `rm`. Every walker over a shell's
+/// options reads this one grammar. Measured on bash 5.2, dash 0.5.12 and zsh
+/// 5.9:
 ///
 /// - A cluster ending in `o`, after `-` or `+` (`-o`, `-euo`, `+o`), takes the
 ///   next word in all three. Only the last letter is read: bash and dash take
 ///   a word for any `o` in the cluster, but zsh reads `-oe` as the option `e`.
 /// - A cluster ending in `O` (`-O extglob`, `+O`) takes one in bash only. zsh's
 ///   `-O` is a plain flag and dash rejects it. `sh` counts as bash, which it is
-///   on macOS.
+///   on macOS. On Linux it is dash, which refuses `-O` and runs nothing, so
+///   the extra read costs nothing.
 /// - bash's `--rcfile FILE` and `--init-file FILE` take one. dash and zsh
 ///   reject both.
-fn takes_option_value(shell: &str, word: &str) -> bool {
+pub fn shell_option_takes_value(shell: &str, word: &str) -> bool {
     let bash = matches!(shell, "bash" | "sh");
     if word.starts_with("--") {
         return bash && matches!(word, "--rcfile" | "--init-file");
@@ -22942,8 +22946,14 @@ mod tests {
             "bash -co pipefail 'rm note.md'",
             "bash -ceuo pipefail 'rm note.md'",
             "bash -co pipefail -- 'rm note.md'",
+            "zsh -co pipefail 'rm note.md'",
+            "dash -co errexit 'rm note.md'",
+            // A here-string after the value is the script, as for a bare
+            // `bash <<< 'rm note.md'`.
+            "bash -euo pipefail <<< 'rm note.md'",
             "sh -o errexit -c 'rm note.md'",
-            // `sh` is bash on macOS (measured as `exec -a sh bash`).
+            // `sh` is bash on macOS (measured as `exec -a sh bash`). On Linux
+            // it is dash, which refuses `-O` and runs nothing.
             "sh -O extglob -c 'rm note.md'",
             "dash -euo errexit -c 'rm note.md'",
             "zsh -euo pipefail -c 'rm note.md'",
@@ -22968,6 +22978,10 @@ mod tests {
             assert_eq!(shell_c_argument(cmd), None, "{cmd:?}");
             assert_eq!(command_segments(cmd), vec![cmd.to_string()], "{cmd:?}");
         }
+        // Only a cluster's last letter is read. zsh takes the rest of `-oe`
+        // as the option name `e` and runs nothing. bash and dash would run
+        // the script: a gap left open, see [`shell_option_takes_value`].
+        assert_eq!(shell_c_argument("zsh -oe pipefail -c 'rm note.md'"), None);
     }
 
     #[test]
