@@ -1,0 +1,207 @@
+## Purpose
+Repo ownership is the set of Bash hooks that keep writes on repositories the operator owns, refuse repository deletion, and advise when a repo is created or published: `cadence-hooks guardrails guard-push-remote`, `cadence-hooks guardrails guard-gh-write`, `cadence-hooks guardrails guard-forge-write`, `cadence-hooks guardrails guard-gh-dangerous`, `cadence-hooks guardrails inject-gh-write-context`, `cadence-hooks guardrails guard-git-init` and `cadence-hooks guardrails warn-going-public`.
+
+## ADDED Requirements
+
+### Requirement: Owner allowlist
+The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNERS` and `owner/repo` pairs from `CADENCE_ALLOWED_REPOS` in the hook process environment, each a space- or comma-separated list matched case-insensitively. A bare entry MUST match only the default host (`GH_HOST`, else `github.com`) and hosts in `CADENCE_EXTRA_HOSTS`. A host-qualified entry (`host/owner`) MUST match only its own host. An inline prefix on the command MUST NOT change a verdict.
+
+#### Scenario: Bare entry on the default host
+- **WHEN** `CADENCE_ALLOWED_OWNERS=cameronsjo` and a push targets `https://github.com/CameronSjo/tool.git`
+- **THEN** the target counts as owned
+
+#### Scenario: Bare entry on a self-hosted forge
+- **WHEN** `CADENCE_ALLOWED_OWNERS=cameron`, `CADENCE_EXTRA_HOSTS` is unset, and a push targets `https://git.example.com/cameron/tool.git`
+- **THEN** the push blocks, and the reason suggests qualifying the entry as `git.example.com/<owner>` or setting `CADENCE_EXTRA_HOSTS=git.example.com`
+
+#### Scenario: Repo entry
+- **WHEN** `CADENCE_ALLOWED_REPOS=external/shared-repo` and a write targets `external/shared-repo`
+- **THEN** the target counts as owned while every other `external/*` repo does not
+
+### Requirement: Push to a repository the operator does not own
+`guard-push-remote` (PreToolUse, Bash) SHALL block (exit 2, `Push target is not yours`) a `git push` to a repository outside the allowlist. It MUST judge every destination: an explicit URL directly, a named remote through git's push URL, a bare push through the tracking remote, each in the directory the push runs in (`cd <dir> &&`, `git -C <dir>`, `bash -c`). A push whose targets are all owned, and a command with no push, SHALL be allowed.
+
+#### Scenario: Ordinary push to an owned remote
+- **WHEN** `git push origin feat/x` runs in a checkout whose `origin` is an owned GitHub repo
+- **THEN** the hook exits 0 with no output
+
+#### Scenario: Push to an unowned URL
+- **WHEN** the command is `git push https://github.com/someone-else/repo.git main`
+- **THEN** the hook exits 2 and the reason names the URL, the directory and the allowed entries
+
+#### Scenario: Push text that is not a push
+- **WHEN** the command is `git commit -m "remember to git push https://github.com/x/y.git"`
+- **THEN** the hook allows
+
+#### Scenario: Chained pushes to owned remotes
+- **WHEN** the command is `git push origin main && git push backup main` and both remotes are owned
+- **THEN** the hook allows, each push judged on its own target
+
+### Requirement: Push shapes the push guard refuses
+`guard-push-remote` SHALL block a push whose destination git would pick in a way the guard read as uncertain: a looped push with no explicit remote, a bare push chained after a branch switch or tracking change, a URL with no `owner/repo`, a repository moved by `eval`, `trap` or a `GIT_DIR`/`--git-dir`/`--work-tree` redirect, a push URL rewritten in the same command, more than four push directories or loop remotes, and a push whose remote git cannot resolve.
+
+#### Scenario: Loop with no remote
+- **WHEN** the command is `for b in a b; do git push; done`
+- **THEN** the hook exits 2 with `git push in loop without explicit remote`
+
+#### Scenario: Rewritten push URL
+- **WHEN** the command is `git -c url.https://evil.example/.insteadOf=https://github.com/ push origin main`
+- **THEN** the hook exits 2 with `Cannot tell where this push goes`
+
+#### Scenario: No push remote
+- **WHEN** a bare `git push` runs in a repository with no `origin` and no configured push remote for the branch
+- **THEN** the hook exits 2 with `Cannot resolve push target`
+
+### Requirement: Push directory or target built at run time
+`guard-push-remote` SHALL nudge, not block, when an otherwise allowed push follows a directory change the shell resolves at run time (`cd "$VAR"`, `cd -`, `cd $(...)`, `popd`, a bare `cd`, `git -C "$D"`), naming the directory it checked instead. It SHALL also nudge when a push names a destination built at run time and the tracking remote it checked instead is owned, unless a URL readable in the command is unowned, which blocks.
+
+#### Scenario: Variable directory
+- **WHEN** the command is `cd "$REPO" && git push origin main` from an owned checkout
+- **THEN** the hook exits 0 with a `Push directory could not be verified` nudge naming the checked directory
+
+#### Scenario: Variable remote
+- **WHEN** the command is `git push "$REMOTE" main` and the tracking remote is owned
+- **THEN** the hook exits 0 with a nudge that the push target is resolved by the shell
+
+### Requirement: Push guard configuration and probe failures
+`guard-push-remote` SHALL block every push it reaches with `Not configured` when `CADENCE_ALLOWED_OWNERS` is empty. It SHALL allow a push from a directory that is not a git repository. When a single push's ownership probe exceeds the git-probe deadline (`CADENCE_HOOK_DEADLINE_MS`) it MUST allow; when a looped or multi-directory push's probe times out it MUST block and ask for each push to run on its own.
+
+#### Scenario: Unconfigured machine
+- **WHEN** `CADENCE_ALLOWED_OWNERS` is unset and the command is `git push origin main`
+- **THEN** the hook exits 2 with a reason naming `CADENCE_ALLOWED_OWNERS is not set`
+
+#### Scenario: Not a repository
+- **WHEN** an owner list is set and `git push origin main` runs in a directory with no git repository
+- **THEN** the hook allows
+
+### Requirement: gh write to a repository the operator does not own
+`guard-gh-write` (PreToolUse, Bash) SHALL block (exit 2, `gh write targets repo you don't own`) a `gh` write on a repository outside the allowlist, judging each segment of a chain on its own target. The target SHALL be read from `-R`/`--repo`, a `GH_REPO` assignment, a `gh repo` verb's positional `owner/repo`, a `gh api repos/<owner>/<repo>/...` path, and otherwise the git remotes of the directory the segment runs in. Reads SHALL be allowed whatever the target.
+
+#### Scenario: Ordinary write with an owned target
+- **WHEN** the command is `gh pr create -R cameronsjo/tool --title t --body-file b.md` and `cameronsjo` is allowed
+- **THEN** the hook allows
+
+#### Scenario: Unowned write after an owned one
+- **WHEN** the command is `gh issue comment 1 -R cameronsjo/tool --body ok && gh issue comment 2 -R evil/repo --body x`
+- **THEN** the hook exits 2 naming `evil/repo` and the allowed entries
+
+#### Scenario: Read on an unowned repo
+- **WHEN** the command is `gh pr view 5 -R someone/else` or `gh repo clone someone/else`
+- **THEN** the hook allows
+
+### Requirement: What counts as a gh write
+`guard-gh-write` SHALL treat as writes: `gh pr|issue|release|label|repo|gist|workflow` with a mutating verb (`create`, `merge`, `close`, `comment`, `edit`, `delete`, `review`, `ready`, `reopen`, `lock`, `archive`, `rename`, `transfer`, `fork`, `run`, `enable`, `disable`), `gh secret|variable set|delete`, `gh release upload`, `gh label clone`, and `gh api` with a mutating `-X`/`--method`, a field flag or `--input`, unless an explicit `GET` method is given.
+
+#### Scenario: API field write
+- **WHEN** the command is `gh api repos/evil/repo/issues -f title=x`
+- **THEN** the hook exits 2
+
+#### Scenario: Explicit GET with fields
+- **WHEN** the command is `gh api repos/evil/repo/issues -X GET -f state=open`
+- **THEN** the hook allows
+
+### Requirement: gh writes the guard cannot place
+`guard-gh-write` SHALL block a write it cannot place on an owned repository: no `-R` and no resolvable remote (`Cannot determine target repo for gh write operation`), an unparseable or ambiguous `-R`, an unexpanded variable target, a fork checkout with an unowned fork or upstream, a `gh api` write outside `repos/<owner>/<repo>` and an allowed owner's `orgs/<org>`, a GraphQL mutation, a loop it cannot follow, and a command too large or nested to read. Each reason SHALL name a concrete fix.
+
+#### Scenario: Write with no resolvable target
+- **WHEN** `gh issue create --title t` runs in a directory with no git remote
+- **THEN** the hook exits 2 and the reason tells the operator to add `-R <owner>/<repo>`
+
+#### Scenario: GraphQL read and thread resolution
+- **WHEN** the command is `gh api graphql -f query='query { viewer { login } }'` or a `resolveReviewThread` mutation
+- **THEN** the hook allows
+
+#### Scenario: Unconfigured machine
+- **WHEN** `CADENCE_ALLOWED_OWNERS` is unset and the command is `gh pr merge 5 -R cameronsjo/tool`
+- **THEN** the hook exits 2 with `Not configured`
+
+### Requirement: gh writes allowed without an ownership check
+`guard-gh-write` SHALL allow `gh gist` writes and `gh repo fork` (they land under the operator's account) and `gh issue create --web`/`-w` unless the command sets `BROWSER=` or `GH_BROWSER=`. A loop of writes with no `-R` SHALL be allowed when its body never changes directory and the directory resolves to an owned non-fork repository; with `CADENCE_GH_STRICT_LOOPS=1` it MUST block and suggest the resolved `-R`. An ownership probe past the git-probe deadline MUST allow.
+
+#### Scenario: Gist from an unowned checkout
+- **WHEN** `gh gist create notes.md` runs in a checkout whose remote is unowned
+- **THEN** the hook allows
+
+#### Scenario: Strict loops
+- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for n in 1 2; do gh issue close $n; done` in an owned checkout
+- **THEN** the hook exits 2 and the reason suggests the resolved `-R owner/repo`
+
+### Requirement: Untargeted gh write context
+`inject-gh-write-context` (PreToolUse, Bash) SHALL nudge on every `gh` write segment that names no target (no `-R`, no `repos/owner/repo` path, no positional repo), restating that writes are allowlist-policed, that `-R owner/repo` should always be passed, and the allowed owners or that none are configured. It MUST repeat on every such write, MUST NOT block, and SHALL stay silent on reads and on writes that name their target.
+
+#### Scenario: Bare write
+- **WHEN** the command is `gh pr create --title t --body-file b.md`
+- **THEN** the hook exits 0 with context naming `-R owner/repo` and the allowed owners
+
+#### Scenario: Targeted write
+- **WHEN** the command is `gh pr create -R cameronsjo/tool --title t --body-file b.md` with no bare `#N` in the body
+- **THEN** the hook exits 0 with no output
+
+### Requirement: Bare issue reference in a retargeted body
+`inject-gh-write-context` SHALL nudge when `gh issue create|edit|comment` or `gh pr create|edit|comment|review` posts with `-R other/repo` a body holding a bare `#N` and `other/repo` is not the `origin` of the checkout the command runs in, advising `owner/repo#N`. It SHALL stay silent when no origin can be read.
+
+#### Scenario: Cross-repo body
+- **WHEN** the checkout's origin is `cameronsjo/cadence` and the command is `gh issue comment 4 -R cameronsjo/forgectl --body "see #12"`
+- **THEN** the hook exits 0 with a nudge that a bare `#12` resolves against `cameronsjo/forgectl`
+
+### Requirement: tea and glab writes
+`guard-forge-write` (PreToolUse, Bash) SHALL block (exit 2) a `tea` or `glab` write whose `-R`/`--repo` target is outside the allowlist or cannot be read, and SHALL allow reads and any verb outside its write table. A bare target MUST match a bare entry only on a host in `CADENCE_EXTRA_HOSTS`, never on the GitHub default host; for `glab` it also matches a `gitlab.com/<owner>` entry. With no allowlist every write it reaches MUST block. `glab api` and `tea api` SHALL be allowed.
+
+#### Scenario: Unowned GitLab write
+- **WHEN** the command is `glab mr create -R evil/r --title t`
+- **THEN** the hook exits 2 naming `glab write targets` and the allowed entries
+
+#### Scenario: GitLab read
+- **WHEN** the command is `glab mr list -R evil/r`
+- **THEN** the hook allows
+
+### Requirement: Repository deletion
+`guard-gh-dangerous` (PreToolUse, Bash) SHALL block (exit 2, `gh repo delete is blocked`) `gh repo delete` and `gh api -X DELETE repos/<owner>/<repo>` on any repository, owned or not, including inside shell wrappers, a literal piped into a shell, and quoted or brace-built spellings the shell runs as a delete. It SHALL block a `gh` command too large to read when its text could spell a delete. Other `gh` commands, and the phrase in quoted prose, SHALL be allowed.
+
+#### Scenario: Owned repo deletion
+- **WHEN** the command is `gh repo delete cameronsjo/tool --yes` and `cameronsjo` is allowed
+- **THEN** the hook exits 2 with a fix to delete manually on github.com
+
+#### Scenario: Ordinary gh command
+- **WHEN** the command is `gh repo view cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: API delete of a sub-resource
+- **WHEN** the command is `gh api -X DELETE repos/cameronsjo/tool/labels/bug`
+- **THEN** `guard-gh-dangerous` allows
+
+### Requirement: Protected ownership guards
+`CADENCE_DISABLE` MUST NOT switch off `guard-push-remote`, `guard-gh-write` or `guard-gh-dangerous`: the name is reported as refused and the guard still runs. `CADENCE_BYPASS=1` SHALL switch them off. `guard-forge-write`, `inject-gh-write-context`, `guard-git-init` and `warn-going-public` SHALL honour `CADENCE_DISABLE`. Every hook here SHALL run unchanged under `CLAUDE_CODE_REMOTE=true`.
+
+#### Scenario: Disable refused
+- **WHEN** `CADENCE_DISABLE=guard-gh-write` and the command writes to an unowned repo
+- **THEN** the write still blocks
+
+### Requirement: New repository reminder
+`guard-git-init` (PostToolUse, Bash) SHALL nudge after `git init` or `gh repo create` to run `/a-star-is-born` and to confirm the license with the author before assuming one. A `git init` whose every created repository resolves under a temp root (`$TMPDIR`, `/tmp`, a `mktemp -d` path) SHALL be silent; `gh repo create` MUST nudge from any directory. It MUST NOT block and SHALL ignore the commands inside quoted prose.
+
+#### Scenario: Real project
+- **WHEN** `git init ~/Projects/new-tool` completes
+- **THEN** the hook exits 0 with context naming `/a-star-is-born` and the license decision
+
+#### Scenario: Test fixture
+- **WHEN** `d=$(mktemp -d) && git init "$d"` completes
+- **THEN** the hook exits 0 with no output
+
+### Requirement: Going-public term scan
+`warn-going-public` (PreToolUse, Bash) SHALL nudge, never block, when `gh repo create` (any visibility), `gh repo rename`, or `gh repo edit` with a public visibility carries a name or `--description` matching a compiled home-media term (the `*arr` family and similar), a `CADENCE_GOING_PUBLIC_TERMS` term, or a work term from `~/.config/cadence/redaction.toml`. Any parse problem SHALL allow.
+
+#### Scenario: Sensitive name
+- **WHEN** the command is `gh repo create sonarr-stack --public`
+- **THEN** the hook exits 0 with a nudge naming `sonarr` and `CADENCE_GOING_PUBLIC_IGNORE`
+
+#### Scenario: Neutral repository
+- **WHEN** the command is `gh repo create cli-tools --public --description "small shell helpers"`
+- **THEN** the hook exits 0 with no output
+
+### Requirement: Going-public relief
+`CADENCE_GOING_PUBLIC_IGNORE` SHALL relieve compiled and `CADENCE_GOING_PUBLIC_TERMS` terms and MUST NOT relieve a `redaction.toml` term, which only that file's own `allow` entries relieve. Both variables MUST be read from the session environment, not from an inline prefix on the command.
+
+#### Scenario: Inline ignore prefix
+- **WHEN** the command is `CADENCE_GOING_PUBLIC_IGNORE=sonarr gh repo create sonarr-stack` and the session environment does not set it
+- **THEN** the hook still nudges
