@@ -7072,6 +7072,18 @@ mod tests {
                 r"bash -c 'echo hi' _ x; git commit -m 'mention .env'",
                 r"set -- a b; git commit -m 'mention .env'",
                 "docker run --env-file .env img sh -c 'x' _ y",
+                // An accepted cost of removing the rule: a literal read in a
+                // `-c` script that `parallel` or `fd -x`/`-X` runs, or in a
+                // script piped to `bash -s` with an operand, was caught only
+                // by it. The guard does not peel `parallel` or `fd`, so
+                // `parallel cat .env ::: a` and `fd -x cat .env` already
+                // passed; peeling them is a separate change.
+                "parallel sh -c 'cat .env' ::: a b",
+                "parallel sh -c 'cat {}/.env' ::: dir1 dir2",
+                "fd -t d -x sh -c 'cat {}/.env'",
+                "fd -x sh -c 'cat .env'",
+                "fd -H x -X sh -c 'cat .env'",
+                "echo 'cat .env' | bash -s x",
             ],
             cadence_hooks_core::Outcome::Allow,
             "positional parameters beside a secret name",
@@ -7126,6 +7138,15 @@ mod tests {
                 "bash -euo pipefail -c 'cat .env.local'",
                 "set -- a b; cat .env",
                 r#"bash -c 'cat "$1"' _ x; cat .env"#,
+                // The runners the reader peels still reach a `-c` script's
+                // read, with or without words after it.
+                r"find . -exec sh -c 'cat .env' \;",
+                "echo x | xargs sh -c 'cat .env'",
+                "env FOO=1 bash -c 'cat .env'",
+                "bash -c 'cat .env' _ x",
+                "timeout 5 bash -c 'cat .env'",
+                "sudo -u app bash -c 'cat .env'",
+                "nohup sh -c 'cat .env'",
             ],
             cadence_hooks_core::Outcome::Block,
             "a literal read beside positional parameters",
