@@ -724,6 +724,9 @@ struct PushWalk {
     /// Set when [`judge_literal_push_loop`] placed and owner-checked every
     /// push of the command: the directory nudge has nothing left to say.
     every_push_placed: std::cell::Cell<bool>,
+    /// The nudge for a chain or loop the loop parser could not read, given
+    /// on top of any verdict that does not block.
+    unparsed: std::cell::Cell<Option<&'static str>>,
 }
 
 impl PushWalk {
@@ -1089,15 +1092,62 @@ impl Check for PushRemoteGuard {
         // One push walk per command, shared by the gate, the directory check
         // and the nudge: each is a full walk of every child script.
         let walk = PushWalk::default();
-        let verdict = judge_push(input, &walk);
-        if verdict.outcome != cadence_hooks_core::Outcome::Allow
-            || verdict.bypass.is_some()
-            || walk.every_push_placed.get()
-        {
-            return verdict;
+        let verdict = judge_with_directory_nudge(input, &walk);
+        // A chain or loop the parser could not read is not refused for that
+        // (cadence-ecosystem ADR-0046 rule 3): each push it read was judged.
+        match walk.unparsed.get() {
+            Some(note)
+                if verdict.outcome != cadence_hooks_core::Outcome::Block
+                    && verdict.bypass.is_none() =>
+            {
+                CheckResult::nudge(match verdict.message {
+                    Some(message) => format!("{note}\n\n{message}"),
+                    None => note.to_string(),
+                })
+            }
+            _ => verdict,
         }
-        unverified_directory_nudge(input, &walk).unwrap_or(verdict)
     }
+}
+
+/// [`judge_push`], then the [`unverified_directory_nudge`] for an allowed
+/// push.
+fn judge_with_directory_nudge(input: &HookInput, walk: &PushWalk) -> CheckResult {
+    let verdict = judge_push(input, walk);
+    if verdict.outcome != cadence_hooks_core::Outcome::Allow
+        || verdict.bypass.is_some()
+        || walk.every_push_placed.get()
+    {
+        return verdict;
+    }
+    unverified_directory_nudge(input, walk).unwrap_or(verdict)
+}
+
+/// The nudge for several pushes in a command the loop parser could not read.
+/// It names why the parse failed, not the chain: the chain is fine.
+const UNPARSED_CHAIN_NUDGE: &str = "⚠️  git-guardrails: several git pushes in a command the \
+     guard could not parse — each push it read was checked on its own target\n   \
+     Cause: the command is over 12 KB, holds a heredoc or a syntax error the parser \
+     cannot read, or took too long to parse\n   \
+     Verify: shorten the command, or run each push as its own command";
+
+/// The nudge for a command whose loop the loop parser could not read, when a
+/// push in the command has no remote or one only the shell resolves. It reads
+/// every push in the command, not only those in the loop, so it says so.
+const UNPARSED_LOOP_NUDGE: &str = "⚠️  git-guardrails: git push in a command with a loop the \
+     guard could not parse — each push it read was checked on its own target\n   \
+     Verify: give every push in the command an explicit remote, e.g. `git push origin main`";
+
+/// Whether a push names no repository, or one only the shell resolves (a
+/// `$` or backtick), so its remote is the tracking one or decided at run
+/// time. `words` are the push's arguments, as [`extract_push_targets`]
+/// reads them.
+fn push_lacks_literal_remote(words: &[String]) -> bool {
+    let found = cadence_hooks_core::shell::push_repository_argument(words);
+    found
+        .positional
+        .or(found.repo_flag)
+        .is_none_or(|remote| remote.contains(['$', '`']))
 }
 
 /// A nudge for an allowed push that runs after a directory change the push walk
@@ -1210,7 +1260,8 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
         | ChainAnalysis::DifferentRemotes(_)
         | ChainAnalysis::MissingRemotes(_) => {}
         ChainAnalysis::ParseFailed => {
-            // Fall back to counting. The substring count alone misses a
+            // Fall back to counting, for the nudge: every push is still
+            // judged on its own target below. The substring count alone misses a
             // push carrying a git global (`git -C . push …`), which is
             // exactly the shape #554 was about — so take the larger of the
             // two counts rather than trusting either on its own.
@@ -1225,10 +1276,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 .count()
                 .max(git_push_count(command) + heredoc_push_count);
             if push_count > 1 {
-                return CheckResult::block(
-                    "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
-                     Fix: run each push separately, e.g. `git push origin main && git push origin dev`",
-                );
+                walk.unparsed.set(Some(UNPARSED_CHAIN_NUDGE));
             }
         }
         ChainAnalysis::SingleOrNone => {}
@@ -1250,12 +1298,20 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
             ));
         }
         LoopAnalysis::ParseFailed => {
-            let stripped = strip_quotes(command);
-            if LOOP_PATTERN.is_match(&stripped) {
-                return CheckResult::block(
-                    "🚫 git-guardrails: git push in loop — cannot verify targets\n   \
-                     Fix: run each push individually with explicit remote, e.g. `git push origin main`",
-                );
+            // The loop nudge asks for an explicit remote, so it is given only
+            // when a push lacks one: every push named `origin` has nothing to
+            // fix. The pushes are the ones the target check below reads.
+            if LOOP_PATTERN.is_match(&strip_quotes(command))
+                && (push_segments
+                    .iter()
+                    .any(|words| push_lacks_literal_remote(words))
+                    || walk.of(command, &input_cwd(input)).iter().any(|push| {
+                        push_lacks_literal_remote(
+                            &push.repository.clone().into_iter().collect::<Vec<_>>(),
+                        )
+                    }))
+            {
+                walk.unparsed.set(Some(UNPARSED_LOOP_NUDGE));
             }
         }
         LoopAnalysis::AllTargetsExplicit(_) | LoopAnalysis::NoLoops => {}
@@ -3197,11 +3253,12 @@ mod tests {
     /// heredoc whose body holds a kept span (`a=(x)#` before a quote) is read
     /// twice, rewritten and as written. When the chain parser rejects the
     /// command, the fallback count took both copies and blocked one push as
-    /// "multiple git push commands"; main allows it. Two pushes still block.
+    /// "multiple git push commands"; main allows it. Two pushes nudge, and an
+    /// unowned target among them blocks (cadence-ecosystem ADR-0046 rule 3).
     #[cfg(unix)]
     #[test]
     fn one_heredoc_push_read_two_ways_is_counted_once() {
-        use cadence_hooks_core::Outcome::{Allow, Block};
+        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
         let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
         let cwd = owned.path().to_string_lossy().to_string();
         with_env(&owners_only(), || {
@@ -3216,6 +3273,10 @@ mod tests {
                 ),
                 (
                     "bash <<'Z'\na=(x)#; echo 'hi'\ngit push origin main\ngit push origin feat\nZ\necho $((",
+                    Nudge,
+                ),
+                (
+                    "bash <<'Z'\na=(x)#; echo 'hi'\ngit push origin main\ngit push https://github.com/evil/x.git feat\nZ\necho $((",
                     Block,
                 ),
             ] {
@@ -3230,18 +3291,19 @@ mod tests {
     /// timed out, and the push behind them went through unchecked. Seven
     /// lines finish in well under a second, so this leaves no runaway parse
     /// behind; the budget itself is pinned in `loop_analysis`. The guard must
-    /// still refuse an unowned target and a second push behind a flood.
+    /// still refuse an unowned target behind a flood, and nudge on a second
+    /// push it judged without the chain parse.
     #[cfg(unix)]
     #[test]
     fn parser_backtracking_flood_still_judges_the_push() {
-        use cadence_hooks_core::Outcome::{Allow, Block};
+        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
         let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
         let cwd = owned.path().to_string_lossy().to_string();
         let flood = "(( 1 # x ))\n".repeat(7);
         with_env(&owners_only(), || {
             for (tail, outcome) in [
                 ("git push https://github.com/other/repo.git main", Block),
-                ("git push origin main\ngit push origin feat", Block),
+                ("git push origin main\ngit push origin feat", Nudge),
                 ("git push origin main", Allow),
             ] {
                 let command = format!("{flood}{tail}");
@@ -3255,6 +3317,109 @@ mod tests {
                 assert_eq!(result.outcome, outcome, "{tail:?}: {:?}", result.message);
             }
         });
+    }
+
+    /// Review of #1470: past the byte cap the loop nudge asks for an explicit
+    /// remote, so it fires only for a push that has none or one only the
+    /// shell resolves; and the chain nudge names why the parse failed rather
+    /// than suggesting the chain it fired on.
+    #[test]
+    fn an_unparsed_command_nudges_only_with_something_to_fix() {
+        use cadence_hooks_core::Outcome::{Allow, Nudge};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_string_lossy().to_string();
+        let pad = format!(
+            "\n# {}",
+            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
+        );
+        let chain_nudge = "⚠️  git-guardrails: several git pushes in a command the guard \
+            could not parse — each push it read was checked on its own target\n   \
+            Cause: the command is over 12 KB, holds a heredoc or a syntax error the \
+            parser cannot read, or took too long to parse\n   \
+            Verify: shorten the command, or run each push as its own command";
+        with_env(&owners_only(), || {
+            for (command, outcome, note) in [
+                // Every push names its remote: nothing to fix.
+                (
+                    "for b in main feat; do git push origin $b; done",
+                    Allow,
+                    None,
+                ),
+                (
+                    "for b in main feat; do git push -u origin $b; done",
+                    Allow,
+                    None,
+                ),
+                // No remote, or one only the shell resolves.
+                (
+                    "for b in main feat; do git push; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                (
+                    "for r in origin; do git push $r main; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                // The loop nudge is the OR of two readings of the pushes, and
+                // each catches a push the other misses (review of #1470).
+                // `bash -c` and `sh -c` hide the push from the segment
+                // reading; the push walk reads into the child script.
+                (
+                    "for b in a b; do bash -c 'git push'; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                (
+                    "for b in a b; do sh -c 'git push'; done",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                // A heredoc fed to the shell hides the push from the walk;
+                // the segment reading finds it.
+                (
+                    "for b in a b; do bash <<'Z'\ngit push\nZ\ndone",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                // The same two shapes with a remote named: nothing to fix.
+                (
+                    "for b in a b; do bash -c 'git push origin'; done",
+                    Allow,
+                    None,
+                ),
+                (
+                    "for b in a b; do bash <<'Z'\ngit push origin\nZ\ndone",
+                    Allow,
+                    None,
+                ),
+                // The nudge reads every push in the command, not only those
+                // in the loop: the bare push after it is the one to fix.
+                (
+                    "for b in a b; do git push origin $b; done; git push",
+                    Nudge,
+                    Some(UNPARSED_LOOP_NUDGE),
+                ),
+                (
+                    "git push origin main && git push origin main:feat",
+                    Nudge,
+                    Some(chain_nudge),
+                ),
+            ] {
+                let padded = format!("{command}{pad}");
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&padded, &cwd));
+                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+                let message = result.message.as_deref().unwrap_or("");
+                match note {
+                    Some(note) => assert!(message.starts_with(note), "{command}: {message}"),
+                    None => assert!(!message.contains("could not parse"), "{command}: {message}"),
+                }
+            }
+        });
+        assert!(
+            !UNPARSED_CHAIN_NUDGE.contains("&&"),
+            "{UNPARSED_CHAIN_NUDGE}"
+        );
     }
 
     /// cadence-hooks#1144 review round 2: the substitution a child script runs
@@ -3695,7 +3860,7 @@ mod tests {
             let repo = crate::github_origin_repo();
             let cwd = repo.path().to_string_lossy();
             // Sized under the loop parser's byte cap: a larger command is not
-            // parsed and its push count blocks it (cameronsjo/cadence-hooks#1405).
+            // parsed and takes the parse-failure nudge (#1405).
             let unit = "git -C d push origin main; ";
             let command =
                 unit.repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES / unit.len());
@@ -3734,7 +3899,7 @@ mod tests {
             let cwd = repo.path().to_string_lossy();
             let unit = "for i in 1; do git push origin main; git config user.name x; done;";
             // Sized under the loop parser's byte cap: a larger command is not
-            // parsed and its push count blocks it (cameronsjo/cadence-hooks#1405).
+            // parsed and takes the parse-failure nudge (#1405).
             let flood =
                 unit.repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES / unit.len());
             // Pin the #1161 regression by counting spawns, not by timing
