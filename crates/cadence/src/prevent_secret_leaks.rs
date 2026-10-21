@@ -7600,6 +7600,9 @@ mod tests {
                 "sh <<<'cat .env'",
                 "script -c 'cat .env' /dev/null",
                 "script -qc cat\\ .env /dev/null",
+                // util-linux's bare `-t` leaves `-c` alone.
+                "script -q -t -c 'cat .env' /dev/null",
+                "script -qt -c 'cat .env' /dev/null",
                 "flock /tmp/l -c 'cat .env'",
                 "flock /tmp/l -c cat\\ .env",
                 "watch 'cat .env'",

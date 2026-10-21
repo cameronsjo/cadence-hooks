@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Guards read `script -q -t -c CMD` as util-linux runs it.** util-linux's `-t` takes only a glued value, so in `script -q -t -c 'cat .env' /dev/null` the `-c` is `script`'s own and it runs `cat .env`. Core read `-t` as BSD's `-t time`, took `-c` as its value, and read the command as `/dev/null`, so `prevent-secret-leaks` allowed it. A bare `-t` now takes the next word only when that word is not an option, and BSD's `script -t 0 FILE CMD` reads as before.
+
 - **`guard-gh-write` no longer blocks a `-R` write behind an `eval` or `trap` it cannot read.** An `eval "$(direnv export bash)"`, `eval "$X"` or `trap "$CMD" DEBUG` in front of `gh pr comment 1 -R owner/repo` made `GH_HOST` unknown, so the write blocked. That text cannot be read before it runs, so it is now skipped and the write is judged on the hosts the guard did read. An `eval` string that sets `GH_HOST` in plain text still counts. (Part of cameronsjo/cadence-hooks#1443)
 
 - **`cadence-hooks try` reads a payload piped to stdin.** It ignored stdin and always ran the generated sample unless `--payload FILE` was given, so `… | cadence-hooks try <ns> <hook>` tested `git status` and could report ALLOW for a payload that blocks. A piped payload now runs; `--payload` still wins, and empty stdin (`/dev/null`) runs the sample as before. Stdin that sends nothing for 2 s runs the sample with a warning; once bytes arrive, `try` reads to the end however slow the producer. Stdin that is not UTF-8 exits 1.
