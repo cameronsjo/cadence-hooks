@@ -1999,7 +1999,7 @@ fn looped_write_block_message(
 fn unresolvable_message(work_dir: &str, fix: &str) -> String {
     let work_dir = if work_dir == UNRESOLVABLE_DIR {
         "unknown (an earlier part of the command may change directory in a way this guard \
-         cannot read, such as `eval`, `popd` or `cd \"$D\"`)"
+         cannot read, such as `eval`, `popd` or `pushd a b`)"
     } else {
         work_dir
     };
