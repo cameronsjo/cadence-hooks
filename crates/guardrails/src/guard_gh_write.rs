@@ -1993,7 +1993,16 @@ fn looped_write_block_message(
 /// Build the block message for an unresolvable target, naming the directory
 /// that failed to resolve and a concrete target example — `fix`, spelled for
 /// the command by [`target_spelling`].
+///
+/// [`UNRESOLVABLE_DIR`] is a sentinel that starts with a NUL byte, so it is
+/// named in words rather than printed.
 fn unresolvable_message(work_dir: &str, fix: &str) -> String {
+    let work_dir = if work_dir == UNRESOLVABLE_DIR {
+        "unknown (an earlier part of the command may change directory in a way this guard \
+         cannot read, such as `eval`, `popd` or `cd \"$D\"`)"
+    } else {
+        work_dir
+    };
     format!(
         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
          Directory: {work_dir}\n   \
@@ -5677,6 +5686,39 @@ mod tests {
         let msg = unresolvable_message("/tmp", "-R owner/<repo>");
         assert!(msg.contains("Directory: /tmp"));
         assert!(msg.contains("-R owner/<repo>"));
+    }
+
+    /// True when `text` holds a control byte other than the newline the
+    /// messages are laid out with.
+    fn has_control_byte(text: &str) -> bool {
+        text.chars().any(|c| c.is_control() && c != '\n')
+    }
+
+    #[test]
+    fn unresolvable_message_names_an_unread_directory_in_words() {
+        // The per-segment walk reports a directory it cannot follow as
+        // UNRESOLVABLE_DIR, which starts with a NUL byte. The message used to
+        // print it as is.
+        let msg = unresolvable_message(UNRESOLVABLE_DIR, "-R owner/<repo>");
+        assert!(!has_control_byte(&msg), "{msg:?}");
+        assert!(msg.contains("Directory: unknown ("), "{msg}");
+    }
+
+    #[test]
+    fn write_after_an_unread_eval_prints_no_control_byte() {
+        // `eval "$S"` may change directory, so the write's own directory is
+        // the sentinel, while the checkout itself is owned. The block stands;
+        // only its text changed.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                r#"eval "$S"; gh pr create --title t --body b"#,
+                OWNED_DIR,
+            ));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+            let message = result.message.unwrap_or_default();
+            assert!(!has_control_byte(&message), "{message:?}");
+            assert!(message.contains("Directory: unknown ("), "{message}");
+        });
     }
 
     #[test]
