@@ -456,7 +456,9 @@ fn shell_first_operand<'a>(shell: &str, words: &'a [String]) -> Option<&'a Strin
         if !word.starts_with(['-', '+']) {
             return Some(word);
         }
-        // Before the value test: `-so pipefail` still reads stdin.
+        // Under `-s` (`-s`, `-es`, `-so pipefail`) stdin is the script, so no
+        // file is the consumer. A cluster that also holds `c` blocks too, the
+        // safe side. A long option such as `--posix` is not a cluster.
         if word.starts_with('-') && !word.starts_with("--") && word.contains('s') {
             return None;
         }
@@ -827,6 +829,8 @@ mod tests {
                 "sops -d secrets.sops.yaml | zsh -euo pipefail scripts/secret-keys.sh",
                 // zsh's `-O` is a plain flag, so zsh runs the file after it.
                 "sops -d secrets.sops.yaml | zsh -O scripts/secret-keys.sh",
+                // A long option holding an `s` is not `-s`: bash runs the file.
+                "sops -d secrets.sops.yaml | bash --posix scripts/secret-keys.sh",
             ] {
                 assert_eq!(outcome(command), Outcome::Allow, "{command:?}");
             }
@@ -838,10 +842,14 @@ mod tests {
                 "sops -d secrets.sops.yaml | zsh -O scripts/other.sh scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | zsh -O extglob scripts/secret-keys.sh",
                 // Under `-s` stdin is the script: bash runs the plaintext as
-                // commands and prints its lines to stderr.
+                // commands, and each line's first word reaches stderr in a
+                // "command not found" error (`-x` traces the whole line).
                 "sops -d secrets.sops.yaml | bash -s scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | bash -so pipefail scripts/secret-keys.sh",
                 "sops -d secrets.sops.yaml | bash -euo pipefail -s scripts/secret-keys.sh",
+                // `s` after another letter in the cluster.
+                "sops -d secrets.sops.yaml | bash -es scripts/secret-keys.sh",
+                "sops -d secrets.sops.yaml | bash -xs scripts/secret-keys.sh",
             ] {
                 assert_eq!(outcome(command), Outcome::Block, "{command:?}");
             }
