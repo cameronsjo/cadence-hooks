@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Specs for every hook, and OpenSpec for new work.** `openspec/specs/` records what each hook and CLI action does today, one spec per capability, read from the code as of the phase 1 guard loosening. New behavior starts as an OpenSpec change under `openspec/changes/`; `scripts/openspec.sh` runs the pinned CLI, CI validates the specs, and `docs/plans/` takes no new plans. The binary is unchanged. (cameronsjo/cadence-hooks#1446)
 
+## [0.130.1] - 2026-10-20
+
+### Fixed
+
+- **The redaction scan's `skill-id` category no longer flags a host:port or an image tag.** `media-mcp:3000`, `obaass-mcp:3000`, `homelab-mcp:main`, `ghcr.io/owner/core:main`, a bare `mcp:3000` and `core:v1.2` were reported as skill IDs because the namespace matched at the end of a longer name and the skill part allowed a leading digit. A skill ID is now matched only when its namespace starts the token (a `/` that starts it, as in `/cadence:outro`, still counts), its skill name starts with a letter, and no `.` plus a name character follows it. True skill IDs such as `cadence:writing-skills` and `cadence-forge:polish` still flag; a standalone `mcp:main` still flags, since its shape is a skill ID's.
+
+## [0.130.0] - 2026-10-20
+
 ### Changed
 
 - **Guards judge what they read and allow the rest (cadence-ecosystem ADR-0046, phase 1).** A Bash command the parser could not read in full was refused by `git-safety`, `prevent-secret-leaks`, `prevent-secret-writes`, `prevent-secret-push`, `guard-push-remote`, `trash-guard` and `guard-runbook-scrub` ("command too large", a `#` glued to `(` or `)`, a loosely read function header, a bash 5.3 `${ cmd; }`). The shared refusal is gone: each guard now judges the parts it read, so `git reset --hard` beside an unreadable shape still blocks, and padding or exotic spelling no longer refuses an ordinary command. Guards stop accidents by a cooperative model, not deliberate evasion. (cameronsjo/cadence-hooks#1442)
