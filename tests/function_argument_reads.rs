@@ -116,3 +116,25 @@ fn two_hundred_definitions_and_a_long_command_are_judged_in_one_pass() {
         "a secret name handed to a function"
     );
 }
+
+#[test]
+fn a_literal_read_at_the_end_of_a_long_command_still_blocks() {
+    // The reader scan still reaches a read after a long run of other words:
+    // 1000 `$(…)` assignments and their echoes, or a 50 KB value referenced
+    // 15 000 times before a `-c` script behind an option.
+    let assignments: String = (0..1000)
+        .map(|i| format!("OUT{i}=$(git rev-parse HEAD~{i})\n"))
+        .collect();
+    let echoes: String = (0..1000).map(|i| format!("echo \"$OUT{i}\"\n")).collect();
+    let after_assignments = format!("{assignments}{echoes}cat .env");
+    let after_a_long_value = format!(
+        "V='({}'; echo {}; bash -O extglob -c 'cat .env'",
+        "x".repeat(50_000),
+        "$V ".repeat(15_000)
+    );
+    assert_exit(
+        &[&after_assignments, &after_a_long_value],
+        2,
+        "a literal read at the end of a long command",
+    );
+}
