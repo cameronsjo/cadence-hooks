@@ -30,11 +30,11 @@
 //! name (`…_key`, `auth`, `db_pass`) needs a credential-shaped value in the
 //! prose-shaped forms ([`secret_like`]). A bare `PASS`/`FAIL` is a test
 //! runner's status word, and `Token expired` (a name, a space, a word, at the
-//! start of a line outside a `.netrc`/vault table) is prose, not a pair, as is
-//! a bare `pass:` after another word on its line (`one record per pass: x`,
-//! [`pass_key_position`]). A
-//! corpus test holds everyday output (test runners, builds, git over code,
-//! listings, error prose) at zero masks.
+//! start of a line outside a `.netrc`/vault table) is prose, not a pair. A
+//! bare `pass:` after an ordinary word on its line (`one record per pass: x`)
+//! is read as a WEAK name ([`pass_key_position`]). A corpus test holds
+//! everyday output (test runners, builds, git over code, listings, error
+//! prose) at zero masks.
 //!
 //! **Views.** Every detector runs on the output with ANSI CSI sequences
 //! removed (`grep --color`, coloured logs), and again on windows around each
@@ -588,7 +588,8 @@ pub enum Strength {
     /// in a plain `pass=5` / `pass: 5` form, which is a test runner's tally
     /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
     /// string's `&pass=` all mask, as does a longer number. In the mid-line
-    /// colon form it is a key only in key position ([`pass_key_position`]).
+    /// colon form, out of key position ([`pass_key_position`]), it is read as
+    /// [`Strength::Weak`].
     Tally,
 }
 
@@ -1641,11 +1642,14 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         let Some(strength) = names.get(tail_name(&head[..colon])) else {
             continue;
         };
-        // A bare `pass:` after another word on its line is prose ("one record
-        // per pass: x"), not a key (#1449).
-        if strength == Strength::Tally && !pass_key_position(text, name_at) {
-            continue;
-        }
+        // A bare `pass:` after another word on its line may be prose ("one
+        // record per pass: x"), so out of key position it is a weak name whose
+        // value must look like a credential ("DB pass: <secret>", #1449).
+        let strength = if strength == Strength::Tally && !pass_key_position(text, name_at) {
+            Strength::Weak
+        } else {
+            strength
+        };
         let eol = line_end(text, start, &mut eol_cache);
         let rest = &text[start..eol];
         if rest.starts_with("//") {
@@ -1702,19 +1706,32 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
 }
 
 /// Is the bare `pass` starting at `name_at` in key position for the mid-line
-/// colon form (#1449)? It is when only blanks, list, diff and quote markers
-/// (`- * > < +`, `"`, `'`) or comment leaders (`#`, `/`) come before it on its
-/// line; when it follows `{ , ; & ? ( [` or a quote (blanks between allowed),
-/// as in a map, an argument list, a query or a quoted string; or when the word
-/// before it is a field's value (`user: admin pass: x`, `user=admin pass: x`).
-/// After any other word it is prose, as in "the second pass: done". Every
-/// other name, and the `pass=` form, keeps its rules.
+/// colon form (#1449)? It is when:
+///
+/// - two or more blanks, or a tab, come right before it (indentation or a
+///   column: `grep -n`'s `3:  pass:`, `cat -n`, `git blame`, a table row);
+/// - only blanks, list, diff and quote markers (`- * > < +`, `"`, `'`) or
+///   comment leaders (`#`, `/`) come before it on its line;
+/// - it follows `{ , ; & ? ( [` or a quote (blanks between allowed), as in a
+///   map, an argument list, a query or a quoted string;
+/// - the word before it ends in `:` (a `file:line:` prefix or a label),
+///   starts with `-` (a flag, `-passout pass:x`, or a dash, `x -- pass: y`),
+///   or is a field's value (`user: admin pass: x`, `user=admin pass: x`,
+///   Go's `{User:admin Pass:x}`).
+///
+/// After any other word it may be prose, as in "the second pass: done", and
+/// the caller reads it as a weak name. Every other name, and the `pass=` form,
+/// keeps its rules.
 ///
 /// Each scan stops at a newline, a blank or the first byte that does not
 /// qualify, and reads at most two words back, so a long line stays linear.
 fn pass_key_position(text: &str, name_at: usize) -> bool {
     let before = &text.as_bytes()[..name_at];
     let blank = |b: u8| matches!(b, b' ' | b'\t');
+    let gap = before.iter().rev().take_while(|&&b| blank(b));
+    if gap.clone().count() >= 2 || gap.clone().any(|&b| b == b'\t') {
+        return true;
+    }
     let opener = before.iter().rev().copied().find(|&b| !blank(b));
     if matches!(
         opener,
@@ -1732,7 +1749,8 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
     if markers_only {
         return true;
     }
-    // The word before `pass`, and the one before that.
+    // The word before `pass`, and the one before that, with any opener glued
+    // to its front (`{User:admin`, `&{User:admin`) dropped.
     let skip_blanks = |mut i: usize| {
         while i > 0 && blank(before[i - 1]) {
             i -= 1;
@@ -1745,12 +1763,13 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
         }
         i
     };
+    let field = |word: &str| starts_key_field(word.trim_start_matches(['{', '(', '[', '&']));
     let end = skip_blanks(before.len());
     let start = word_start(end);
     let Ok(word) = std::str::from_utf8(&before[start..end]) else {
         return false;
     };
-    if starts_key_field(word) {
+    if word.ends_with(':') || word.starts_with('-') || field(word) {
         return true;
     }
     let prev_end = skip_blanks(start);
@@ -1758,7 +1777,7 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
         return false;
     }
     std::str::from_utf8(&before[word_start(prev_end)..prev_end])
-        .is_ok_and(|prev| prev.ends_with([':', '=']) && starts_key_field(prev))
+        .is_ok_and(|prev| prev.ends_with([':', '=']) && field(prev))
 }
 
 /// Parenthesis depth on the current line at a byte offset, advanced
@@ -2835,9 +2854,10 @@ mod tests {
         }
     }
 
-    /// cameronsjo/cadence-hooks#1449: a bare `pass:` after another word on its
-    /// line is prose (an iteration, a review round), not a key. In key
-    /// position it masks as before, and so does every longer name.
+    /// cameronsjo/cadence-hooks#1449: a bare `pass:` after an ordinary word on
+    /// its line may be prose (an iteration, a review round), so there its value
+    /// masks only when it looks like a credential. In key position any value
+    /// masks as before, and so does every longer name.
     #[test]
     fn issue_1449_pass_in_prose_passes_through() {
         let kept = [
@@ -2848,32 +2868,113 @@ mod tests {
             "Second Pass: complete\n",
             "// MARK: one record per pass: x\n",
             "first pass: done, second pass: done\n",
+            "The final pass: emit code.\n",
+            "* Review pass: looks good to me\n",
+            "lint pass: ok\n",
+            "optimizer pass: inline (12 functions)\n",
         ];
         for input in kept {
             assert_eq!(redact(input), None, "{input:?}");
         }
+        // Six characters, so not shaped like a credential even with a closing
+        // `)` or `]` glued on: it masks only where `pass` is a key.
+        let w = "hunt3r";
+        let keys = [
+            // Line start after blanks, markers, a quote or a comment leader.
+            format!("pass: {w}\n"),
+            format!("  pass: {w}\n"),
+            format!("+ pass: {w}\n"),
+            format!("- pass: {w}\n"),
+            format!("\"pass: {w}\"\n"),
+            format!("# pass: {w}\n"),
+            format!("// pass: {w}\n"),
+            // Glued markers, which the line-start pass does not read.
+            format!("-- pass: {w}\n"),
+            format!("** pass: {w}\n"),
+            format!(">> pass: {w}\n"),
+            format!("<< pass: {w}\n"),
+            format!("++ pass: {w}\n"),
+            format!("\"- pass: {w}\n"),
+            format!("'- pass: {w}\n"),
+            format!("+- pass: {w}\n"),
+            // After a map, list, argument or query opener, or a quote.
+            format!("{{ pass: {w} }}\n"),
+            format!("{{pass: {w}}}\n"),
+            format!("a, pass: {w}\n"),
+            format!("a; pass: {w}\n"),
+            format!("a & pass: {w}\n"),
+            format!("a? pass: {w}\n"),
+            format!("connect(pass: {w})\n"),
+            format!("x [pass: {w}]\n"),
+            format!("x' pass: {w}\n"),
+            format!("x\" pass: {w}\n"),
+            format!("echo \"pass: {w}\"\n"),
+            format!("msg='pass: {w}'\n"),
+            // After a field's value, Go's `%+v` included.
+            format!("user: admin pass: {w}\n"),
+            format!("user=admin pass: {w}\n"),
+            format!("user= admin pass: {w}\n"),
+            format!("login: root   pass: {w}\n"),
+            format!("{{user: admin pass: {w}}}\n"),
+            format!("{{User:admin Pass:{w}}}\n"),
+            format!("&{{User:admin Pass:{w} Host:db}}\n"),
+            format!("[User:admin Pass:{w}]\n"),
+            format!("(user:admin pass:{w})\n"),
+            // Indentation or a column: two blanks or a tab before it.
+            format!("x  pass: {w}\n"),
+            format!("x\tpass: {w}\n"),
+            format!("host  db.internal  user  admin  pass: {w}\n"),
+            format!("     3\t  pass: {w}\n"),
+            format!("   3 │   pass: {w}\n"),
+            format!("^abc1234 (Cam 2026-10-21 12:00:00 +0000 3)   pass: {w}\n"),
+            // After a word ending in `:`: grep's `file:line:`, a label.
+            format!("config/db.yml:3: pass: {w}\n"),
+            format!("config/db.yml:3:  pass: {w}\n"),
+            format!("config/db.yml:  pass: {w}\n"),
+            format!("config/db.yml-3-  pass: {w}\n"),
+            format!("3:  pass: {w}\n"),
+            format!("src/mail.js:12:    pass: '{w}',\n"),
+            // After a word starting with `-`: an `openssl` continuation line,
+            // a dash, a mid-line SQL comment.
+            format!("x - pass: {w}\n"),
+            format!("SELECT 1; -- pass: {w}\n"),
+            format!("x -passout pass:{w}\n"),
+            format!("  -passout pass:{w} \\\n"),
+            format!("scripts/cert.sh:14:  -passout pass:{w} \\\n"),
+            format!("  -passin pass:{w} \\\n"),
+            format!("x -pass pass:{w}\n"),
+        ];
+        for input in &keys {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(w), "{input:?} -> {out:?}");
+        }
         let p = pw();
         let masks = [
-            // Key position: line start after blanks, markers, a quote or a
-            // comment leader.
-            format!("pass: {p}\n"),
-            format!("  pass: {p}\n"),
-            format!("+ pass: {p}\n"),
-            format!("- pass: {p}\n"),
-            format!("\"pass: {p}\"\n"),
-            format!("# pass: {p}\n"),
-            format!("// pass: {p}\n"),
-            // After a map, list, argument or query opener, or a quote.
-            format!("{{ pass: {p} }}\n"),
-            format!("{{pass: {p}}}\n"),
-            format!("user: u, pass: {p}\n"),
-            format!("connect(pass: {p})\n"),
-            format!("echo \"pass: {p}\"\n"),
-            format!("msg='pass: {p}'\n"),
-            // After a field's value.
-            format!("user: admin pass: {p}\n"),
-            format!("user=admin pass: {p}\n"),
-            format!("login: root   pass: {p}\n"),
+            // After an ordinary word, a credential-shaped value masks.
+            format!("DB pass: {p}\n"),
+            format!("Admin pass: {p}\n"),
+            format!("MySQL root pass: {p}\n"),
+            format!("Generated pass: {p}\n"),
+            format!("SMTP user: bob, SMTP pass: {p}\n"),
+            format!("user: bob  db pass: {p}\n"),
+            format!("DB user: app / DB pass: {p}\n"),
+            format!("Credentials -> user: admin | pass: {p}\n"),
+            format!("login=admin | pass: {p}\n"),
+            format!("INFO  Using pass: {p}\n"),
+            format!("[debug] pass: {p}\n"),
+            format!("{{\"log\":\"DB pass: {p}\\n\"}}\n"),
+            format!("{{\"msg\":\"user: bob pass: {p}\"}}\n"),
+            format!("* WiFi pass: {p}\n"),
+            format!("- Router pass: {p}\n"),
+            format!("> Admin pass: {p}\n"),
+            format!("+ echo pass: {p}\n"),
+            format!("++ export pass: {p}\n"),
+            format!("Host db1  User admin  pass: {p}\n"),
+            format!("x pass:{p}\n"),
+            format!("x Pass: {p}\n"),
+            format!("Connecting as root with pass: {p}\n"),
+            format!("2026-10-21T12:00:00Z pass: {p}\n"),
+            format!("Enter pass: {p}\n"),
             // The `=` and JSON forms keep their rules.
             format!("pass={p}\n"),
             format!("x pass={p}\n"),
@@ -3215,6 +3316,8 @@ mod tests {
             // #1449: every bare `pass:` here looks back for its key position.
             "one more pass: x ".repeat(5 * MB / 17),
             format!(" {} pass:", "w".repeat(4096)).repeat(5 * MB / 4103),
+            format!(" {}u:a pass:", "{".repeat(4096)).repeat(5 * MB / 4106),
+            "x \t pass: ".repeat(5 * MB / 10),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
