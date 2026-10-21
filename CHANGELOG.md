@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`redact-secret-output` no longer masks prose after a bare `pass:`.** A `git diff` of a comment ending "one record per pass: x" came back with `x` replaced by `[redacted: secret-named value]`, and so did "the second pass: done". Mid-line, a bare `pass:` now counts as a key only in key position: when only blanks, diff or list markers, quotes or comment leaders come before it on its line (`  pass: x`, `+ pass: x`, `# pass: x`); right after `{ , ; & ? ( [` or a quote (`{ pass: x }`, `user: u, pass: x`, `echo "pass: x"`); or after a field's value (`user: admin pass: x`). After any other word it passes through, so `Connecting as root with pass: x` is no longer masked either. `pass=x`, `"pass": "x"`, the line-start forms and every longer name (`password:`, `passwd:`, `db_pass:`) mask as before. (cameronsjo/cadence-hooks#1449)
+
 ## [0.131.0] - 2026-10-21
 
 ### Added

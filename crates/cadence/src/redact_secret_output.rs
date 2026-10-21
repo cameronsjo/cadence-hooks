@@ -30,7 +30,9 @@
 //! name (`…_key`, `auth`, `db_pass`) needs a credential-shaped value in the
 //! prose-shaped forms ([`secret_like`]). A bare `PASS`/`FAIL` is a test
 //! runner's status word, and `Token expired` (a name, a space, a word, at the
-//! start of a line outside a `.netrc`/vault table) is prose, not a pair. A
+//! start of a line outside a `.netrc`/vault table) is prose, not a pair, as is
+//! a bare `pass:` after another word on its line (`one record per pass: x`,
+//! [`pass_key_position`]). A
 //! corpus test holds everyday output (test runners, builds, git over code,
 //! listings, error prose) at zero masks.
 //!
@@ -585,7 +587,8 @@ pub enum Strength {
     /// [`Strength::Strong`] is, except an unquoted value of at most six digits
     /// in a plain `pass=5` / `pass: 5` form, which is a test runner's tally
     /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
-    /// string's `&pass=` all mask, as does a longer number.
+    /// string's `&pass=` all mask, as does a longer number. In the mid-line
+    /// colon form it is a key only in key position ([`pass_key_position`]).
     Tally,
 }
 
@@ -1638,6 +1641,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         let Some(strength) = names.get(tail_name(&head[..colon])) else {
             continue;
         };
+        // A bare `pass:` after another word on its line is prose ("one record
+        // per pass: x"), not a key (#1449).
+        if strength == Strength::Tally && !pass_key_position(text, name_at) {
+            continue;
+        }
         let eol = line_end(text, start, &mut eol_cache);
         let rest = &text[start..eol];
         if rest.starts_with("//") {
@@ -1691,6 +1699,66 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             }
         }
     }
+}
+
+/// Is the bare `pass` starting at `name_at` in key position for the mid-line
+/// colon form (#1449)? It is when only blanks, list, diff and quote markers
+/// (`- * > < +`, `"`, `'`) or comment leaders (`#`, `/`) come before it on its
+/// line; when it follows `{ , ; & ? ( [` or a quote (blanks between allowed),
+/// as in a map, an argument list, a query or a quoted string; or when the word
+/// before it is a field's value (`user: admin pass: x`, `user=admin pass: x`).
+/// After any other word it is prose, as in "the second pass: done". Every
+/// other name, and the `pass=` form, keeps its rules.
+///
+/// Each scan stops at a newline, a blank or the first byte that does not
+/// qualify, and reads at most two words back, so a long line stays linear.
+fn pass_key_position(text: &str, name_at: usize) -> bool {
+    let before = &text.as_bytes()[..name_at];
+    let blank = |b: u8| matches!(b, b' ' | b'\t');
+    let opener = before.iter().rev().copied().find(|&b| !blank(b));
+    if matches!(
+        opener,
+        Some(b'{' | b',' | b';' | b'&' | b'?' | b'(' | b'[' | b'"' | b'\'')
+    ) {
+        return true;
+    }
+    let markers_only = before.iter().rev().take_while(|&&b| b != b'\n').all(|&b| {
+        blank(b)
+            || matches!(
+                b,
+                b'-' | b'*' | b'>' | b'<' | b'+' | b'"' | b'\'' | b'#' | b'/'
+            )
+    });
+    if markers_only {
+        return true;
+    }
+    // The word before `pass`, and the one before that.
+    let skip_blanks = |mut i: usize| {
+        while i > 0 && blank(before[i - 1]) {
+            i -= 1;
+        }
+        i
+    };
+    let word_start = |mut i: usize| {
+        while i > 0 && !blank(before[i - 1]) && before[i - 1] != b'\n' {
+            i -= 1;
+        }
+        i
+    };
+    let end = skip_blanks(before.len());
+    let start = word_start(end);
+    let Ok(word) = std::str::from_utf8(&before[start..end]) else {
+        return false;
+    };
+    if starts_key_field(word) {
+        return true;
+    }
+    let prev_end = skip_blanks(start);
+    if prev_end == start || prev_end == 0 || before[prev_end - 1] == b'\n' {
+        return false;
+    }
+    std::str::from_utf8(&before[word_start(prev_end)..prev_end])
+        .is_ok_and(|prev| prev.ends_with([':', '=']) && starts_key_field(prev))
 }
 
 /// Parenthesis depth on the current line at a byte offset, advanced
@@ -2767,6 +2835,62 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1449: a bare `pass:` after another word on its
+    /// line is prose (an iteration, a review round), not a key. In key
+    /// position it masks as before, and so does every longer name.
+    #[test]
+    fn issue_1449_pass_in_prose_passes_through() {
+        let kept = [
+            // The issue's three rows, as the `git diff` lines it reported.
+            "+ // one record per pass: x\n",
+            "+ // the second pass: done\n",
+            "+ // one record per run: its seconds\n",
+            "Second Pass: complete\n",
+            "// MARK: one record per pass: x\n",
+            "first pass: done, second pass: done\n",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+        let p = pw();
+        let masks = [
+            // Key position: line start after blanks, markers, a quote or a
+            // comment leader.
+            format!("pass: {p}\n"),
+            format!("  pass: {p}\n"),
+            format!("+ pass: {p}\n"),
+            format!("- pass: {p}\n"),
+            format!("\"pass: {p}\"\n"),
+            format!("# pass: {p}\n"),
+            format!("// pass: {p}\n"),
+            // After a map, list, argument or query opener, or a quote.
+            format!("{{ pass: {p} }}\n"),
+            format!("{{pass: {p}}}\n"),
+            format!("user: u, pass: {p}\n"),
+            format!("connect(pass: {p})\n"),
+            format!("echo \"pass: {p}\"\n"),
+            format!("msg='pass: {p}'\n"),
+            // After a field's value.
+            format!("user: admin pass: {p}\n"),
+            format!("user=admin pass: {p}\n"),
+            format!("login: root   pass: {p}\n"),
+            // The `=` and JSON forms keep their rules.
+            format!("pass={p}\n"),
+            format!("x pass={p}\n"),
+            format!("user=admin pass={p}\n"),
+            format!("{{\"pass\": \"{p}\"}}\n"),
+            // Longer names mask after any word, as before.
+            format!("the password: {p}\n"),
+            format!("one record per passwd: {p}\n"),
+            format!("x db_pass: {p}\n"),
+            format!("PASSWORD={p}\n"),
+        ];
+        for input in &masks {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(&p), "{input:?} -> {out:?}");
+        }
+    }
+
     /// cameronsjo/cadence-hooks#1274's false-positive subset: pagination and
     /// idempotency handles, MySQL's 1045 message, and glued `…pass` words that
     /// are not credentials. The neighbouring credential shapes still mask.
@@ -3088,6 +3212,9 @@ mod tests {
                 format!("  {}\n", "x".repeat(60)).repeat(5 * MB / 63)
             ),
             "a:".repeat(5 * MB / 2),
+            // #1449: every bare `pass:` here looks back for its key position.
+            "one more pass: x ".repeat(5 * MB / 17),
+            format!(" {} pass:", "w".repeat(4096)).repeat(5 * MB / 4103),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
