@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` counts a looped `gh repo` argument with a literal owner as the target.** `gh repo archive`, `delete`, `edit` and `create` take the repository as an argument and have no `-R` flag. In a loop the guard did not count that argument, so `for r in alpha beta; do gh repo archive "<owner>/$r" --yes; done` blocked unless it ran in an owned checkout with no `cd` in the loop, and the block said to add `-R`. Now an argument that spells out its owner names the target, as `-R` does: its owner is judged against the allowlist wherever the loop runs, strict loops included. An owner you do not own still blocks. A variable owner (`"$o/$r"`), a bare name or no argument keeps the directory rule. For these four verbs the loop block and the single-command fix name the argument (`gh repo archive owner/<repo>`) instead of `-R`; `gh repo rename` keeps `-R`. (cameronsjo/cadence-hooks#1491)
+
 ## [0.131.0] - 2026-10-21
 
 ### Added

@@ -103,6 +103,13 @@ const REPO_TARGET_VERBS: &[&str] = &[
     "create",
 ];
 
+/// The writes among [`REPO_TARGET_VERBS`] whose argument is the repository
+/// they write to and which have no `-R` flag (gh 2.89.0 `--help`), so a fix
+/// for them names the argument, never `-R` (cameronsjo/cadence-hooks#1491).
+/// `rename` is left out because its argument is the new name and it does take
+/// `-R`. `fork` lands under the operator's account, and `clone` is a read.
+const REPO_ARGUMENT_VERBS: &[&str] = &["archive", "delete", "edit", "create"];
+
 /// `owner/repo` from a `gh api` endpoint PATH. Anchored to the start: an
 /// unanchored search matched anywhere in the token, which let a query-string
 /// decoy stand in for the real target (see [`api_repos_target`]).
@@ -1913,16 +1920,34 @@ fn looped_write_fix(
     literal_api: bool,
 ) -> String {
     if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
-        PLAIN_LOOP_FIX.to_string()
-    } else if only_api_writes(writes, api_writes) {
-        format!("gh api repos/{target}/…")
-    } else if api_writes.is_empty() && literal_api {
-        format!("-R {target} on every command but the literal-path gh api writes")
-    } else if api_writes.is_empty() {
-        format!("-R {target}")
-    } else {
-        format!("-R {target}; for gh api, gh api repos/{target}/…")
+        return PLAIN_LOOP_FIX.to_string();
     }
+    if only_api_writes(writes, api_writes) {
+        return format!("gh api repos/{target}/…");
+    }
+    // `gh repo archive` and the other argument verbs have no -R (#1491).
+    let repo_verb = writes
+        .iter()
+        .find_map(|w| repo_argument_verb(w.trim_matches('`')));
+    let flag_writes = writes
+        .iter()
+        .any(|w| repo_argument_verb(w.trim_matches('`')).is_none());
+    let mut parts = Vec::new();
+    if flag_writes || repo_verb.is_none() {
+        parts.push(if api_writes.is_empty() && literal_api {
+            format!("-R {target} on every command but the literal-path gh api writes")
+        } else {
+            format!("-R {target}")
+        });
+    }
+    if let Some(verb) = repo_verb {
+        let owner = target.split('/').next().unwrap_or("<owner>");
+        parts.push(format!("gh repo {verb} {owner}/<repo>"));
+    }
+    if !api_writes.is_empty() {
+        parts.push(format!("for gh api, gh api repos/{target}/…"));
+    }
+    parts.join("; ")
 }
 
 /// Build the block message for a looped gh write, with a concrete fix target
@@ -1947,8 +1972,13 @@ fn looped_write_block_message(
     if found.is_empty() {
         found.push("gh write command(s) without a target");
     }
+    // `gh repo archive` and the other argument verbs have no -R: their fix is
+    // the argument, with the owner spelled out (#1491).
+    let (repo_writes, flag_writes): (Vec<&String>, Vec<&String>) = writes
+        .iter()
+        .partition(|w| repo_argument_verb(w.trim_matches('`')).is_some());
     let mut fixes = Vec::new();
-    if !writes.is_empty() || api_writes.is_empty() {
+    if !flag_writes.is_empty() || (api_writes.is_empty() && repo_writes.is_empty()) {
         fixes.push(if literal_api {
             format!(
                 "add `-R {fix_target}` to each gh command except the literal-path `gh api` \
@@ -1957,6 +1987,25 @@ fn looped_write_block_message(
         } else {
             format!("add `-R {fix_target}` to each command")
         });
+    }
+    let mut verbs: Vec<String> = Vec::new();
+    for verb in repo_writes
+        .iter()
+        .filter_map(|w| repo_argument_verb(w.trim_matches('`')))
+    {
+        if !verbs.contains(&verb) {
+            verbs.push(verb);
+        }
+    }
+    if let Some(first) = verbs.first() {
+        let owner = fix_target.split('/').next().unwrap_or("owner");
+        let named: Vec<String> = verbs.iter().map(|v| format!("`gh repo {v}`")).collect();
+        fixes.push(format!(
+            "{} {} no -R flag: give it the repo as its argument with the owner spelled out \
+             (`gh repo {first} {owner}/<repo>`; the repo name may come from the loop variable)",
+            named.join(", "),
+            if verbs.len() == 1 { "has" } else { "have" },
+        ));
     }
     // A literal path counts as the target only in a plain loop
     // ([`loop_targets_are_literal`]), so a write that already has one was
@@ -1978,6 +2027,8 @@ fn looped_write_block_message(
         "gh api write in a loop the guard cannot follow"
     } else if only_api_writes(writes, api_writes) {
         "gh api write in loop without a literal repos/<owner>/<repo> path"
+    } else if flag_writes.is_empty() && !repo_writes.is_empty() {
+        "gh write command in loop without an explicit target"
     } else {
         "gh write command in loop without explicit -R flag"
     };
@@ -2447,6 +2498,48 @@ fn non_flag_target(verb: &str, target: &str) -> Option<(String, Option<String>, 
         ));
     }
     Some((verb.to_string(), None, target.to_string()))
+}
+
+/// The verb of a `gh repo` command in [`REPO_ARGUMENT_VERBS`], or `None` for
+/// any other command.
+fn repo_argument_verb(segment: &str) -> Option<String> {
+    let argv = gh_argv(segment)?;
+    if argv.get(1).map(String::as_str) != Some("repo") {
+        return None;
+    }
+    let verb = gh_canonical_verb("repo", argv.get(2)?);
+    REPO_ARGUMENT_VERBS
+        .contains(&verb)
+        .then(|| verb.to_string())
+}
+
+/// True when a looped `gh repo` write in [`REPO_ARGUMENT_VERBS`] names its
+/// repository as its argument with the owner (and any host) spelled out, as
+/// in `gh repo archive "cameronsjo/$r"` (cameronsjo/cadence-hooks#1491).
+///
+/// That names the target the way `-R cameronsjo/$r` does: the repo name may
+/// come from the loop variable, but every iteration writes under the same
+/// owner, which the per-segment pass judges against the allowlist. The
+/// directory the loop runs in does not matter. A variable owner (`"$o/$r"`),
+/// a bare name, a URL, or no argument gives `false`, and the loop keeps the
+/// directory-based policy.
+fn looped_repo_argument_is_literal(c: &loop_analysis::LoopedCommand) -> bool {
+    let Some((verb, host, target)) = gh_repo_positional_target(&format!("gh {}", c.args.join(" ")))
+    else {
+        return false;
+    };
+    let literal = |word: &str, punct: &[u8]| {
+        !word.is_empty()
+            && !word.starts_with('-')
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || punct.contains(&b))
+    };
+    REPO_ARGUMENT_VERBS.contains(&verb.as_str())
+        && host.as_deref().is_none_or(|h| literal(h, b"-."))
+        && target
+            .split_once('/')
+            .is_some_and(|(owner, name)| literal(owner, b"-") && !name.is_empty())
 }
 
 /// True when `segment`'s gh invocation targets the user's own account
@@ -3566,10 +3659,13 @@ fn judge_write_segment(
 
 /// How `segment` should name the repo `owner_repo` in a fix: `-R owner/repo`,
 /// or for `gh api`, which has no `-R` (gh rejects it), the endpoint path
-/// (cameronsjo/cadence-hooks#1344).
+/// (cameronsjo/cadence-hooks#1344), or for a `gh repo` verb in
+/// [`REPO_ARGUMENT_VERBS`], which has no `-R` either, the argument (#1491).
 fn target_spelling(segment: &str, owner_repo: &str) -> String {
     if gh_api_endpoint(segment).is_some() {
         format!("gh api repos/{owner_repo}/…")
+    } else if let Some(verb) = repo_argument_verb(segment) {
+        format!("gh repo {verb} {owner_repo}")
     } else {
         format!("-R {owner_repo}")
     }
@@ -3953,7 +4049,22 @@ impl Check for GhWriteGuard {
                         );
                     }
                 }
-                let has_write = cmds.iter().any(|c| kind(c) == LoopedWriteKind::RepoWrite);
+                // A `gh repo` write whose argument spells out its owner names
+                // its target as `-R` does (#1491), so the directory rule
+                // skips it and the per-segment pass below judges its owner,
+                // wherever the loop runs. A loop in which every command names
+                // its target, this way or with `-R`, skips the directory rule
+                // whole; that pass judges each of its targets.
+                let names_repo = |c: &loop_analysis::LoopedCommand| {
+                    c.explicit_repo.is_none() && looped_repo_argument_is_literal(c)
+                };
+                let all_named = cmds
+                    .iter()
+                    .all(|c| c.explicit_repo.is_some() || names_repo(c));
+                let has_write = !all_named
+                    && cmds
+                        .iter()
+                        .any(|c| kind(c) == LoopedWriteKind::RepoWrite && !names_repo(c));
                 if has_write {
                     // Relaxed-when-deterministic policy (#44): a loop whose
                     // body never changes directory, running in an owned
@@ -3976,7 +4087,9 @@ impl Check for GhWriteGuard {
                         let (api_writes, writes): (Vec<String>, Vec<String>) = cmds
                             .iter()
                             .filter(|c| {
-                                c.explicit_repo.is_none() && kind(c) == LoopedWriteKind::RepoWrite
+                                c.explicit_repo.is_none()
+                                    && kind(c) == LoopedWriteKind::RepoWrite
+                                    && !names_repo(c)
                             })
                             .map(|c| format!("gh {}", c.args.join(" ")))
                             .partition(|c| gh_api_endpoint(c).is_some());
@@ -9184,6 +9297,168 @@ mod tests {
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
         });
+    }
+
+    // --- #1491: a looped `gh repo` argument with a literal owner names its target ---
+
+    /// The loop blocked in cameronsjo/cadence-hooks#1491, under an allowed owner.
+    const ISSUE_1491_LOOP: &str =
+        r#"for r in alpha beta; do gh repo archive "cameronsjo/$r" --yes; done"#;
+
+    /// Run the guard from `cwd` with `cameronsjo` allowed, in relaxed or
+    /// strict loop mode.
+    fn run_1491(command: &str, cwd: &str, strict: bool) -> CheckResult {
+        let mut result = None;
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+                ("CADENCE_GH_STRICT_LOOPS", strict.then_some("1")),
+                ("GH_HOST", None),
+                ("GH_REPO", None),
+            ],
+            || result = Some(GhWriteGuard.run(&input_with(command, cwd))),
+        );
+        result.expect("guard ran")
+    }
+
+    #[test]
+    fn issue_1491_loop_of_literal_owner_archives_allows_anywhere() {
+        // The argument names the target as `-R cameronsjo/$r` would, so the
+        // directory the loop runs in, a `cd` in its body, and strict mode do
+        // not matter. /tmp has no git remote, so before #1491 the loop gate
+        // blocked there and asked for `-R`, which `gh repo archive` lacks.
+        let cd_loop = r#"for d in a b; do cd "$d"; gh repo archive "cameronsjo/$d" --yes; done"#;
+        let repo_verbs = r#"for r in a b; do gh repo create "cameronsjo/$r" --private; gh repo edit cameronsjo/$r --enable-issues; gh repo delete "cameronsjo/${r}" --yes; done"#;
+        // Beside a `-R` command the loop is judged as a loop of `-R` commands.
+        let with_dash_r = r#"for r in a b; do gh repo create "cameronsjo/$r" --private; gh issue create -R cameronsjo/$r --title t --body b; done"#;
+        for command in [ISSUE_1491_LOOP, cd_loop, repo_verbs, with_dash_r] {
+            for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
+                let result = run_1491(command, cwd, strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "{command} in {cwd} (strict {strict}): {:?}",
+                    result.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn looped_archive_under_an_unowned_literal_owner_still_blocks() {
+        let command = r#"for r in alpha beta; do gh repo archive "evil-corp/$r" --yes; done"#;
+        for cwd in ["/tmp", OWNED_DIR] {
+            let result = run_1491(command, cwd, false);
+            assert!(blocks(&result), "{cwd}");
+            assert!(!msg(&result).contains("`-R "), "{cwd}: {}", msg(&result));
+        }
+    }
+
+    #[test]
+    fn looped_archive_with_a_variable_or_missing_owner_still_blocks() {
+        // A variable owner, a bare name, or a host from a variable is not a
+        // literal owner, so the loop keeps the directory policy and blocks
+        // from /tmp. The fix names the argument, since `gh repo archive` has
+        // no `-R`.
+        for command in [
+            r#"for r in alpha beta; do gh repo archive "$o/$r" --yes; done"#,
+            r#"for r in alpha beta; do gh repo archive "$r" --yes; done"#,
+            r#"for r in alpha beta; do gh repo archive "$h/cameronsjo/$r" --yes; done"#,
+        ] {
+            let result = run_1491(command, "/tmp", false);
+            assert!(blocks(&result), "{command}");
+            let message = msg(&result);
+            assert!(!message.contains("`-R "), "{command}: {message}");
+            assert!(
+                message.contains("`gh repo archive owner/<repo>`"),
+                "{command}: {message}"
+            );
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
+            assert_eq!(meta.fix, "gh repo archive <owner>/<repo>");
+        }
+    }
+
+    #[test]
+    fn looped_literal_owner_archive_does_not_cover_an_untargeted_write() {
+        // The archive names its target; the `gh issue create` beside it does
+        // not, so the loop still blocks from /tmp, and only the untargeted
+        // write is named, with `-R` as its fix.
+        let result = run_1491(
+            r#"for r in a b; do gh repo archive "cameronsjo/$r" --yes; gh issue create --title t --body b; done"#,
+            "/tmp",
+            false,
+        );
+        assert!(blocks(&result));
+        let message = msg(&result);
+        assert!(message.contains("without explicit -R flag"), "{message}");
+        assert!(
+            message.contains("Found: `gh issue create --title t --body b`\n"),
+            "{message}"
+        );
+        assert!(!message.contains("gh repo archive"), "{message}");
+    }
+
+    #[test]
+    fn looped_rename_keeps_the_dash_r_fix() {
+        // `gh repo rename`'s argument is the new name and it takes `-R`, so a
+        // slash in that argument names no target and the fix stays `-R`.
+        let result = run_1491(
+            r#"for r in a b; do gh repo rename "cameronsjo/$r" --yes; done"#,
+            "/tmp",
+            false,
+        );
+        assert!(blocks(&result));
+        assert!(
+            msg(&result).contains("add `-R owner/repo` to each command"),
+            "{}",
+            msg(&result)
+        );
+    }
+
+    #[test]
+    fn looped_write_message_names_the_argument_for_repo_verbs() {
+        let repo = vec![
+            "`gh repo archive \"$o/$r\" --yes`".to_string(),
+            "`gh repo delete \"$o/$r\" --yes`".to_string(),
+        ];
+        let msg = looped_write_block_message(&repo, &[], Some("cameronsjo/tool"), false);
+        assert!(!msg.contains("-R cameronsjo"), "{msg}");
+        assert!(msg.contains("without an explicit target"), "{msg}");
+        assert!(
+            msg.contains("`gh repo archive`, `gh repo delete` have no -R flag"),
+            "{msg}"
+        );
+        assert!(msg.contains("`gh repo archive cameronsjo/<repo>`"), "{msg}");
+        assert_eq!(
+            looped_write_fix(&repo, &[], "cameronsjo/tool", false),
+            "gh repo archive cameronsjo/<repo>"
+        );
+        // Beside a `-R` command, each gets its own fix.
+        let mixed = vec![
+            "`gh issue close $i`".to_string(),
+            "`gh repo edit \"$o/$r\" --enable-issues`".to_string(),
+        ];
+        let msg = looped_write_block_message(&mixed, &[], None, false);
+        assert!(msg.contains("without explicit -R flag"), "{msg}");
+        assert!(msg.contains("add `-R owner/repo` to each command"), "{msg}");
+        assert!(msg.contains("`gh repo edit owner/<repo>`"), "{msg}");
+        assert_eq!(
+            looped_write_fix(&mixed, &[], "<owner>/<repo>", false),
+            "-R <owner>/<repo>; gh repo edit <owner>/<repo>"
+        );
+    }
+
+    #[test]
+    fn single_repo_verb_fix_names_the_argument() {
+        // Outside a loop the same verbs get the same advice: `gh repo edit`
+        // with no argument, from a directory with no remote.
+        let result = run_1491("gh repo edit --enable-issues", "/tmp", false);
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+        assert_eq!(meta.fix, "gh repo edit cameronsjo/<repo>");
     }
 
     // --- #457: `gh repo edit` names its target positionally ---
