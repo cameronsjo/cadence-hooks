@@ -34,3 +34,11 @@ On PostToolUse for Bash, `redact-secret-output` SHALL replace, in place in stdou
 #### Scenario: A credential and a note after a bare pass in prose
 - **WHEN** a Bash command prints `Admin pass: Zq9vKhunter7Xw (change on first login)`
 - **THEN** the hook masks `Zq9vKhunter7Xw`, because the first word of the value is shaped like a credential and the value runs to the end of the line, so what follows that word does not change the verdict
+
+#### Scenario: A later field after a bare pass in prose
+- **WHEN** a Bash command prints `Admin pass: hunter2, DB pass: Zq9vKhunter7Xw`
+- **THEN** the hook masks `Zq9vKhunter7Xw`, because `hunter2` is not shaped like a credential, so only that word is judged and spent and the later `DB pass:` is read on its own
+
+#### Scenario: A mark before a credential after a bare pass in prose
+- **WHEN** a Bash command prints `**DB pass:** Zq9vKhunter7Xw`
+- **THEN** the hook masks `Zq9vKhunter7Xw`, because a mark, a border or an arrow is not a word, so the first word of the value that holds a letter or a digit is judged

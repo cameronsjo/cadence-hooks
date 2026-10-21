@@ -32,10 +32,10 @@
 //! runner's status word, and `Token expired` (a name, a space, a word, at the
 //! start of a line outside a `.netrc`/vault table) is prose, not a pair. A
 //! bare `pass:` after an ordinary word on its line (`one record per pass: x`)
-//! masks only when the first word of its value looks like a credential
-//! ([`pass_key_position`], [`secret_like`]). A corpus test holds
-//! everyday output (test runners, builds, git over code, listings, error
-//! prose) at zero masks.
+//! masks its unquoted value only when the value's first word that holds a
+//! letter or a digit looks like a credential ([`pass_key_position`],
+//! [`secret_like`]). A corpus test holds everyday output (test runners,
+//! builds, git over code, listings, error prose) at zero masks.
 //!
 //! **Views.** Every detector runs on the output with ANSI CSI sequences
 //! removed (`grep --color`, coloured logs), and again on windows around each
@@ -589,9 +589,10 @@ pub enum Strength {
     /// in a plain `pass=5` / `pass: 5` form, which is a test runner's tally
     /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
     /// string's `&pass=` all mask, as does a longer number. In the mid-line
-    /// colon form, out of key position ([`pass_key_position`]), it masks only
-    /// when, on top of those rules, the first word of the value is
-    /// credential-shaped ([`secret_like`]).
+    /// colon form, out of key position ([`pass_key_position`]), an unquoted
+    /// value masks only when, on top of those rules, its first word that holds
+    /// a letter or a digit is credential-shaped ([`secret_like`]); a quoted
+    /// value keeps those rules alone.
     Tally,
 }
 
@@ -1173,7 +1174,8 @@ fn is_header_name(name: &str) -> bool {
 /// For a WEAK name in a prose-shaped form: the value must look like a
 /// credential — one word of at least 8 characters that is not a plain word,
 /// number, duration, or identifier/type expression. A bare `pass:` out of key
-/// position is judged the same way on the first word of its value.
+/// position is judged the same way on the first word of its unquoted value
+/// ([`first_word`]).
 fn secret_like(value: &str) -> bool {
     let v = value.trim().trim_end_matches([',', ';']);
     if !maskable(v) || v.chars().any(char::is_whitespace) || v.chars().count() < 8 {
@@ -1646,10 +1648,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             continue;
         };
         // A bare `pass:` after another word on its line may be prose ("one
-        // record per pass: x"). It keeps every rule of the strength it has on
-        // `origin/main` and, on top of them, masks only when the value's first
-        // word looks like a credential ("DB pass: <secret> (rotate)", #1449).
-        // The extra test can only narrow what the rules mask.
+        // record per pass: x"). Its unquoted value keeps every rule of its
+        // `Strength::Tally` (the short count skip, the value test) and, on top
+        // of them, masks only when the value's first word looks like a
+        // credential ("DB pass: <secret> (rotate)", #1449). A quoted value
+        // keeps the rules alone.
         let weak_pass = strength == Strength::Tally && !pass_key_position(text, name_at);
         let eol = line_end(text, start, &mut eol_cache);
         let rest = &text[start..eol];
@@ -1674,6 +1677,21 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                     done = start + n;
                     continue;
                 }
+                // The unquoted value runs to the end of the line, so a note or
+                // a next field after the secret is part of it: judge its first
+                // word that holds a letter or a digit. When that word is not
+                // credential-shaped, nothing masks and only that word is spent,
+                // so a secret-named field later on the line is still read
+                // ("Admin pass: hunter2, DB pass: <secret>"). The spend must
+                // not look at the rest of the line: a trim there would walk a
+                // long blank run once per match.
+                if weak_pass {
+                    let first = first_word(rest);
+                    if !first.is_some_and(|(word, _)| secret_like(word)) {
+                        done = start + first.map_or(rest.len(), |(_, end)| end);
+                        continue;
+                    }
+                }
                 let tally = (strength == Strength::Counter).then(|| tally_len(rest));
                 (0, tally.flatten().unwrap_or(rest.trim_end().len()), false)
             }
@@ -1686,10 +1704,7 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         {
             false
         } else {
-            // The unquoted value runs to the end of the line, so a note or a
-            // next field after the secret is part of it: judge its first word.
             value_masks(strength, value, true)
-                && (!weak_pass || value.split_whitespace().next().is_some_and(secret_like))
         };
         if masks {
             spans.push(named(start + vs, start + ve));
@@ -1724,9 +1739,10 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
 ///   Go's `{User:admin Pass:x}`).
 ///
 /// After any other word it may be prose, as in "the second pass: done", and
-/// the caller masks it only when the first word of its value looks like a
-/// credential, besides its usual rules. Every other name, and the `pass=` form,
-/// keeps its rules.
+/// the caller masks its unquoted value only when the value's first word that
+/// holds a letter or a digit looks like a credential ([`first_word`]), besides
+/// its usual rules. A quoted value, every other name and the `pass=` form keep
+/// their rules.
 ///
 /// Each scan stops at a newline, a blank or the first byte that does not
 /// qualify, and reads at most two words back, so a long line stays linear.
@@ -1783,6 +1799,20 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
     }
     std::str::from_utf8(&before[word_start(prev_end)..prev_end])
         .is_ok_and(|prev| prev.ends_with([':', '=']) && field(prev))
+}
+
+/// The first blank-separated word of `value` that holds a letter or a digit,
+/// and the byte offset in `value` where it ends. A markup mark, a cell border,
+/// an arrow or an emoji before a secret (`**`, `|`, `->`, `🔑`) is not a word
+/// to judge. It stops at the first such word, so the cost is bounded by the
+/// text up to it.
+fn first_word(value: &str) -> Option<(&str, usize)> {
+    let word = value
+        .split_whitespace()
+        .find(|w| w.chars().any(char::is_alphanumeric))?;
+    // `word` is a subslice of `value`, so the pointer difference is its offset.
+    let end = word.as_ptr() as usize - value.as_ptr() as usize + word.len();
+    Some((word, end))
 }
 
 /// Parenthesis depth on the current line at a byte offset, advanced
@@ -2997,11 +3027,13 @@ mod tests {
         }
     }
 
-    /// cameronsjo/cadence-hooks#1449, second review: out of key position the
-    /// unquoted value of a bare `pass:` runs to the end of the line, so a note,
-    /// a next field or a closing `|` after the secret is part of it. The value
-    /// is judged by its first word, on top of every rule `origin/main` applies
-    /// to a bare `pass`, so the check can only narrow what main masks.
+    /// cameronsjo/cadence-hooks#1449: out of key position the unquoted value
+    /// of a bare `pass:` runs to the end of the line, so a note, a next field
+    /// or a closing `|` after the secret is part of it. The value is judged by
+    /// its first word that holds a letter or a digit, on top of every rule a
+    /// bare `pass` has in key position. When that word is not a credential,
+    /// only it is spent, so a secret-named field later on the line is read.
+    /// A quoted value is not judged by its first word.
     #[test]
     fn issue_1449_pass_value_is_judged_by_its_first_word() {
         let p = pw();
@@ -3031,18 +3063,58 @@ mod tests {
             format!("\u{2502} smtp \u{2502} bob \u{2502} pass: {p} \u{2502}\n"),
             format!("    12\tAdmin pass: {p} (rotate)\n"),
             format!("+Admin pass: {p} (rotate)\n"),
+            // A tab ends the first word as a blank does.
+            format!("Admin pass: {p}\t(rotate)\n"),
+            format!("DB pass: {p}\t# rotate monthly\n"),
+            // A first word that is not a credential spends only itself, so a
+            // secret-named field later on the line is still read.
+            format!("Admin pass: hunter2, DB pass: {p}\n"),
+            format!("first pass: done, second pass: {p}\n"),
+            format!("lint pass: ok, password: {p}\n"),
+            format!("lint pass: ok password: {p}\n"),
+            format!("build pass: yes, DB password: {p}\n"),
+            format!("Admin pass: admin / DB pass: {p}\n"),
+            format!("x pass: hunter2 and DB pass: {p}\n"),
+            format!("a pass: x, b pass: y, c pass: {p}\n"),
+            format!("{}DB pass: {p}\n", "x pass: y ".repeat(1_000)),
+            // Marks, borders and arrows are not the first word: skip them.
+            format!("**DB pass:** {p}\n"),
+            format!("`DB pass:` {p}\n"),
+            format!("| DB pass: | {p} |\n"),
+            format!("| pass: | {p} |\n"),
+            format!("Admin pass: -> {p}\n"),
+            format!("Admin pass: - {p}\n"),
+            format!("Admin pass: | {p}\n"),
+            format!("Admin pass: \u{2192} {p}\n"),
+            format!("Admin pass: \u{1F511} {p}\n"),
+            // A quoted value keeps the rules of a bare `pass` alone.
+            format!("Admin pass: \"{p}\"\n"),
         ];
         for input in &masks {
             let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
             assert!(!out.contains(&p), "{input:?} -> {out:?}");
         }
+        // The mask runs to the end of the line, notes included.
+        assert_eq!(
+            masked(&format!("DB pass: {p}\n")),
+            format!("DB pass: {NAMED_MARK}\n")
+        );
+        assert_eq!(
+            masked(&format!("Admin pass: {p} (change on first login)\n")),
+            format!("Admin pass: {NAMED_MARK}\n")
+        );
+        // A quoted value is not judged by its first word: this one is shorter
+        // than a credential and still masks.
+        let short = masked("Admin pass: \"hunt3\"\n");
+        assert!(!short.contains("hunt3"), "{short:?}");
         let kept = [
             // The issue's prose rows, and a multi-word value.
             "+ // one record per pass: x\n",
             "+ // the second pass: done\n",
             "x pass: 5 hunter2\n",
             "lint pass: ok and the build is green\n",
-            // Code that main keeps: a type, an expression closing a field.
+            // Code, which the value test refuses: a type, an expression closing
+            // a field.
             "  private pass: string|null;\n",
             "  readonly pass: string|undefined;\n",
             "+  public pass: Buffer|null;\n",
@@ -3050,7 +3122,8 @@ mod tests {
             "  static pass: getPass(),\n",
             "    mail pass: env.SMTP_PASS2,\n",
             "x pass: config.get('pass'),\n",
-            // A test runner's tally, which main skips before it reads the value.
+            // A test runner's tally: the short count is skipped before the value
+            // is read.
             "x pass: 5,fail=0\n",
             "x pass: 123456,fail=0\n",
         ];
@@ -3385,6 +3458,10 @@ mod tests {
             format!(" {} pass:", "w".repeat(4096)).repeat(5 * MB / 4103),
             format!(" {}u:a pass:", "{".repeat(4096)).repeat(5 * MB / 4106),
             "x \t pass: ".repeat(5 * MB / 10),
+            // #1449: a first word that is no credential spends only itself. A
+            // blank run after the last of these matches must not be walked
+            // once per match.
+            format!("{}{}", "x pass: y ".repeat(1_000), " ".repeat(4 * MB)),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
