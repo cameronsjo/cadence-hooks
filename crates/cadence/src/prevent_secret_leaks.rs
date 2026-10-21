@@ -7044,12 +7044,15 @@ mod tests {
         // Without `--`, getopt permutes, takes `head`'s `-c` as runuser's
         // own and refuses it beside `-u`: nothing runs.
         assert_bash(
-            &[
-                "runuser -u app head -c 5 .env",
-                "runuser -ucarol cat README.md",
-            ],
+            &["runuser -u app head -c 5 .env"],
             cadence_hooks_core::Outcome::Allow,
             "a runuser command line runuser refuses",
+        );
+        // Control: runuser runs this, and the file is not a secret.
+        assert_bash(
+            &["runuser -ucarol cat README.md"],
+            cadence_hooks_core::Outcome::Allow,
+            "a runuser read of a file that is not a secret",
         );
     }
 
