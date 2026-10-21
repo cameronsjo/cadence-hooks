@@ -294,12 +294,26 @@ const CONFLICTS_HEADER: &str = "# Conflicts:";
 /// call (another commit, a branch switch, a merge abort) or a commit that ran
 /// in another worktree can leave HEAD on a commit that is not the merge, so
 /// the text says to amend only where `git log -1 --format=%B` still shows the
-/// block and `git reflog -1 --format=%gs` starts with `commit (merge):`. The
-/// block alone is not enough: HEAD can land on an earlier merge that also kept
-/// its block. Only a commit that finishes a merge writes that reflog entry.
-/// In a repo with no reflog (one made with `core.logAllRefUpdates=false`) the
-/// check fails, so HEAD is left alone. While the merge is still in progress,
-/// `git commit --amend` refuses ("cannot amend"), which the text also says.
+/// block and `git reflog -1 --format=%gs` starts with `commit (merge):`. An
+/// amend also commits whatever is staged, which the text says too. While the
+/// merge is still in progress, `git commit --amend` refuses ("cannot amend"),
+/// which the text also says.
+///
+/// The two checks are necessary, not sufficient. The block alone is not
+/// enough: HEAD can land on an earlier merge that also kept its block, and the
+/// reflog half is what fails there. But the reflog half shows only that the
+/// last HEAD move in that directory finished a merge, not that this call made
+/// it. `git checkout -f` (no branch) and `git merge --quit` end a merge
+/// without writing a reflog entry, so an earlier block-carrying merge at the
+/// tip passes both checks, and so does a second conflicted merge finished
+/// later in the same chain. An amend then rewrites that merge. The risk is
+/// low: the rewrite is local, and the reflog keeps the old commit.
+///
+/// The checks also fail where HEAD is the merge: in a repo with no reflog (one
+/// made with `core.logAllRefUpdates=false`), and after a later command that
+/// writes a reflog entry without moving HEAD (`git reset`, `git stash`). That
+/// leaves HEAD alone, the safe direction, and is why the text says HEAD "may
+/// not" be the merge rather than "is not".
 const CONFLICTS_AFTER_TRAILERS_NUDGE: &str = "A merge is waiting on this commit, and its pending \
     message (MERGE_MSG) has git's `# Conflicts:` block below the trailers. `git commit \
     --no-edit` keeps `#` lines under its default cleanup (`whitespace`), so the commit lands \
@@ -308,8 +322,9 @@ const CONFLICTS_AFTER_TRAILERS_NUDGE: &str = "A merge is waiting on this commit,
     call, so fix it afterwards with an amend, before you push it (a pushed commit needs a \
     force-push). Run the amend in the directory the commit ran in, and only if two checks pass \
     there: `git log -1 --format=%B` still shows the `# Conflicts:` block, and `git reflog -1 \
-    --format=%gs` starts with `commit (merge):`. If either fails, HEAD is not that merge, so \
-    leave it. If no other line of the message starts with `#`, run `git commit \
+    --format=%gs` starts with `commit (merge):`. If either fails, HEAD may not be that merge, \
+    so leave it. An amend also commits anything staged. If no other line of the message \
+    starts with `#`, run `git commit \
     --amend --no-edit --cleanup=strip`. It keeps both parents and drops the block, but it \
     also drops every line that starts with `#`, an issue reference or a markdown heading \
     included, with no warning. If the message has such lines, run `git log -1 --format=%B > \
@@ -1201,13 +1216,18 @@ mod tests {
         let check = "Run the amend in the directory the commit ran in, and only if two \
                      checks pass there: `git log -1 --format=%B` still shows the \
                      `# Conflicts:` block, and `git reflog -1 --format=%gs` starts with \
-                     `commit (merge):`. If either fails, HEAD is not that merge, so leave it.";
+                     `commit (merge):`. If either fails, HEAD may not be that merge, so \
+                     leave it. An amend also commits anything staged.";
         let at = msg.find(check);
         assert!(at.is_some(), "the nudge says to check HEAD first: {msg}");
         assert!(
             at < msg.find("`git commit --amend --no-edit --cleanup=strip`")
                 && at < msg.find("`git commit --amend -F <copy>`"),
             "the check comes before both routes: {msg}"
+        );
+        assert!(
+            !msg.contains("HEAD is not that merge"),
+            "the check also fails where HEAD is the merge (no reflog): {msg}"
         );
         // Both of these fail once the commit has landed: MERGE_MSG is gone and
         // there is nothing left to commit.
@@ -1750,9 +1770,9 @@ mod tests {
     /// (where the commit ran, `git log -1 --format=%B` still shows the
     /// `# Conflicts:` block and `git reflog -1 --format=%gs` starts with
     /// `commit (merge):`) fails in every one, so following the advice leaves
-    /// it alone. The reflog half fails in all seven. In the last two, HEAD is
-    /// an earlier merge that also kept its block, so the block half alone
-    /// passes there.
+    /// it alone. The reflog half fails in all seven. In the fifth and sixth,
+    /// HEAD is an earlier merge that also kept its block, so the block half
+    /// alone passes there.
     #[test]
     fn the_head_check_fails_when_head_is_not_the_merge() {
         let msg = TRAILERS_MESSAGE;

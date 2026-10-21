@@ -8,6 +8,7 @@
 - [x] 1.6 Advise an amend of the landed commit, not a second commit or a copy of MERGE_MSG, because the commit runs in the same tool call and MERGE_MSG is gone when the nudge is read; pin that git refuses the amend while the merge is still in progress
 - [x] 1.7 Say to run the amend in the directory the commit ran in, and only if `git log -1 --format=%B` there still shows the `# Conflicts:` block, because a merge abort, a later commit or branch switch in the same call, or a commit made in another worktree leaves HEAD on a commit that is not the merge; pin on real git that the check fails in each of those five shapes
 - [x] 1.8 Add `git reflog -1 --format=%gs` starting with `commit (merge):` to that check, because a merge abort or a branch switch can leave HEAD on an earlier merge that also kept its block; pin on real git that the reflog half fails in those two shapes and the five, passes for the merge and for the linked worktree run there, and fails with no reflog
+- [x] 1.9 Word the check as "HEAD may not be that merge" (it also fails in a repo with no reflog), say an amend also commits anything staged, and state in the doc comment that the two checks are necessary, not sufficient: `git checkout -f`, `git merge --quit` and a second conflicted merge finished later in the same chain pass them, at low risk (local, and the reflog keeps the old commit)
 
 ## 2. Docs
 
