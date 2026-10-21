@@ -5,9 +5,7 @@
 //! or sender (`READERS`: `cat`, `grep`, `base64`, `curl -d @`, `gh --input`,
 //! `source`, …), or redirected into one's standard input
 //! (cameronsjo/cadence-hooks#1303), or named anywhere the reader scan reads a
-//! word in a command that defines a shell function
-//! (cameronsjo/cadence-hooks#1409, #1425) or sets positional parameters
-//! (#1422).
+//! word in a command that sets positional parameters (#1422).
 //! Unknown commands, variables, URL and API paths, regex patterns, and globs
 //! that only share letters with a secret name are not judged. Safe templates
 //! (.env.example, .env.test) are always allowed. Environment dumps nudge.
@@ -28,7 +26,6 @@ use cadence_hooks_core::shell::{
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -2993,31 +2990,8 @@ struct SegmentReads {
     children: Vec<String>,
     /// The first secret-like word in any position, when asked for.
     secret_word: Option<String>,
-    /// A word assigns a `BASH_FUNC_` environment import.
-    imports_function: bool,
     /// The segment sets positional parameters ([`sets_positionals`]).
     sets_positionals: bool,
-}
-
-/// The name of bash's environment import of a function, `BASH_FUNC_<name>%%`
-/// or the older `BASH_FUNC_<name>()`.
-static FUNCTION_IMPORT_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^BASH_FUNC_\S*(?:%%|\(\))$").expect("function import pattern compiles")
-});
-
-/// Does a dequoted `word` assign a function import? bash imports the value
-/// after quote removal, which [`command_segments`] does not do for an `env`
-/// operand, so the name decides, whatever the value (#1430). The word keeps
-/// its unquoted backslashes (`BASH_FUNC_f\%\%=`), so they are dropped here.
-fn imports_a_function(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    if name.contains('\\') {
-        FUNCTION_IMPORT_NAME.is_match(&name.replace('\\', ""))
-    } else {
-        FUNCTION_IMPORT_NAME.is_match(name)
-    }
 }
 
 /// The options of a shell invocation `argv` (`argv[0]` is the shell), read
@@ -3221,8 +3195,7 @@ fn sets_positionals(words: &[String], head: usize) -> bool {
 fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> SegmentReads {
     let (outer, mut children) = split_process_substitutions(segment);
     let (words, stdin) = words_and_stdin(&outer);
-    let imports_function = words.iter().any(|w| imports_a_function(w));
-    // Any secret-like word, for the function rule: read here so the rule
+    // Any secret-like word, for the positional rule: read here so the rule
     // reuses this segmentation instead of walking the command again (#1425).
     let secret_word = find_secret
         .then(|| {
@@ -3249,7 +3222,6 @@ fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> Se
             reads,
             children,
             secret_word,
-            imports_function,
             sets_positionals: find_positionals && sets_positionals(&words, words.len()),
         };
     };
@@ -3258,7 +3230,6 @@ fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> Se
             reads: Vec::new(),
             children,
             secret_word,
-            imports_function,
             sets_positionals: false,
         };
     }
@@ -3328,7 +3299,6 @@ fn segment_reads(segment: &str, find_secret: bool, find_positionals: bool) -> Se
         reads,
         children,
         secret_word,
-        imports_function,
         sets_positionals: find_positionals && sets_positionals(&words, words.len() - argv.len()),
     }
 }
@@ -3354,104 +3324,14 @@ fn without_data_heredocs(command: &str) -> Cow<'_, str> {
 /// Most levels of command text [`segment_reads`] hands back for re-scanning.
 const NESTED_SCAN_DEPTH: usize = 8;
 
-/// A shell function definition: `NAME()` with or without a group after it,
-/// `function NAME` followed by any word, an anonymous `()` or zsh
-/// `function {`, a value starting `() {` (bash's `BASH_FUNC_f%%=() {…}`
-/// environment import), and an assignment to zsh's `functions` array. Quotes
-/// are not read, so a header inside a quoted string (a `bash -c` or `eval`
-/// script, or prose) counts too; that can only add a block.
-static FUNCTION_DEFINITION: LazyLock<Regex> = LazyLock::new(|| {
-    const NAME: &str = r#"[^\s(){}<>;&|'"\\$`=]+"#;
-    Regex::new(&format!(
-        r#"(?:^|[\s;&|(){{}}!'"`])(?:function[ \t]+{NAME}\s*\S|function[ \t]*\{{|(?:{NAME})?[ \t]*\([ \t]*\)|functions(?:\[|\+?=))|=\(\)[ \t]*\{{"#
-    ))
-    .expect("function definition pattern compiles")
-});
-
-/// A word that assigns a variable, `NAME=value` or `NAME+=value`.
-static ASSIGNMENT_WORD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)$").expect("assignment pattern compiles")
-});
-
-/// A `$NAME` or `${NAME}` reference, or `${NAME:-…}` and the other
-/// default operators, read as the variable's value.
-static VARIABLE_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-=+?][^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))")
-        .expect("reference pattern compiles")
-});
-
-/// Record each variable `segment` assigns a parenthesis, which
-/// [`command_segments`] leaves unsubstituted: `P='('; eval "f$P) {…}"`
-/// defines `f` (#1425). Words are read dequoted, every assignment word
-/// counts (`P='(' Q=')'`), and a later value replaces an earlier one, as in
-/// bash.
-fn record_paren_assignments(segment: &str, vars: &mut HashMap<String, String>) {
-    // A parenthesis written as itself, or as an escape in `$'…'`.
-    if !segment.contains('=') || !(segment.contains(['(', ')']) || segment.contains("$'")) {
-        return;
-    }
-    let (words, _) = words_and_stdin(segment);
-    for word in &words {
-        if let Some(captures) = ASSIGNMENT_WORD.captures(word) {
-            let value = &captures[2];
-            if value.contains(['(', ')']) {
-                vars.insert(captures[1].to_string(), value_ends(value));
-            }
-        }
-    }
-}
-
-/// The first and last few characters of `value`. A header inside a value
-/// is already in the text: written with a literal parenthesis it is in the
-/// assignment's own segment, and [`command_segments`] decodes a `$'…'`
-/// value into the reference. Only a value's ends can join the text around a
-/// reference into a new header, so keeping just the ends bounds the
-/// substituted text (#1425 security review).
-fn value_ends(value: &str) -> String {
-    const KEEP: usize = 4;
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= 2 * KEEP {
-        return value.to_string();
-    }
-    chars[..KEEP]
-        .iter()
-        .chain(&chars[chars.len() - KEEP..])
-        .collect()
-}
-
-/// Does `text` define a shell function, read as is or with the
-/// parenthesis-valued variables in `vars` substituted? A wrong substitution
-/// can only add a block. One pass over `text` per call.
-fn defines_a_function(text: &str, vars: &HashMap<String, String>) -> bool {
-    FUNCTION_DEFINITION.is_match(text)
-        || (!vars.is_empty()
-            && text.contains('$')
-            && FUNCTION_DEFINITION.is_match(&VARIABLE_REFERENCE.replace_all(
-                text,
-                |captures: &regex::Captures| {
-                    let name = captures
-                        .get(1)
-                        .or_else(|| captures.get(2))
-                        .map_or("", |m| m.as_str());
-                    vars.get(name)
-                        .cloned()
-                        .unwrap_or_else(|| captures[0].to_string())
-                },
-            )))
-}
-
-/// The shapes [`shape_block`] names: a function definition (#1409), and a
-/// `sh -c` script with words after it, `set --` and the like (#1422).
-const FUNCTION_SHAPE: &str = "defines a shell function";
+/// The shape [`shape_block`] names: a `sh -c` script with words after it,
+/// `set --` and the like (#1422).
 const POSITIONAL_SHAPE: &str = "sets positional parameters";
 
 /// The block for a secret-like name in a command of a `shape` whose reads
-/// are not traced, such as one that defines a shell
-/// function: `f(){ cat "$1"; }; f .env` makes bash read `.env`, yet the name
-/// never sits where a reader takes a file (cameronsjo/cadence-hooks#1409).
-/// What the function does with its arguments is not read: where a body
-/// ends, how it reads them and how a name is spelled each had shapes a list
-/// missed (#1420 review), so any definition and any secret name block.
+/// are not traced, such as one that sets positional parameters:
+/// `bash -c 'cat "$1"' _ .env` makes bash read `.env`, yet the name never
+/// sits where a reader takes a file (cameronsjo/cadence-hooks#1422).
 fn shape_block(secret: &str, shape: &str, detect: fn() -> bool) -> CheckResult {
     CheckResult::block(with_forgectl_hint(
         format!(
@@ -3489,29 +3369,17 @@ fn bash_leaks_secrets(
     // Segmented from the ORIGINAL command (#508): `command_segments` expands
     // `bash -c` scripts, substitutions, and visible assignments, so a wrapped
     // or `F=.env; cat $F` read is a segment of its own.
-    // The function rule (#1409) reads the same walk: a definition in the
-    // raw text, any script or any resolved segment arms it, so a header
-    // spelled with a continuation, `eval` quoting or `$'…'` counts (#1425).
-    let mut defines_function = false;
     let mut sets_positional_parameters = false;
-    let mut paren_vars: HashMap<String, String> = HashMap::new();
     let mut secret_word: Option<String> = None;
     let mut scripts = vec![(command.to_string(), 0)];
     while let Some((script, depth)) = scripts.pop() {
-        defines_function = defines_function || defines_a_function(&script, &paren_vars);
         for segment in command_segments(&script) {
-            if !defines_function {
-                record_paren_assignments(&segment, &mut paren_vars);
-                defines_function = defines_a_function(&segment, &paren_vars);
-            }
             let SegmentReads {
                 reads,
                 children,
                 secret_word: secret,
-                imports_function,
                 sets_positionals,
             } = segment_reads(&segment, secret_word.is_none(), !sets_positional_parameters);
-            defines_function = defines_function || imports_function;
             sets_positional_parameters = sets_positional_parameters || sets_positionals;
             for (verb, token) in reads {
                 if envrc_bash_read_allowed(&token, cwd, || *command_has_cd, || *envrc_replaceable) {
@@ -3524,17 +3392,11 @@ fn bash_leaks_secrets(
                 scripts.extend(children.into_iter().map(|child| (child, depth + 1)));
             }
         }
-        // The script again with every value its segments assigned: the
-        // segmentation can substitute an older value (`P=')'; P='('`).
-        defines_function = defines_function || defines_a_function(&script, &paren_vars);
     }
-    if let Some(secret) = secret_word {
-        if defines_function {
-            return Some(shape_block(&secret, FUNCTION_SHAPE, detect));
-        }
-        if sets_positional_parameters {
-            return Some(shape_block(&secret, POSITIONAL_SHAPE, detect));
-        }
+    if let Some(secret) = secret_word
+        && sets_positional_parameters
+    {
+        return Some(shape_block(&secret, POSITIONAL_SHAPE, detect));
     }
 
     // Warn: env dump commands. Must appear as the executed command at the
@@ -7347,196 +7209,36 @@ mod tests {
     }
 
     #[test]
-    fn function_definition_with_a_secret_word_blocked() {
-        // cameronsjo/cadence-hooks#1409: bash reads `.env` in each of these,
-        // but the name never sits where a reader takes a file.
+    fn a_function_definition_does_not_change_the_verdict() {
+        // cadence-ecosystem ADR-0046 rule 1: a read through a shell function
+        // is out of scope, so a definition no longer blocks a command that
+        // names a secret anywhere (the #1409 rule is gone). These were its
+        // accepted false-block cost.
         assert_bash(
             &[
-                r#"f(){ cat "$1"; }; f .env"#,
-                r#"function f { cat "$1"; }; f .env"#,
-                "function f() { cat \"$@\"; }\nf .env",
-                r#"f() { cat $*; }; f x .env"#,
-                r#"f(){ cat < "$1"; }; f .env"#,
-                "f(){ cat; }; f < .env",
-                r#"f() ( cat "$1" ); f .env"#,
-                r#"(f(){ cat "$1"; }; f .env)"#,
-                r#"f(){ cat "$1"; }; sudo f .env"#,
-                r#"f(){ "$@"; }; f cat .env"#,
-                r#"f() { echo "$1" | xargs cat; }; f .env"#,
-                r#"g h(){ cat "$1"; }; g .env"#,
-                r#"f(){ cat ".env.$1"; }; f .env"#,
-                r#"bash -c 'f(){ cat "$1"; }; f .env'"#,
-                r#"f(){ cat $argv; }; f .env"#,
-                r#"() { cat "$1"; } .env"#,
-                // #1420 review, round 1: I-A, I-B, I-C.
-                r#"run(){ "$@"; }; show(){ cat "$1"; }; run show .env"#,
-                r#"f(){ echo $*; cat "$1"; }; f .env "it's""#,
-                r#"f(){ echo $*; cat "$1"; }; f .env '#tag'"#,
-                "f(){ # closes }\n cat \"$1\"; }; f .env",
-                "f(){\n  cat <<EOF\n}\nEOF\n  cat \"$1\"\n}; f .env",
-                r#"f()( case $1 in a) cat "$1";; esac ); f .env"#,
-                // Round 2, I-1: where a body ends.
-                r#"f(){ echo }; cat "$1"; }; f .env"#,
-                r#"f(){ x=a}; cat "$1"; }; f .env"#,
-                r#"f(){ echo "${x:-"}"}"; cat "$1"; }; f .env"#,
-                r#"f(){ case x in }) ;; esac; cat "$1"; }; f .env"#,
-                "f(){ true&# }\ncat \"$1\"; }; f .env",
-                "f(){ true|# }\ncat \"$1\"; }; f .env",
-                "f(){ true(# }\ncat \"$1\"; }; f .env",
-                r#"function f if :; then cat "$1"; fi; f .env"#,
-                r#"function f for x; do cat "$x"; done; f .env"#,
-                "f() if :\nthen cat \"$1\"\nfi\nf .env",
-                "f() while :\ndo cat \"$1\"; break\ndone\nf .env",
-                // I-2: how a body reads its arguments.
-                r#"f(){ cat "${!#}"; }; f .env"#,
-                r#"f(){ n=1; cat "${!n}"; }; f .env"#,
-                r#"f(){ eval "cat \$""1"; }; f .env"#,
-                r#"f(){ getopts a: o; cat "$OPTARG"; }; f -a .env"#,
-                r#"f(){ cat "$_"; }; f .env"#,
-                // I-3: how a name is spelled, read the reader scan's way.
-                r#"f(){ cat "$1"; }; f .e''nv"#,
-                r#"f(){ cat "$1"; }; f ".e"nv"#,
-                r#"f(){ cat "$1"; }; f .en"v""#,
-                r#"f(){ cat "$1"; }; f {.,}env"#,
-                r#"f(){ cat "$1"; }; f $'\x2e'env"#,
-                r#"p=.e; f(){ cat "$1"; }; f "${p}nv""#,
-                r#"f(){ cat "$1"; }; f "$(printf %s .e nv)""#,
-                r#"S=.env.local; f(){ cat "$1"; }; f "$S""#,
-                r#"export S=.env.local; f(){ cat "$1"; }; f "$S""#,
-                // A reader's own name rebound (#1303 allowed these as out of
-                // scope before #1409).
-                "jq(){ cat \"$1\"; }; jq .env.local",
-                "jq () { cat \"$1\"; }; jq .env.local",
-                "function jq { cat $1; }; jq .env.local",
-                "command_not_found_handle(){ cat \"$2\"; }; jq .env.local",
-                "eval 'jq(){ cat $1;}'; jq .env.local",
-                // The accepted cost: what the function does is not read.
                 r#"f(){ echo "$1"; }; f .env"#,
                 r#"die(){ echo "$*" >&2; exit 1; }; [ -f .env ] || die "missing .env""#,
                 r#"f(){ echo "$1"; }; f x; git commit -m 'ignore .env'"#,
+                r#"f(){ echo hi; }; f; git commit -m '.env'"#,
+                r#"f(){ git add "$@"; }; f .env"#,
                 r#"f(){ ls; }; ls .env"#,
                 r#"git commit -m 'the function load reads .env'"#,
-            ],
-            cadence_hooks_core::Outcome::Block,
-            "a function definition and a secret name",
-        );
-        assert_bash(
-            &[
-                // A function and no secret word.
-                r#"f(){ cat "$1"; }; f README.md"#,
-                r#"retry(){ for i in 1 2 3; do "$@" && return; done; }; retry cargo test"#,
-                // A safe template is not a secret name.
-                r#"f(){ cat "$1"; }; f .env.example"#,
-                r#"f(){ echo "$HOME"; }; f; git add .env.example"#,
-                // Prose with no definition.
-                r#"git commit -m 'load reads .env'"#,
-                r#"git commit -m 'see the function docs'"#,
-                // Not a definition.
-                r#"awk '{print $1}' notes.txt"#,
-                "for f in a b; do cat \"$f\"; done",
-                "arr=(a b); echo \"${arr[@]}\"",
-            ],
-            cadence_hooks_core::Outcome::Allow,
-            "no function definition, or no secret name",
-        );
-    }
-
-    #[test]
-    fn function_definition_found_in_resolved_text_blocked() {
-        // cameronsjo/cadence-hooks#1425, I1: a header the raw text does not
-        // show, spelled with a continuation, `eval` quoting, `$'…'` or an
-        // assignment. Each makes bash or zsh read `.env`.
-        assert_bash(
-            &[
-                "fu\\\nnction f { cat \"$1\"; }; f .env",
-                "function \\\nf { cat \"$1\"; }; f .env",
-                "f(\\\n){ cat \"$1\"; }; f .env",
-                r#"eval f\(\)\{\ cat\ \$1\;\ \}; f .env"#,
-                r#"eval "f(""){ cat \$1; }"; f .env"#,
-                "eval \"f(\\\n){ cat \\$1; }\"; f .env",
-                r#"eval $'f\x28\x29{ cat "$1"; }'; f .env"#,
-                r#"eval $'f\50\51{ cat "$1"; }'; f .env"#,
-                r#"P='('; eval "f$P) { cat \$1; }"; f .env"#,
-                r#"eval "f$(printf %s '(' ')'){ cat \"\$1\"; }"; f .env"#,
-                // Polish review: the last value counts, and every
-                // assignment word in a segment.
-                r#"P=')'; P='('; eval "f$P) { cat \$1; }"; f .env"#,
-                r#"P='(' Q=')'; eval "f$P$Q{ cat \$1; }"; f .env"#,
-                r#"export P='(' Q=')'; eval "f${P}${Q}{ cat \$1; }"; f .env"#,
-                // Security review I-2: a default operator, and `$'…'`.
-                r#"P='('; eval "f${P:-}) { cat \$1; }"; f .env"#,
-                r#"P='('; eval "f${P-}) { cat \$1; }"; f .env"#,
-                r#"P=$'\x28'; eval "f$P) { cat \$1; }"; f .env"#,
-                // Only a value's ends are substituted; a header inside a
-                // long value is still read where it is written.
-                r#"P=$'#padding\nf\x28\x29{ cat "$1"; }'; eval "$P"; f .env"#,
-            ],
-            cadence_hooks_core::Outcome::Block,
-            "a definition only the resolved text shows",
-        );
-    }
-
-    #[test]
-    fn function_definition_spellings_blocked() {
-        // cameronsjo/cadence-hooks#1425, I2: zsh's nameless `function {`,
-        // its `functions` array, and bash's environment import.
-        assert_bash(
-            &[
-                "function { cat $1; } .env",
-                "functions[f]='cat $1'; f .env",
-                "functions+=(f 'cat $1'); f .env",
+                // Indirection the guard no longer follows.
+                r#"f(){ cat "$1"; }; f .env"#,
                 r#"env 'BASH_FUNC_f%%=() { cat "$1"; }' bash -c 'f .env'"#,
             ],
-            cadence_hooks_core::Outcome::Block,
-            "a definition spelling",
-        );
-        assert_bash(
-            &[
-                "files=(); echo README.md",
-                // Only a value starting `() {` is an import (security review).
-                "files=(); echo .env",
-                "declare -a args=(); args+=(--env-file .env); docker compose \"${args[@]}\" config",
-                "x=foo(); echo .env",
-                r#"echo "call=compute()" .env"#,
-                "echo functions; echo .env.example",
-                // `functions` is read only as a command word.
-                "jq '.functions[0]' package.json; echo .env",
-                "cmd --functions=all; echo .env",
-                r#"git commit -m 'the functions page'"#,
-            ],
             cadence_hooks_core::Outcome::Allow,
-            "a spelling with no secret name",
+            "a function definition beside a secret name",
         );
-    }
-
-    #[test]
-    fn function_import_found_by_its_name_blocked() {
-        // #1430 review: bash imports a function from any `BASH_FUNC_<name>%%`
-        // whose value is `() {` after quote removal, and `command_segments`
-        // does not decode an `env` operand, so the name decides.
+        // A literal read is judged by the reader rules, in a body or out.
         assert_bash(
             &[
-                r#"env BASH_FUNC_f%%=$'\x28\x29 { cat "$1"; }' bash -c 'f .env'"#,
-                r"env BASH_FUNC_f%%=$'\50\51 { cat $1; }' bash -c 'f .env'",
-                r"env BASH_FUNC_f%%=\(\)\ \{\ cat\ \$1\;\ \} bash -c 'f .env'",
-                r"env BASH_FUNC_f%%='('')'' { cat $1; }' bash -c 'f .env'",
-                r#"env BASH_FUNC_f%%="("")"' { cat $1; }' bash -c 'f .env'"#,
-                r"env 'BASH_FUNC_f()=() { cat $1; }' bash -c 'f .env'",
-                r"export BASH_FUNC_f%%=$'\x28\x29 { cat $1; }'; bash -c 'f .env'",
-                r"BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
-                r"env BASH_FUNC_f\%\%=$'\x28\x29 { cat $1; }' bash -c 'f .env'",
-                r#"env "BASH_FUNC_f%%"=$'\x28\x29 { cat $1; }' bash -c 'f .env'"#,
+                "f(){ cat .env; }; f",
+                "function f { grep KEY .env.local; }; f",
+                r#"f(){ echo "$1"; }; f x; cat .env"#,
             ],
             cadence_hooks_core::Outcome::Block,
-            "a function import named BASH_FUNC_",
-        );
-        assert_bash(
-            &[
-                r"env BASH_FUNC_f%%=$'\x28\x29 { cat $1; }' bash -c 'f README.md'",
-                "echo BASH_FUNC_f; echo .env.example",
-            ],
-            cadence_hooks_core::Outcome::Allow,
-            "an import with no secret name",
+            "a literal read beside a function definition",
         );
     }
 
@@ -7668,17 +7370,6 @@ mod tests {
         let message = result.message.unwrap_or_default();
         assert!(
             message.contains("`.env` in a command that sets positional parameters"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn function_definition_block_names_the_secret() {
-        let result =
-            SecretLeaksGuard::default().run(&make_bash_input(r#"f(){ cat "$1"; }; f .e''nv"#));
-        let message = result.message.unwrap_or_default();
-        assert!(
-            message.contains("`.env` in a command that defines a shell function"),
             "{message}"
         );
     }
@@ -8183,7 +7874,6 @@ mod tests {
             &[
                 "jq -R .env.local<x.json",
                 // Same-command shadowing of the name `jq` (#843's analogue).
-                // A function reading its argument blocks instead (#1409).
                 "alias jq=cat; jq .env.local",
                 "source defs.sh; jq .env.local",
                 ". defs.sh && jq .env.local",
