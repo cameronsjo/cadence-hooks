@@ -4595,6 +4595,137 @@ mod tests {
         });
     }
 
+    /// The third cap in "How many pushes the push guard checks": over four
+    /// directory and remote pairs that a `-c` config value names across a
+    /// command's pushes block.
+    #[test]
+    fn over_four_config_named_remotes_block() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        for n in 1..=5 {
+            let url = format!("https://github.com/cameronsjo/r{n}.git");
+            cadence_hooks_core::git_fixtures::git_in(
+                owned.path(),
+                &["remote", "add", &format!("r{n}"), &url],
+            );
+        }
+        let cwd = owned.path().to_string_lossy().to_string();
+        let pushes = |count: usize| {
+            (1..=count)
+                .map(|n| format!("git -c remote.pushDefault=r{n} push"))
+                .collect::<Vec<_>>()
+                .join(" && ")
+        };
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(4), &cwd));
+            assert_eq!(result.outcome, Allow, "four: {:?}", result.message);
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(5), &cwd));
+            assert_eq!(result.outcome, Block, "five: {:?}", result.message);
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too many push remotes to verify")),
+                "five: {:?}",
+                result.message
+            );
+        });
+    }
+
+    /// The config cap counts directory and remote pairs, not remotes: two
+    /// remotes over three `git -C` directories are six pairs and block,
+    /// though no other cap is passed.
+    // Embeds a native path in a POSIX shell string.
+    #[cfg(unix)]
+    #[test]
+    fn the_config_cap_counts_directory_and_remote_pairs() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let dirs: Vec<_> = (1..=3)
+            .map(|_| {
+                let dir = checkout_with_origin("https://github.com/cameronsjo/x.git");
+                for n in 1..=2 {
+                    let url = format!("https://github.com/cameronsjo/r{n}.git");
+                    cadence_hooks_core::git_fixtures::git_in(
+                        dir.path(),
+                        &["remote", "add", &format!("r{n}"), &url],
+                    );
+                }
+                dir
+            })
+            .collect();
+        let cwd = dirs[0].path().to_string_lossy().to_string();
+        let pushes = |dir_count: usize| {
+            (1..=2)
+                .flat_map(|n| {
+                    dirs[..dir_count].iter().map(move |d| {
+                        format!(
+                            "git -C {} -c remote.pushDefault=r{n} push",
+                            d.path().display()
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" && ")
+        };
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(2), &cwd));
+            assert_eq!(result.outcome, Allow, "four pairs: {:?}", result.message);
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&pushes(3), &cwd));
+            assert_eq!(result.outcome, Block, "six pairs: {:?}", result.message);
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too many push remotes to verify")),
+                "six pairs: {:?}",
+                result.message
+            );
+        });
+    }
+
+    /// "Literal `git -C` push loops": the loop reader takes only a command
+    /// that begins with `for`, so a comment line before the loop sends it to
+    /// the general loop checks and their remote cap.
+    // Embeds a native path in a POSIX shell string.
+    #[cfg(unix)]
+    #[test]
+    fn a_comment_before_a_literal_loop_meets_the_loop_cap() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        for n in 1..=5 {
+            let url = format!("https://github.com/cameronsjo/r{n}.git");
+            cadence_hooks_core::git_fixtures::git_in(
+                owned.path(),
+                &["remote", "add", &format!("r{n}"), &url],
+            );
+        }
+        let dir = owned.path().to_string_lossy().to_string();
+        let pushes = (1..=5)
+            .map(|n| format!("git -C $d push r{n} main"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let lp = format!("for d in {dir}; do {pushes}; done");
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&lp, &dir));
+            assert_eq!(result.outcome, Allow, "literal loop: {:?}", result.message);
+            let commented = format!("# push all\n{lp}");
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(&commented, &dir));
+            assert_eq!(
+                result.outcome, Block,
+                "after a comment: {:?}",
+                result.message
+            );
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too many push-loop remotes to verify")),
+                "after a comment: {:?}",
+                result.message
+            );
+        });
+    }
+
     /// cadence-hooks#1144 item 3: a push in a child script run somewhere
     /// else, with no top-level push segment and no literal `git push`, was
     /// allowed at the gate before the directory check ran.
