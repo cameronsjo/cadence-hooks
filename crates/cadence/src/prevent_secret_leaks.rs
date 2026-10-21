@@ -7075,25 +7075,16 @@ mod tests {
                 // An accepted cost of removing the rule: a literal read in a
                 // `-c` script that a wrapper runs was caught only by it when
                 // the guard does not peel the wrapper (`parallel`, `fd
-                // -x`/`-X`), or when core re-joins its operands without their
-                // quotes (`flock FILE CMD…`, BSD `script FILE CMD…`: `sh -c
-                // 'cat .env'` reaches the reader as `sh -c cat .env`, a
-                // script of `cat` with `$0` set to `.env`). So is a script
-                // piped to `bash -s` with an operand. The direct forms
-                // (`parallel cat .env ::: a`, `fd -x cat .env`) already
-                // passed; peeling the first pair and quoting the re-join are
-                // separate changes.
+                // -x`/`-X`). So is a script piped to `bash -s` with an
+                // operand. The direct forms (`parallel cat .env ::: a`, `fd -x
+                // cat .env`) already passed; peeling the pair is a separate
+                // change.
                 "parallel sh -c 'cat .env' ::: a b",
                 "parallel sh -c 'cat {}/.env' ::: dir1 dir2",
                 "fd -t d -x sh -c 'cat {}/.env'",
                 "fd -x sh -c 'cat .env'",
                 "fd -H x -X sh -c 'cat .env'",
                 "echo 'cat .env' | bash -s x",
-                "flock /tmp/l sh -c 'cat .env'",
-                "flock -n /tmp/l sh -c 'cat .env'",
-                "flock /tmp/l bash -c 'source .env && env'",
-                "script -q /dev/null sh -c 'cat .env'",
-                "script -q /dev/null bash -c 'source .env && env'",
             ],
             cadence_hooks_core::Outcome::Allow,
             "positional parameters beside a secret name",
@@ -7158,14 +7149,52 @@ mod tests {
                 "sudo -u app bash -c 'cat .env'",
                 "nohup sh -c 'cat .env'",
                 // A bare command behind `flock` or BSD `script`, and `flock`'s
-                // `-c` script (one word, kept whole), have no quote to lose
-                // in the re-join.
+                // `-c` script (one word, kept whole).
                 "flock /tmp/l cat .env",
                 "flock /tmp/l -c 'cat .env'",
                 "script -q /dev/null cat .env",
+                // The wrappers that exec their words keep each word whole, so
+                // a `-c` script behind them is still one script
+                // (cadence-hooks#1468 recorded these as accepted costs while
+                // core stripped the quotes).
+                "flock /tmp/l sh -c 'cat .env'",
+                "flock -n /tmp/l sh -c 'cat .env'",
+                "flock /tmp/l bash -c 'source .env && env'",
+                r#"flock /tmp/l sh -c "cat .env""#,
+                "script -q /dev/null sh -c 'cat .env'",
+                "script -q /dev/null bash -c 'source .env && env'",
+                "watch -x sh -c 'cat .env'",
+                "watch --exec sh -c 'cat .env'",
+                "watch -n 1 -x sh -c 'cat .env'",
+                "watch -xn 1 sh -c 'cat .env'",
+                "env -S 'sh -c' 'cat .env'",
+                "env -S sh -c 'cat .env'",
+                "tmux new -d sh -c 'cat .env'",
+                "tmux neww sh -c 'cat .env'",
+                // Without `-x`, `watch`'s `sh -c` splits the words again.
+                "watch echo 'x; cat .env'",
             ],
             cadence_hooks_core::Outcome::Block,
             "a literal read beside positional parameters",
+        );
+        // The same whole words: a quoted `;` behind an exec wrapper is part
+        // of one argument, not a second command (each blocked while core
+        // stripped the quotes).
+        assert_bash(
+            &[
+                "flock /tmp/l echo 'x; cat .env'",
+                r#"flock /tmp/l echo "x; cat .env""#,
+                "watch -x echo 'x; cat .env'",
+                "runuser -u app -- echo 'x; cat .env'",
+                "env -S 'echo hi' 'x; cat .env'",
+                "tmux new -d echo 'x; cat .env'",
+                // Without `-x`, `watch` hands its words to `sh -c` as one
+                // string: that shell runs `sh -c cat .env`, a script of
+                // `cat` with `$0` set to `.env`, which reads no file.
+                "watch sh -c 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Allow,
+            "a quoted `;` behind a wrapper that execs its words",
         );
     }
 
