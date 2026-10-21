@@ -2,7 +2,7 @@
 
 - [x] 1.1 Remove the positional-parameter block and its helpers, keeping the shared shell option reader
 - [x] 1.2 Flip the positional block tests to allows, keeping literal reads blocked behind an option cluster and behind the peeled runners
-- [x] 1.3 Record the `parallel`, `fd -x`/`-X` and `bash -s` rows as an accepted cost in `positional_parameters_do_not_change_the_verdict`
+- [x] 1.3 Record the `parallel`, `fd -x`/`-X`, `bash -s`, `flock FILE CMD…` and BSD `script FILE CMD…` rows as an accepted cost in `positional_parameters_do_not_change_the_verdict`, and pin the direct `flock` and `script` forms as blocks
 
 ## 2. Docs
 

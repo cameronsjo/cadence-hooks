@@ -103,7 +103,7 @@ Before judging, `prevent-secret-leaks` SHALL peel command runners (`sudo`, `env`
 - **THEN** the hook allows, while `cat .env*` blocks
 
 ### Requirement: A literal read blocks whatever the command's shape
-`prevent-secret-leaks` SHALL judge a Bash command by the reads the reader rules find, so a literal read SHALL block whether or not the command defines a shell function or sets positional parameters, including one in a `-c` script behind a shell option cluster. A secret named only as an argument (`$1`, `"$@"`, `$0`) MUST be allowed. A `-c` script that `parallel` or `fd -x`/`-X` runs, and a script piped into a shell, are not read and MUST be allowed, like the bare `parallel cat .env ::: a`.
+`prevent-secret-leaks` SHALL judge a Bash command by the reads the reader rules find, so a literal read SHALL block whether or not the command defines a shell function or sets positional parameters, including one in a `-c` script behind a shell option cluster. A secret named only as an argument (`$1`, `"$@"`, `$0`) MUST be allowed.
 
 #### Scenario: Script behind an option cluster
 - **WHEN** a Bash command runs `bash -eo pipefail -c 'cat .env'`
@@ -117,13 +117,20 @@ Before judging, `prevent-secret-leaks` SHALL peel command runners (`sudo`, `env`
 - **WHEN** a Bash command runs `bash -c 'cat "$1"' _ .env`, `set -- .env; cat "$1"` or `f(){ cat "$1"; }; f .env`
 - **THEN** the hook allows, since a read through an argument is indirection the guard does not trace
 
-#### Scenario: Script the guard does not read
-- **WHEN** a Bash command runs `parallel sh -c 'cat .env' ::: a`, `fd -x sh -c 'cat .env'` or `echo 'cat .env' | bash -s x`
-- **THEN** the hook allows
-
 #### Scenario: Shapes with no secret
 - **WHEN** a Bash command defines a function or sets positional parameters and names no secret file
 - **THEN** the hook allows
+
+### Requirement: A script the guard does not read is allowed
+`prevent-secret-leaks` MUST allow a `-c` script behind a wrapper the guard does not peel, or whose operands it re-joins without their quotes (`parallel`, `fd -x`/`-X`, `bash -s` with operands, `flock FILE CMD…`, BSD `script FILE CMD…`), like the bare `parallel cat .env ::: a`. A script piped into a shell is not read either. A bare command behind `flock` or BSD `script` is read, so it MUST block.
+
+#### Scenario: Script the guard does not read
+- **WHEN** a Bash command runs `parallel sh -c 'cat .env' ::: a`, `fd -x sh -c 'cat .env'`, `echo 'cat .env' | bash -s x`, `flock /tmp/l sh -c 'cat .env'` or `script -q /dev/null sh -c 'cat .env'`
+- **THEN** the hook allows
+
+#### Scenario: Bare command behind flock or script
+- **WHEN** a Bash command runs `flock /tmp/l cat .env`, `flock /tmp/l -c 'cat .env'` or `script -q /dev/null cat .env`
+- **THEN** the hook blocks
 
 ### Requirement: forgectl env is the accepted form
 `forgectl env` subcommands (`keys`, `check`, `get`, `set`) are not readers, and `prevent-secret-leaks` MUST allow them whatever `--file` they name. When a block names a dotenv-shaped file and `forgectl` is on PATH, the block message SHALL gain one line beginning `Or: forgectl env keys --file` that names value-free alternatives. A block on `.envrc`, a key, or a credential file MUST keep its message unchanged.
