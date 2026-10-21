@@ -12,9 +12,7 @@ use std::process::Command;
 
 fn cadence_hooks() -> Command {
     let mut cmd = support::cadence_hooks();
-    // Don't inherit env that would bypass, disable, or re-price the logger.
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
+    // Don't inherit env that would re-price the logger.
     cmd.env_remove("CLAUDECODE");
     cmd.env_remove("CADENCE_METRICS_PRICES");
     cmd

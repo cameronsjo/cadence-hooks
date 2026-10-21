@@ -17,9 +17,6 @@ use std::process::Command;
 /// serialization against other tests.
 fn cadence_hooks(marker_dir: &std::path::Path) -> Command {
     let mut cmd = support::cadence_hooks();
-    // Don't inherit enforcement toggles from the test runner's session.
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
     // The gate's own escape hatch would defeat the assertion outright.
     cmd.env_remove("CADENCE_NO_DAILY_GATE");

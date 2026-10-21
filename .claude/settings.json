@@ -1,5 +1,8 @@
 {
   "enabledPlugins": {
     "cadence-dev@workbench": true
+  },
+  "env": {
+    "CADENCE_PLANS_DIR": ".claude/plans"
   }
 }

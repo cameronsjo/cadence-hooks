@@ -23,8 +23,11 @@ release:
 # --no-fail-fast is load-bearing: without it cargo stops after the first test
 # binary that fails and never builds the rest, so one red crate hides every
 # other crate's results while the run still looks like a complete answer.
+# The three CADENCE switches are cleared because a Claude session can export
+# them: an ambient CADENCE_DISABLE or CADENCE_ALLOW_MAIN turns block assertions
+# into false failures or false passes, in unit tests and the binary alike.
 test:
-	$(CARGO) test --workspace --no-fail-fast
+	env -u CADENCE_DISABLE -u CADENCE_ALLOW_MAIN -u CADENCE_BYPASS $(CARGO) test --workspace --no-fail-fast
 
 .PHONY: check
 ## Run cargo check (fast compilation check)

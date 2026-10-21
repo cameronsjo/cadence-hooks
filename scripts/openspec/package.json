@@ -1,0 +1,8 @@
+{
+  "name": "cadence-hooks-openspec-cli",
+  "private": true,
+  "description": "Pins the OpenSpec CLI that validates openspec/. Install with scripts/openspec.sh, never a bare npx.",
+  "dependencies": {
+    "@fission-ai/openspec": "1.14.3"
+  }
+}

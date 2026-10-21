@@ -35,13 +35,21 @@ fn config_dir() -> &'static PathBuf {
 
 /// A `cadence-hooks` command that cannot reach the real `~/.claude`:
 /// `CLAUDE_CONFIG_DIR` points at an isolated dir and an ambient
-/// `CLAUDE_PROJECT_DIR` is dropped.
+/// `CLAUDE_PROJECT_DIR` is dropped. The three enforcement switches are dropped
+/// too, so a runner session's value cannot decide a verdict.
 pub fn cadence_hooks() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     cmd.env("CLAUDE_CONFIG_DIR", config_dir())
         .env_remove("CLAUDE_PROJECT_DIR")
         // A cloud session exports this; ambient, it would self-disable the hooks
         // these tests exercise (cadence-hooks#1197). Tests that want it set it.
-        .env_remove("CLAUDE_CODE_REMOTE");
+        .env_remove("CLAUDE_CODE_REMOTE")
+        // A session can export any of these. Ambient, CADENCE_DISABLE and
+        // CADENCE_BYPASS exempt the hook under test, and CADENCE_ALLOW_MAIN
+        // exempts enforce-worktree, so a block assertion fails or passes for
+        // the wrong reason. Tests that want one set it after this call.
+        .env_remove("CADENCE_DISABLE")
+        .env_remove("CADENCE_BYPASS")
+        .env_remove("CADENCE_ALLOW_MAIN");
     cmd
 }

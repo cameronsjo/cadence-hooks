@@ -16,8 +16,6 @@ fn cadence_hooks() -> Command {
     let mut cmd = support::cadence_hooks();
     // Isolate from the test runner's session env so the block output and the
     // logging decision are deterministic.
-    cmd.env_remove("CADENCE_BYPASS");
-    cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CADENCE_LOG_NUDGES");
     cmd.env_remove("CADENCE_NO_FEEDBACK_FOOTER");
     cmd.env_remove("CLAUDECODE");
