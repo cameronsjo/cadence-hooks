@@ -45,9 +45,4 @@ if [[ "$UPDATED" != "$VERSION" ]]; then
 fi
 
 echo "Updated Cargo.toml workspace version to $VERSION"
-echo ""
-echo "Next steps:"
-echo "  git add Cargo.toml"
-echo "  git commit -m \"chore: bump version to $VERSION\""
-echo "  git tag v$VERSION"
-echo "  git push --tags"
+echo "Do not tag: auto-tag.yml tags the release when the ship gate merges its PR."
