@@ -2669,7 +2669,7 @@ fn closing_paren(chars: &[char], from: usize) -> Option<usize> {
 }
 
 /// The `-c` script of a shell invocation whose options [`command_segments`]
-/// does not walk (`bash -o pipefail -c '…'`, `bash +x -c '…'`).
+/// does not walk (`bash -oe pipefail -c '…'`, `ksh -o pipefail -c '…'`).
 fn shell_c_script(argv: &[String]) -> Option<&str> {
     let options = shell_options(argv);
     options
@@ -7177,6 +7177,11 @@ mod tests {
             &[
                 "bash -eo pipefail -c 'cat .env'",
                 "bash -euo pipefail -c 'cat .env.local'",
+                // Core reads past the `-o` value now, so these reach the
+                // guard as segments of their own. `-co pipefail` did not
+                // block before: core read `pipefail` as its script.
+                "bash -euo pipefail -c 'cat .env'",
+                "bash -co pipefail 'cat .env'",
                 "set -- a b; cat .env",
                 r#"bash -c 'cat "$1"' _ x; cat .env"#,
                 // The runners the reader peels still reach a `-c` script's

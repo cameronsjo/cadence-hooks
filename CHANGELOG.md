@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Guards read a shell's `-c` script behind an option value such as `-o pipefail`.** `bash -euo pipefail -c 'rm note.md'` deleted a vault note with no block. Core read `pipefail`, the value of `-o`, as the shell's first operand and surfaced no script, so no guard that reads command segments saw the `rm`. Core now skips the value of a cluster ending in `o` (`-o`, `-euo`, `+o`) for `sh`, `bash`, `zsh` and `dash`, and of bash's `-O`, `+O`, `--rcfile` and `--init-file`. It also reads a `+…` word (`bash +e -c`) as an option, and finds the script after the value in `bash -co pipefail '…'`. `git-safety`, `prevent-secret-writes` and `trash-guard` now judge these scripts as they judge `bash -c '…'`. `prevent-secret-leaks` already blocked `bash -o pipefail -c 'cat .env'` through its own option walk, so its verdicts do not change, except that `bash -co pipefail 'cat .env'` now blocks. A script file after the same options (`bash -euo pipefail check.sh`) is still not read.
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
