@@ -712,21 +712,6 @@ fn moves_by_option(tokens: &[String], argv: &[String]) -> bool {
         .any(|word| option_moves(&verb, word))
 }
 
-/// Does a command in a wrapper's script move by an option of its own
-/// ([`moves_by_option`]), a deletion included? The directory walk places that
-/// deletion where the wrapper starts, and core does not follow its option, so
-/// `cd /tmp && sh -c 'env -C /vault rm x.md'` would read as `/tmp/x.md`. The
-/// same deletion unwrapped (`cd /tmp && env -C /vault rm x.md`) is core's
-/// placement and unchanged here.
-fn script_moves_by_option(segment: &str) -> bool {
-    segment_scripts(segment).iter().any(|script| {
-        command_segments(script).iter().any(|inner| {
-            let tokens = executable_tokens(inner);
-            moves_by_option(&tokens, peel_command_runners(&tokens))
-        })
-    })
-}
-
 /// Does `word`, one option word handed to `tool`, change the directory the
 /// command runs in ([`moves_by_option`])?
 fn option_moves(tool: &str, word: &str) -> bool {
@@ -851,10 +836,11 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// deletion verb at a segment head is judged (not `git rm`, `xargs`,
 /// `find`), every operand must pass [`operand_outside_vault`] as the path it
 /// lands on, and every other segment must be a directory move, inert, or a
-/// script wrapper ([`is_script_wrapper`]) that does not move on its own and
-/// runs no command that does ([`may_move_directory`], [`moves_by_option`],
-/// [`script_moves_by_option`]). Beside such a wrapper, no deletion may move by
-/// an option either. A deletion the walk leaves in `cwd`, or cannot place,
+/// script wrapper ([`is_script_wrapper`]) that does not move on its own
+/// ([`may_move_directory`], [`moves_by_option`]). Every segment of such a
+/// wrapper's script is a segment of this walk too, so a wrapper inside it is
+/// judged the same way. Beside or inside such a wrapper, no deletion may move
+/// by an option either. A deletion the walk leaves in `cwd`, or cannot place,
 /// keeps the block.
 fn placed_deletions_all_outside_vault(
     command: &str,
@@ -891,8 +877,7 @@ fn placed_deletions_all_outside_vault(
         {
             if !(is_script_wrapper(&tokens, argv, segment, &listed)
                 && !may_move_directory(segment)
-                && !moves_by_option(&tokens, argv)
-                && !script_moves_by_option(segment))
+                && !moves_by_option(&tokens, argv))
             {
                 return false;
             }
@@ -903,7 +888,11 @@ fn placed_deletions_all_outside_vault(
     // put the shell, not where the option moves it. Beside a wrapper, `main`
     // blocked that deletion only because the wrapper ended this walk, so a
     // walk that passed one over keeps the block: `cd /tmp && flock /tmp/l echo
-    // hi; env -C /vault rm x.md` deletes the vault's `x.md`.
+    // hi; env -C /vault rm x.md` deletes the vault's `x.md`. A deletion inside
+    // the wrapper's script is one of this walk's segments, so `cd /tmp && sh
+    // -c 'env -C /vault rm x.md'` keeps it too. An option on a command that
+    // deletes nothing moves only that command: `cd /tmp && sh -c 'sudo -i
+    // true; rm -rf build'` deletes `/tmp/build`.
     if passed_a_wrapper && a_deletion_moves {
         return false;
     }
@@ -2701,6 +2690,23 @@ mod tests {
             (vault, "cd /tmp && sh -c 'env A=1 rm -rf build'", Allow),
             (vault, "cd /tmp && flock /tmp/l env -i rm -rf build", Allow),
             (vault, "cd /tmp && sh -c 'sudo -u me rm -rf build'", Allow),
+            // An option on a command in the script that deletes nothing moves
+            // only that command.
+            (
+                vault,
+                "cd /tmp && sh -c 'env -C /home/me/vault ls; rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'sudo -i true; rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build; sudo -i true'",
+                Allow,
+            ),
             // `trap` and `git` run a command string too, but they are not
             // script wrappers: the handler runs at exit, wherever the shell
             // ends up, and a `!` alias or `rebase -x` runs at the repository's
