@@ -2367,7 +2367,8 @@ mod tests {
             (vault, "cd /tmp && flock /tmp/l git rm -r x", Block),
             // `trap` and `git` run a command string too, but they are not
             // script wrappers: the handler runs at exit, wherever the shell
-            // ends up, and an alias or `rebase -x` runs in git's directory.
+            // ends up, and a `!` alias or `rebase -x` runs at the repository's
+            // top level, not where the walk placed it.
             (vault, "cd /tmp && trap 'rm -rf build' EXIT", Block),
             (
                 vault,

@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: What the guard cannot read is allowed
-`trash-guard` SHALL block only on a verb and operand it read exactly. A verb built by substitution (`$(echo rm) x`), a body the guard does not treat as executed (a `trap` handler), a deleting binary outside its verb list (`srm`), a runner option it cannot classify (`nice --bogus rm x`), and a relative delete after a `cd` it cannot place (`cd "$D"`, `cd -`) MUST be judged on what was read and otherwise allowed.
+`trash-guard` SHALL block only on a verb and operand it read exactly. A verb built by a substitution the guard cannot read (`$(which rm) x`), a body bash does not run (`trap 'rm x'` with no signal, which installs nothing), a deleting binary outside its verb list (`srm`), a runner option it cannot classify (`nice --bogus rm x`), and a relative delete after a `cd` it cannot place (`cd "$D"`, `cd -`) MUST be judged on what was read and otherwise allowed.
 
 #### Scenario: Unlisted deleting binary
 - **WHEN** the cwd is the vault and a Bash call runs `srm note.md`
@@ -29,7 +29,7 @@ From a cwd inside the vault, `trash-guard` SHALL judge a deletion that a script 
 - **THEN** the hook exits 0
 
 ### Requirement: What a wrapper does not hand to the operand walk
-A deletion behind a wrapper SHALL keep the cwd verdict, and so block, when the wrapper sits behind `xargs`, runs `find`, `git rm` or `eval`, runs `cd`, `pushd` or `popd` inside its script, follows `ln`, `mv`, or a `cd` the walk cannot place, or has a script the guard did not read in full (nested past what it expands). A directory option or login shell (`env -C`, `env --chdir`, `su -`, `su -l`, `runuser -l`, `sudo -i`) is not followed, the same as for a bare deletion.
+A deletion behind a wrapper SHALL keep the cwd verdict, and so block, when the wrapper sits behind `xargs`, runs `find`, `git rm` or `eval`, runs `cd`, `pushd` or `popd` inside its script, follows `ln`, `mv`, or a `cd` the walk cannot place, or has a script the guard did not read in full (too deeply nested) beside a deletion it did read. A directory option or login shell (`env -C`, `env --chdir`, `su -`, `su -l`, `runuser -l`, `sudo -i`) is not followed, the same as for a bare deletion.
 
 #### Scenario: Wrapper changes directory itself
 - **WHEN** the cwd is the vault and a Bash call runs `cd /tmp && sh -c 'cd /vault; rm x.md'`
