@@ -1689,19 +1689,25 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 // stop early; a trim from the end would walk a long blank run
                 // once per match. The search reads to the end of the line only
                 // when no word there qualifies, and then no secret name is left
-                // on it.
+                // on it. When the word passes, the value starts at it: markup
+                // before it is kept, and a line that ends in a tag
+                // (`<p><b>DB pass:</b> <secret></p>`) is not read as a
+                // placeholder from `</b>` to `</p>`.
+                let mut from = 0;
                 if weak_pass {
-                    let first = first_word(rest);
-                    if !first.is_some_and(|(word, _)| secret_like(word)) {
-                        done = start + first.map_or(rest.len(), |(_, end)| end);
-                        continue;
+                    match first_word(rest) {
+                        Some((word, end)) if secret_like(word) => from = end - word.len(),
+                        first => {
+                            done = start + first.map_or(rest.len(), |(_, end)| end);
+                            continue;
+                        }
                     }
                 }
                 let tally = (strength == Strength::Counter).then(|| tally_len(rest));
                 // Trim only when no count ends the value: a run of counts
                 // (`lastpass: 5 lastpass: 5 …`) reaches here once per match.
                 (
-                    0,
+                    from,
                     tally.flatten().unwrap_or_else(|| rest.trim_end().len()),
                     false,
                 )
@@ -1815,15 +1821,19 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
 /// and is not a closing HTML tag, and the byte offset in `value` where it
 /// ends. A markup mark, a cell border, an arrow, an emoji or a closing tag
 /// before a secret (`**`, `|`, `->`, `🔑`, `</b>`) is not a word to judge.
-/// When no word qualifies, the first blank-separated word is judged, so a
-/// value of symbols only is still read. The search stops at the first word
-/// that qualifies, and only a line with no such word left is read to its
-/// end, so the cost is bounded by the text up to that word.
+/// A closing tag is any word that starts with `</` and ends with `>`, so
+/// nested tags closed together (`</i></b>`) and a custom element
+/// (`</my-label>`) count too. The value test reads such a word as a
+/// placeholder and never passes it, so skipping one only moves the test to
+/// the next word. When no word qualifies, the first blank-separated word is
+/// judged, so a value of symbols only is still read. The search stops at the
+/// first word that qualifies, and only a line with no such word left is read
+/// to its end, so the cost is bounded by the text up to that word.
 fn first_word(value: &str) -> Option<(&str, usize)> {
     let closing_tag = |w: &str| {
         w.strip_prefix("</")
             .and_then(|t| t.strip_suffix('>'))
-            .is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+            .is_some_and(|t| !t.is_empty())
     };
     let word = value
         .split_whitespace()
@@ -3107,9 +3117,18 @@ mod tests {
             format!("Admin pass: | {p}\n"),
             format!("Admin pass: \u{2192} {p}\n"),
             format!("Admin pass: \u{1F511} {p}\n"),
-            // Nor is a closing HTML tag.
+            // Nor is a closing HTML tag, whatever its name: nested tags closed
+            // together, a custom element.
             format!("<b>DB pass:</b> {p}\n"),
             format!("<code>DB pass:</code> {p}\n"),
+            format!("<b><i>DB pass:</i></b> {p}\n"),
+            format!("<my-label>DB pass:</my-label> {p}\n"),
+            // The value starts at the judged word, so a tag that ends the line
+            // does not make it read as a placeholder.
+            format!("<p><b>DB pass:</b> {p}</p>\n"),
+            format!("<td><b>DB pass:</b> {p}</td>\n"),
+            format!("<b>DB pass:</b> {p}<br>\n"),
+            format!("<b>Admin pass:</b> {p} <i>(rotate)</i>\n"),
             // A quoted value keeps the rules of a bare `pass` alone.
             format!("Admin pass: \"{p}\"\n"),
         ];
@@ -3138,7 +3157,23 @@ mod tests {
             let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
             assert!(!out.contains(secret), "{input:?} -> {out:?}");
         }
-        // The mask runs to the end of the line, notes included.
+        // A later field after a tag-wrapped secret is masked too: the mask
+        // runs from the secret to the end of the line.
+        let later = masked(&format!(
+            "<p><b>Admin pass:</b> {p}, DB password: hunter22</p>\n"
+        ));
+        assert!(
+            !later.contains(&p) && !later.contains("hunter22"),
+            "{later:?}"
+        );
+        // A rule of a symbol other than `=` is read like a password of symbols
+        // only, and masks.
+        assert_eq!(
+            masked("Second pass: ##########\n"),
+            format!("Second pass: {NAMED_MARK}\n")
+        );
+        // The mask runs to the end of the line, notes included, and starts at
+        // the judged word, so markup before it is kept.
         assert_eq!(
             masked(&format!("DB pass: {p}\n")),
             format!("DB pass: {NAMED_MARK}\n")
@@ -3146,6 +3181,14 @@ mod tests {
         assert_eq!(
             masked(&format!("Admin pass: {p} (change on first login)\n")),
             format!("Admin pass: {NAMED_MARK}\n")
+        );
+        assert_eq!(
+            masked(&format!("**DB pass:** {p}\n")),
+            format!("**DB pass:** {NAMED_MARK}\n")
+        );
+        assert_eq!(
+            masked(&format!("<p><b>DB pass:</b> {p}</p>\n")),
+            format!("<p><b>DB pass:</b> {NAMED_MARK}\n")
         );
         // A quoted value is not judged by its first word: this one is shorter
         // than a credential and still masks.
@@ -3157,14 +3200,22 @@ mod tests {
             "+ // the second pass: done\n",
             "x pass: 5 hunter2\n",
             "lint pass: ok and the build is green\n",
-            // No word holds a letter or a digit: the first word is judged, and
-            // these are too short, a rule or a placeholder.
+            // No word holds a letter or a digit: the first word is judged. These
+            // are shorter than a credential (`->`, `...`, `--`, `**`), a
+            // placeholder (`********`), or a value that starts with `=`, which
+            // the value test refuses (`========`).
             "Admin pass: ->\n",
             "the second pass: ...\n",
             "lint pass: --\n",
             "Second pass: ========\n",
             "x pass: ** **\n",
             "x pass: ********\n",
+            // The first word is judged, not a later one: `->` is too short.
+            "Admin pass: -> ~!@#$%^&*()_+\n",
+            // Prose after closing tags of any name.
+            "<b><i>Second pass:</i></b> done\n",
+            "<my-label>Lint pass:</my-label> ok\n",
+            "<b><i>Test pass:</i></b> 42/42\n",
             // Code, which the value test refuses: a type, an expression closing
             // a field.
             "  private pass: string|null;\n",
