@@ -2640,7 +2640,7 @@ fn looped_repo_argument_is_literal(c: &loop_analysis::LoopedCommand) -> bool {
         && host.as_deref().is_none_or(|h| literal(h, b"-."))
         && target
             .split_once('/')
-            .is_some_and(|(owner, name)| literal(owner, b"-") && !name.is_empty())
+            .is_some_and(|(owner, name)| literal(owner, b"-_") && !name.is_empty())
 }
 
 /// True when `segment`'s gh invocation targets the user's own account
@@ -9438,10 +9438,15 @@ mod tests {
     /// Run the guard from `cwd` with `cameronsjo` allowed, in relaxed or
     /// strict loop mode.
     fn run_1491(command: &str, cwd: &str, strict: bool) -> CheckResult {
+        run_1491_owners("cameronsjo", command, cwd, strict)
+    }
+
+    /// [`run_1491`] with `owners` allowed instead.
+    fn run_1491_owners(owners: &str, command: &str, cwd: &str, strict: bool) -> CheckResult {
         let mut result = None;
         with_env(
             &[
-                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_OWNERS", Some(owners)),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
                 ("CADENCE_GH_STRICT_LOOPS", strict.then_some("1")),
@@ -9476,6 +9481,17 @@ mod tests {
                 );
             }
         }
+        // `_` is an owner character too: managed-user owners carry one.
+        let managed_user = r#"for r in a b; do gh repo archive "mona_acme/$r" --yes; done"#;
+        for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
+            let result = run_1491_owners("cameronsjo,mona_acme", managed_user, cwd, strict);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{managed_user} in {cwd} (strict {strict}): {:?}",
+                result.message
+            );
+        }
     }
 
     #[test]
@@ -9495,6 +9511,20 @@ mod tests {
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{cwd}");
             assert_eq!(meta.fix, "gh repo archive cameronsjo/<repo>", "{cwd}");
+        }
+        // A `_` owner is literal too, so the loop names it as unowned rather
+        // than asking for an explicit target.
+        let underscore = r#"for r in alpha beta; do gh repo archive "my_org/$r" --yes; done"#;
+        for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
+            let result = run_1491(underscore, cwd, strict);
+            assert!(blocks(&result), "{cwd} (strict {strict})");
+            assert!(
+                msg(&result).contains("gh write targets repo you don't own"),
+                "{cwd} (strict {strict}): {}",
+                msg(&result)
+            );
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{cwd}");
         }
     }
 
