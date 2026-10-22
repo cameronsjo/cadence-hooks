@@ -7,11 +7,11 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    UNRESOLVABLE_DIR, carries_substitution, child_scripts, clobber_redirect_targets,
-    command_segments, command_word, executable_tokens, executable_tokens_marked, looks_absolute,
-    peel_command_runners, redirect_operator_span, redirect_targets, segment_scripts,
-    segment_work_dirs, skip_git_global_options, strip_verbatim_prefix, substitution_bodies,
-    tokenize,
+    COMMAND_RUNNERS, UNRESOLVABLE_DIR, carries_substitution, child_scripts,
+    clobber_redirect_targets, command_segments, command_word, executable_tokens,
+    executable_tokens_marked, looks_absolute, peel_command_runners, redirect_operator_span,
+    redirect_targets, segment_scripts, segment_work_dirs, skip_git_global_options,
+    strip_verbatim_prefix, substitution_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -647,13 +647,85 @@ fn is_script_wrapper(
 /// never lifts one. The directory walk places a wrapper's whole script where
 /// the wrapper starts, so a `cd` inside the script would put its deletions
 /// somewhere the walk does not look: `cd /tmp && sh -c 'cd /vault; rm x.md'`.
-/// A directory option (`env -C`, `env --chdir`) or a login shell (`su -`,
-/// `su -l`, `runuser -l`, `sudo -i`) is not followed, the same as for a bare
-/// deletion: the walk does not place those either.
+/// A wrapper that moves by an option of its own (`env -C`, `su -l`, `sudo -i`)
+/// is [`moves_by_option`]'s question. A bare deletion behind the same option
+/// (`cd /tmp && env -C /vault rm x.md`) is placed by core, unchanged here.
 fn may_move_directory(text: &str) -> bool {
     ["cd", "pushd", "popd"]
         .iter()
         .any(|word| text.contains(word))
+}
+
+/// Does a wrapper segment start its script somewhere other than where the
+/// segment runs, by an option of the wrapper or of a runner in front of it?
+/// `env -C <dir>` and `sudo -D <dir>` (each also `--chdir`) move to the
+/// directory they name, and a login (`su -`, `su -l`, `runuser -l`,
+/// `sudo -i`) moves to the target user's home. The directory walk places a
+/// wrapper's script where the wrapper starts, so one that moves keeps the cwd
+/// verdict there: `cd /tmp && env -C /vault sh -c 'rm x.md'` deletes the
+/// vault's `x.md`, not `/tmp/x.md`.
+///
+/// Each runner's options are read as that runner's (`sudo -u me env -i`
+/// does not log in), and a short cluster ends at a flag that takes a value,
+/// so `sudo -uadmin` and `su -s/usr/local/bin/zsh` are not read as `-i` or
+/// `-l`. A login shell (`bash -lc`, `sh -l -c`) and a cleared environment
+/// (`env -i`) stay where they started and are not moves, and the wrapper's
+/// own options end at `--`, so `runuser -u me -- bash -lc '…'` is not either.
+/// Reading a move that is not there only keeps the cwd verdict.
+fn moves_by_option(tokens: &[String], argv: &[String]) -> bool {
+    let mut runner = None;
+    for token in &tokens[..tokens.len() - argv.len()] {
+        let word = command_word(token);
+        if !token.starts_with('-') && COMMAND_RUNNERS.contains(&word.as_ref()) {
+            runner = Some(word);
+        } else if runner
+            .as_deref()
+            .is_some_and(|tool| option_moves(tool, token))
+        {
+            return true;
+        }
+    }
+    let Some(verb) = argv.first() else {
+        return false;
+    };
+    let verb = command_word(verb);
+    argv[1..]
+        .iter()
+        .take_while(|word| *word != "--")
+        .any(|word| option_moves(&verb, word))
+}
+
+/// Does `word`, one option word handed to `tool`, change the directory the
+/// command runs in ([`moves_by_option`])?
+fn option_moves(tool: &str, word: &str) -> bool {
+    // Per tool: the short flags that move, the short flags that take a value
+    // (the rest of the cluster is that value), and the long options that move.
+    let (moving, valued, long): (&str, &str, &[&str]) = match tool {
+        "env" => ("C", "uSPa", &["--chdir"]),
+        "sudo" => ("iD", "aCcgpRrTtUu", &["--login", "--chdir"]),
+        "su" | "runuser" => ("l", "cgGsuw", &["--login"]),
+        _ => return false,
+    };
+    if word == "-" {
+        // `su -` logs in; `env -` is `env -i`.
+        return tool != "env";
+    }
+    if word.starts_with("--") {
+        let name = word.split_once('=').map_or(word, |(name, _)| name);
+        return long.contains(&name);
+    }
+    let Some(cluster) = word.strip_prefix('-') else {
+        return false;
+    };
+    for flag in cluster.chars() {
+        if moving.contains(flag) {
+            return true;
+        }
+        if valued.contains(flag) {
+            return false;
+        }
+    }
+    false
 }
 
 /// With the shell standing inside the vault, is every deletion the command
@@ -747,8 +819,9 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// deletion verb at a segment head is judged (not `git rm`, `xargs`,
 /// `find`), every operand must pass [`operand_outside_vault`] as the path it
 /// lands on, and every other segment must be a directory move, inert, or a
-/// script wrapper ([`is_script_wrapper`]). A deletion the walk leaves in
-/// `cwd`, or cannot place, keeps the block.
+/// script wrapper ([`is_script_wrapper`]) that does not move on its own
+/// ([`may_move_directory`], [`moves_by_option`]). A deletion the walk leaves
+/// in `cwd`, or cannot place, keeps the block.
 fn placed_deletions_all_outside_vault(
     command: &str,
     cwd: &str,
@@ -778,7 +851,9 @@ fn placed_deletions_all_outside_vault(
             }
         } else if !matches!(verb.as_ref(), "cd" | "pushd" | "popd")
             && !is_inert_segment(argv, segment)
-            && !(is_script_wrapper(&tokens, argv, segment, &listed) && !may_move_directory(segment))
+            && !(is_script_wrapper(&tokens, argv, segment, &listed)
+                && !may_move_directory(segment)
+                && !moves_by_option(&tokens, argv))
         {
             return false;
         }
@@ -2365,6 +2440,90 @@ mod tests {
             ),
             (vault, "cd /tmp && sh -c 'find . -delete'", Block),
             (vault, "cd /tmp && flock /tmp/l git rm -r x", Block),
+            // So does a directory option or a login on the wrapper, or on a
+            // runner in front of it.
+            (
+                vault,
+                "cd /tmp && env -C /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -C/home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -iC /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir=/home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir=/home/me/vault/env sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -C /home/me/vault -S 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && flock /tmp/l env -C /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sudo -u me env -C /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && su -l me -c 'rm note.md'", Block),
+            (vault, "cd /tmp && su - me -c 'rm note.md'", Block),
+            (vault, "cd /tmp && su --login me -c 'rm note.md'", Block),
+            (vault, "cd /tmp && su -lc 'rm note.md' me", Block),
+            (vault, "cd /tmp && su me -l -c 'rm note.md'", Block),
+            (vault, "cd /tmp && runuser -l me -c 'rm note.md'", Block),
+            (
+                vault,
+                "cd /tmp && runuser --login me -c 'rm note.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && sudo -i sh -c 'rm note.md'", Block),
+            (vault, "cd /tmp && sudo -iu me sh -c 'rm note.md'", Block),
+            (vault, "cd /tmp && sudo --login sh -c 'rm note.md'", Block),
+            (vault, "cd /tmp && nice sudo -i sh -c 'rm note.md'", Block),
+            // A login shell, a cleared environment, and an option's value
+            // are not moves.
+            (vault, "cd /tmp && env A=1 sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && env -i sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && env - sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && env -uC sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && bash -lc 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sh -l -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && su me -c 'rm -rf build'", Allow),
+            (
+                vault,
+                "cd /tmp && su -s/usr/local/bin/zsh me -c 'rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && runuser -u me -- bash -lc 'rm -rf build'",
+                Allow,
+            ),
+            (vault, "cd /tmp && sudo sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sudo -uadmin sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sudo env -i sh -c 'rm -rf build'", Allow),
             // `trap` and `git` run a command string too, but they are not
             // script wrappers: the handler runs at exit, wherever the shell
             // ends up, and a `!` alias or `rebase -x` runs at the repository's
@@ -2410,6 +2569,23 @@ mod tests {
             let result =
                 check_destructive_in_vault_at(command, cwd, vault, Some("/home/me"), &dirs);
             assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
+        }
+    }
+
+    /// Core does not peel `sudo -D` yet, so no command reaches the directory
+    /// walk's wrapper arm with it; the move is still read for when it does.
+    #[test]
+    fn sudo_chdir_reads_as_a_move() {
+        for (segment, moves) in [
+            ("sudo -D /home/me/vault sh -c 'rm note.md'", true),
+            ("sudo -D/home/me/vault sh -c 'rm note.md'", true),
+            ("sudo --chdir=/home/me/vault sh -c 'rm note.md'", true),
+            ("sudo --chdir /home/me/vault sh -c 'rm note.md'", true),
+            ("sudo -u me sh -c 'rm -rf build'", false),
+        ] {
+            let tokens = executable_tokens(segment);
+            let argv = peel_command_runners(&tokens);
+            assert_eq!(moves_by_option(&tokens, argv), moves, "{segment}");
         }
     }
 
