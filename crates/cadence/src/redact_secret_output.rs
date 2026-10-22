@@ -1688,8 +1688,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                 // short count test above read the value from its front and
                 // stop early; a trim from the end would walk a long blank run
                 // once per match. The search reads to the end of the line only
-                // when no word there qualifies, and then no secret name is left
-                // on it. When the word passes, the value starts at it: markup
+                // when no word there qualifies, and then no bare `pass:` that
+                // runs this search is left on it: such a `pass:` starts its own
+                // word, which qualifies, and a name inside a tag word
+                // (`</x(pass:>`) follows an opener, so it is in key position.
+                // When the word passes, the value starts at it: markup
                 // before it is kept, and a line that ends in a tag
                 // (`<p><b>DB pass:</b> <secret></p>`) is not read as a
                 // placeholder from `</b>` to `</p>`.
@@ -1818,26 +1821,33 @@ fn pass_key_position(text: &str, name_at: usize) -> bool {
 }
 
 /// The first blank-separated word of `value` that holds a letter or a digit
-/// and is not a closing HTML tag, and the byte offset in `value` where it
-/// ends. A markup mark, a cell border, an arrow, an emoji or a closing tag
-/// before a secret (`**`, `|`, `->`, `🔑`, `</b>`) is not a word to judge.
-/// A closing tag is any word that starts with `</` and ends with `>`, so
-/// nested tags closed together (`</i></b>`) and a custom element
-/// (`</my-label>`) count too. The value test reads such a word as a
+/// and is not an HTML tag, and the byte offset in `value` where it ends. A
+/// markup mark, a cell border, an arrow, an emoji or a tag before a secret
+/// (`**`, `|`, `->`, `🔑`, `<b>`, `</b>`) is not a word to judge. A tag word
+/// is one or more tags back to back, each `<name>` or `</name>`: an opening
+/// tag (`<b>`, `<span>`), a closing one, nested tags (`<b><i>`, `</i></b>`)
+/// and a custom element (`</my-label>`) all count. A value wrapped in tags
+/// (`<b>secret</b>`) does not, so it is still the word judged. The value
+/// test reads a tag word as a
 /// placeholder and never passes it, so skipping one only moves the test to
 /// the next word. When no word qualifies, the first blank-separated word is
 /// judged, so a value of symbols only is still read. The search stops at the
 /// first word that qualifies, and only a line with no such word left is read
 /// to its end, so the cost is bounded by the text up to that word.
 fn first_word(value: &str) -> Option<(&str, usize)> {
-    let closing_tag = |w: &str| {
-        w.strip_prefix("</")
+    // Only tags, back to back: `<b>`, `</b>`, `</i></b>`; not `<b>secret</b>`.
+    let tag = |w: &str| {
+        w.strip_prefix('<')
             .and_then(|t| t.strip_suffix('>'))
-            .is_some_and(|t| !t.is_empty())
+            .is_some_and(|t| {
+                t.split("><").all(|name| {
+                    !name.contains(['<', '>']) && !name.strip_prefix('/').unwrap_or(name).is_empty()
+                })
+            })
     };
     let word = value
         .split_whitespace()
-        .find(|w| w.chars().any(char::is_alphanumeric) && !closing_tag(w))
+        .find(|w| w.chars().any(char::is_alphanumeric) && !tag(w))
         .or_else(|| value.split_whitespace().next())?;
     // `word` is a subslice of `value`, so the pointer difference is its offset.
     let end = word.as_ptr() as usize - value.as_ptr() as usize + word.len();
@@ -3059,7 +3069,7 @@ mod tests {
     /// cameronsjo/cadence-hooks#1449: out of key position the unquoted value
     /// of a bare `pass:` runs to the end of the line, so a note, a next field
     /// or a closing `|` after the secret is part of it. The value is judged by
-    /// its first word that holds a letter or a digit and is not a closing tag
+    /// its first word that holds a letter or a digit and is not an HTML tag
     /// (with none, its first word), on top of every rule a bare `pass` has in
     /// key position. When that word is not a credential, only it is spent, so
     /// a secret-named field later on the line is read. A quoted value is not
@@ -3117,12 +3127,16 @@ mod tests {
             format!("Admin pass: | {p}\n"),
             format!("Admin pass: \u{2192} {p}\n"),
             format!("Admin pass: \u{1F511} {p}\n"),
-            // Nor is a closing HTML tag, whatever its name: nested tags closed
-            // together, a custom element.
+            // Nor is an HTML tag, opening or closing, whatever its name:
+            // nested tags closed together, a custom element.
             format!("<b>DB pass:</b> {p}\n"),
             format!("<code>DB pass:</code> {p}\n"),
             format!("<b><i>DB pass:</i></b> {p}\n"),
             format!("<my-label>DB pass:</my-label> {p}\n"),
+            format!("Admin pass: <b> {p}\n"),
+            format!("<b>DB pass:</b> <i> {p}\n"),
+            format!("Admin pass: <br> {p}\n"),
+            format!("Admin pass: <i> {p} (rotate)\n"),
             // The value starts at the judged word, so a tag that ends the line
             // does not make it read as a placeholder.
             format!("<p><b>DB pass:</b> {p}</p>\n"),
@@ -3165,6 +3179,13 @@ mod tests {
         assert!(
             !later.contains(&p) && !later.contains("hunter22"),
             "{later:?}"
+        );
+        // A value wrapped in tags is the word judged, not a tag to skip: the
+        // note after it must not be masked in its place, leaving the secret.
+        let wrapped = redact(&format!("DB pass: <b>{p}</b> (rotate)\n"));
+        assert!(
+            wrapped.as_ref().is_none_or(|out| !out.contains(&p)),
+            "{wrapped:?}"
         );
         // A rule of a symbol other than `=` is read like a password of symbols
         // only, and masks.
@@ -3212,10 +3233,13 @@ mod tests {
             "x pass: ********\n",
             // The first word is judged, not a later one: `->` is too short.
             "Admin pass: -> ~!@#$%^&*()_+\n",
-            // Prose after closing tags of any name.
+            // Prose after tags of any name, opening or closing.
             "<b><i>Second pass:</i></b> done\n",
             "<my-label>Lint pass:</my-label> ok\n",
             "<b><i>Test pass:</i></b> 42/42\n",
+            "Second pass: <b> done\n",
+            "<b>Second pass:</b> <i> done\n",
+            "Lint pass: <span> ok\n",
             // Code, which the value test refuses: a type, an expression closing
             // a field.
             "  private pass: string|null;\n",
