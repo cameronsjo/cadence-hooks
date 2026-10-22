@@ -580,14 +580,16 @@ const SCRIPT_WRAPPERS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "env", "script", "flock", "watch", "su", "runuser",
 ];
 
-/// Commands that run something of their own: `find`'s `-exec` action, a
-/// `git` alias, an `eval` or `trap` string, `xargs`'s stdin, a `tmux`
-/// session. Core can read that inner command in place of the wrapper's whole
-/// command: it reads `runuser -u root find . -exec rm {} +` as running only
-/// `rm`, so the `find` would be passed over. A wrapper with one of these among
-/// its own words keeps the verdict. A word with a blank in it is a script
-/// string, judged as its own segments, and is not read here.
-const RUN_THEIR_OWN: &[&str] = &["find", "git", "eval", "trap", "xargs", "tmux"];
+/// `find` runs a command of its own (`-exec`), and core can read that command
+/// in place of the wrapper's whole command: it reads `runuser -u root find .
+/// -exec rm {} +` as running only `rm`, so the `find` would be passed over. A
+/// wrapper with `find` among its own words keeps the verdict, also where the
+/// word is only an argument (`flock /tmp/l rm /tmp/find`), which keeps main's
+/// block. A word with a blank in it is a script string, judged as its own
+/// segments, and is not read here. The other commands that run something of
+/// their own (`git`, `eval`, `trap`, `xargs`, `tmux`) already keep the verdict
+/// behind such a wrapper, so a user or file of that name keeps the relief.
+const RUNS_ITS_OWN: &str = "find";
 
 /// The segments of the command being judged, with the lookup
 /// [`is_script_wrapper`] asks of them, built on first use.
@@ -641,9 +643,10 @@ fn is_script_wrapper(
     if runners.iter().any(|t| command_word(t) == "xargs") {
         return false;
     }
-    if tokens.iter().any(|t| {
-        !t.contains(char::is_whitespace) && RUN_THEIR_OWN.contains(&command_word(t).as_ref())
-    }) {
+    if tokens
+        .iter()
+        .any(|t| !t.contains(char::is_whitespace) && command_word(t) == RUNS_ITS_OWN)
+    {
         return false;
     }
     let scripts = segment_scripts(segment);
@@ -850,8 +853,9 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// lands on, and every other segment must be a directory move, inert, or a
 /// script wrapper ([`is_script_wrapper`]) that does not move on its own and
 /// runs no command that does ([`may_move_directory`], [`moves_by_option`],
-/// [`script_moves_by_option`]). A deletion the walk leaves in `cwd`, or cannot
-/// place, keeps the block.
+/// [`script_moves_by_option`]). Beside such a wrapper, no deletion may move by
+/// an option either. A deletion the walk leaves in `cwd`, or cannot place,
+/// keeps the block.
 fn placed_deletions_all_outside_vault(
     command: &str,
     cwd: &str,
@@ -867,6 +871,8 @@ fn placed_deletions_all_outside_vault(
         return false;
     }
     let listed = ListedSegments::new(&segments);
+    let mut passed_a_wrapper = false;
+    let mut a_deletion_moves = false;
     for segment in segments.iter() {
         let tokens = executable_tokens(segment);
         let argv = peel_command_runners(&tokens);
@@ -879,15 +885,27 @@ fn placed_deletions_all_outside_vault(
             if verb == "git" || runners.iter().any(|t| command_word(t) == "xargs") {
                 return false;
             }
+            a_deletion_moves |= moves_by_option(&tokens, argv);
         } else if !matches!(verb.as_ref(), "cd" | "pushd" | "popd")
             && !is_inert_segment(argv, segment)
-            && !(is_script_wrapper(&tokens, argv, segment, &listed)
+        {
+            if !(is_script_wrapper(&tokens, argv, segment, &listed)
                 && !may_move_directory(segment)
                 && !moves_by_option(&tokens, argv)
                 && !script_moves_by_option(segment))
-        {
-            return false;
+            {
+                return false;
+            }
+            passed_a_wrapper = true;
         }
+    }
+    // Core places a deletion behind `env -C <dir>` or `sudo -i` where the `cd`
+    // put the shell, not where the option moves it. Beside a wrapper, `main`
+    // blocked that deletion only because the wrapper ended this walk, so a
+    // walk that passed one over keeps the block: `cd /tmp && flock /tmp/l echo
+    // hi; env -C /vault rm x.md` deletes the vault's `x.md`.
+    if passed_a_wrapper && a_deletion_moves {
+        return false;
     }
     let placed = moved_deletion_operands(command, cwd, vault, home, meta);
     if placed.lifted.is_empty() || placed.judged.len() > MAX_JUDGED_OPERANDS {
@@ -2037,10 +2055,25 @@ mod tests {
             ("runuser -u root timeout 5 find . -exec rm {} +", Block),
             ("runuser -u root find /tmp -exec rm {} +", Block),
             ("runuser -u root -- find . -exec rm {} +", Block),
-            // A script string that names one of them is its own segments.
+            ("runuser -u root /usr/bin/find . -exec rm {} +", Block),
+            // A wrapper without `find` keeps the relief, and so does one
+            // whose `find` is inside a script string, its own segments.
             ("runuser -u root rm -f /tmp/x", Allow),
             ("runuser -u root env rm -f /tmp/x", Allow),
             ("sh -c 'rm -f /tmp/find'", Allow),
+            // Only `find` is read among the wrapper's words, so a user, file
+            // or argument named after another command that runs its own
+            // keeps the relief.
+            ("sh -c 'rm -f /tmp/x' git", Allow),
+            ("sudo -u git sh -c 'rm -f /tmp/x'", Allow),
+            ("runuser -u git -- rm -f /tmp/x", Allow),
+            ("flock /tmp/l rm -rf /tmp/git", Allow),
+            // Those commands keep the block behind such a wrapper anyway.
+            ("runuser -u root eval 'rm note.md'", Block),
+            ("runuser -u root trap 'rm note.md' EXIT", Block),
+            ("runuser -u root xargs rm < list.txt", Block),
+            ("runuser -u root tmux new 'rm note.md'", Block),
+            ("runuser -u root git rm note.md", Block),
         ];
         for &(command, expected) in cases {
             let result = check_destructive_in_vault(command, "/vault", "/vault", &fs);
@@ -2594,6 +2627,29 @@ mod tests {
                 "cd /tmp && bash -c 'sh -c \"env --chdir=/home/me/vault rm note.md\"'",
                 Block,
             ),
+            // Core places a bare deletion behind a directory or login option
+            // where the `cd` put the shell. Beside a wrapper the walk passed
+            // over, that deletion keeps the block.
+            (
+                vault,
+                "cd /tmp && flock /tmp/l echo hi; env -C /home/me/vault rm x.md",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir=/home/me/vault rm note.md && sh -c 'echo hi'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && (watch -x echo hi; nice env -C /home/me/vault rm note.md)",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build'; sudo -i rm note.md",
+                Block,
+            ),
             // A login shell, a cleared environment, and an option's value
             // are not moves.
             (vault, "cd /tmp && env A=1 sh -c 'rm -rf build'", Allow),
@@ -2615,6 +2671,32 @@ mod tests {
             ),
             (vault, "cd /tmp && sudo sh -c 'rm -rf build'", Allow),
             (vault, "cd /tmp && sudo -uadmin sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sudo -ubill sh -c 'rm -rf build'", Allow),
+            (
+                vault,
+                "cd /tmp && sudo -gwireshark sh -c 'rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && su -s/opt/local/bin/zsh me -c 'rm -rf build'",
+                Allow,
+            ),
+            (vault, "cd /tmp && su -gplugdev me -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && su me -c'ls; rm -rf build'", Allow),
+            (
+                vault,
+                "cd /tmp && runuser -ulocal -- sh -c 'rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && env -S'CC=gcc sh -c \"rm -rf build\"'",
+                Allow,
+            ),
+            // With no wrapper beside it, a bare deletion behind the same
+            // option is core's to place, unchanged.
+            (vault, "cd /tmp && rm -rf build; env -C /tmp rm -f x", Allow),
             (vault, "cd /tmp && sudo env -i sh -c 'rm -rf build'", Allow),
             (vault, "cd /tmp && sh -c 'env A=1 rm -rf build'", Allow),
             (vault, "cd /tmp && flock /tmp/l env -i rm -rf build", Allow),

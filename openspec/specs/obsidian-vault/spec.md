@@ -139,7 +139,7 @@ From a cwd inside the vault, `trash-guard` SHALL judge a deletion that a script 
 - **THEN** the hook exits 0
 
 ### Requirement: What a wrapper does not hand to the operand walk
-A deletion behind a wrapper SHALL keep the cwd verdict, and so block, when the wrapper sits behind `xargs`, runs `find`, `git rm` or `eval`, runs `cd`, `pushd` or `popd` inside its script, follows `ln`, `mv`, or a `cd` the walk cannot place, or has a script too deeply nested to read in full beside a deletion the guard did read. After a `cd`, so SHALL one where the wrapper or a command in its script has a directory or login option (`env -C`, `su -l`, `sudo -i`).
+A deletion the guard reads behind a wrapper SHALL keep the cwd verdict, a block, when the wrapper sits behind `xargs`, runs `find`, `git rm` or `eval`, runs `cd`, `pushd` or `popd` in its script, follows `ln`, `mv`, or a `cd` the walk cannot place, or has a script too deep to read in full beside a deletion the guard read. After a `cd`, so SHALL one where the wrapper or a command in its script has a directory or login option (`env -C`, `sudo -i`), and one with such an option beside a wrapper.
 
 #### Scenario: Wrapper changes directory itself
 - **WHEN** the cwd is the vault and a Bash call runs `cd /tmp && sh -c 'cd /vault; rm x.md'`
@@ -151,6 +151,10 @@ A deletion behind a wrapper SHALL keep the cwd verdict, and so block, when the w
 
 #### Scenario: Wrapper runs find
 - **WHEN** the cwd is the vault and a Bash call runs `runuser -u root find . -exec rm {} +`
+- **THEN** the hook exits 2
+
+#### Scenario: Deletion moves by its own option beside a wrapper
+- **WHEN** the cwd is the vault, `/tmp` exists, and a Bash call runs `cd /tmp && flock /tmp/l echo hi; env -C /vault rm x.md`
 - **THEN** the hook exits 2
 
 #### Scenario: Sibling re-points an operand
