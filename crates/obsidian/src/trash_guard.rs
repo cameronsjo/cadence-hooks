@@ -610,9 +610,10 @@ fn uses_parameter_default(command: &str) -> bool {
     })
 }
 
-/// Does the command assign a bare `*`, as `t=*` or `t="*"`? [`command_segments`]
-/// lists a `*` beside an assignment from `mktemp`, so the operand walk passes
-/// that segment ([`is_fresh_temp_bookkeeping`]). A `*` the command typed never
+/// Does the command assign a bare `*`, as `t=*` or `t="*"`, also as the whole
+/// of a quoted `trap` action (`trap 'tmp=*' INT`)? [`command_segments`] lists
+/// a `*` beside an assignment from `mktemp`, so the operand walk passes that
+/// segment ([`is_fresh_temp_bookkeeping`]). A `*` the command typed never
 /// shows in the raw text that way: it is a glob, and after
 /// `trap 'rm -rf $t' EXIT; t=*` the trap deletes every file in the cwd.
 fn assigns_a_bare_star(command: &str) -> bool {
@@ -620,9 +621,9 @@ fn assigns_a_bare_star(command: &str) -> bool {
         command[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
             && ["*", "\"*\""].iter().any(|star| {
                 command[at + 1..].strip_prefix(star).is_some_and(|rest| {
-                    rest.chars()
-                        .next()
-                        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+                    rest.chars().next().is_none_or(|c| {
+                        c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '\'' | '"')
+                    })
                 })
             })
     })
@@ -3617,6 +3618,15 @@ mod tests {
             (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t="*""#, Block),
             (
                 r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; ls; tmp=*"#,
+                Block,
+            ),
+            // The `*` can be a trap's whole action.
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; trap 'tmp=*' INT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; trap "tmp=*" INT"#,
                 Block,
             ),
             // An assignment that may not have run (`assigns_unseen`: a
