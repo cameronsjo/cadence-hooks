@@ -3922,18 +3922,18 @@ fn judge_resolution(
                 // `gh repo` verbs that change or remove the repo they name:
                 // their fix is a command that runs, and rerun as written it
                 // would act on the operator's own repo of that name.
-                // An expanded name is reused only when the command spells
-                // the whole `owner/name` (`-R "evil/$r"`): one read from the
-                // checkout's remote is `.git/config` text, and the fix is a
-                // command the model runs. The name alone is not enough: it
-                // can sit in a `--title`, a `--body` or a heredoc, where it
-                // never ran.
+                // An expanded name is never reused, whoever spelled it: the
+                // fix is a command the model runs, and a name with `$` or a
+                // backtick runs as shell. The command's own `-R "evil/$r"`
+                // and a name read from the checkout's remote both get
+                // `<repo>`. Testing whether the command's text holds the
+                // name cannot tell the target from a `--title`, a `--body`
+                // or a heredoc that merely repeats it.
                 let name = repo.split('/').next_back().unwrap_or(repo.as_str());
                 let repo_name = if matches!(
                     repo_argument_verb(segment).as_deref(),
                     Some("edit" | "archive" | "delete")
-                ) || (repo_has_unexpanded_expansion(name)
-                    && !segment.contains(repo.as_str()))
+                ) || repo_has_unexpanded_expansion(name)
                 {
                     "<repo>"
                 } else {
@@ -9722,7 +9722,7 @@ mod tests {
                 );
                 let meta = result.block_metadata.expect("structured block");
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{flag}");
-                assert_eq!(meta.fix, "-R cameronsjo/$r", "{flag}");
+                assert_eq!(meta.fix, "-R cameronsjo/<repo>", "{flag}");
             }
         }
         // No literal owner to name, so no `Fix: -R cameronsjo/…` that drops
@@ -9888,12 +9888,14 @@ mod tests {
                 "{repo}: {segment}"
             );
         }
-        // The command's own `$r` is the model's text, so the fix keeps it.
+        // The command's own `$r` is not reused either (round 10, CodeRabbit
+        // 4368133188): whoever spelled an expanded name, the fix is a command
+        // the model runs.
         for name in ["$r", "${r}"] {
             let segment = format!(r#"gh issue create -R "evil/{name}" --title t --body b"#);
             assert_eq!(
                 fix("github.com", &format!("evil/{name}"), &segment),
-                format!("-R cameronsjo/{name}")
+                "-R cameronsjo/<repo>"
             );
         }
         // A literal name from the remote is still reused.
@@ -9934,7 +9936,8 @@ mod tests {
             }
         }
         // Round 8: the remote's name inside the command's own quoted text is
-        // not the command naming the target.
+        // not the command naming the target. Round 10 (CodeRabbit
+        // 4368133188): nor is the remote's whole `owner/name` there.
         for (url, command) in [
             ("git@git.example:work-org/`make clean`", PR_WITH_A_CODE_SPAN),
             (
@@ -9944,6 +9947,14 @@ mod tests {
             (
                 "https://github.com/work-org/$(reboot)",
                 "gh issue create --title '$(reboot)' --body b",
+            ),
+            (
+                "git@git.example:work-org/$(reboot)",
+                "gh issue create --title 'work-org/$(reboot)' --body b",
+            ),
+            (
+                "git@git.example:work-org/$b",
+                r#"gh issue create --title t --body "see work-org/$b""#,
             ),
         ] {
             let checkout = origin_checkout(url);
@@ -9963,43 +9974,43 @@ mod tests {
     }
 
     #[test]
-    fn a_command_that_spells_the_whole_target_keeps_its_expansion_in_the_fix() {
-        // Each spelling holds the target's whole `evil/$r`, so the fix keeps
-        // the model's own `$r`. The split-quote spellings (`-R evil/"$r"`,
-        // `-R "evil"/"$r"`) do not hold it and get `<repo>`: text only.
+    fn an_expanded_target_the_command_spells_gets_repo_in_the_fix() {
+        // Each spelling holds the target's whole `evil/$r`, and none keeps the
+        // `$r`: an expanded name is never reused, whoever spelled it (round
+        // 10, CodeRabbit 4368133188). Round 9 kept it for these.
         for (command, expected) in [
             (
                 r#"gh issue create -R "evil/$r" --title t --body b"#,
-                "-R cameronsjo/$r",
+                "-R cameronsjo/<repo>",
             ),
             (
                 r#"gh issue create -R "evil/${r}" --title t --body b"#,
-                "-R cameronsjo/${r}",
+                "-R cameronsjo/<repo>",
             ),
             (
                 r#"gh issue create --repo="evil/$r" --title t --body b"#,
-                "-R cameronsjo/$r",
+                "-R cameronsjo/<repo>",
             ),
             (
                 r#"gh issue create -R "https://github.com/evil/$r" --title t --body b"#,
-                "-R cameronsjo/$r",
+                "-R cameronsjo/<repo>",
             ),
             (
                 r#"gh issue create -R "github.com/evil/$r" --title t --body b"#,
-                "-R cameronsjo/$r",
+                "-R cameronsjo/<repo>",
             ),
             (
                 r#"GH_REPO="evil/$r" gh issue create --title t --body b"#,
-                "-R cameronsjo/$r",
+                "-R cameronsjo/<repo>",
             ),
-            (r#"gh pr merge 5 -R "evil/$1""#, "-R cameronsjo/$1"),
+            (r#"gh pr merge 5 -R "evil/$1""#, "-R cameronsjo/<repo>"),
             (
                 r#"gh repo create "evil/$r" --private"#,
-                "gh repo create cameronsjo/$r",
+                "gh repo create cameronsjo/<repo>",
             ),
             (
                 r#"gh api -X POST "repos/evil/$r/issues" -f title=t"#,
-                "gh api repos/cameronsjo/$r/…",
+                "gh api repos/cameronsjo/<repo>/…",
             ),
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
