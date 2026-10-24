@@ -11778,6 +11778,20 @@ mod tests {
                 let result = GhWriteGuard.run(&input_with(&command, cwd));
                 assert!(blocks(&result), "{command} in {cwd}");
             }
+            // Flags that may name two repos still leave the unowned URL
+            // judged: the block is the unowned-repo one, not the two-repo
+            // one. `work-org/x` is no test: the two-repo message echoes the
+            // command, URL included.
+            let command = format!(
+                "gh issue transfer {ISSUE_W} cameronsjo/y -R cameronsjo/y --body -Rcameronsjo/z"
+            );
+            let result = GhWriteGuard.run(&input_with(&command, &owned));
+            assert!(blocks(&result), "{command}");
+            assert!(
+                msg(&result).contains("you don't own"),
+                "{command}: {}",
+                msg(&result)
+            );
             // An owned `-R` outranks an unowned checkout, as on main.
             for (command, cwd) in [
                 (format!("gh issue transfer {url} cameronsjo/y"), &*owned),
