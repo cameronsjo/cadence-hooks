@@ -1938,6 +1938,11 @@ fn is_arg_reference(value: &str, name: &str) -> bool {
 /// the text given.
 type Edit = (usize, usize, &'static str);
 
+/// A secret-named key glued to a prefix: for an emphasized one, its opening
+/// marker's length and its closing marker's span ([`emphasized_key`]), and
+/// the name's strength.
+type GluedKey = (Option<(usize, usize, usize)>, Strength);
+
 /// Mask the value of a secret-named key glued to what comes before it, which
 /// no other detector reads: a mid-line name needs a blank, a quote or a
 /// bracket before it, and a line-start name may follow only blanks and spaced
@@ -2008,8 +2013,15 @@ fn glued_spans(original: &str, view: &View<'_>, names: &mut Names, spans: &mut V
 ///   after it; a context line's `path-3-` also has its dashes read as colons;
 /// - a diff marker, a `+` or `-` that starts the line, gets `: ` after it;
 /// - emphasis that opens right after such a prefix is dropped; elsewhere, at
-///   the line start or after a blank, it becomes `: `, or a plain word before
-///   a bare `pass`. Its close, right before or after the colon, is dropped.
+///   the line start or after a blank, it becomes `: `. Its close, right
+///   before or after the colon, is dropped.
+///
+/// Emphasis alone does not make a bare `pass` a key (`**Pass:** 12/12`): it
+/// reads as after an ordinary word (#1449), behind a prefix too
+/// (`+**Pass:** 12/12`). So its opening marker becomes two plain words
+/// instead of a label: after a field (`Status:`, a grep prefix's `3:`), one
+/// word would be that field's value, and a bare `pass` after a value is a
+/// key.
 ///
 /// A key is a name ([`is_name_char`]) the redactor reads as secret
 /// ([`Names::get`]), followed by `:` or `=` when it is plain and by `:` when
@@ -2017,32 +2029,34 @@ fn glued_spans(original: &str, view: &View<'_>, names: &mut Names, spans: &mut V
 fn glue_edits(line: &str, names: &mut Names, edits: &mut Vec<Edit>) {
     let bytes = line.as_bytes();
     let mut done = 0;
-    if let Some((key, dashes)) = grep_prefix(line) {
-        if let Some(close) = glued_key(line, key, names) {
+    // What a key's opening emphasis, or the gap after its prefix, becomes:
+    // the label given, or two plain words for an emphasized bare `pass`.
+    let label = |(close, strength): GluedKey, label: &'static str, words| {
+        let tally = close.is_some() && strength == Strength::Tally;
+        (close, if tally { words } else { label })
+    };
+    if let Some((at, dashes)) = grep_prefix(line) {
+        if let Some(key) = glued_key(line, at, names) {
             if let Some((a, b)) = dashes {
                 edits.push((a, a + 1, ":"));
                 edits.push((b, b + 1, ":"));
             }
-            done = push_key(edits, key, close, " ");
+            let (close, with) = label(key, " ", " x x ");
+            done = push_key(edits, at, close, with);
         }
     } else if matches!(bytes.first(), Some(b'+' | b'-'))
-        && let Some(close) = glued_key(line, 1, names)
+        && let Some(key) = glued_key(line, 1, names)
     {
-        done = push_key(edits, 1, close, ": ");
+        let (close, with) = label(key, ": ", " x x ");
+        done = push_key(edits, 1, close, with);
     }
     for (p, _) in line.match_indices(['*', '_']) {
         if p < done || (p > 0 && !matches!(bytes[p - 1], b' ' | b'\t')) {
             continue;
         }
         if let Some((open, s, e, strength)) = emphasized_key(line, p, names) {
-            // Emphasis alone does not make a bare `pass` a key (`**Pass:**
-            // 12/12`): it reads as after an ordinary word (#1449).
-            let with = if strength == Strength::Tally {
-                "x "
-            } else {
-                ": "
-            };
-            done = push_key(edits, p, Some((open, s, e)), with);
+            let (close, with) = label((Some((open, s, e)), strength), ": ", "x x ");
+            done = push_key(edits, p, close, with);
         }
     }
 }
@@ -2112,12 +2126,11 @@ fn grep_prefix(line: &str) -> Option<(usize, Option<(usize, usize)>)> {
     None
 }
 
-/// A secret-named key glued to a prefix at `at`, plain or emphasized; see
-/// [`emphasized_key`] for what an emphasized one returns. `Some(None)` is a
-/// plain key, followed by `:` or `=`.
-fn glued_key(line: &str, at: usize, names: &mut Names) -> Option<Option<(usize, usize, usize)>> {
-    if let Some((open, s, e, _)) = emphasized_key(line, at, names) {
-        return Some(Some((open, s, e)));
+/// A secret-named key glued to a prefix at `at`, plain (followed by `:` or
+/// `=`) or emphasized.
+fn glued_key(line: &str, at: usize, names: &mut Names) -> Option<GluedKey> {
+    if let Some((open, s, e, strength)) = emphasized_key(line, at, names) {
+        return Some((Some((open, s, e)), strength));
     }
     let rest = &line[at..];
     if !rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
@@ -2127,7 +2140,7 @@ fn glued_key(line: &str, at: usize, names: &mut Names) -> Option<Option<(usize, 
     if !rest[end..].starts_with([':', '=']) {
         return None;
     }
-    names.get(&rest[..end]).map(|_| None)
+    names.get(&rest[..end]).map(|strength| (None, strength))
 }
 
 /// A secret-named key wrapped, with its colon, in markdown emphasis (`**`,
@@ -3828,6 +3841,17 @@ mod tests {
                 format!("src/a.env:3:db_pass=abc\\tPASSWORD: {p}\n"),
                 format!("src/a.env:3:db_pass={m} {m}\n"),
             ),
+            // Behind a prefix, an emphasized bare `pass` is judged as in
+            // prose, so a credential-shaped first word still masks.
+            (format!("+**Pass:** {p}\n"), format!("+**Pass:** {m}\n")),
+            (
+                format!("docs/report.md:3:**Pass:** {p}\n"),
+                format!("docs/report.md:3:**Pass:** {m}\n"),
+            ),
+            (
+                format!("Status: **Pass:** {p}\n"),
+                format!("Status: **Pass:** {m}\n"),
+            ),
         ];
         for (input, want) in &masks {
             assert_eq!(masked(input), *want, "{input:?}");
@@ -3848,6 +3872,19 @@ mod tests {
             "**Pass:** 12/12\n",
             "**pass:** ok\n",
             "- **Pass:** ok\n",
+            // ...behind a diff marker or a grep prefix too.
+            "+**Pass:** 12/12\n",
+            "-**Pass:** 12/12\n",
+            "+**pass:** ok\n",
+            "+**Pass:** ok\n",
+            "+**Pass:** 42/42\n",
+            "+**Pass:** 98%\n",
+            "+**Pass:** \u{2705}\n",
+            "+*Pass:* 12/12\n",
+            "+__Pass:__ 12/12\n",
+            "docs/report.md:3:**Pass:** 12/12\n",
+            "docs/report.md-3-**Pass:** 12/12\n",
+            "Status: **Pass:** 12/12\n",
             // No glued secret-named key.
             "token.c:12:5: warning: unused variable\n",
             "config/db.yml:3:user: admin\n",
