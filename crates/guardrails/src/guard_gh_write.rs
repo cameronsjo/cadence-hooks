@@ -3729,7 +3729,9 @@ fn repo_has_unexpanded_expansion(repo: &str) -> bool {
 /// aimed at the other remote, so a fix naming this one, rerun as written,
 /// would merge, close or delete there; it names `<repo>` instead (#1525). The
 /// fix is spelled for `segment`'s verb ([`target_spelling`]): `gh repo edit`
-/// and the other argument verbs have no `-R`.
+/// and the other argument verbs have no `-R`. A `gh repo create` that blocks
+/// here names no repo, and its fix would name the remote's repo, which exists
+/// already, so a rerun would create it again: it always gets `<repo>`.
 fn fork_block_message(
     origin: (&str, &str, bool),
     upstream: (&str, &str, bool),
@@ -3738,6 +3740,7 @@ fn fork_block_message(
 ) -> String {
     let (origin_host, origin_repo, origin_owned) = origin;
     let (upstream_host, upstream_repo, upstream_owned) = upstream;
+    let keep_name = keep_name && repo_argument_verb(segment).as_deref() != Some("create");
     let line = |label: &str, repo: &str, owned: bool| {
         if repo.is_empty() {
             format!("The {label} remote URL could not be parsed, so it cannot be targeted here")
@@ -10845,6 +10848,13 @@ mod tests {
                     false,
                     "Use gh repo edit cameronsjo/<repo> to target",
                 ),
+                // The remote's repo exists, so `create` never names it, even
+                // when every write in the command creates.
+                (
+                    "gh repo create --source=. --push",
+                    true,
+                    "Use gh repo create cameronsjo/<repo> to target",
+                ),
             ] {
                 let message = fork_block_message(origin, upstream, segment, keep);
                 let want = format!("{line} {label}");
@@ -10931,6 +10941,10 @@ mod tests {
                 (
                     "gh repo edit --enable-issues",
                     "Use gh repo edit cameronsjo/<repo> to target your fork",
+                ),
+                (
+                    "gh repo create --source=. --push",
+                    "Use gh repo create cameronsjo/<repo> to target your fork",
                 ),
             ] {
                 let result = GhWriteGuard.run(&input_with(command, cwd));
