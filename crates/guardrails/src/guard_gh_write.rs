@@ -11715,6 +11715,11 @@ mod tests {
     /// which the guard does not read. An owned URL adds a target, so the
     /// `-R` or checkout judged before #1529 still decides. The first row is
     /// "move cameronsjo/x#3 here", typed in a checkout of the destination.
+    ///
+    /// The URL stays judged beside every later source: an owned `-R`, a `-R`
+    /// that may be another flag's value, an inline `GH_REPO` and an inherited
+    /// one are each added to it, never put in its place. Only an unowned URL
+    /// beside an owned one of these tells the two apart.
     #[test]
     fn owned_url_leaves_an_issue_transfer_judged_on_the_checkout() {
         with_env(&owners_env(), || {
@@ -11722,6 +11727,8 @@ mod tests {
             let work_app = work_app.path().to_string_lossy();
             let owned = crate::github_origin_repo();
             let owned = owned.path().to_string_lossy();
+            let unowned = unowned_checkout();
+            let unowned = unowned.path().to_string_lossy();
             let url = "https://github.com/cameronsjo/x/issues/3";
             for (command, cwd) in [
                 (format!("gh issue transfer {url} work-org/app"), &*work_app),
@@ -11732,13 +11739,48 @@ mod tests {
                 ),
                 // The URL is still judged.
                 (format!("gh issue transfer {ISSUE_W} cameronsjo/y"), &*owned),
+                (
+                    format!("gh issue transfer {ISSUE_W} cameronsjo/y -R cameronsjo/y"),
+                    &*owned,
+                ),
+                (
+                    format!("gh issue transfer {ISSUE_W} cameronsjo/y --repo cameronsjo/y"),
+                    &*owned,
+                ),
+                (
+                    format!("gh issue transfer {ISSUE_W} cameronsjo/y --unknown -R cameronsjo/y"),
+                    &*owned,
+                ),
+                (
+                    format!("GH_REPO=cameronsjo/y gh issue transfer {ISSUE_W} cameronsjo/y"),
+                    &*owned,
+                ),
             ] {
                 let result = GhWriteGuard.run(&input_with(&command, cwd));
                 assert!(blocks(&result), "{command} in {cwd}");
             }
-            let command = format!("gh issue transfer {url} cameronsjo/y");
+            // An owned `-R` outranks an unowned checkout, as on main.
+            for (command, cwd) in [
+                (format!("gh issue transfer {url} cameronsjo/y"), &*owned),
+                (
+                    format!("gh issue transfer {url} cameronsjo/y -R cameronsjo/y"),
+                    &*unowned,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert!(!blocks(&result), "{command} in {cwd}: {}", msg(&result));
+            }
+        });
+        let inherited = owners_env().map(|(key, value)| match key {
+            "GH_REPO" => (key, Some("cameronsjo/y")),
+            _ => (key, value),
+        });
+        with_env(&inherited, || {
+            let owned = crate::github_origin_repo();
+            let owned = owned.path().to_string_lossy();
+            let command = format!("gh issue transfer {ISSUE_W} cameronsjo/y");
             let result = GhWriteGuard.run(&input_with(&command, &owned));
-            assert!(!blocks(&result), "{command}: {}", msg(&result));
+            assert!(blocks(&result), "{command} with GH_REPO inherited");
         });
     }
 
