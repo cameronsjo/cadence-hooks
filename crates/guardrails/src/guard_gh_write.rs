@@ -10270,6 +10270,12 @@ mod tests {
                 r#"gh pr review 1 --approve -R "$H/evil/x""#.to_string(),
                 "$H/evil/x",
             ),
+            // Beside that `-R`, gh reads an inline `GH_REPO`, and the host
+            // shown is the one it spells.
+            (
+                r#"GH_REPO="$H/z/y" gh pr review 1 --approve -R cameronsjo/x"#.to_string(),
+                "$H/z/y",
+            ),
             // A host the command selects that did not decide is not shown in
             // place of the one that did.
             (
