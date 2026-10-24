@@ -3923,15 +3923,17 @@ fn judge_resolution(
                 // their fix is a command that runs, and rerun as written it
                 // would act on the operator's own repo of that name.
                 // An expanded name is reused only when the command spells
-                // it (`-R "evil/$r"`): one read from the checkout's remote
-                // is `.git/config` text, and the fix is a command the model
-                // runs.
+                // the whole `owner/name` (`-R "evil/$r"`): one read from the
+                // checkout's remote is `.git/config` text, and the fix is a
+                // command the model runs. The name alone is not enough: it
+                // can sit in a `--title`, a `--body` or a heredoc, where it
+                // never ran.
                 let name = repo.split('/').next_back().unwrap_or(repo.as_str());
                 let repo_name = if matches!(
                     repo_argument_verb(segment).as_deref(),
                     Some("edit" | "archive" | "delete")
                 ) || (repo_has_unexpanded_expansion(name)
-                    && !segment.contains(name))
+                    && !segment.contains(repo.as_str()))
                 {
                     "<repo>"
                 } else {
@@ -9813,6 +9815,11 @@ mod tests {
         "gh pr merge 5 --squash",
     ];
 
+    /// A model's usual `gh pr create`: its body is a quoted heredoc that
+    /// holds a markdown code span, so `$(cat <<'EOF'` and `` `make clean` ``
+    /// are in the command's text but never run as written.
+    const PR_WITH_A_CODE_SPAN: &str = "gh pr create --title \"Fix\" --body \"$(cat <<'EOF'\n## Test plan\n- Run `make clean` first\nEOF\n)\"";
+
     #[test]
     fn an_expanded_name_from_the_remote_is_not_reused_in_the_fix() {
         // Security review of #1498, round 7, I1. A literal unowned owner sends
@@ -9849,6 +9856,37 @@ mod tests {
                     "{repo}: {segment}"
                 );
             }
+        }
+        // Round 8 (security review N1, code review Nit 1): the name alone in
+        // the command is not the command spelling the target. A `--title`, a
+        // `--body` or a quoted heredoc holds text that never ran, and the
+        // usual `gh pr create` body carries markdown code spans.
+        for (repo, segment) in [
+            (
+                "work-org/$(reboot)",
+                r#"gh issue create --title "$t" --body "$(cat body.md)""#,
+            ),
+            ("work-org/`make clean`", PR_WITH_A_CODE_SPAN),
+            (
+                "work-org/`make clean`",
+                "gh issue create --title t --body 'Run `make clean` first'",
+            ),
+            ("work-org/$(cat <<'EOF'", PR_WITH_A_CODE_SPAN),
+            ("work-org/$b", r#"gh issue create --title t --body "$body""#),
+            (
+                "work-org/$HOME",
+                r#"gh issue create --title t --body "see $HOME""#,
+            ),
+            (
+                "work-org/$(reboot)",
+                "gh issue create --title '$(reboot)' --body b",
+            ),
+        ] {
+            assert_eq!(
+                fix("git.example", repo, segment),
+                "-R cameronsjo/<repo>",
+                "{repo}: {segment}"
+            );
         }
         // The command's own `$r` is the model's text, so the fix keeps it.
         for name in ["$r", "${r}"] {
@@ -9895,12 +9933,83 @@ mod tests {
                 assert_eq!(meta.fix, "-R cameronsjo/<repo>", "{url}: {command}");
             }
         }
+        // Round 8: the remote's name inside the command's own quoted text is
+        // not the command naming the target.
+        for (url, command) in [
+            ("git@git.example:work-org/`make clean`", PR_WITH_A_CODE_SPAN),
+            (
+                "git@git.example:work-org/$b",
+                r#"gh issue create --title t --body "$body""#,
+            ),
+            (
+                "https://github.com/work-org/$(reboot)",
+                "gh issue create --title '$(reboot)' --body b",
+            ),
+        ] {
+            let checkout = origin_checkout(url);
+            let cwd = checkout.path().to_str().expect("utf-8 path");
+            let result = run_1491(command, cwd, false);
+            assert!(blocks(&result), "{url}: {command}");
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{url}");
+            assert_eq!(meta.fix, "-R cameronsjo/<repo>", "{url}: {command}");
+        }
         // A literal name from the remote is still reused.
         let checkout = origin_checkout("git@git.example:work-org/cool-tool.git");
         let cwd = checkout.path().to_str().expect("utf-8 path");
         let result = run_1491(UNTARGETED_WRITES[0], cwd, false);
         let meta = result.block_metadata.expect("structured block");
         assert_eq!(meta.fix, "-R cameronsjo/cool-tool");
+    }
+
+    #[test]
+    fn a_command_that_spells_the_whole_target_keeps_its_expansion_in_the_fix() {
+        // Each spelling holds the target's whole `evil/$r`, so the fix keeps
+        // the model's own `$r`. The split-quote spellings (`-R evil/"$r"`,
+        // `-R "evil"/"$r"`) do not hold it and get `<repo>`: text only.
+        for (command, expected) in [
+            (
+                r#"gh issue create -R "evil/$r" --title t --body b"#,
+                "-R cameronsjo/$r",
+            ),
+            (
+                r#"gh issue create -R "evil/${r}" --title t --body b"#,
+                "-R cameronsjo/${r}",
+            ),
+            (
+                r#"gh issue create --repo="evil/$r" --title t --body b"#,
+                "-R cameronsjo/$r",
+            ),
+            (
+                r#"gh issue create -R "https://github.com/evil/$r" --title t --body b"#,
+                "-R cameronsjo/$r",
+            ),
+            (
+                r#"gh issue create -R "github.com/evil/$r" --title t --body b"#,
+                "-R cameronsjo/$r",
+            ),
+            (
+                r#"GH_REPO="evil/$r" gh issue create --title t --body b"#,
+                "-R cameronsjo/$r",
+            ),
+            (r#"gh pr merge 5 -R "evil/$1""#, "-R cameronsjo/$1"),
+            (
+                r#"gh repo create "evil/$r" --private"#,
+                "gh repo create cameronsjo/$r",
+            ),
+            (
+                r#"gh api -X POST "repos/evil/$r/issues" -f title=t"#,
+                "gh api repos/cameronsjo/$r/…",
+            ),
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(command, cwd, false);
+                assert!(blocks(&result), "{command} in {cwd}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+                assert_eq!(meta.fix, expected, "{command} in {cwd}");
+            }
+        }
     }
 
     #[test]
