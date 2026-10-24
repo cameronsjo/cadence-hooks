@@ -13624,6 +13624,45 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
     rest.get(grammar.operands_before_command..)
 }
 
+/// The words of a `git rm` (the words after `rm`) that git can read as its
+/// own options: each word ahead of `--` or `--end-of-options`, less every word
+/// of a command substitution. What a substitution prints is known only when it
+/// runs, so its words are not `git rm`'s: in `git rm -f note.md $(git diff
+/// --name-only --cached)` the `--cached` belongs to `git diff`, and git deletes
+/// the note. Readers hand such a body over split at blanks when the
+/// substitution ends the segment ([`strip_group_wrappers`] takes its `)` for a
+/// group closer), so the skip runs from a word that opens `$(` until the `)`
+/// count balances, and over every word of a backtick span, however the words
+/// were split. A `--` inside a substitution is skipped with it.
+///
+/// Skipping a word can only hide an option. A caller that asks whether one is
+/// present (`--cached`) therefore answers no, the side that blocks, when a
+/// quoted `(` or backtick throws the count off. Each `git rm` option reader
+/// iterates these words in place of its raw arguments (cadence-hooks#1521).
+pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
+    // Open `$(` (and nested `(`) count, and whether a backtick span is open,
+    // carried from one word to the next.
+    let mut open = 0usize;
+    let mut in_backticks = false;
+    args.iter()
+        .map(String::as_str)
+        .filter(move |word| {
+            let inside = open > 0 || in_backticks;
+            let mut prev = None;
+            for c in word.chars() {
+                match c {
+                    '`' => in_backticks = !in_backticks,
+                    '(' if open > 0 || prev == Some('$') => open += 1,
+                    ')' if open > 0 => open -= 1,
+                    _ => {}
+                }
+                prev = Some(c);
+            }
+            !inside && !word.contains("$(") && !word.contains('`')
+        })
+        .take_while(|word| *word != "--" && *word != "--end-of-options")
+}
+
 /// Skip `git`'s global options so the slice begins at its SUBCOMMAND.
 ///
 /// `git`'s globals sit in exactly the position a `argv[1] == "rm"` alias test
@@ -17041,6 +17080,51 @@ mod tests {
                 .and_then(<[String]>::first)
                 .map(String::as_str);
             assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    /// The words after `git rm` that git can read as its own options. A
+    /// command substitution's words are skipped however a reader split them:
+    /// each row is read as [`executable_tokens`] splits it (a substitution
+    /// that ends the command reaches it split at blanks) and split at every
+    /// blank.
+    #[test]
+    fn git_rm_option_words_skip_every_word_of_a_command_substitution() {
+        let rows: &[(&str, &[&str])] = &[
+            // cadence-hooks#1521 (#1556 review N1): the `--cached` is `git diff`'s.
+            ("note.md $(git diff --cached --name-only)", &["note.md"]),
+            ("note.md `git diff --cached --name-only`", &["note.md"]),
+            (
+                "-f note.md $(git diff --name-only --cached)",
+                &["-f", "note.md"],
+            ),
+            (
+                "-f note.md $(git diff --name-only --cached) x.md",
+                &["-f", "note.md", "x.md"],
+            ),
+            // A real option outside the substitution still counts.
+            ("--cached note.md $(printf -- x)", &["--cached", "note.md"]),
+            ("--cached note.md", &["--cached", "note.md"]),
+            ("$(printf x) --cached note.md", &["--cached", "note.md"]),
+            ("`printf x` --cached note.md", &["--cached", "note.md"]),
+            ("$(echo $(printf x) y) --cached", &["--cached"]),
+            ("$((1 + 2)) --cached", &["--cached"]),
+            // A `(` with no `$` in front opens nothing.
+            ("note(1).md --cached", &["note(1).md", "--cached"]),
+            // `--` ends git's options, but not a `--` inside a substitution.
+            ("--cached -- note.md", &["--cached"]),
+            ("--end-of-options --cached", &[]),
+            ("$(printf -- x) --cached note.md", &["--cached", "note.md"]),
+            ("", &[]),
+        ];
+        for &(args, want) in rows {
+            let read = executable_tokens(&format!("git rm {args}"));
+            assert_eq!(read.get(..2), Some(&words("git rm")[..]), "git rm {args}");
+            let split: Vec<String> = args.split_whitespace().map(String::from).collect();
+            for argv in [&read[2..], &split[..]] {
+                let got: Vec<&str> = git_rm_option_words(argv).collect();
+                assert_eq!(got, want, "git rm {args}, read as {argv:?}");
+            }
         }
     }
 

@@ -206,14 +206,16 @@ fn head_deletes(argv: &[String]) -> bool {
 /// off again; the last of the two wins. There is no short form, and after `--`
 /// the word is a file named `--cached`, which `git rm` does delete.
 ///
+/// Only the words git reads as typed count
+/// ([`git_rm_option_words`](cadence_hooks_core::shell::git_rm_option_words)):
+/// in `git rm -f note.md $(git diff --name-only --cached)` the `--cached` is
+/// `git diff`'s, and git deletes the note (cadence-hooks#1556 review N1).
+///
 /// A word that is the value of an option such as `--pathspec-from-file` is
 /// read as an option here, which no one types.
 fn git_rm_keeps_the_tree(args: &[String]) -> bool {
     let mut cached = false;
-    for arg in args {
-        if arg == "--" || arg == "--end-of-options" {
-            break;
-        }
+    for arg in cadence_hooks_core::shell::git_rm_option_words(args) {
         let Some(name) = arg.strip_prefix("--") else {
             continue;
         };
@@ -3300,6 +3302,47 @@ mod tests {
             ("git ls-files | xargs git rm", Block),
             (r"find . -exec git rm {} \;", Block),
             ("sudo git rm note.md", Block),
+        ];
+        for &(command, expected) in cases {
+            assert_eq!(
+                outcome_in_vault(command),
+                expected,
+                "cwd=/vault/notes: {command}"
+            );
+        }
+    }
+
+    /// A `--cached` inside a command substitution is the inner command's, so
+    /// the `git rm` around it still deletes (cadence-hooks#1556 review N1).
+    /// A substitution that ends the segment reached the option scan split at
+    /// blanks, so its `--cached` was read as `git rm`'s and the note's
+    /// deletion was allowed. Every row was run through `git` 2.43: the Block
+    /// rows delete `note.md`, the Allow rows leave it on disk.
+    #[test]
+    fn git_rm_reads_no_cached_from_a_command_substitution() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("git rm -f note.md $(git diff --name-only --cached)", Block),
+            ("git rm note.md $(git diff --cached --name-only)", Block),
+            ("git rm -r sub/ $(git diff --cached --name-only)", Block),
+            (
+                "git rm -f note.md $(git diff --name-only --cached) && git commit -m x",
+                Block,
+            ),
+            (
+                "git rm -f note.md $(git diff --name-only --cached); echo ok",
+                Block,
+            ),
+            ("git rm -f note.md `git diff --name-only --cached`", Block),
+            (
+                "git rm -f note.md $(git diff --name-only --cached) x.md",
+                Block,
+            ),
+            // A real `--cached` outside the substitution still counts.
+            ("git rm --cached note.md $(git ls-files -d)", Allow),
+            ("git rm --cached note.md $(printf -- x)", Allow),
+            ("git rm $(git ls-files -d) --cached note.md", Allow),
+            ("git rm --cached -r . `git ls-files -d`", Allow),
         ];
         for &(command, expected) in cases {
             assert_eq!(
