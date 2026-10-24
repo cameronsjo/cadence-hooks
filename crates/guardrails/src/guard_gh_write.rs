@@ -5734,16 +5734,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_block_from_a_hostile_directory_prints_its_name_flattened() {
-        // A real directory named with a CR, an ESC and U+202E. The write names
-        // no target and the directory has no remote, so the block prints it.
-        let root = tempfile::tempdir().expect("tempdir");
-        let dir = crate::hostile_named_dir(root.path());
-        let cwd = dir.to_str().expect("utf-8 path");
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with("gh pr create --title hi", cwd));
-            assert!(blocks(&result), "{:?}", result.message);
-            crate::assert_hostile_dir_flattened(msg(&result), "guard-gh-write");
-        });
+        // A real directory named with a CR, an ESC and U+202E, then one named
+        // with a line feed. The write names no target and the directory has no
+        // remote, so the block prints it.
+        for (name, displayed) in crate::HOSTILE_DIR_NAMES {
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = crate::hostile_named_dir(root.path(), name);
+            let cwd = dir.to_str().expect("utf-8 path");
+            with_env(&owners_env(), || {
+                let result = GhWriteGuard.run(&input_with("gh pr create --title hi", cwd));
+                assert!(blocks(&result), "{:?}", result.message);
+                crate::assert_hostile_dir_flattened(msg(&result), displayed, "guard-gh-write");
+            });
+        }
     }
 
     #[test]
