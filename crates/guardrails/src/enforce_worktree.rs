@@ -1380,6 +1380,15 @@ struct Plain {
     segments: Vec<(String, Option<&'static str>)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`plain_of`] ran the segmenter on this thread. The
+    /// segmenter is quadratic in a command's line continuations, so a test
+    /// reads this to prove a walk reused a [`Plain`] instead of splitting the
+    /// command again, which a wall-clock comparison can only guess at.
+    static PLAIN_SPLITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The command as a [`Plain`] when its shape is plain, else `None`.
 fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
     // A heredoc a shell runs is code the plain walk would read as data.
@@ -1390,6 +1399,8 @@ fn plain_of(command: &str, cwd: &str, env: CdEnv<'_>) -> Option<Plain> {
     if heredoc_reading_suspect(command, &carve) {
         return None;
     }
+    #[cfg(test)]
+    PLAIN_SPLITS.with(|splits| splits.set(splits.get() + 1));
     let segments = split_segments_with_ops_joining_redirects(&carve.text);
     plain_segments_ok(&segments, cwd, env).then_some(Plain { segments })
 }
@@ -11229,20 +11240,38 @@ mod tests {
         // separately); the plain analysis splits once and both walks reuse it.
         let cmd = format!("{}git commit -m x", "true && \\\n".repeat(8_000));
         let env = CdEnv::new(None, false);
+        let splits = || PLAIN_SPLITS.with(std::cell::Cell::get);
+        let before = splits();
         let started = std::time::Instant::now();
         let plain = plain_of(&cmd, "/w", env);
         let once = started.elapsed();
         assert!(plain.is_some());
+        assert_eq!(splits() - before, 1, "plain_of splits the command once");
         let started = std::time::Instant::now();
         let scan = scan_prepared(&cmd, "/w", env, plain.as_ref());
         let _ = inchain_dismissed_prepared(&cmd, "/w", env, plain.as_ref());
         let walks = started.elapsed();
         assert_eq!(scan.commits, vec!["/w".to_string()]);
-        // Both walks together cost no more than a few splits' worth.
-        assert!(
-            walks < once * 3 + std::time::Duration::from_millis(200),
-            "{walks:?} vs {once:?}"
+        // The property, counted: neither walk calls `plain_of` again. Work,
+        // not time, so a loaded machine cannot move it. A walk that drops the
+        // Plain for the union reading re-segments without `plain_of`, which
+        // this count cannot see.
+        assert_eq!(
+            splits() - before,
+            1,
+            "a walk split the command again instead of reusing the Plain"
         );
+        // The cost, timed: both walks together cost no more than a few
+        // splits' worth. Two timings compared with each other still move with
+        // whichever slice the scheduler gave each, so this is a wall-clock
+        // check and runs only under CADENCE_TIMING_TESTS=1, with the other
+        // flood budgets (cadence-hooks#1366).
+        if cadence_hooks_core::test_builders::timing_tests_enabled() {
+            assert!(
+                walks < once * 3 + std::time::Duration::from_millis(200),
+                "{walks:?} vs {once:?}"
+            );
+        }
     }
 
     // --- plain-gate re-check (#1058 spec re-check) ---
