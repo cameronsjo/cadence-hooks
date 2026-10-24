@@ -2882,6 +2882,12 @@ mod tests {
                 "Zq9vKh7wR3xPq",
             ),
             ("INFO (pid 12 token=Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            // An open paren with no `,` or `)` after the value: these
+            // all-lowercase values mask only when the value takes the normal
+            // path, which a mixed-case value cannot show.
+            ("INFO (pid 12 token=abcdef\n", "abcdef"),
+            ("(pid 1 secret=topsecret\n", "topsecret"),
+            ("f(x, password=letmein\n", "letmein"),
             (
                 "log: retrying (attempt 2 of 3 password=Zq9vKh7wR3xPq\n",
                 "Zq9vKh7wR3xPq",
