@@ -1628,6 +1628,51 @@ fn flag_value_is_owned(
     }
 }
 
+/// The loop's raw `-R` word with its quotes removed, as the shell hands it to
+/// gh, when it is a quoted literal. The loop parser keeps the word's text
+/// as typed, so `-R "cameronsjo/tool"` arrives with both quotes on, and the
+/// owner it reads is `"cameronsjo` (#1504). The single-command arm never sees
+/// them: [`tokenize`] has removed them by then.
+///
+/// `None` leaves the word as it is, which is the verdict it had before:
+///
+/// - It carries no quote: nothing to remove.
+/// - It carries an expansion (`$`, a backtick). Only the running shell knows
+///   its value, and [`loop_target_is_unresolvable`] judges it from the raw
+///   text.
+/// - [`tokenize`] does not read it as exactly one word: a brace expansion
+///   (`"cameronsjo"/{a,b}`) or a stray compound keyword.
+///
+/// Quote removal is the tokenizer's, not a second copy of its rules, so a
+/// backslash or a quote inside the other kind reads as it does for a single
+/// command.
+fn unquoted_literal_loop_repo(word: &str) -> Option<String> {
+    if !word.contains(['"', '\'']) || repo_has_unexpanded_expansion(word) {
+        return None;
+    }
+    let mut words = tokenize(word);
+    let only = words.pop()?;
+    words.is_empty().then_some(only)
+}
+
+/// [`flag_value_is_owned`] for a loop's raw `-R` word: a quoted literal is
+/// judged without its quotes, so `-R "cameronsjo/tool"` is as owned as
+/// `-R cameronsjo/tool` (#1504). Any other word is judged as typed.
+fn loop_flag_value_is_owned(
+    word: &str,
+    dh: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> bool {
+    let unquoted = unquoted_literal_loop_repo(word);
+    flag_value_is_owned(
+        unquoted.as_deref().unwrap_or(word),
+        dh,
+        allowed_owners,
+        allowed_repos,
+    )
+}
+
 /// For a blocked target that carries a shell expansion: true when it still
 /// names a literal owner this guard can read, and the allowlist rejects that
 /// owner. Only then does the block say "targets repo you don't own" rather
@@ -4080,7 +4125,7 @@ impl Check for GhWriteGuard {
                     .filter(|c| kind(c) == LoopedWriteKind::RepoWrite)
                     .filter(|c| {
                         !c.explicit_repo.as_ref().is_some_and(|r| {
-                            flag_value_is_owned(r, &dh, &allowed_owners, &allowed_repos)
+                            loop_flag_value_is_owned(r, &dh, &allowed_owners, &allowed_repos)
                         })
                     })
                     .filter_map(|c| c.explicit_repo.as_deref())
@@ -9673,17 +9718,140 @@ mod tests {
             }
         }
         // A quoted literal has no expansion, so it keeps the unowned message
-        // and never says it cannot resolve a shell parameter. That it blocks
-        // at all is #1504.
+        // and never says it cannot resolve a shell parameter.
         for cwd in ["/tmp", OWNED_DIR] {
-            let result = run_1491(&loop_of(&[r#"-R "cameronsjo/tool""#]), cwd, false);
+            let result = run_1491(&loop_of(&[r#"-R "work-org/tool""#]), cwd, false);
             assert!(blocks(&result), "{cwd}");
             let message = msg(&result);
             assert!(
-                message.contains("Found: \"cameronsjo/tool\"\n"),
+                message.contains("Found: \"work-org/tool\"\n"),
                 "{cwd}: {message}"
             );
             assert!(!message.contains("cannot resolve"), "{cwd}: {message}");
+        }
+    }
+
+    #[test]
+    fn issue_1504_quoted_literal_dash_r_in_a_loop_is_judged_without_its_quotes() {
+        // The loop parser keeps the `-R` word as typed, quotes on, so the
+        // owner it read was `"cameronsjo` and an owned repo blocked. The
+        // unquoted form and a single command already allowed.
+        let contexts = [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)];
+        let for_close =
+            |flag: &str| format!(r#"for n in 1 2 3; do gh issue close "$n" {flag}; done"#);
+        for flag in [
+            r#"-R "cameronsjo/tool""#,
+            r#"--repo "cameronsjo/tool""#,
+            r#"-R="cameronsjo/tool""#,
+            r#"--repo="cameronsjo/tool""#,
+            "-R 'cameronsjo/tool'",
+            r#"-R "https://github.com/cameronsjo/tool""#,
+            r#"-R "github.com/cameronsjo/tool""#,
+            // Quote removal is the shell's, word by word.
+            r#"-R "cameronsjo"/"tool""#,
+            r#"-R cameron"sjo/tool""#,
+            // The unquoted form, which allowed before.
+            "-R cameronsjo/tool",
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(flag);
+                let result = run_1491(&command, cwd, strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "{command} in {cwd} (strict {strict}): {:?}",
+                    result.message
+                );
+            }
+        }
+        // The other loop forms, and the other verbs the issue names.
+        for command in [
+            r#"while read -r n; do gh issue close "$n" -R "cameronsjo/tool"; done < ids.txt"#,
+            r#"until false; do gh issue close 1 -R "cameronsjo/tool"; done"#,
+            r#"for n in 1 2; do gh pr merge "$n" -R "cameronsjo/tool" --squash; done"#,
+            r#"for l in a b; do gh label create "$l" -R "cameronsjo/tool"; done"#,
+            r#"for n in 1 2; do gh issue edit "$n" -R "cameronsjo/tool" --add-label x; done"#,
+            // Beside a command that was already allowed.
+            r#"for n in 1 2; do gh issue close "$n" -R "cameronsjo/tool"; gh issue close "$n" -R cameronsjo/tool; done"#,
+        ] {
+            for (cwd, strict) in contexts {
+                let result = run_1491(command, cwd, strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "{command} in {cwd} (strict {strict}): {:?}",
+                    result.message
+                );
+            }
+        }
+        // A quoted literal the allowlist rejects still blocks, and the block
+        // names the target as typed. An allowed-looking owner on another host
+        // is not owned either.
+        for (flag, found) in [
+            (r#"-R "work-org/tool""#, r#""work-org/tool""#),
+            ("-R 'work-org/tool'", "'work-org/tool'"),
+            (r#"--repo="work-org/tool""#, r#""work-org/tool""#),
+            (r#"-R "work-org"/"tool""#, r#""work-org"/"tool""#),
+            (
+                r#"-R "https://github.com/work-org/tool""#,
+                r#""https://github.com/work-org/tool""#,
+            ),
+            (
+                r#"-R "https://evil.example/cameronsjo/tool""#,
+                r#""https://evil.example/cameronsjo/tool""#,
+            ),
+            // A brace expansion is two words, so it is left as typed.
+            (
+                r#"-R "cameronsjo"/{tool,evil}"#,
+                r#""cameronsjo"/{tool,evil}"#,
+            ),
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(flag);
+                let result = run_1491(&command, cwd, strict);
+                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh loop targets repo you don't own"),
+                    "{command} in {cwd}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("Found: {found}\n")),
+                    "{command} in {cwd}: {message}"
+                );
+            }
+        }
+        // Beside an owned one, only the unowned target is named.
+        let mixed = r#"for n in 1 2; do gh issue close "$n" -R "cameronsjo/tool"; gh issue close "$n" -R "work-org/x"; done"#;
+        for (cwd, strict) in contexts {
+            let result = run_1491(mixed, cwd, strict);
+            assert!(blocks(&result), "{cwd} (strict {strict})");
+            let message = msg(&result);
+            assert!(
+                message.contains("Found: \"work-org/x\"\n"),
+                "{cwd}: {message}"
+            );
+            assert!(!message.contains("cameronsjo/tool"), "{cwd}: {message}");
+        }
+        // A quoted value with an expansion is not a literal: it keeps its
+        // verdict, "cannot resolve", though its owner is allowed.
+        for flag in [
+            r#"-R "cameronsjo/$r""#,
+            "-R 'cameronsjo/$r'",
+            r#"-R "cameronsjo/${r}""#,
+            r#"-R "https://github.com/cameronsjo/$r""#,
+            "-R $'cameronsjo/tool'",
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(flag);
+                let result = run_1491(&command, cwd, strict);
+                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+                assert!(
+                    msg(&result).contains("gh loop: cannot resolve"),
+                    "{command} in {cwd}: {}",
+                    msg(&result)
+                );
+            }
         }
     }
 
