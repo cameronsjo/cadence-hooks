@@ -11621,6 +11621,8 @@ mod tests {
             ("https://github.com/o%2Fx/r/pull/1", false, None),
             ("https://u@github.com/o/r/pull/1", false, None),
             ("https://[::1]/o/r/pull/1", false, None),
+            ("https://github.com:44x/o/r/pull/1", false, None),
+            ("https:///o/r/pull/1", false, None),
             ("https://github.com/$o/r/pull/1", false, None),
             ("https://github.com/o/r/pull/1 ", false, None),
             ("https://github.com/o/r/pull/1%zz", false, None),
@@ -11637,6 +11639,7 @@ mod tests {
             (format!("gh pr merge --squash {URL_W}"), w()),
             (format!("gh pr merge -- {URL_W}"), w()),
             (format!("gh pr merge -R cameronsjo/x {URL_W}"), w()),
+            (format!("gh pr merge --repo cameronsjo/x {URL_W}"), w()),
             (format!("gh -R cameronsjo/x pr merge {URL_W}"), w()),
             // `--attach` takes a file name (cli/cli `attachments.AddFlag`).
             (format!("gh pr comment --attach a.png {URL_W}"), w()),
@@ -11736,6 +11739,22 @@ mod tests {
             let command = format!("gh issue transfer {url} cameronsjo/y");
             let result = GhWriteGuard.run(&input_with(&command, &owned));
             assert!(!blocks(&result), "{command}: {}", msg(&result));
+        });
+    }
+
+    #[test]
+    fn owned_url_on_an_extra_host_allows() {
+        let command = "gh pr merge https://ghe.example.com/cameronsjo/x/pull/1 --squash";
+        with_env(&owners_env(), || {
+            assert!(blocks(&GhWriteGuard.run(&input_with(command, "/tmp"))));
+        });
+        let extras = owners_env().map(|(key, value)| match key {
+            "CADENCE_EXTRA_HOSTS" => (key, Some("ghe.example.com")),
+            _ => (key, value),
+        });
+        with_env(&extras, || {
+            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+            assert!(!blocks(&result), "{}", msg(&result));
         });
     }
 
