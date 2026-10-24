@@ -11252,8 +11252,10 @@ mod tests {
         let _ = inchain_dismissed_prepared(&cmd, "/w", env, plain.as_ref());
         let walks = started.elapsed();
         assert_eq!(scan.commits, vec!["/w".to_string()]);
-        // The property, counted: neither walk runs the segmenter again. Work,
-        // not time, so a loaded machine cannot move it.
+        // The property, counted: neither walk calls `plain_of` again. Work,
+        // not time, so a loaded machine cannot move it. A walk that drops the
+        // Plain for the union reading re-segments without `plain_of`, which
+        // this count cannot see.
         assert_eq!(
             splits() - before,
             1,
