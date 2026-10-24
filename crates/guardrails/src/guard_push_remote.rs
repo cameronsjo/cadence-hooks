@@ -1182,8 +1182,9 @@ fn unverified_directory_nudge(input: &HookInput, walk: &PushWalk) -> Option<Chec
         .of(&command, cwd)
         .iter()
         .find(|push| push.directory_unverified && !push.repository_unresolved)?;
-    // The directory checked instead is the session's cwd or one derived from
-    // it, so its name is not the guard's own text (cameronsjo/cadence-hooks#1509).
+    // The directory checked instead is the session's cwd, or a directory the
+    // command names, so its name is not the guard's own text
+    // (cameronsjo/cadence-hooks#1509).
     let work_dir = sanitize_field(&push.work_dir, MAX_PATH_DISPLAY);
     Some(CheckResult::nudge(format!(
         "⚠️  git-guardrails: Push directory could not be verified\n   \
