@@ -329,7 +329,7 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 - **THEN** the hook exits 0 with a nudge that says a bare push was checked against the branch checked out now
 
 ### Requirement: gh write named by a PR or issue URL argument
-On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host a PR or issue URL there names before `-R`, `GH_REPO` and the checkout, and under `gh issue transfer` as well as them. A loop check SHALL still read `-R`, or without one the checkout, first. A URL it cannot read for certain SHALL be judged as before. An unowned URL SHALL block with a fix that names no target. A flag's value SHALL NOT count.
+On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host a PR or issue URL there names before `-R`, `GH_REPO` and the checkout; under `gh issue transfer` the URL is judged in addition to them. A loop check SHALL still read `-R`, or without one the checkout, first. A URL it cannot read for certain SHALL be judged as before. An unowned URL SHALL block with a fix that names no target. A flag's value SHALL NOT count.
 
 #### Scenario: Unowned PR URL past an owned target
 - **WHEN** the command is `gh pr merge https://github.com/evil/repo/pull/1 --squash -R cameronsjo/tool`, in a checkout of `cameronsjo/tool`
