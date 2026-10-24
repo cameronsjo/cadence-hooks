@@ -1640,24 +1640,26 @@ fn flag_value_is_owned(
 /// A brace expansion is several words, quoted or not (`"cameronsjo"/{a,b}`,
 /// `{cameronsjo,mona_acme}/tool`).
 ///
-/// `None` leaves the word as it is: [`tokenize`] reads no word in it.
+/// A word [`tokenize`] reads no word in (`{,}`) is returned as typed.
 ///
 /// Quote removal is the tokenizer's, not a second copy of its rules, so a
 /// backslash, a quote inside the other kind, `$'…'` or a brace reads as it
 /// does for a single command. The verdict ([`loop_flag_value_is_owned`])
 /// and the message ([`loop_target_is_unresolvable`]) both read the word
 /// through here.
-fn unquoted_loop_repo_words(word: &str) -> Option<Vec<String>> {
+fn unquoted_loop_repo_words(word: &str) -> Vec<String> {
     let words = tokenize(word);
-    (!words.is_empty()).then_some(words)
+    if words.is_empty() {
+        return vec![word.to_string()];
+    }
+    words
 }
 
 /// [`flag_value_is_owned`] for a loop's raw `-R` word: the word is judged
 /// as the shell hands it to gh, so `-R "cameronsjo/tool"` and
 /// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A word
 /// the shell expands to several words, quoted or not, is owned only when each
-/// of them is, whichever one gh takes as the repo. A word [`tokenize`] reads
-/// no word in is judged as typed.
+/// of them is, whichever one gh takes as the repo.
 ///
 /// This gate can only add a block. Once it passes, the per-segment pass
 /// judges every looped write again, as a single command, so reading the word
@@ -1668,12 +1670,9 @@ fn loop_flag_value_is_owned(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
-    match unquoted_loop_repo_words(word) {
-        Some(words) => words
-            .iter()
-            .all(|w| flag_value_is_owned(w, dh, allowed_owners, allowed_repos)),
-        None => flag_value_is_owned(word, dh, allowed_owners, allowed_repos),
-    }
+    unquoted_loop_repo_words(word)
+        .iter()
+        .all(|w| flag_value_is_owned(w, dh, allowed_owners, allowed_repos))
 }
 
 /// For a blocked target that carries a shell expansion: true when it still
@@ -1739,8 +1738,7 @@ fn loop_target_is_unresolvable(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
-    let words = unquoted_loop_repo_words(value).unwrap_or_else(|| vec![value.to_string()]);
-    words.iter().all(|word| {
+    unquoted_loop_repo_words(value).iter().all(|word| {
         flag_value_is_owned(word, dh, allowed_owners, allowed_repos)
             || match flag_value_resolution(word, dh) {
                 RepoResolution::Resolved { host, repo } => {
