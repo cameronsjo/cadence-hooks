@@ -6042,8 +6042,77 @@ pub enum UnreadEval {
     /// or pointed git elsewhere ([`crate::push::may_redefine_known_commands`],
     /// a `GIT_` name). The guard then judges the directory it read
     /// (cadence-ecosystem ADR-0046 rule 3). The gh-write guard reads an
-    /// `eval` this way.
+    /// `eval` this way, and so does the push-remote guard, in this walk and
+    /// in the push walk ([`crate::push::push_locations_reading`]).
     StaysPut,
+}
+
+/// The operand half of [`UnreadEval::StaysPut`]: no operand of an unread
+/// `eval` (its words after `eval`) names `cd`, `pushd`, `popd` or `eval` or
+/// carries a backslash, and each expansion in them is a command substitution
+/// or a variable `mentions` ([`variable_mentions`]) never names.
+fn unread_eval_operands_stay_put<'w>(
+    operands: impl IntoIterator<Item = &'w str>,
+    mentions: &std::collections::HashMap<String, Vec<usize>>,
+) -> bool {
+    operands.into_iter().all(|word| {
+        !DIRECTORY_MOVER.is_match(word)
+            && !word.contains('\\')
+            && PARAMETER_EXPANSION.captures_iter(word).all(|caps| {
+                match caps.get(1).or(caps.get(2)) {
+                    // One the command never names comes from the
+                    // environment; one it names may hold a `cd`.
+                    Some(name) => !mentions.contains_key(name.as_str()),
+                    // A command substitution, read by its own words.
+                    // `$1`, `$@`, `${x:-…}` and `$'…'` are not read.
+                    None => caps.get(3).is_some_and(|c| c.as_str() == "("),
+                }
+            })
+    })
+}
+
+/// [`UnreadEval::StaysPut`] for a walk that does not follow the command's
+/// functions as it goes: the push walk ([`crate::push::push_locations_reading`]).
+/// It reads the whole command at most once, however many `eval`s it meets.
+#[derive(Debug)]
+pub struct UnreadEvalReading<'a> {
+    command: &'a str,
+    /// The command defines a function, or may have replaced a tool or
+    /// pointed git elsewhere ([`known_commands_are_trusted`]).
+    command_may_move: std::cell::OnceCell<bool>,
+    mentions: std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>,
+}
+
+impl<'a> UnreadEvalReading<'a> {
+    /// The reading for `command`, the whole command the guard judges.
+    pub fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            command_may_move: std::cell::OnceCell::new(),
+            mentions: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Does an `eval` with these `operands` (its words after `eval`) leave
+    /// the shell where it was? Only when its script needs expansion to read
+    /// (a `$` or a backtick), the command defines no function anywhere and
+    /// its known commands are trusted, and the operands pass the word checks
+    /// [`UnreadEval::StaysPut`] names. An `eval` this says no to is read as
+    /// it is without the switch.
+    pub fn stays_put(&self, operands: &[&str]) -> bool {
+        static DEFINES_A_FUNCTION: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\bfunction\b|\(\s*\)").expect("pattern should compile"));
+        operands.iter().any(|word| word.contains(['$', '`']))
+            && !*self.command_may_move.get_or_init(|| {
+                DEFINES_A_FUNCTION.is_match(self.command)
+                    || !known_commands_are_trusted(self.command)
+            })
+            && unread_eval_operands_stay_put(
+                operands.iter().copied(),
+                self.mentions
+                    .get_or_init(|| variable_mentions(self.command)),
+            )
+    }
 }
 
 /// [`command_segments_with_dirs`], reading an `eval` of text the walk
@@ -6828,15 +6897,16 @@ static PARAMETER_EXPANSION: LazyLock<Regex> = LazyLock::new(|| {
         .expect("pattern should compile")
 });
 
+/// A `cd`, `pushd`, `popd` or `eval` word anywhere in a text.
+static DIRECTORY_MOVER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^\w-])(?:cd|pushd|popd|eval)(?:$|[^\w-])").expect("pattern should compile")
+});
+
 /// Does a `trap` action change directory? Its action runs later — before
 /// every command under `DEBUG` — in the parent shell.
 fn trap_action_moves(words: &[MarkedToken], functions: &DirWalk) -> bool {
-    static MOVES: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:^|[^\w-])(?:cd|pushd|popd|eval)(?:$|[^\w-])")
-            .expect("pattern should compile")
-    });
     words.iter().skip(1).any(|word| {
-        MOVES.is_match(&word.text)
+        DIRECTORY_MOVER.is_match(&word.text)
             || tokenize(&word.text)
                 .iter()
                 .any(|inner| functions.functions.contains_key(inner.as_str()))
@@ -7098,7 +7168,6 @@ impl DirWalk {
     fn unread_eval_stays_put(&mut self, words: &[MarkedToken]) -> bool {
         if self.unread_eval != UnreadEval::StaysPut
             || !self.functions.is_empty()
-            || trap_action_moves(words, self)
             || !self.known_commands_trusted()
         {
             return false;
@@ -7107,19 +7176,10 @@ impl DirWalk {
         let mentions = self
             .mentions
             .get_or_insert_with(|| variable_mentions(command));
-        words.iter().skip(1).all(|word| {
-            !word.text.contains('\\')
-                && PARAMETER_EXPANSION.captures_iter(&word.text).all(|caps| {
-                    match caps.get(1).or(caps.get(2)) {
-                        // One the command never names comes from the
-                        // environment; one it names may hold a `cd`.
-                        Some(name) => !mentions.contains_key(name.as_str()),
-                        // A command substitution, read by its words above.
-                        // `$1`, `$@`, `${x:-…}` and `$'…'` are not read.
-                        None => caps.get(3).is_some_and(|c| c.as_str() == "("),
-                    }
-                })
-        })
+        unread_eval_operands_stay_put(
+            words.iter().skip(1).map(|word| word.text.as_str()),
+            mentions,
+        )
     }
 
     fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
@@ -7576,7 +7636,7 @@ pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
 
 /// [`segment_work_dirs`], reading an `eval` of text the walk cannot see as
 /// `unread_eval` says.
-fn segment_work_dirs_reading(
+pub fn segment_work_dirs_reading(
     command: &str,
     cwd: &str,
     unread_eval: UnreadEval,
