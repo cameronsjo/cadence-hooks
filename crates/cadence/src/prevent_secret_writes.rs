@@ -14,9 +14,9 @@ use crate::secret_patterns::{
     unresolved_parameter_cause, wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_word, executable_tokens, git_rm_keeps_the_tree,
-    peel_command_runners, redirect_operator_span, redirect_targets, skip_git_global_options,
-    strip_group_wrappers, tokenize, unescape_word,
+    carries_substitution, command_segments, command_word, executable_tokens, git_rm_is_dry_run,
+    git_rm_keeps_the_tree, peel_command_runners, redirect_operator_span, redirect_targets,
+    skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -77,8 +77,9 @@ fn writer_argv(tokens: &[String]) -> &[String] {
 /// value AND every operand (each source materializes under the target dir);
 /// `dd` — `of=` values; `truncate` — operands after consuming `-s <size>` /
 /// `--size=<n>`. `git rm` is judged as `rm` unless it is told `--cached`
-/// ([`git_rm_keeps_the_tree`]), which leaves the file on disk, and command
-/// runners (`sudo rm .env`, `env -i cp x .env`) are peeled by [`writer_argv`].
+/// ([`git_rm_keeps_the_tree`]) or is a dry run ([`git_rm_is_dry_run`]), both
+/// of which leave the file on disk, and command runners (`sudo rm .env`,
+/// `env -i cp x .env`) are peeled by [`writer_argv`].
 ///
 /// Quote-aware via [`tokenize`] (#86): a quoted filename is one clean token,
 /// so prose inside quotes (`rm "notes about .env stuff.txt"`, commit
@@ -100,10 +101,11 @@ fn writer_targets(segment: &str) -> Vec<String> {
         // `git rm --cached` takes the path out of the index and leaves the
         // file on disk, so it writes and deletes nothing (#1535). Core's test
         // is the one trash-guard reads `git rm` with, so the two agree.
+        // A dry run (`-n`, `--dry-run`) only prints what it would remove (#1547).
         if let Some((sub, rest)) = skip_git_global_options(args).split_first()
             && sub == "rm"
         {
-            if git_rm_keeps_the_tree(rest) {
+            if git_rm_keeps_the_tree(rest) || git_rm_is_dry_run(rest) {
                 return Vec::new();
             }
             cmd = "rm";
@@ -1536,6 +1538,43 @@ mod tests {
             "git rm --cached .env; rm .env",
             "git rm --cached .env && echo x > .env",
             "git rm --cached x.txt .env.local; git rm .env",
+        ] {
+            assert!(bash_targets_env_file(command), "{command} must block");
+        }
+    }
+
+    /// A `git rm` dry run prints what it would remove and leaves the index
+    /// and the file alone (#1547). The rule is core's `git_rm_is_dry_run`.
+    #[test]
+    fn bash_git_rm_dry_run_env_allowed() {
+        for command in [
+            "git rm -n .env",
+            "git rm --dry-run .env",
+            "git rm --dry .env",
+            "git rm -rn .env",
+            "git rm -n -f .env",
+            "git rm .env -n",
+            "git rm --no-dry-run -n .env",
+            "git -C . rm -n .env",
+            "sudo git rm --dry-run .env",
+            "xargs git rm -n .env",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command} must be allowed");
+        }
+    }
+
+    #[test]
+    fn bash_git_rm_env_without_dry_run_still_blocked() {
+        // After `--` the word is a file, and a later `--no-dry-run` undoes
+        // `-n`; a deleting sibling is judged as it always was.
+        for command in [
+            "git rm -f .env",
+            "git rm -- -n .env",
+            "git rm --end-of-options -n .env",
+            "git rm -n --no-dry-run .env",
+            "git rm --dry-run --no-d .env",
+            "git rm -n .env; rm .env",
+            "git rm -n .env && git rm .env",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }

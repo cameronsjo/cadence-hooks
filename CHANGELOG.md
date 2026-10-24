@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`prevent-secret-writes` allows `git rm --cached` on a secret file.** It read every `git rm` as `rm`, so `git rm --cached .env`, `git rm --cached -r .env` and `git -C . rm --cached .env` blocked, though `--cached` takes the file out of the index and leaves it on disk. It now reads `git rm` through the same core test as `trash-guard`, so the two cannot disagree: `--cached` counts in any order before `--` or `--end-of-options`, as an unambiguous prefix (`--cach`), and a later `--no-cached` undoes it. `git rm .env`, `git rm -- --cached .env`, `git rm --cached --no-cached .env` and a writing or deleting command beside the `git rm --cached` still block. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
 
+- **`prevent-secret-writes` allows a `git rm` dry run on a secret file.** `git rm -n .env`, `git rm --dry-run .env` and `git rm --dry .env` blocked, though a dry run only prints what it would remove and changes neither the index nor the file. It now reads `-n` and `--dry-run` as git does: in any order before `--` or `--end-of-options`, `-n` inside a cluster of `git rm`'s short flags (`-rn`), `--dry-run` as an unambiguous prefix (`--d`), and a later `--no-dry-run` undoes it. `git rm .env`, `git rm -- -n .env`, `git rm -n --no-dry-run .env` and a writing or deleting command beside the dry run still block. `trash-guard` is unchanged. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
+
 ## [0.131.0] - 2026-10-21
 
 ### Added

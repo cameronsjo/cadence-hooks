@@ -13671,6 +13671,41 @@ pub fn git_rm_keeps_the_tree(args: &[String]) -> bool {
     cached
 }
 
+/// Is this `git rm` (the words after `rm`) a dry run, which prints what it
+/// would remove and touches neither the index nor the working tree? That is
+/// `-n` or `--dry-run`, which git reads among the options in any order and
+/// ahead of any `--` (or `--end-of-options`). `-n` can share one word with
+/// `git rm`'s other short flags (`-rn`, `-nf`), none of which takes a value.
+/// `--dry-run` takes an unambiguous prefix (`--dry`, `--d`), and
+/// `--no-dry-run` (`--no-d`) turns it off again; the last of the two wins.
+///
+/// Only `prevent_secret_writes::writer_targets` asks this (#1547).
+/// `obsidian-trash-guard` does not, so it still reads `git rm -n` as a deletion.
+///
+/// A word that is the value of an option such as `--pathspec-from-file` is
+/// read as an option here, which no one types.
+pub fn git_rm_is_dry_run(args: &[String]) -> bool {
+    let mut dry_run = false;
+    for arg in args {
+        if arg == "--" || arg == "--end-of-options" {
+            break;
+        }
+        if let Some(name) = arg.strip_prefix("--") {
+            if "dry-run".starts_with(name) {
+                dry_run = true;
+            } else if name.len() > "no-".len() && "no-dry-run".starts_with(name) {
+                dry_run = false;
+            }
+        } else if let Some(flags) = arg.strip_prefix('-')
+            && flags.contains('n')
+            && flags.chars().all(|c| matches!(c, 'n' | 'q' | 'f' | 'r'))
+        {
+            dry_run = true;
+        }
+    }
+    dry_run
+}
+
 /// `git push` long options whose value is a SEPARATE following word.
 ///
 /// Measured against git 2.55.0 by pointing pushes at nonexistent local paths and
@@ -17134,6 +17169,50 @@ mod tests {
             ("--cachedx note.md", false),
         ] {
             assert_eq!(git_rm_keeps_the_tree(&words(args)), keeps, "git rm {args}");
+        }
+    }
+
+    /// The words after `git rm`, and whether git only prints what it would
+    /// remove. Each row was run through git 2.43 against a tracked `.env`.
+    #[test]
+    fn git_rm_is_dry_run_reads_n_and_dry_run_as_git_does() {
+        for (args, dry_run) in [
+            ("-n .env", true),
+            ("--dry-run .env", true),
+            ("--dry .env", true),
+            ("--d .env", true),
+            ("-rn sub/", true),
+            ("-nr sub/", true),
+            ("-fn .env", true),
+            ("-r -q -f -n .env", true),
+            (".env -n", true),
+            (".env --dry-run", true),
+            ("-n -- .env", true),
+            ("-n --cached .env", true),
+            ("--no-dry-run -n .env", true),
+            ("--no-dry-run --dry-run .env", true),
+            // `--n` and `--no-` are ambiguous to git, which refuses the line.
+            ("--dry-run --n .env", true),
+            ("--dry-run --no- .env", true),
+            (".env", false),
+            ("-f .env", false),
+            ("-rf .env", false),
+            ("", false),
+            ("--cached .env", false),
+            ("-- -n .env", false),
+            ("--end-of-options -n .env", false),
+            ("./-n .env", false),
+            ("n .env", false),
+            ("-n --no-dry-run .env", false),
+            ("--dry-run --no-dry-run .env", false),
+            ("--dry-run --no-d .env", false),
+            // git refuses these lines; read as no dry run, the side that blocks.
+            ("--dry-runx .env", false),
+            ("--dry-run=1 .env", false),
+            ("-nx .env", false),
+            ("-N .env", false),
+        ] {
+            assert_eq!(git_rm_is_dry_run(&words(args)), dry_run, "git rm {args}");
         }
     }
 
