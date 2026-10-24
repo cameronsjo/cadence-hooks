@@ -2,6 +2,8 @@
 
 Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatches Claude Code hook checks via clap subcommands, organized by namespace (cadence, guardrails, rules, obsidian, metrics, session).
 
+Guard authoring (anatomy, test scaffolding, negative testing, core utilities) is the `developing-guards` repo skill in `.claude/skills/developing-guards/`; it loads only in sessions working in this checkout.
+
 ## Build & Test
 
 - `make ci` = fmt-check + clippy `-D warnings` + all tests. Run before every commit.
