@@ -1628,8 +1628,8 @@ fn flag_value_is_owned(
     }
 }
 
-/// The words the loop's raw `-R` word becomes once its quotes are removed,
-/// as the shell hands them to gh, when it carries a quote. The loop parser
+/// The words the loop's raw `-R` word becomes once the shell has removed its
+/// quotes and expanded its braces, as it hands them to gh. The loop parser
 /// keeps the word's text as typed, so `-R "cameronsjo/tool"` arrives with
 /// both quotes on, and the owner it reads is `"cameronsjo` (#1504). The
 /// single-command arm never sees them: [`tokenize`] has removed them by then.
@@ -1637,29 +1637,26 @@ fn flag_value_is_owned(
 /// An expansion stays in the text (`"cameronsjo/$r"` reads `cameronsjo/$r`),
 /// and the ownership check judges it as it judges an unquoted `-R` value: a
 /// literal allowed owner is owned, and `$o/$r` or `$h/cameronsjo/x` is not.
-/// [`loop_target_is_unresolvable`] still reads the raw text for the message.
-/// A brace expansion is several words (`"cameronsjo"/{a,b}`).
+/// A brace expansion is several words, quoted or not (`"cameronsjo"/{a,b}`,
+/// `{cameronsjo,mona_acme}/tool`).
 ///
-/// `None` leaves the word as it is: it carries no quote, so there is nothing
-/// to remove, or [`tokenize`] reads no word in it.
+/// `None` leaves the word as it is: [`tokenize`] reads no word in it.
 ///
 /// Quote removal is the tokenizer's, not a second copy of its rules, so a
 /// backslash, a quote inside the other kind, `$'…'` or a brace reads as it
-/// does for a single command.
+/// does for a single command. [`loop_target_is_unresolvable`] still reads
+/// the raw text for the message.
 fn unquoted_loop_repo_words(word: &str) -> Option<Vec<String>> {
-    if !word.contains(['"', '\'']) {
-        return None;
-    }
     let words = tokenize(word);
     (!words.is_empty()).then_some(words)
 }
 
-/// [`flag_value_is_owned`] for a loop's raw `-R` word: a quoted word is
-/// judged without its quotes, so `-R "cameronsjo/tool"` and
-/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A
-/// quoted word the shell expands to several words is owned only when each of
-/// them is, whichever one gh takes as the repo. Any other word is judged as
-/// typed.
+/// [`flag_value_is_owned`] for a loop's raw `-R` word: the word is judged
+/// as the shell hands it to gh, so `-R "cameronsjo/tool"` and
+/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A word
+/// the shell expands to several words, quoted or not, is owned only when each
+/// of them is, whichever one gh takes as the repo. A word [`tokenize`] reads
+/// no word in is judged as typed.
 ///
 /// This gate can only add a block. Once it passes, the per-segment pass
 /// judges every looped write again, as a single command, so reading the word
@@ -9830,6 +9827,46 @@ mod tests {
                 );
                 assert!(
                     message.contains(&format!("Found: {found}\n")),
+                    "{command} in {cwd}: {message}"
+                );
+            }
+        }
+        // An unquoted brace is several words too, as for a single command:
+        // across two allowed owners, whichever word gh takes is owned.
+        for flag in [
+            "--repo={cameronsjo,mona_acme}/tool",
+            "-R {cameronsjo,mona_acme}/tool",
+            r#"--repo={"cameronsjo","mona_acme"}/tool"#,
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(flag);
+                let result = run_1491_owners("cameronsjo,mona_acme", &command, cwd, strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "{command} in {cwd} (strict {strict}): {:?}",
+                    result.message
+                );
+            }
+        }
+        // It blocks when any word it expands to is a repo the allowlist
+        // rejects, in either order, and the block names the word as typed.
+        for (owners, value) in [
+            ("cameronsjo,mona_acme", "{work-org,cameronsjo}/tool"),
+            ("cameronsjo,mona_acme", "{cameronsjo,work-org}/tool"),
+            ("cameronsjo", "{cameronsjo,mona_acme}/tool"),
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(&format!("-R {value}"));
+                let result = run_1491_owners(owners, &command, cwd, strict);
+                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh loop targets repo you don't own"),
+                    "{command} in {cwd}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("Found: {value}\n")),
                     "{command} in {cwd}: {message}"
                 );
             }
