@@ -309,6 +309,12 @@ mod tests {
                 "gh pr create --repo cameronsjo/cadence -t t -b 'Closes #12'",
                 true,
             ),
+            // A `-R` right after a no-value flag of `gh pr review` is the
+            // target (#1528), so its body's bare ref nudges too.
+            (
+                "gh pr review 3 --comment -R cameronsjo/cadence --body 'see #12'",
+                true,
+            ),
             // Qualified refs are fine.
             (
                 "gh issue create -R cameronsjo/cadence -t t -b 'see cameronsjo/cadence-hooks#42'",
