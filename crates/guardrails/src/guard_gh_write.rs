@@ -3798,22 +3798,44 @@ fn target_spelling(segment: &str, owner_repo: &str) -> String {
 /// True when the fix for an unowned target may keep the target's repo name
 /// under an allowed owner: the segment that blocked keeps it
 /// ([`segment_keeps_repo_name`]), and so does every write among `whole`, the
-/// [`command_segments`] of the whole command. The block shows one fix for the
-/// whole command, so in `gh pr create … && gh pr merge …` the merge must not
-/// inherit the create's name: a model that puts the fix on every command
-/// reruns the merge on the operator's own repo of that name
-/// (cameronsjo/cadence-hooks#1506 review).
+/// [`command_segments`] of the whole command ([`every_write_keeps_repo_name`]).
+/// The block shows one fix for the whole command, so in `gh pr create … && gh
+/// pr merge …` the merge must not inherit the create's name: a model that puts
+/// the fix on every command reruns the merge on the operator's own repo of
+/// that name (cameronsjo/cadence-hooks#1506 review).
 ///
 /// Read only when a block is built, never for a verdict. A segment without the
 /// text `gh` is skipped unread, which keeps a flood of other commands in front
 /// of the write cheap.
 fn fix_keeps_repo_name(segment: &str, whole: &[String]) -> bool {
-    segment_keeps_repo_name(segment)
-        && whole
-            .iter()
-            .filter(|s| contains_ignoring_ascii_case(s, "gh"))
-            .filter(|s| is_write_command(s) || is_write_command(&requote_words(s)))
-            .all(|s| segment_keeps_repo_name(s))
+    segment_keeps_repo_name(segment) && every_write_keeps_repo_name(whole, 0)
+}
+
+/// True when every gh write among `segments` keeps the name, the writes in a
+/// script a runner runs in another directory included: [`command_segments`]
+/// does not split `sudo -D DIR sh -c '…'`, so that script's writes are not
+/// among `segments` (#1506 review). [`scripts_run_elsewhere`] reads them as
+/// the write walk does, wherever the runner sits. From `.`, every runner that
+/// names a directory moves it, so this reads at least each script the walk
+/// reads. Past [`MAX_RUNNER_HOPS`] nested scripts, or once the expansion
+/// allowance runs out and a script may be read only in part, nothing keeps
+/// the name.
+fn every_write_keeps_repo_name(segments: &[String], depth: usize) -> bool {
+    segments
+        .iter()
+        .filter(|s| contains_ignoring_ascii_case(s, "gh"))
+        .all(|s| {
+            let write = is_write_command(s) || is_write_command(&requote_words(s));
+            (!write || segment_keeps_repo_name(s))
+                && scripts_run_elsewhere(s, ".").is_none_or(|(_, scripts)| {
+                    depth < MAX_RUNNER_HOPS
+                        && scripts.iter().all(|script| {
+                            let inner = command_segments(script);
+                            !ExpansionWork::spent()
+                                && every_write_keeps_repo_name(&inner, depth + 1)
+                        })
+                })
+        })
 }
 
 /// True when the segment's gh invocations spell at least one write verb, and
@@ -4698,6 +4720,24 @@ fn dir_after_runners(segment: &str, dir: &str) -> String {
     peel_runners(segment, dir).0
 }
 
+/// The directory a runner in front of `segment` moves `dir` to, and the
+/// scripts it hands a shell there (`env -C DIR sh -c '…'`, `sudo -D DIR sh -c
+/// '…'`), which the write walk judges in that directory (cadence-hooks#1141).
+/// `None` when no runner moves the directory.
+fn scripts_run_elsewhere(segment: &str, dir: &str) -> Option<(String, Vec<String>)> {
+    let (moved, peeled) = peel_runners(segment, dir);
+    if moved == dir {
+        return None;
+    }
+    let mut scripts = wrapped_scripts(&peeled);
+    for script in wrapped_scripts(&executable_tokens(segment)) {
+        if !scripts.contains(&script) {
+            scripts.push(script);
+        }
+    }
+    Some((moved, scripts))
+}
+
 /// [`dir_after_runners`]'s directory, and the words left once the runners in
 /// front are peeled (the runner itself when the peel gave up).
 fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
@@ -4779,14 +4819,7 @@ fn judge_write_segments(
         // (cadence-hooks#1141). Judge the script's segments in the runner's
         // directory as well; this only ever adds a verdict, so the reading
         // in the original directory still stands.
-        let (moved, peeled) = peel_runners(&segment, &dir);
-        if moved != *dir {
-            let mut scripts = wrapped_scripts(&peeled);
-            for script in wrapped_scripts(&executable_tokens(&segment)) {
-                if !scripts.contains(&script) {
-                    scripts.push(script);
-                }
-            }
+        if let Some((moved, scripts)) = scripts_run_elsewhere(&segment, &dir) {
             let moved: std::rc::Rc<str> = std::rc::Rc::from(moved.as_str());
             for body in scripts {
                 let inner: Reading = command_segments(&body)
@@ -9757,6 +9790,18 @@ mod tests {
                 "gh label create bug -f -c ff0000 -R work-org/thing",
                 "-R cameronsjo/<repo>",
             ),
+            // A gh named by a variable assigned after the function that uses
+            // it, which only the segment that blocked spells as `gh`, and a
+            // lone create in `bash -c`, whose wrapper segment the guard reads
+            // no verb from.
+            (
+                "f() { $G pr merge 5 -R work-org/thing; }; G=gh; f",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "bash -c 'gh issue create -R work-org/thing -t x -b y'",
+                "-R cameronsjo/<repo>",
+            ),
             (
                 "gh issue create -R work-org/thing -t x -b y && gh release create v1 -R work-org/thing",
                 "-R cameronsjo/<repo>",
@@ -9873,6 +9918,29 @@ mod tests {
                 "env -C /tmp sh -c 'gh issue create -R work-org/thing -t x -b y' && gh release delete v1 -R work-org/thing --yes",
                 dash_r,
             ),
+            // The whole command's segments do not split `sudo -D DIR` or
+            // `--chdir=DIR`, so the fix reads the script that runner runs,
+            // whichever side of it the create sits on.
+            (
+                "sudo -D /opt sh -c 'gh -R work-org/thing issue create -t x -b y; gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "sudo --chdir=/opt sh -c 'gh -R work-org/thing issue create -t x -b y; gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "sudo -D /opt sh -c 'gh -R work-org/thing issue create -t x -b y; gh -R work-org/thing release delete v1 --yes'",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y; sudo -D /opt sh -c 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "gh -R work-org/thing issue create -t x -b y && sudo --chdir=/opt sh -c 'gh -R work-org/thing release delete v1 --yes'",
+                dash_r,
+            ),
             (
                 r#"for r in a b; do gh repo create "work-org/$r" --private; gh repo delete "work-org/$r" --yes; done"#,
                 "gh repo create cameronsjo/<repo>",
@@ -9884,6 +9952,10 @@ mod tests {
             ),
             (
                 "gh issue create -R work-org/thing -t x -b y && gh api repos/work-org/thing/issues",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "sudo -D /opt sh -c 'gh -R work-org/thing issue create -t x -b y'",
                 "-R cameronsjo/thing",
             ),
         ] {
