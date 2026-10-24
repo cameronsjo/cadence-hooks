@@ -8,7 +8,7 @@ From a cwd inside the vault, `trash-guard` SHALL read a bare `$(mktemp …)` ope
 - **THEN** the hook exits 0
 
 #### Scenario: A call the guard does not read
-- **WHEN** the cwd is the vault and a Bash call runs `t=$(mktemp -p /tmp); rm "$t"` (a `/` in the call), `t=$(TMPDIR=. mktemp); rm "$t"` (a word before `mktemp`) or `rm -f $(mktemp --help)` (the call prints text, not a path)
+- **WHEN** the cwd is the vault and a Bash call runs `rm -f $(mktemp $opts)` (a `$` in the call), `t=$(TMPDIR=. mktemp); rm "$t"` (a word before `mktemp`) or `rm -f $(mktemp --help)` (the call prints text, not a path)
 - **THEN** the hook exits 2
 
 #### Scenario: A variable that may not hold the fresh path
