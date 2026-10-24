@@ -10908,55 +10908,66 @@ mod tests {
         // #1525: from a fork whose upstream is unowned, the write was aimed at
         // upstream. Rerun as `-R cameronsjo/x`, a merge or a delete lands in
         // the operator's fork. The split is #1506's, for the whole command.
-        let fork = origin_checkout("https://github.com/cameronsjo/x.git");
-        cadence_hooks_core::git_fixtures::git_in(
-            fork.path(),
-            &[
-                "remote",
-                "add",
-                "upstream",
+        // An owned upstream beside an unowned fork follows it too.
+        let keep = "Use -R cameronsjo/x";
+        let placeholder = "Use -R cameronsjo/<repo>";
+        let rows = [
+            ("gh pr create --fill", keep),
+            ("gh pr new -t a -b b", keep),
+            ("gh issue create -t t -b b", keep),
+            ("gh label create bug", keep),
+            ("gh release delete v1 --yes", placeholder),
+            ("gh pr merge 5", placeholder),
+            ("gh issue close 5", placeholder),
+            ("gh pr comment 5 --body x", placeholder),
+            ("gh secret set X --body y", placeholder),
+            ("gh release create v1", placeholder),
+            ("gh label create bug --force", placeholder),
+            (
+                "gh pr create --fill && gh pr merge --auto --squash",
+                placeholder,
+            ),
+            (
+                "gh repo edit --enable-issues",
+                "Use gh repo edit cameronsjo/<repo>",
+            ),
+            (
+                "gh repo create --source=. --push",
+                "Use gh repo create cameronsjo/<repo>",
+            ),
+        ];
+        for (origin, upstream, label) in [
+            (
+                "https://github.com/cameronsjo/x.git",
                 "https://github.com/other/x.git",
-            ],
-        );
-        let cwd = fork.path().to_str().expect("utf-8 path");
-        let keep = "Use -R cameronsjo/x to target your fork";
-        let placeholder = "Use -R cameronsjo/<repo> to target your fork";
-        with_env(&owners_env(), || {
-            for (command, line) in [
-                ("gh pr create --fill", keep),
-                ("gh pr new -t a -b b", keep),
-                ("gh issue create -t t -b b", keep),
-                ("gh label create bug", keep),
-                ("gh release delete v1 --yes", placeholder),
-                ("gh pr merge 5", placeholder),
-                ("gh issue close 5", placeholder),
-                ("gh pr comment 5 --body x", placeholder),
-                ("gh secret set X --body y", placeholder),
-                ("gh release create v1", placeholder),
-                ("gh label create bug --force", placeholder),
-                (
-                    "gh pr create --fill && gh pr merge --auto --squash",
-                    placeholder,
-                ),
-                (
-                    "gh repo edit --enable-issues",
-                    "Use gh repo edit cameronsjo/<repo> to target your fork",
-                ),
-                (
-                    "gh repo create --source=. --push",
-                    "Use gh repo create cameronsjo/<repo> to target your fork",
-                ),
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, cwd));
-                assert!(blocks(&result), "{command}");
-                let message = msg(&result);
-                assert!(message.contains("Write operation in a fork"), "{message}");
-                assert!(
-                    message.lines().any(|l| l.trim() == line),
-                    "{command}: {message}"
-                );
-            }
-        });
+                "your fork",
+            ),
+            (
+                "https://github.com/other/x.git",
+                "https://github.com/cameronsjo/x.git",
+                "upstream",
+            ),
+        ] {
+            let fork = origin_checkout(origin);
+            cadence_hooks_core::git_fixtures::git_in(
+                fork.path(),
+                &["remote", "add", "upstream", upstream],
+            );
+            let cwd = fork.path().to_str().expect("utf-8 path");
+            with_env(&owners_env(), || {
+                for (command, fix) in rows {
+                    let result = GhWriteGuard.run(&input_with(command, cwd));
+                    assert!(blocks(&result), "{label}: {command}");
+                    let message = msg(&result);
+                    assert!(message.contains("Write operation in a fork"), "{message}");
+                    let line = format!("{fix} to target {label}");
+                    assert!(
+                        message.lines().any(|l| l.trim() == line),
+                        "{label}: {command}: {message}"
+                    );
+                }
+            });
+        }
     }
 
     // --- #868: a `--help` token never makes a gh write a read ---
