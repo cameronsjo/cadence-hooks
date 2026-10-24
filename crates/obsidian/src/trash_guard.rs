@@ -9,9 +9,10 @@
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, UNRESOLVABLE_DIR, carries_substitution, child_scripts,
     clobber_redirect_targets, command_segments, command_word, executable_tokens,
-    executable_tokens_marked, looks_absolute, peel_command_runners, redirect_operator_span,
-    redirect_targets, segment_scripts, segment_work_dirs, skip_git_global_options,
-    strip_verbatim_prefix, substitution_bodies, tokenize,
+    executable_tokens_marked, installs_trap_action, is_assignment_word, looks_absolute,
+    peel_command_runners, redirect_operator_span, redirect_targets, segment_scripts,
+    segment_work_dirs, skip_git_global_options, strip_verbatim_prefix, substitution_bodies,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -568,6 +569,186 @@ fn is_inert_segment(argv: &[String], segment: &str) -> bool {
         && redirect_targets(segment).is_empty()
 }
 
+/// The `mktemp` call that `text` is, when `text` is exactly one `$(mktemp …)`
+/// or backtick substitution of it, as its option and template words.
+/// [`command_segments`] writes a variable assigned from such a call into the
+/// later segments as the call itself, so `t=$(mktemp); rm "$t"` reads
+/// `rm "$(mktemp)"`. The call is read only over plain words: a `/`, a quote,
+/// a `$` or a nested substitution in it is not read.
+fn mktemp_call_words(text: &str) -> Option<Vec<&str>> {
+    let inner = text
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            text.strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        })?;
+    if !inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '='))
+    {
+        return None;
+    }
+    let mut words = inner.split_whitespace();
+    (words.next() == Some("mktemp")).then(|| words.collect())
+}
+
+/// Do these `mktemp` arguments name a new path under the temp directory?
+/// Not with `-p` or `--tmpdir` (GNU getopt reads `--t` as the latter), which
+/// put it where the caller says; not with a template and no `-t`, which makes
+/// it in the shell's directory; and not with any word that holds a `/`.
+fn fresh_mktemp_args(args: &[&str]) -> bool {
+    let mut template = false;
+    let mut under_tmpdir = false;
+    for arg in args {
+        if arg.contains('/') {
+            return false;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            if !name.is_empty() && "tmpdir".starts_with(name) {
+                return false;
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-') {
+            if cluster.contains('p') {
+                return false;
+            }
+            under_tmpdir |= cluster.contains('t');
+        } else {
+            template = true;
+        }
+    }
+    !template || under_tmpdir
+}
+
+/// Can the command give a variable a value that no assignment segment shows,
+/// or skip an assignment [`command_segments`] reads as made? Then a variable
+/// assigned from `mktemp` need not hold that path at its deletion:
+///
+/// - a parameter default (`t=${t:-$(mktemp)}`, `${t:=…}`, `${t+…}`), which the
+///   shell leaves at the value the name already holds;
+/// - an assignment straight after `&&` or `||` (`[ -z "$t" ] && t=$(mktemp)`),
+///   which a failed test skips;
+/// - `printf -v t …`, which assigns from inside a command that is otherwise
+///   inert. (An arithmetic assignment, `$((t=3))`, lists as a segment of its
+///   own and is not inert.)
+///
+/// Substring tests that can only keep a block.
+fn assigns_unseen(command: &str, segments: &[String]) -> bool {
+    uses_parameter_default(command)
+        || assigns_after_logical_operator(command)
+        || (command.contains("printf")
+            && segments.iter().any(|segment| {
+                let tokens = executable_tokens(segment);
+                let argv = peel_command_runners(&tokens);
+                argv.first()
+                    .is_some_and(|first| command_word(first) == "printf")
+                    && argv[1..].iter().any(|arg| arg.starts_with("-v"))
+            }))
+}
+
+/// Does the command use a parameter default or substitution (`${t:-word}`,
+/// `${t:=word}`, `${t+word}`)? A `${t:0:3}` reads as one too.
+fn uses_parameter_default(command: &str) -> bool {
+    command.match_indices("${").any(|(at, _)| {
+        let rest = &command[at + 2..];
+        let name = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        name > 0 && rest[name..].starts_with([':', '-', '=', '+', '?'])
+    })
+}
+
+/// Does an `&&` or `||` come straight before an assignment word?
+fn assigns_after_logical_operator(command: &str) -> bool {
+    ["&&", "||"].iter().any(|operator| {
+        command.match_indices(operator).any(|(at, _)| {
+            let rest = command[at + operator.len()..].trim_start();
+            let name = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            name > 0 && rest[name..].starts_with(['=', '+'])
+        })
+    })
+}
+
+/// Is this word a `$(mktemp …)` or backtick `mktemp` substitution that names a
+/// fresh path under the temp directory ([`fresh_mktemp_args`])?
+fn is_fresh_temp_word(word: &str) -> bool {
+    mktemp_call_words(word).is_some_and(|args| fresh_mktemp_args(&args))
+}
+
+/// The value of a segment that only assigns one variable (`t=$(mktemp)`,
+/// `t="$(mktemp -d)"`, `t=*`), with one pair of double quotes taken off.
+fn plain_assignment_value(segment: &str) -> Option<&str> {
+    let segment = segment.trim();
+    let (name, value) = segment.split_once('=')?;
+    if name.ends_with('+') || !is_assignment_word(segment) {
+        return None;
+    }
+    Some(
+        value
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.strip_suffix('"'))
+            .unwrap_or(value),
+    )
+}
+
+/// Is this segment one the operand walk may pass over because all it does is
+/// make or fill a fresh `mktemp` path? The path is judged as a deletion operand
+/// ([`is_fresh_temp_word`]), and none of these can move a vault file under it:
+///
+/// - an assignment of such a call, or of the `*` the walk lists beside it;
+/// - the call itself, with no redirect;
+/// - an [`INERT_VERBS`] command whose every redirect writes such a path;
+/// - a `trap` whose action only deletes variables (`trap 'rm -rf "$tmp"'
+///   EXIT`). The action runs later, but each variable in it reads as the call
+///   it was assigned, so its deletion is judged in this walk like any other,
+///   and an operand that is not a variable (`trap 'rm -rf build' EXIT`) keeps
+///   the verdict.
+///
+/// Any other assignment, `t=note.md` or `t=$(date)`, is not inert, so a
+/// variable that is reassigned anywhere in the command keeps the block.
+fn is_fresh_temp_bookkeeping(tokens: &[String], argv: &[String], segment: &str) -> bool {
+    if plain_assignment_value(segment)
+        .is_some_and(|value| value == "*" || is_fresh_temp_word(value))
+    {
+        return true;
+    }
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let verb = command_word(first);
+    let targets = redirect_targets(segment);
+    if verb == "mktemp" {
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        return targets.is_empty() && fresh_mktemp_args(&args);
+    }
+    if INERT_VERBS.contains(&verb.as_ref()) {
+        return !targets.is_empty() && targets.iter().all(|target| is_fresh_temp_word(target));
+    }
+    verb == "trap" && installs_trap_action(tokens) && trap_only_deletes_variables(segment)
+}
+
+/// Does every command of this `trap`'s action delete only operands that start
+/// with `$` (`rm -rf "$tmp"`, `rm -f $a ${b}`)? Read standalone, so a variable
+/// stays the reference it is. This only tells a variable from a path; the
+/// action's deletions are judged by the operand walk like any other, where a
+/// variable that is not a fresh `mktemp` path keeps the block.
+fn trap_only_deletes_variables(segment: &str) -> bool {
+    segment_scripts(segment).iter().all(|script| {
+        command_segments(script).iter().all(|inner| {
+            let tokens = executable_tokens(inner);
+            let argv = peel_command_runners(&tokens);
+            head_deletes(argv)
+                && argv[1..]
+                    .iter()
+                    .filter(|arg| !arg.starts_with('-'))
+                    .all(|arg| arg.starts_with('$'))
+        })
+    })
+}
+
 /// Verbs that run a command string they were handed in a child of their own: a
 /// shell's `-c`, `env -S`, `script -c`, `flock`, `watch`, and `su`/`runuser`.
 /// These are the wrappers core reads a script out of ([`segment_scripts`]) that
@@ -759,7 +940,10 @@ fn option_moves(tool: &str, word: &str) -> bool {
 /// command that sits beside the deletion unless it is inert
 /// ([`is_inert_segment`]) — so `find`, `eval`, a wrapper core read no script
 /// out of, and anything that could re-point an operand (`ln`, `mv`, `cd`) keep
-/// the block. Options are skipped only before the
+/// the block. An operand that is a fresh `mktemp` path ([`is_fresh_temp_word`],
+/// which is what [`command_segments`] makes of `rm "$t"` after `t=$(mktemp)`)
+/// is outside the vault, and the segments that make or fill one pass
+/// ([`is_fresh_temp_bookkeeping`]). Options are skipped only before the
 /// first operand or `--`, so a `-f` a strict-POSIX `rm` would treat as a file
 /// is judged as one. A redirection is skipped only when its operator is
 /// unquoted — a quoted `'>note.md'` is a file `rm` deletes.
@@ -772,6 +956,10 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
         return false;
     }
     let listed = ListedSegments::new(&segments);
+    // A path from `mktemp` is under the temp directory unless the command
+    // sets that directory, and a variable assigned from it holds that path
+    // unless something in the command can change or skip the assignment.
+    let fresh_temps = !command.contains("TMPDIR") && !assigns_unseen(command, &segments);
     let mut judged = 0;
     for segment in &segments {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
@@ -785,6 +973,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
             // walk, so it is passed over.
             if !is_inert_segment(argv, segment)
                 && !is_script_wrapper(&tokens, argv, segment, &listed)
+                && !(fresh_temps && is_fresh_temp_bookkeeping(&tokens, argv, segment))
             {
                 return false;
             }
@@ -818,7 +1007,10 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
             }
             options_done = true;
             judged += 1;
-            if judged > MAX_JUDGED_OPERANDS || !operand_outside_vault(arg, vault, meta) {
+            if judged > MAX_JUDGED_OPERANDS
+                || !(operand_outside_vault(arg, vault, meta)
+                    || (fresh_temps && is_fresh_temp_word(arg)))
+            {
                 return false;
             }
             i += 1;
@@ -3208,6 +3400,162 @@ mod tests {
                 "{command} must stay allowed"
             );
         }
+    }
+
+    /// With the shell standing in the vault, a variable assigned from a bare
+    /// `$(mktemp …)` in the same command names a fresh path under the temp
+    /// directory, so deleting it deletes nothing of the vault's. Everything
+    /// that could make the path a vault one (an option, a template, a
+    /// `TMPDIR`, a reassignment, an assignment that may not have run, a sibling
+    /// that moves files) keeps the block.
+    #[test]
+    fn a_variable_holding_a_fresh_mktemp_path_is_deleted_outside_the_vault() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // The reports.
+            (r#"t=$(mktemp); echo x > "$t"; rm -f "$t""#, Allow),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT"#, Allow),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; ls"#, Allow),
+            // The assignment, the call and the operand, in each spelling.
+            (r#"t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp -d); rm -rf "$t""#, Allow),
+            ("t=`mktemp`; rm -f \"$t\"", Allow),
+            (r#"t="$(mktemp -d)"; rm -rf "$t""#, Allow),
+            (r#"t=$(mktemp) && rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); printf '%s\n' "$t"; rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); rm -f "${t}""#, Allow),
+            (r#"rm -f "$(mktemp)""#, Allow),
+            (r#"t=$(mktemp -u); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp --suffix=.md); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp --); rm -f "$t""#, Allow),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "${tmp}"' EXIT"#, Allow),
+            // Under `-t` a template names the temp directory's file.
+            (r#"t=$(mktemp -t note.XXXX); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp -d -t note); rm -rf "$t""#, Allow),
+            // What fills the path: a fresh redirect on an inert verb.
+            (
+                r#"t=$(mktemp); echo x >> "$t"; cat "$t"; rm -f "$t""#,
+                Allow,
+            ),
+            (r#"t=$(mktemp); cat note.md > "$t"; rm -f "$t""#, Allow),
+            ("mktemp; rm /tmp/x", Allow),
+            // No variable, `-p`, `--tmpdir`, or a path in the call.
+            (r#"rm -f "$t""#, Block),
+            (r#"t=$(mktemp -p .); rm "$t""#, Block),
+            (r#"t=$(mktemp -p /vault/x); rm "$t""#, Block),
+            (r#"t=$(mktemp -dp .); rm -rf "$t""#, Block),
+            (r#"t=$(mktemp -p.); rm "$t""#, Block),
+            (r#"t=$(mktemp --tmpdir=/vault); rm "$t""#, Block),
+            (r#"t=$(mktemp --tmpdir); rm "$t""#, Block),
+            (r#"t=$(mktemp --tmp); rm "$t""#, Block),
+            (r#"t=$(mktemp --tmpdir=.); rm "$t""#, Block),
+            (r#"t=$(mktemp /tmp/x.XXXX); rm "$t""#, Block),
+            (r#"t=$(mktemp -t /tmp/x.XXXX); rm "$t""#, Block),
+            // A template with no `-t` is made where the shell stands.
+            (r#"t=$(mktemp note.XXXX); rm "$t""#, Block),
+            (r#"t=$(mktemp -d note.XXXX); rm -rf "$t""#, Block),
+            // `TMPDIR` set anywhere in the command.
+            (r#"TMPDIR=.; t=$(mktemp); rm "$t""#, Block),
+            (r#"export TMPDIR=.; t=$(mktemp); rm "$t""#, Block),
+            (r#"t=$(TMPDIR=. mktemp); rm "$t""#, Block),
+            (r#"TMPDIR=. mktemp; rm -f "$(mktemp)""#, Block),
+            // The variable is assigned again, however.
+            (r#"t=$(mktemp); t=note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); t+=note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); read t; rm "$t""#, Block),
+            (r#"t=$(mktemp); printf -v t note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); printf -vt note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); echo $((t=5)); rm "$t""#, Block),
+            (r#"t=$(mktemp); : $((t = 5)); rm "$t""#, Block),
+            (r#"t=$(mktemp); (( t = 5 )); rm "$t""#, Block),
+            (r#"t=$(mktemp); u=$(date); rm "$u""#, Block),
+            (
+                r#"tmp=$(mktemp -d); tmp=note.md; trap 'rm -rf "$tmp"' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; tmp=note.md"#,
+                Block,
+            ),
+            // An assignment that may not have run, or that is not the call.
+            (r#"t=${t:-$(mktemp)}; rm -f "$t""#, Block),
+            (r#": ${t:=$(mktemp)}; rm -f "$t""#, Block),
+            (r#"[ -n "$t" ] || t=$(mktemp); rm -f "$t""#, Block),
+            (r#"false && t=$(mktemp); rm -f "$t""#, Block),
+            (r#"[ -z "$t" ] && t=$(mktemp); rm -f "$t""#, Block),
+            (r#"[ -n "$t" ] || t=$(mktemp) && rm -f "$t""#, Block),
+            (r#"(t=$(mktemp)); rm -f "$t""#, Block),
+            (r#"t=$(mktemp) rm -f "$t""#, Block),
+            (r#"t+=$(mktemp); rm -f "$t""#, Block),
+            (r#"t=$(mktemp); rm -f "${t:-note.md}""#, Block),
+            (r#"t=$(mktemp -d)/x; rm -rf "$t""#, Block),
+            // Only the path itself is read, and every operand must be one.
+            (r#"t=$(mktemp -d); rm -rf "$t"/x"#, Block),
+            (r#"t=$(mktemp -d -t "$(cat note.md)"); rm -rf "$t""#, Block),
+            (r#"t=$(mktemp); rm -f "$t" note.md"#, Block),
+            (r#"t=$(mktemp); rm -f "$t" "$u""#, Block),
+            (r#"t=$(mktemp); rm -f "$t"; rm note.md"#, Block),
+            (r#"rm -f $(mktemp -p .)"#, Block),
+            // A sibling that moves, copies or links files, or a redirect to
+            // anything but the fresh path.
+            (
+                r#"tmp=$(mktemp -d); mv note.md "$tmp"; rm -rf "$tmp""#,
+                Block,
+            ),
+            (r#"tmp=$(mktemp -d); cp -r . "$tmp"; rm -rf "$tmp""#, Block),
+            (r#"tmp=$(mktemp -d); cd "$tmp"; rm -rf "$tmp""#, Block),
+            (
+                r#"tmp=$(mktemp -d); ln -s $PWD "$tmp/l"; rm -rf "$tmp""#,
+                Block,
+            ),
+            (
+                r#"t=$(mktemp); echo x > "$t"; echo y > note.md; rm -f "$t""#,
+                Block,
+            ),
+            (r#"t=$(mktemp); tee "$t" < note.md; rm -f "$t""#, Block),
+            ("mktemp > note.md; rm /tmp/x", Block),
+            ("mktemp -t > note.md; rm /tmp/x", Block),
+            ("mktemp -t /vault/x.XXXX; rm /tmp/x", Block),
+            // A trap whose action deletes more than variables.
+            (r#"tmp=$(mktemp -d); trap 'rm -rf build' EXIT"#, Block),
+            (
+                r#"tmp=$(mktemp -d); trap 'echo "$tmp"' EXIT; rm -rf "$tmp""#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"; rm note.md' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp" note.md' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp" > note.md' EXIT"#,
+                Block,
+            ),
+            (r#"tmp=$(mktemp -d); trap 'git rm -rf "$tmp"' EXIT"#, Block),
+            (
+                r#"tmp=$(mktemp -d); trap "$cleanup" EXIT; rm -rf "$tmp""#,
+                Block,
+            ),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "$1"' EXIT"#, Block),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf $' EXIT"#, Block),
+            (r#"trap 'rm -rf "$tmp"' EXIT"#, Block),
+        ];
+        for &(command, expected) in cases {
+            let result =
+                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::with(&["/tmp"]));
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
+        }
+        // From a vault subdirectory the same.
+        let result = check_destructive_in_vault(
+            r#"t=$(mktemp); echo x > "$t"; rm -f "$t""#,
+            "/vault/notes",
+            "/vault",
+            &FakeFs::default(),
+        );
+        assert_eq!(result.outcome, Allow);
     }
 
     #[test]
