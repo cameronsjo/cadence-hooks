@@ -353,7 +353,7 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 - **THEN** the hook exits 0 with a nudge that says a bare push was checked against the branch checked out now
 
 ### Requirement: Loop fix targets
-A `guard-gh-write` loop block SHALL name the directory's resolved repository in its fix only when gh sends every looped write there: the loop body stays in the directory; every gh command in the command runs in that directory when each segment is followed on its own, so a `cd` in a subshell, a `{ …; }` group or an `if`, a `pushd`, a `cd` on a line after another command, or `env -C`/`sudo -D` moves it; the command does not name `GH_REPO`, `GH_HOST` or `GIT_DIR`, and none is set non-empty in the hook's environment; and a `gh api` write's path is `repos/{owner}/{repo}/…`. Every other fix SHALL hold a placeholder for the repository (`-R owner/repo`, `gh api repos/owner/repo/…`), since such a write goes to another repository.
+A `guard-gh-write` loop block SHALL name the directory's resolved repository in its fix only when gh sends every looped write there: the loop body stays in the directory, every gh write runs there when each segment is followed on its own, the command names no `GH_REPO`, `GH_HOST` or `GIT_DIR` and the hook's environment sets none, and each `gh api` write's path is `repos/{owner}/{repo}/…`. Every other fix SHALL hold a placeholder (`-R owner/repo`, `gh api repos/owner/repo/…`).
 
 #### Scenario: Strict loop that stays in the checkout
 - **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for n in 1 2; do gh issue close $n; done` in a checkout of `cameronsjo/tool`
