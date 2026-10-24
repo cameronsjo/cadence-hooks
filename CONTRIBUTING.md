@@ -42,7 +42,7 @@ asserts exit 2 from the real `cadence-hooks group`, which fails open past its
 4000 ms deadline. It prints "did not finish within N ms and did not block" where
 its exit code puts it: on stdout, in the envelope's `additionalContext`, for exit 0
 (a member that finished nudged, as git-safety does on a heredoc flood), and on
-stderr for exit 1 (every member timed out). Without `CADENCE_TIMING_TESTS=1`, a
+stderr for exit 1 (no member that finished had anything to say). Without `CADENCE_TIMING_TESTS=1`, a
 run that took at least the deadline and shows that signature on its exit code's
 channel passes as load; a bare exit 1, a panic, or a faster non-block still
 fails. With the variable set, only the block passes.
