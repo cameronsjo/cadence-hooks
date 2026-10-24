@@ -358,3 +358,7 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 #### Scenario: Percent sign in the path
 - **WHEN** the command is `gh pr merge https://github.com/evil%2Drepo/x/pull/1`, in a checkout of `cameronsjo/tool`
 - **THEN** the hook allows, judging the checkout as before
+
+#### Scenario: Bad escape in the fragment
+- **WHEN** the command is `gh pr merge 'https://github.com/evil/repo/pull/1#f%zz'`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows, judging the checkout as before

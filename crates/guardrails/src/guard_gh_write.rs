@@ -2640,12 +2640,21 @@ fn selector_url_is_the_only_target(segment: &str) -> bool {
 /// `/OWNER/REPO/pull/N` (or `/issues/N`), the host lowercased less a leading
 /// `www.`. `None` for anything else, and for any URL Go may decode or reject
 /// differently (a `%` before any `?` or `#`, a backslash, whitespace,
-/// userinfo, an odd host), which is then judged as before. Go decodes only
-/// the path, so a `%` in the query or fragment is read. A `$` may stand for
-/// the number.
+/// userinfo, an odd host), which is then judged as before. Go keeps the
+/// query as typed, so any `%` there is read. It decodes the fragment and
+/// rejects a `%` there that two hex digits do not follow; gh then reads no
+/// URL, so neither does this. A `$` may stand for the number.
 fn selector_url_target(word: &str, issue_paths: bool) -> Option<(String, String)> {
     let before_query = word.split(['?', '#']).next().unwrap_or_default();
+    let fragment = word.split_once('#').map_or("", |(_, fragment)| fragment);
+    let bad_fragment_escape = fragment.split('%').skip(1).any(|after| {
+        !after
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    });
     if before_query.contains('%')
+        || bad_fragment_escape
         || word.contains('\\')
         || word.contains(|c: char| c.is_whitespace() || c.is_control())
     {
@@ -11585,12 +11594,14 @@ mod tests {
                 gh("o/r"),
             ),
             ("https://github.com/o/r/pull/1?w=1", false, gh("o/r")),
-            // Go decodes only the path, so a `%` after `?` or `#` is read.
+            // Go keeps the query as typed and decodes a valid escape in the
+            // fragment, so these are read.
             (
                 "https://github.com/o/r/pull/7/files?file-filters%5B%5D=.rs",
                 false,
                 gh("o/r"),
             ),
+            ("https://github.com/o/r/pull/1?x=%zz", false, gh("o/r")),
             (
                 "https://github.com/o/r/pull/7#discussion_r%41",
                 false,
@@ -11626,6 +11637,9 @@ mod tests {
             ("https://github.com/$o/r/pull/1", false, None),
             ("https://github.com/o/r/pull/1 ", false, None),
             ("https://github.com/o/r/pull/1%zz", false, None),
+            // Go rejects a bad escape in the fragment, and gh reads no URL.
+            ("https://github.com/o/r/pull/7#f%zz", false, None),
+            ("https://github.com/o/r/pull/7#%", false, None),
         ] {
             assert_eq!(selector_url_target(word, issue_paths), want, "{word}");
         }
