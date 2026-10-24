@@ -734,7 +734,7 @@ mod tests {
         );
         assert!(
             msg.contains(
-                "Also missing, advisory only (a nudge, never a block): a ## Loop section, an Alternatives"
+                "Also missing, advisory only (a nudge, never a block): a ## Loop section, a ## Concessions section, an Alternatives"
             ),
             "the other stanzas are named as advice: {msg}"
         );
@@ -779,6 +779,7 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("plan-shape gate: plan lacks "));
         assert!(msg.contains("a ## Loop section"));
+        assert!(msg.contains("a ## Concessions section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -816,6 +817,44 @@ mod tests {
         assert!(
             msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
             "the Loop nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_missing_only_concessions_nudges_and_never_blocks() {
+        let r = judge_plan_shape(&plan_scan::template_shaped_plan_without_concessions());
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "a missing Concessions section never blocks"
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("plan-shape gate: plan lacks a ## Concessions section — advisory, from "),
+            "the nudge names only the Concessions stanza and marks it advisory: {msg}"
+        );
+        assert!(
+            !msg.contains("the one stanza that blocks"),
+            "the block wording is for an unsettled Panel: line: {msg}"
+        );
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "the Concessions nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_concessions_is_advisory_when_the_panel_line_blocks() {
+        let plan = plan_scan::template_shaped_plan_without_concessions()
+            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        let r = judge_plan_shape(&plan);
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains(
+                "Also missing, advisory only (a nudge, never a block): a ## Concessions section"
+            ),
+            "Concessions is named as advice, not as the blocking stanza: {msg}"
         );
     }
 
