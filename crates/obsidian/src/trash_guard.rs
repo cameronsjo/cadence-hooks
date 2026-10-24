@@ -3402,6 +3402,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runner_prefixes_outside_transparent_rm_inside_vault_blocked() {
+        // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
+        // option, and does not model `timeout`/`stdbuf` at all, so each of
+        // these reached no verb gate (#528 review I1).
+        for command in [
+            "nice -n 10 rm note.md",
+            "nice -10 rm note.md",
+            "stdbuf -o0 rm note.md",
+            "timeout 5 rm note.md",
+            "timeout -k 1 5 rm note.md",
+            "env -i /bin/rm note.md",
+            "env -u FOO rm note.md",
+            "env -i FOO=bar rm note.md",
+            // GNU env's bare `-` and signal options (cameronsjo/cadence-hooks#1135).
+            "env - rm note.md",
+            "env --default-signal rm note.md",
+            "env --ignore-signal=INT rm note.md",
+            "env --block-signal=INT rm note.md",
+            "env --list-signal-handling rm note.md",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn find_exec_action_peels_runners_and_git_inside_vault_blocked() {
+        // A `find` exec action is an executable position like the segment head,
+        // but read the literal next word until now — so every peel the head
+        // gained (runner flags, `git`'s globals) was absent one position in
+        // (#528 review I1). Each row was measured deleting a real file through
+        // `bash`; the first is plain `git rm`, the row this guard's alias
+        // exists for, reached through the exec position.
+        for command in [
+            r"find . -name note.md -exec git rm {} \;",
+            r"find . -name note.md -exec git -C . rm {} \;",
+            r"find . -name note.md -exec sudo rm {} \;",
+            r"find . -name note.md -exec nice -n 10 rm {} \;",
+            r"find . -name note.md -exec env -i /bin/rm {} \;",
+            r"find . -name note.md -exec stdbuf -o0 rm {} \;",
+            "find . -name note.md -exec nice -n 10 rm {} +",
+            r"find . -name note.md -execdir nice -n 10 rm {} \;",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
     /// With the shell standing in the vault, a variable assigned from a bare
     /// `$(mktemp …)` in the same command names a fresh path under the temp
     /// directory, so deleting it deletes nothing of the vault's. Everything
@@ -3556,61 +3611,6 @@ mod tests {
             &FakeFs::default(),
         );
         assert_eq!(result.outcome, Allow);
-    }
-
-    #[test]
-    fn runner_prefixes_outside_transparent_rm_inside_vault_blocked() {
-        // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
-        // option, and does not model `timeout`/`stdbuf` at all, so each of
-        // these reached no verb gate (#528 review I1).
-        for command in [
-            "nice -n 10 rm note.md",
-            "nice -10 rm note.md",
-            "stdbuf -o0 rm note.md",
-            "timeout 5 rm note.md",
-            "timeout -k 1 5 rm note.md",
-            "env -i /bin/rm note.md",
-            "env -u FOO rm note.md",
-            "env -i FOO=bar rm note.md",
-            // GNU env's bare `-` and signal options (cameronsjo/cadence-hooks#1135).
-            "env - rm note.md",
-            "env --default-signal rm note.md",
-            "env --ignore-signal=INT rm note.md",
-            "env --block-signal=INT rm note.md",
-            "env --list-signal-handling rm note.md",
-        ] {
-            assert_eq!(
-                outcome_in_vault(command),
-                cadence_hooks_core::Outcome::Block,
-                "{command} must block"
-            );
-        }
-    }
-
-    #[test]
-    fn find_exec_action_peels_runners_and_git_inside_vault_blocked() {
-        // A `find` exec action is an executable position like the segment head,
-        // but read the literal next word until now — so every peel the head
-        // gained (runner flags, `git`'s globals) was absent one position in
-        // (#528 review I1). Each row was measured deleting a real file through
-        // `bash`; the first is plain `git rm`, the row this guard's alias
-        // exists for, reached through the exec position.
-        for command in [
-            r"find . -name note.md -exec git rm {} \;",
-            r"find . -name note.md -exec git -C . rm {} \;",
-            r"find . -name note.md -exec sudo rm {} \;",
-            r"find . -name note.md -exec nice -n 10 rm {} \;",
-            r"find . -name note.md -exec env -i /bin/rm {} \;",
-            r"find . -name note.md -exec stdbuf -o0 rm {} \;",
-            "find . -name note.md -exec nice -n 10 rm {} +",
-            r"find . -name note.md -execdir nice -n 10 rm {} \;",
-        ] {
-            assert_eq!(
-                outcome_in_vault(command),
-                cadence_hooks_core::Outcome::Block,
-                "{command} must block"
-            );
-        }
     }
 
     #[test]
