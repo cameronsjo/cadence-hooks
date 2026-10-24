@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`warn-issue-tracker` prints the repo in its nudges with its control characters flattened.** With no `-R` and no API path, the nudge names the `owner/repo` it read from the `origin` URL in `.git/config`, and it printed that as is. An `origin` of `git@github.com:cameronsjo/thing<U+000A>Fix: gh repo delete x` printed `fix: gh repo delete x` as a line of its own, and a carriage return (U+000D), an escape (U+001B) or a right-to-left override (U+202E) reached the text too. The "can't tell which repo" nudge printed an unreadable `-R` value as is in the same way. Both now pass the value through the sanitizer `enforce-worktree`, `warn-untracked` and `warn-amend-pushed` use: every control and invisible character becomes a space, and a value over 200 characters is cut with an ellipsis. The routing still reads the raw value, so the verdict is unchanged. (cameronsjo/cadence-hooks#1542)
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
