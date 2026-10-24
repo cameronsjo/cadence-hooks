@@ -5710,12 +5710,12 @@ mod tests {
 
     #[test]
     fn write_after_an_unread_eval_prints_no_control_byte() {
-        // `eval "$S"` may change directory, so the write's own directory is
-        // the sentinel, while the checkout itself is owned. The block stands;
-        // only its text changed.
+        // `eval "cd $D"` changes directory to a place the guard cannot read,
+        // so the write's own directory is the sentinel, while the checkout
+        // itself is owned. The block stands; only its text changed.
         with_env(&owners_env(), || {
             let result = GhWriteGuard.run(&input_with(
-                r#"eval "$S"; gh pr create --title t --body b"#,
+                r#"eval "cd $D"; gh pr create --title t --body b"#,
                 OWNED_DIR,
             ));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
