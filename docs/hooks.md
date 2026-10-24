@@ -74,7 +74,7 @@ Rules for wiring:
 - **Members are `<namespace>/<hook>`** and must be PreToolUse or PostToolUse checks. Loggers, CLI actions, and SessionStart hooks are refused, and `doctor` reports them.
 - **Only group hooks with the same matcher and no `if:`.** A group entry has one matcher and one `if:`, so a hook whose prefilter differs from the others keeps its own entry.
 - **Keep a hook that starts a slow external tool in its own entry** (`markdown-lint` runs the Node `markdownlint` CLI). Grouping saves it nothing, and its own entry keeps its own timeout.
-- **A binary older than `group`** (before 0.103.0) does not know the subcommand. The wrapper no longer replays the payload to each member, so upgrade the binary.
+- **A binary older than 0.103.0** does not know the `group` subcommand. The wrapper no longer replays the payload to each member, so upgrade the binary.
 
 ## cadence
 
