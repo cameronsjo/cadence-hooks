@@ -25036,6 +25036,31 @@ mod tests {
             assert_eq!(dirs(command, UnreadEval::StaysPut), want, "{command}");
             assert_eq!(dirs(command, UnreadEval::MayMove), moves, "{command}");
         }
+        // The two public wrappers, which every guard but gh-write calls,
+        // keep `MayMove`.
+        let last_dirs = |located: Vec<(String, std::rc::Rc<str>)>| -> Vec<String> {
+            let last = located.last().map(|(raw, _)| raw.clone());
+            located
+                .iter()
+                .filter(|(raw, _)| Some(raw) == last.as_ref())
+                .map(|(_, dir)| dir.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let command = "eval \"$S\"; gh pr create";
+        let mut moves = vec!["/cwd".to_string(), X.to_string()];
+        moves.sort();
+        let located = segment_work_dirs(command, "/cwd")
+            .into_iter()
+            .map(|LocatedSegment { raw, dir }| (raw, dir))
+            .collect();
+        assert_eq!(last_dirs(located), moves, "segment_work_dirs: {command}");
+        assert_eq!(
+            last_dirs(command_segments_with_dirs(command, "/cwd")),
+            moves,
+            "command_segments_with_dirs: {command}"
+        );
     }
 
     /// A flood of `pushd`, `popd` and checkout-root `cd`s is bounded: each
