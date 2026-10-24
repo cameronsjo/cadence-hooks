@@ -10263,19 +10263,20 @@ mod tests {
                 "$GH_HOST/cameronsjo/x",
             ),
             // An inline `GH_REPO` names its host as `-R` does, and so does a
-            // `-R` gh may ignore (`gh pr review` with a number).
+            // `-R` gh may ignore: one after `-s`, which this guard does not
+            // know takes no value under `gh pr merge`.
             (
                 r#"GH_REPO="$H/evil/x" gh issue create --title t --body b"#.to_string(),
                 "$H/evil/x",
             ),
             (
-                r#"gh pr review 1 --approve -R "$H/evil/x""#.to_string(),
+                r#"gh pr merge 5 -s -R "$H/evil/x""#.to_string(),
                 "$H/evil/x",
             ),
             // Beside that `-R`, gh reads an inline `GH_REPO`, and the host
             // shown is the one it spells.
             (
-                r#"GH_REPO="$H/z/y" gh pr review 1 --approve -R cameronsjo/x"#.to_string(),
+                r#"GH_REPO="$H/z/y" gh pr merge 5 -s -R cameronsjo/x"#.to_string(),
                 "$H/z/y",
             ),
             // A host the command selects that did not decide is not shown in
