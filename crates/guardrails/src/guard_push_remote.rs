@@ -2590,6 +2590,9 @@ mod tests {
         }
     }
 
+    // Embeds a native path in a POSIX shell string; Windows paths lose their
+    // backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
     #[test]
     fn a_url_the_command_names_prints_flattened() {
         // The three "owner cannot be determined" blocks print a URL typed in
