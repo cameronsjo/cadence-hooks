@@ -2030,6 +2030,11 @@ fn disallowed_message(
     // match the default host only. Tell them how to widen, mirroring
     // guard_push_remote's hint.
     let default = default_host();
+    // The host and repo are often read from the checkout's `origin` URL, so
+    // they are not the guard's own text (cameronsjo/cadence-hooks#1526). The
+    // host checks below read the raw host; only the printed text is flattened.
+    let shown_host = sanitize_field(host, MAX_PATH_DISPLAY);
+    let repo = sanitize_field(repo, MAX_PATH_DISPLAY);
     let host_hint = if host == UNRESOLVED_GH_HOST {
         "\n   Host: this command may set `GH_HOST` to a value this guard cannot read (a \
          declaring builtin such as `declare -x`, an expanded variable name or value, or an \
@@ -2038,7 +2043,7 @@ fn disallowed_message(
             .to_string()
     } else if host != default && !extra_hosts.iter().any(|e| e == host) {
         format!(
-            "\n   Host scope: bare entries match `{default}` only — for `{host}`, qualify them (`{host}/<owner>`) or set `CADENCE_EXTRA_HOSTS={host}`"
+            "\n   Host scope: bare entries match `{default}` only — for `{shown_host}`, qualify them (`{shown_host}/<owner>`) or set `CADENCE_EXTRA_HOSTS={shown_host}`"
         )
     } else {
         String::new()
@@ -2046,7 +2051,7 @@ fn disallowed_message(
 
     format!(
         "🚫 git-guardrails: gh write targets repo you don't own\n   \
-         Target:  {host}/{repo}\n   \
+         Target:  {shown_host}/{repo}\n   \
          Allowed: {}{host_hint}\n\n   \
          DO NOT override with env vars. Instead:\n   \
          1. Confirm the user intends to write to this repo\n   \
@@ -3528,6 +3533,11 @@ fn repo_has_unexpanded_expansion(repo: &str) -> bool {
 fn fork_block_message(origin: (&str, &str, bool), upstream: (&str, &str, bool)) -> String {
     let (origin_host, origin_repo, origin_owned) = origin;
     let (upstream_host, upstream_repo, upstream_owned) = upstream;
+    // Both remotes are read from `.git/config`, so their text is not the
+    // guard's own (cameronsjo/cadence-hooks#1526).
+    let [origin_host, origin_repo, upstream_host, upstream_repo] =
+        [origin_host, origin_repo, upstream_host, upstream_repo]
+            .map(|text| sanitize_field(text, MAX_PATH_DISPLAY));
     let line = |label: &str, repo: &str, owned: bool| {
         if repo.is_empty() {
             format!("The {label} remote URL could not be parsed, so it cannot be targeted here")
@@ -3546,8 +3556,8 @@ fn fork_block_message(origin: (&str, &str, bool), upstream: (&str, &str, bool)) 
          Upstream: {upstream_host}/{upstream_repo}\n\n   \
          {}\n   \
          {}",
-        line("your fork", origin_repo, origin_owned),
-        line("upstream", upstream_repo, upstream_owned),
+        line("your fork", &origin_repo, origin_owned),
+        line("upstream", &upstream_repo, upstream_owned),
     )
 }
 
@@ -3712,9 +3722,10 @@ fn judge_resolution(
                 Some(CheckResult::block_structured(
                     format!(
                         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
-                         Target:  {repo} (an unexpanded shell expansion — its value is only known \
+                         Target:  {shown} (an unexpanded shell expansion — its value is only known \
                          when the shell runs)\n   \
-                         Fix: pass the target as a literal `{literal}`"
+                         Fix: pass the target as a literal `{literal}`",
+                        shown = sanitize_field(&repo, MAX_PATH_DISPLAY),
                     ),
                     BlockMetadata {
                         rule_id: "gh-write-target-unresolvable".to_string(),
@@ -3736,6 +3747,9 @@ fn judge_resolution(
                 let fix = if host == UNRESOLVED_GH_HOST {
                     "name the host on the gh command itself (--hostname <host>)".to_string()
                 } else {
+                    // The name may come from `origin`, and the fix is
+                    // printed as a `Fix:` line (#1526).
+                    let repo_name = sanitize_field(repo_name, MAX_PATH_DISPLAY);
                     target_spelling(segment, &format!("{example_owner}/{repo_name}"))
                 };
                 Some(CheckResult::block_structured(
@@ -3987,6 +4001,8 @@ impl Check for GhWriteGuard {
                         &extra_hosts,
                     );
                     if let LoopWriteDecision::Block { suggestion } = decision {
+                        // The suggestion is the repo `origin` names (#1526).
+                        let suggestion = suggestion.map(|s| sanitize_field(&s, MAX_PATH_DISPLAY));
                         let (api_writes, writes): (Vec<String>, Vec<String>) = cmds
                             .iter()
                             .filter(|c| {
@@ -5747,6 +5763,127 @@ mod tests {
                 crate::assert_hostile_dir_flattened(msg(&result), displayed, "guard-gh-write");
             });
         }
+    }
+
+    // Unix only, like the helpers it uses.
+    #[cfg(unix)]
+    #[test]
+    fn every_remote_repo_line_prints_a_hostile_url_flattened() {
+        // #1526: a write that names no target is judged by the repo its
+        // checkout's remotes name, read from `.git/config`. Each row reaches a
+        // line that prints it: the unowned block (`Target:` and the fix that
+        // reuses the repo's name), the fork block (`Fork:`, `Upstream:` and
+        // `Use -R`), the block for a name holding `$`, and the loop block's
+        // `-R` suggestion. `theirs` is unowned and `mine` owned. Each row is
+        // `(env, heading, command, checkout, a repo as printed, a line of the
+        // guard's own advice, how many lines start with `Fix:`)`. The block is
+        // read as Claude Code gets it, so a forged `Fix:` line would show, and
+        // a real one would be missing when a forged one stands in for it.
+        let mine_env = [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", Some("git.example")),
+            ("GH_HOST", None),
+            ("GH_REPO", None),
+            ("CADENCE_GH_STRICT_LOOPS", None),
+        ];
+        let theirs_env = owners_env();
+        for ((theirs_url, _, theirs_shown), (mine_url, _, mine_shown)) in
+            crate::hostile_remote_urls("work-org")
+                .into_iter()
+                .zip(crate::hostile_remote_urls("cameronsjo"))
+        {
+            let theirs = crate::repo_with_remotes(&[("origin", &theirs_url)]);
+            let fork =
+                crate::repo_with_remotes(&[("origin", &mine_url), ("upstream", &theirs_url)]);
+            let expansion = theirs_url.replace("work-org/", "work-org/$");
+            let dollar = crate::repo_with_remotes(&[("origin", &expansion)]);
+            let mine = crate::repo_with_remotes(&[("origin", &mine_url)]);
+            let name = theirs_shown.trim_start_matches("work-org/");
+            let path =
+                |dir: &tempfile::TempDir| dir.path().to_str().expect("utf-8 path").to_string();
+            for (env, heading, command, cwd, shown, advice, fix_lines) in [
+                (
+                    &theirs_env[..],
+                    "gh write targets repo you don't own",
+                    "gh pr create --title t --body b",
+                    path(&theirs),
+                    format!("Target:  git.example/{theirs_shown}\n"),
+                    format!("Fix: -R cameronsjo/{name}"),
+                    1,
+                ),
+                (
+                    &mine_env[..],
+                    "Write operation in a fork",
+                    "gh pr create --title t --body b",
+                    path(&fork),
+                    format!("Upstream: git.example/{theirs_shown}\n"),
+                    format!("Use -R {mine_shown} to target your fork"),
+                    0,
+                ),
+                (
+                    &theirs_env[..],
+                    "Cannot determine target repo",
+                    "gh pr create --title t --body b",
+                    path(&dollar),
+                    format!("Target:  work-org/${name} (an unexpanded"),
+                    "Fix: pass the target as a literal `-R owner/repo`".to_string(),
+                    1,
+                ),
+                (
+                    &mine_env[..],
+                    "gh write command in loop without explicit -R flag",
+                    "for n in 1 2; do cd .; gh pr comment $n --body x; done",
+                    path(&mine),
+                    format!("-R {mine_shown}`"),
+                    format!("Fix: add `-R {mine_shown}` to each command"),
+                    1,
+                ),
+            ] {
+                with_env(env, || {
+                    let result = GhWriteGuard.run(&input_with(command, &cwd));
+                    assert!(blocks(&result), "{command}: {:?}", result.message);
+                    let text = cadence_hooks_core::render_result(
+                        &result,
+                        cadence_hooks_core::HookEvent::PreToolUse,
+                    )
+                    .1
+                    .unwrap_or_default();
+                    assert!(text.contains(heading), "{command}: {text:?}");
+                    crate::assert_hostile_dir_flattened(&text, &shown, command);
+                    let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+                    assert!(
+                        lines.iter().any(|line| line.starts_with(&advice)),
+                        "{command}: the guard's own advice is missing: {text:?}"
+                    );
+                    assert_eq!(
+                        lines.iter().filter(|line| line.starts_with("Fix:")).count(),
+                        fix_lines,
+                        "{command}: {text:?}"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn disallowed_message_prints_a_hostile_host_flattened() {
+        // The host comes from the same URL, and an scp URL keeps a control
+        // character in its host.
+        let host = "git.example\u{1b}[31m\u{202e}\u{d}x";
+        with_env(&owners_env(), || {
+            let message = disallowed_message(host, "work-org/thing", &[], &[], &[]);
+            assert!(!has_control_byte(&message), "{message:?}");
+            assert!(!message.contains('\u{202e}'), "{message:?}");
+            assert!(
+                message.contains("Target:  git.example [31m  x/work-org/thing\n"),
+                "{message:?}"
+            );
+            assert!(
+                message.contains("for `git.example [31m  x`, qualify them"),
+                "{message:?}"
+            );
+        });
     }
 
     #[test]
