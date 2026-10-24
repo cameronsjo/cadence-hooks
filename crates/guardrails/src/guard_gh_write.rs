@@ -10171,6 +10171,22 @@ mod tests {
                 "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
                 "$GH_HOST/cameronsjo/x",
             ),
+            // An inline `GH_REPO` names its host as `-R` does, and so does a
+            // `-R` gh may ignore (`gh pr review` with a number).
+            (
+                r#"GH_REPO="$H/evil/x" gh issue create --title t --body b"#.to_string(),
+                "$H/evil/x",
+            ),
+            (
+                r#"gh pr review 1 --approve -R "$H/evil/x""#.to_string(),
+                "$H/evil/x",
+            ),
+            // A host the command selects that did not decide is not shown in
+            // place of the one that did.
+            (
+                r#"GH_HOST=$z gh repo archive "$H/evil/x" --yes"#.to_string(),
+                "$H/evil/x",
+            ),
             // A `-R` that decides the target leaves `GH_REPO` unread, as gh
             // does, so the host shown is the inline `GH_HOST` that decided.
             (
