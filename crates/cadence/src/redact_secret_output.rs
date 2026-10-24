@@ -3946,6 +3946,24 @@ mod tests {
                 format!("-a.log-12-token-2026-10:\tsee-2-docs now *Secret*: {p}\n"),
                 format!("-a.log-12-token-2026-10:\tsee-2-docs now *Secret*: {m}\n"),
             ),
+            // A `:digits:` run makes the first word read as a match line's
+            // path: a plain `=` key is read as on a diff line...
+            (
+                "+DB_PASSWORD=Zq9v:12:Kh7w\n".to_string(),
+                format!("+DB_PASSWORD={m}\n"),
+            ),
+            ("+TOKEN=ab:1:cd\n".to_string(), format!("+TOKEN={m}\n")),
+            ("-API_KEY=x:1:y\n".to_string(), format!("-API_KEY={m}\n")),
+            // ...and a `:` key is not, so a later emphasized key is read.
+            (
+                format!("+password:12:x **Token:** {p}\n"),
+                format!("+password:12:x **Token:** {m}\n"),
+            ),
+            // A real match line with a key after it is read as before.
+            (
+                "docs/a.md:12:password: x\n".to_string(),
+                format!("docs/a.md:12:password: {m}\n"),
+            ),
         ];
         for (input, want) in &masks {
             assert_eq!(masked(input), *want, "{input:?}");
@@ -4006,6 +4024,8 @@ mod tests {
             "docs/plans/2026-07-09-pre-push-secret-scan-237.md-7-next: \"Task 0 built\"\n",
             // Emphasis opens only at the line start or after a blank.
             "KEYS user*token:* 0\n",
+            // A name that is not secret leaves a `:digits:` line alone.
+            "+TOKEN_EXPIRES=12:30:45\n",
         ];
         for input in kept {
             assert_eq!(redact(input), None, "{input:?}");
