@@ -1441,10 +1441,16 @@ fn mentions_var(word: &str, name: &str) -> bool {
 /// default, or what an `export` earlier in the same command left behind (#548,
 /// see [`GhHostEnv`]). Inline and `--hostname` selections outrank it.
 fn gh_command_host(command: &str, env_host: &str) -> String {
-    let fallback = env_host.to_string();
-    let Some((tokens, gh_index)) = gh_command_tokens(command) else {
-        return fallback;
-    };
+    selected_gh_host(command, str::to_ascii_lowercase).unwrap_or_else(|| env_host.to_string())
+}
+
+/// The host one `gh` invocation selects itself, `--hostname` over an inline
+/// `GH_HOST=`, or `None` when it selects none; see [`gh_command_host`].
+/// `fold` is applied to the host as typed: [`gh_command_host`] folds its case
+/// to compare it, and a message shows it as typed ([`host_as_typed`]). The
+/// [`UNRESOLVED_GH_HOST`] stand-in is never folded.
+fn selected_gh_host(command: &str, fold: fn(&str) -> String) -> Option<String> {
+    let (tokens, gh_index) = gh_command_tokens(command)?;
     let table = host_scan_flags(&tokens[gh_index..]);
 
     // A prefix word whose NAME is not a plain literal (`env GH_HOS${X}T=h gh`)
@@ -1472,7 +1478,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
             .iter()
             .filter_map(|token| token.strip_prefix("GH_HOST="))
             .rfind(|host| !host.is_empty())
-            .map(str::to_ascii_lowercase)
+            .map(fold)
     };
 
     let mut flag_host = None;
@@ -1484,7 +1490,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
         }
         if token == "--hostname" {
             if let Some(host) = tokens.get(index + 1).filter(|host| !host.is_empty()) {
-                flag_host = Some(host.to_ascii_lowercase());
+                flag_host = Some(fold(host));
                 index += 2;
                 continue;
             }
@@ -1492,7 +1498,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
             .strip_prefix("--hostname=")
             .filter(|host| !host.is_empty())
         {
-            flag_host = Some(host.to_ascii_lowercase());
+            flag_host = Some(fold(host));
         } else if token.starts_with("--") {
             // Any other long flag. A value-taking one owns the following token
             // even when that value is the literal `--hostname`; a boolean long
@@ -1509,7 +1515,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
         index += 1;
     }
 
-    flag_host.or(inline_host).unwrap_or(fallback)
+    flag_host.or(inline_host)
 }
 
 #[cfg(test)]
@@ -1680,6 +1686,46 @@ fn loop_flag_value_is_owned(
 /// its text holds a `$`: its block names the host fix (#548).
 fn host_is_read(host: &str) -> bool {
     host == UNRESOLVED_GH_HOST || !(repo_has_unexpanded_expansion(host) || host.contains('*'))
+}
+
+/// `host` as `segment` typed it. The guard folds a host's case before it
+/// compares it, but `$H` and `$h` are different shell variables, so a message
+/// that names an expanded host shows the text the command spelled (#1503).
+///
+/// The host is looked for where gh takes it from, in gh's order: the target's
+/// own `HOST/` part (`-R`, `--repo`, an inline `GH_REPO`), then the host the
+/// command selects ([`selected_gh_host`]). A host the segment does not spell,
+/// such as the hook's own `GH_HOST`, is shown as given. Message only: no
+/// verdict reads it.
+fn host_as_typed(segment: &str, host: &str) -> String {
+    let typed_in = |text: &str| {
+        let at = text.to_ascii_lowercase().find(host)?;
+        text.get(at..at + host.len()).map(str::to_string)
+    };
+    // `gh api` takes no `-R`, so it never names the host there.
+    let flag = if gh_api_endpoint(segment).is_some() {
+        RepoFlag::Absent
+    } else {
+        repo_flag(segment)
+    };
+    let flag_value = match flag {
+        RepoFlag::Target(value) | RepoFlag::TargetOrAbsent(value) => Some(value),
+        RepoFlag::Absent | RepoFlag::Ambiguous => None,
+    };
+    flag_value
+        .into_iter()
+        .chain(inline_gh_repo(segment))
+        .filter(|value| {
+            parse_gh_repo_value(value)
+                .and_then(|spec| spec.host)
+                .is_some_and(|value_host| value_host == host)
+        })
+        .find_map(|value| typed_in(&value))
+        .or_else(|| {
+            selected_gh_host(segment, str::to_owned)
+                .filter(|typed| typed.eq_ignore_ascii_case(host))
+        })
+        .unwrap_or_else(|| host.to_string())
 }
 
 /// For a blocked target that carries a shell expansion: true when it still
@@ -3954,11 +4000,11 @@ fn judge_resolution(
                 // loop's `-R` arm says the same of that value (#1507).
                 let literal = target_spelling(segment, "owner/repo");
                 // Name the part that expands: with only the host expanded,
-                // `Target:` shows the whole spec, host first.
+                // `Target:` shows the whole spec, host first, as typed.
                 let target = if repo_has_unexpanded_expansion(&repo) {
                     repo
                 } else {
-                    format!("{host}/{repo}")
+                    format!("{}/{repo}", host_as_typed(segment, &host))
                 };
                 Some(CheckResult::block_structured(
                     format!(
@@ -10011,6 +10057,17 @@ mod tests {
             (
                 r#"gh repo archive "$h/evil/x" --yes"#.to_string(),
                 "$h/evil/x",
+            ),
+            // The host shows as typed: `$H` is not `$h` (#1503). The guard
+            // folds its case only to compare it.
+            (single(r#"-R "$H/evil/x""#), "$H/evil/x"),
+            (single(r#"-R "${GH_HOST}/evil/x""#), "${GH_HOST}/evil/x"),
+            (single(r#"-R "https://$H/evil/x""#), "$H/evil/x"),
+            (single(r#"--hostname "$H" -R evil/x"#), "$H/evil/x"),
+            (single(r#"--hostname="$H" -R evil/x"#), "$H/evil/x"),
+            (
+                "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
+                "$GH_HOST/cameronsjo/x",
             ),
         ];
         for (command, target) in &unresolvable {
