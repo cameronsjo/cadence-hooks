@@ -14,9 +14,9 @@ use crate::secret_patterns::{
     unresolved_parameter_cause, wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_word, executable_tokens, peel_command_runners,
-    redirect_operator_span, redirect_targets, skip_git_global_options, strip_group_wrappers,
-    tokenize, unescape_word,
+    carries_substitution, command_segments, command_word, executable_tokens, git_rm_keeps_the_tree,
+    peel_command_runners, redirect_operator_span, redirect_targets, skip_git_global_options,
+    strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -76,8 +76,9 @@ fn writer_argv(tokens: &[String]) -> &[String] {
 /// non-flag operand, or with `-t <dir>` / `--target-directory=<dir>` the dir
 /// value AND every operand (each source materializes under the target dir);
 /// `dd` — `of=` values; `truncate` — operands after consuming `-s <size>` /
-/// `--size=<n>`. `git rm` is judged as `rm`, and command runners (`sudo rm
-/// .env`, `env -i cp x .env`) are peeled by [`writer_argv`].
+/// `--size=<n>`. `git rm` is judged as `rm` unless it is told `--cached`
+/// ([`git_rm_keeps_the_tree`]), which leaves the file on disk, and command
+/// runners (`sudo rm .env`, `env -i cp x .env`) are peeled by [`writer_argv`].
 ///
 /// Quote-aware via [`tokenize`] (#86): a quoted filename is one clean token,
 /// so prose inside quotes (`rm "notes about .env stuff.txt"`, commit
@@ -96,10 +97,17 @@ fn writer_targets(segment: &str) -> Vec<String> {
         // `git`'s global options sit between the verb and the subcommand, so
         // reading `args[0]` alone misses `git -C . rm .env` and
         // `git --no-pager rm .env` — both delete the file (#528 review I2).
-        let subcommand = skip_git_global_options(args);
-        if subcommand.first().map(String::as_str) == Some("rm") {
+        // `git rm --cached` takes the path out of the index and leaves the
+        // file on disk, so it writes and deletes nothing (#1535). Core's test
+        // is the one trash-guard reads `git rm` with, so the two agree.
+        if let Some((sub, rest)) = skip_git_global_options(args).split_first()
+            && sub == "rm"
+        {
+            if git_rm_keeps_the_tree(rest) {
+                return Vec::new();
+            }
             cmd = "rm";
-            args = &subcommand[1..];
+            args = rest;
         }
     }
 
@@ -1491,6 +1499,43 @@ mod tests {
             "git --git-dir=.git rm .env",
             "git -P rm .env",
             "sudo git -C . rm .env",
+        ] {
+            assert!(bash_targets_env_file(command), "{command} must block");
+        }
+    }
+
+    /// `git rm --cached` takes the file out of the index and leaves it on
+    /// disk, so it neither writes nor deletes a secret (#1535). The rule is
+    /// core's `git_rm_keeps_the_tree`, the one trash-guard reads `git rm` by.
+    #[test]
+    fn bash_git_rm_cached_env_allowed() {
+        for command in [
+            "git rm --cached .env",
+            "git rm --cached -r .env",
+            "git rm -r --cached .env",
+            "git rm .env --cached",
+            "git rm --cach .env",
+            "git -C . rm --cached .env",
+            "sudo git rm --cached .env",
+            "git rm --cached .env && git commit -m untrack",
+            "echo .env | xargs git rm --cached",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command} must be allowed");
+        }
+    }
+
+    #[test]
+    fn bash_git_rm_env_without_cached_still_blocked() {
+        // After `--` the word is a file, and a later `--no-cached` undoes
+        // `--cached`; a deleting sibling is judged as it always was.
+        for command in [
+            "git rm -- --cached .env",
+            "git rm --end-of-options --cached .env",
+            "git rm --cached --no-cached .env",
+            "git rm --cached --no-c .env",
+            "git rm --cached .env; rm .env",
+            "git rm --cached .env && echo x > .env",
+            "git rm --cached x.txt .env.local; git rm .env",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }
