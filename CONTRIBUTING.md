@@ -22,7 +22,10 @@ assertions are enabled only by `CADENCE_TIMING_TESTS=1`; an unset variable or an
 other value leaves them off. This setting lives in test helpers and does not
 change production hook deadlines. The enforce-worktree line-continuation test
 counts `plain_of` segmenter calls in the normal suite and compares two
-timings only under the opt-in.
+timings only under the opt-in. The credential-scan 200 KB adversarial test
+(`perf_200kb_adversarial`) checks in the normal suite that each scan finds
+nothing, and checks its 5 s debug and 0.5 s release budgets only under the
+opt-in, unscaled on every platform.
 
 Run the opted-in budgets in release mode with one test thread:
 
@@ -182,7 +185,9 @@ check-author's debugging loop.
 1. Start with `cadence-hooks try <namespace> <hook>` to confirm the hook's
    event and see a working sample payload
 2. Copy that payload into a fixture file and switch to raw piping:
-   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`
+   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`.
+   Export `CADENCE_METRICS_DIR="$(mktemp -d)"` first, so the guard's logged
+   outcome does not land in your real `denials.jsonl` (`try` already does this)
 3. Change one `tool_input` field at a time to isolate what trips the check
 4. If version drift is suspected, run both binaries against the same fixture:
    `cadence-hooks --version` (installed) vs
