@@ -632,11 +632,14 @@ fn fresh_mktemp_args(args: &[&str]) -> bool {
 /// - `printf -v t …`, which assigns from inside a command that is otherwise
 ///   inert. (An arithmetic assignment, `$((t=3))`, lists as a segment of its
 ///   own and is not inert.)
+/// - a bare `*` (`t=*`, `t="*"`, [`assigns_a_bare_star`]), which the walk
+///   cannot tell from the `*` it lists beside an assignment from `mktemp`.
 ///
 /// Substring tests that can only keep a block.
 fn assigns_unseen(command: &str, segments: &[String]) -> bool {
     uses_parameter_default(command)
         || assigns_after_logical_operator(command)
+        || assigns_a_bare_star(command)
         || (command.contains("printf")
             && segments.iter().any(|segment| {
                 let tokens = executable_tokens(segment);
@@ -656,6 +659,24 @@ fn uses_parameter_default(command: &str) -> bool {
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
         name > 0 && rest[name..].starts_with([':', '-', '=', '+', '?'])
+    })
+}
+
+/// Does the command assign a bare `*`, as `t=*` or `t="*"`? [`command_segments`]
+/// lists a `*` beside an assignment from `mktemp`, so the operand walk passes
+/// that segment ([`is_fresh_temp_bookkeeping`]). A `*` the command typed never
+/// shows in the raw text that way: it is a glob, and after
+/// `trap 'rm -rf $t' EXIT; t=*` the trap deletes every file in the cwd.
+fn assigns_a_bare_star(command: &str) -> bool {
+    command.match_indices('=').any(|(at, _)| {
+        command[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && ["*", "\"*\""].iter().any(|star| {
+                command[at + 1..].strip_prefix(star).is_some_and(|rest| {
+                    rest.chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+                })
+            })
     })
 }
 
@@ -3520,6 +3541,12 @@ mod tests {
             (r#"t=$(mktemp); read t; rm "$t""#, Block),
             (r#"t=$(mktemp); printf -v t note.md; rm "$t""#, Block),
             (r#"t=$(mktemp); printf -vt note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*"#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t="*""#, Block),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; ls; tmp=*"#,
+                Block,
+            ),
             (r#"t=$(mktemp); echo $((t=5)); rm "$t""#, Block),
             (r#"t=$(mktemp); : $((t = 5)); rm "$t""#, Block),
             (r#"t=$(mktemp); (( t = 5 )); rm "$t""#, Block),
