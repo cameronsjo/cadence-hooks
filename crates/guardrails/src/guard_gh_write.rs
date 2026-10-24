@@ -1634,8 +1634,8 @@ fn flag_value_is_owned(
     }
 }
 
-/// The words the loop's raw `-R` word becomes once its quotes are removed,
-/// as the shell hands them to gh, when it carries a quote. The loop parser
+/// The words the loop's raw `-R` word becomes once the shell has removed its
+/// quotes and expanded its braces, as it hands them to gh. The loop parser
 /// keeps the word's text as typed, so `-R "cameronsjo/tool"` arrives with
 /// both quotes on, and the owner it reads is `"cameronsjo` (#1504). The
 /// single-command arm never sees them: [`tokenize`] has removed them by then.
@@ -1643,29 +1643,27 @@ fn flag_value_is_owned(
 /// An expansion stays in the text (`"cameronsjo/$r"` reads `cameronsjo/$r`),
 /// and the ownership check judges it as it judges an unquoted `-R` value: a
 /// literal allowed owner is owned, and `$o/$r` or `$h/cameronsjo/x` is not.
-/// [`loop_target_is_unresolvable`] still reads the raw text for the message.
-/// A brace expansion is several words (`"cameronsjo"/{a,b}`).
+/// A brace expansion is several words, quoted or not (`"cameronsjo"/{a,b}`,
+/// `{cameronsjo,mona_acme}/tool`).
 ///
-/// `None` leaves the word as it is: it carries no quote, so there is nothing
-/// to remove, or [`tokenize`] reads no word in it.
+/// `None` leaves the word as it is: [`tokenize`] reads no word in it.
 ///
 /// Quote removal is the tokenizer's, not a second copy of its rules, so a
 /// backslash, a quote inside the other kind, `$'…'` or a brace reads as it
-/// does for a single command.
+/// does for a single command. The verdict ([`loop_flag_value_is_owned`])
+/// and the message ([`loop_target_is_unresolvable`]) both read the word
+/// through here.
 fn unquoted_loop_repo_words(word: &str) -> Option<Vec<String>> {
-    if !word.contains(['"', '\'']) {
-        return None;
-    }
     let words = tokenize(word);
     (!words.is_empty()).then_some(words)
 }
 
-/// [`flag_value_is_owned`] for a loop's raw `-R` word: a quoted word is
-/// judged without its quotes, so `-R "cameronsjo/tool"` and
-/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A
-/// quoted word the shell expands to several words is owned only when each of
-/// them is, whichever one gh takes as the repo. Any other word is judged as
-/// typed.
+/// [`flag_value_is_owned`] for a loop's raw `-R` word: the word is judged
+/// as the shell hands it to gh, so `-R "cameronsjo/tool"` and
+/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A word
+/// the shell expands to several words, quoted or not, is owned only when each
+/// of them is, whichever one gh takes as the repo. A word [`tokenize`] reads
+/// no word in is judged as typed.
 ///
 /// This gate can only add a block. Once it passes, the per-segment pass
 /// judges every looped write again, as a single command, so reading the word
@@ -1775,27 +1773,35 @@ fn names_literal_unowned_owner(
 /// unresolvable rather than unowned, so the loop gate says "cannot resolve"
 /// and not "targets repo you don't own".
 ///
-/// Only a value with an expansion in it can be unresolvable; one without
-/// keeps the unowned message (#1337). With one, the value is
+/// The value is the raw `-R` text, read as the words
+/// [`unquoted_loop_repo_words`] returns, the same words the ownership check
+/// judged, so `$'work-org/tool'` reads `work-org/tool`, as for a single
+/// command. Only a word with an expansion in it can be unresolvable; one
+/// without keeps the unowned message (#1337). With one, the word is
 /// unresolvable unless [`names_literal_unowned_owner`] reads a literal owner
-/// the allowlist rejects. The loop value is the raw `-R` text, so both quote
-/// kinds are dropped before gh's split (`'cameronsjo/$r'` and
-/// `"cameronsjo"/"$r"` name the allowed owner `cameronsjo`).
+/// the allowlist rejects. A value that is several words is unresolvable when
+/// every word the allowlist rejects is, as the loop block says "cannot
+/// resolve" only when every blocked target is; callers pass only a value
+/// the ownership check rejected.
 fn loop_target_is_unresolvable(
     value: &str,
     dh: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
-    match flag_value_resolution(&value.replace(['"', '\''], ""), dh) {
-        RepoResolution::Resolved { host, repo } => {
-            repo_has_unexpanded_expansion(value)
-                && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos)
-        }
-        // A value with a `$` or backtick always resolves, so this one has
-        // no expansion to be unresolvable.
-        _ => false,
-    }
+    let words = unquoted_loop_repo_words(value).unwrap_or_else(|| vec![value.to_string()]);
+    words.iter().all(|word| {
+        flag_value_is_owned(word, dh, allowed_owners, allowed_repos)
+            || match flag_value_resolution(word, dh) {
+                RepoResolution::Resolved { host, repo } => {
+                    repo_has_unexpanded_expansion(word)
+                        && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos)
+                }
+                // A word with a `$` or backtick always resolves, so this one
+                // has no expansion to be unresolvable.
+                _ => false,
+            }
+    })
 }
 
 /// The last non-empty `GH_REPO=` in the assignment prefix of the segment's gh
@@ -9691,7 +9697,7 @@ mod tests {
             format!("for r in a b; do {}; done", body.join("; "))
         };
         // (flags, the `Found:` list the block names)
-        let unowned: [(&[&str], &str); 15] = [
+        let unowned: [(&[&str], &str); 18] = [
             (&[r#"-R "evil/$r""#], r#""evil/$r""#),
             (&["-R evil/$r"], "evil/$r"),
             // Digits and `_` are owner characters too.
@@ -9712,6 +9718,13 @@ mod tests {
             (&[r#"-R "evil"/"$r""#], r#""evil"/"$r""#),
             // No expansion at all: the unowned message, as before.
             (&[r#"-R "evil""#], r#""evil""#),
+            // `$'…'` and `$"…"` are quotes, and the owner past them is read
+            // as a single command reads it, not as a shell parameter.
+            (&["-R $'work-org/tool'"], "$'work-org/tool'"),
+            (&[r#"-R $"work-org/tool""#], r#"$"work-org/tool""#),
+            // A brace that expands to a literal unowned repo beside an
+            // unresolvable one: the literal one decides, as across targets.
+            (&[r#"-R {"work-org/x","$o/x"}"#], r#"{"work-org/x","$o/x"}"#),
             // One literal unowned owner decides the message for the loop, and
             // only it is named: the others are not repos you don't own.
             (&[r#"-R "evil/$r""#, r#"-R "$o/$r""#], r#""evil/$r""#),
@@ -9744,7 +9757,7 @@ mod tests {
         // owner slot; a variable host; and a `/` inside a substitution. An
         // allowed owner beside an expanded name is owned, quoted or not:
         // [`issue_1504_quoted_literal_dash_r_in_a_loop_is_judged_without_its_quotes`].
-        let unresolvable: [&[&str]; 20] = [
+        let unresolvable: [&[&str]; 21] = [
             &[r#"-R "$r""#],
             &[r#"-R "/$r""#],
             &[r#"-R "$o/$r""#],
@@ -9768,6 +9781,8 @@ mod tests {
             // An owned target beside an unresolvable one: only the
             // unresolvable one is left to name.
             &[r#"-R "cameronsjo/$r""#, r#"-R "$o/$r""#],
+            // The same inside one brace.
+            &[r#"-R {"cameronsjo/x","$o/x"}"#],
             &[r#"-R "$o/$r""#, r#"-R "$r""#],
         ];
         for flags in unresolvable {
@@ -9894,6 +9909,46 @@ mod tests {
                 );
                 assert!(
                     message.contains(&format!("Found: {found}\n")),
+                    "{command} in {cwd}: {message}"
+                );
+            }
+        }
+        // An unquoted brace is several words too, as for a single command:
+        // across two allowed owners, whichever word gh takes is owned.
+        for flag in [
+            "--repo={cameronsjo,mona_acme}/tool",
+            "-R {cameronsjo,mona_acme}/tool",
+            r#"--repo={"cameronsjo","mona_acme"}/tool"#,
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(flag);
+                let result = run_1491_owners("cameronsjo,mona_acme", &command, cwd, strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "{command} in {cwd} (strict {strict}): {:?}",
+                    result.message
+                );
+            }
+        }
+        // It blocks when any word it expands to is a repo the allowlist
+        // rejects, in either order, and the block names the word as typed.
+        for (owners, value) in [
+            ("cameronsjo,mona_acme", "{work-org,cameronsjo}/tool"),
+            ("cameronsjo,mona_acme", "{cameronsjo,work-org}/tool"),
+            ("cameronsjo", "{cameronsjo,mona_acme}/tool"),
+        ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(&format!("-R {value}"));
+                let result = run_1491_owners(owners, &command, cwd, strict);
+                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh loop targets repo you don't own"),
+                    "{command} in {cwd}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("Found: {value}\n")),
                     "{command} in {cwd}: {message}"
                 );
             }
