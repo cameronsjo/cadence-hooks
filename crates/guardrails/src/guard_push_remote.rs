@@ -2378,6 +2378,8 @@ mod tests {
     // --- #1509: a `Directory:` line prints the directory name flattened ---
 
     /// A repo named by [`crate::hostile_named_dir`] whose `origin` is `url`.
+    /// Unix only, like the one test that uses it.
+    #[cfg(unix)]
     fn hostile_checkout(root: &std::path::Path, url: &str) -> std::path::PathBuf {
         let dir = crate::hostile_named_dir(root);
         cadence_hooks_core::git_fixtures::init_repo(&dir);
@@ -2385,6 +2387,8 @@ mod tests {
         dir
     }
 
+    // Unix only: Windows refuses these characters in a directory name.
+    #[cfg(unix)]
     #[test]
     fn every_directory_line_prints_a_hostile_directory_name_flattened() {
         // Each row reaches a different `Directory:` line: the unowned-remote

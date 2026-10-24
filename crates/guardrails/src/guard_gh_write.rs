@@ -5730,6 +5730,8 @@ mod tests {
         assert!(msg.contains("d…\n"), "{msg}");
     }
 
+    // Unix only: Windows refuses these characters in a directory name.
+    #[cfg(unix)]
     #[test]
     fn a_block_from_a_hostile_directory_prints_its_name_flattened() {
         // A real directory named with a CR, an ESC and U+202E. The write names
