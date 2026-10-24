@@ -4581,7 +4581,10 @@ fn too_many_dirs_block(
     )
 }
 
-/// Runner hops [`dir_after_runners`] follows before it gives up.
+/// Runner hops [`dir_after_runners`] follows before it gives up. It is also
+/// the depth of nested runner scripts [`every_write_keeps_repo_name`] reads
+/// before the unowned fix drops the repo name, so changing it moves both
+/// limits.
 const MAX_RUNNER_HOPS: usize = 16;
 
 /// The short options of `env` and `sudo` that take a value (the directory
