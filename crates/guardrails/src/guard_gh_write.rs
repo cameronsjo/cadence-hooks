@@ -9790,6 +9790,15 @@ mod tests {
                 "gh label create bug -f -c ff0000 -R work-org/thing",
                 "-R cameronsjo/<repo>",
             ),
+            // `-f` at the head of a cluster, and `--force=…`, force too.
+            (
+                "gh label create bug -fc ff0000 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label create bug --force=true -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
             // A gh named by a variable assigned after the function that uses
             // it, which only the segment that blocked spells as `gh`, and a
             // lone create in `bash -c`, whose wrapper segment the guard reads
