@@ -9722,7 +9722,7 @@ mod tests {
         // owner slot; a variable host; and a `/` inside a substitution. An
         // allowed owner beside an expanded name is owned, quoted or not:
         // [`issue_1504_quoted_literal_dash_r_in_a_loop_is_judged_without_its_quotes`].
-        let unresolvable: [&[&str]; 21] = [
+        let unresolvable: [&[&str]; 22] = [
             &[r#"-R "$r""#],
             &[r#"-R "/$r""#],
             &[r#"-R "$o/$r""#],
@@ -9748,6 +9748,9 @@ mod tests {
             &[r#"-R "cameronsjo/$r""#, r#"-R "$o/$r""#],
             // The same inside one brace.
             &[r#"-R {"cameronsjo/x","$o/x"}"#],
+            // A brace word with an expansion and no `/` is kept and judged,
+            // though it reads as no repo: the shell decides what it names.
+            &["-R {cameronsjo/x,$r}"],
             &[r#"-R "$o/$r""#, r#"-R "$r""#],
         ];
         for flags in unresolvable {
