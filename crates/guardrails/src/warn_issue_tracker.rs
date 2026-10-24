@@ -1385,13 +1385,16 @@ mod tests {
         );
     }
 
-    /// A target over 200 characters is cut with an ellipsis.
+    /// A value over 200 characters is cut with an ellipsis, in both messages.
     #[test]
     fn long_target_is_cut_at_200_characters() {
         let target = format!("cameronsjo/{}", "r".repeat(MAX_PATH_DISPLAY + 50));
-        let msg = nudge_message(&target);
         let cut: String = target.chars().take(MAX_PATH_DISPLAY).collect();
+        let msg = nudge_message(&target);
         assert!(msg.contains(&format!("{cut}… isn't")), "{msg}");
+        assert!(!msg.contains(&target), "{msg}");
+        let msg = unreadable_message(&target);
+        assert!(msg.contains(&format!("target ({cut}…) is not")), "{msg}");
         assert!(!msg.contains(&target), "{msg}");
     }
 }
