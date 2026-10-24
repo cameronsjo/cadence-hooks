@@ -722,11 +722,12 @@ fn plain_assignment_value(segment: &str) -> Option<&str> {
 /// - an assignment of such a call, or of the `*` the walk lists beside it;
 /// - the call itself, with no redirect;
 /// - an [`INERT_VERBS`] command whose every redirect writes such a path;
-/// - a `trap` whose action only deletes variables (`trap 'rm -rf "$tmp"'
-///   EXIT`). The action runs later, but each variable in it reads as the call
-///   it was assigned, so its deletion is judged in this walk like any other,
-///   and an operand that is not a variable (`trap 'rm -rf build' EXIT`) keeps
-///   the verdict.
+/// - a `trap` whose action hands its commands only variables
+///   (`trap 'rm -rf "$tmp"' EXIT`, [`trap_action_takes_only_variables`]). The
+///   action runs later, but each variable in it reads as the call it was
+///   assigned, so its deletion is judged in this walk like any other, and an
+///   operand that is not a variable (`trap 'rm -rf build' EXIT`) keeps the
+///   verdict.
 ///
 /// Any other assignment, `t=note.md` or `t=$(date)`, is not inert, so a
 /// variable that is reassigned anywhere in the command keeps the block.
@@ -748,24 +749,26 @@ fn is_fresh_temp_bookkeeping(tokens: &[String], argv: &[String], segment: &str) 
     if INERT_VERBS.contains(&verb.as_ref()) {
         return !targets.is_empty() && targets.iter().all(|target| is_fresh_temp_word(target));
     }
-    verb == "trap" && installs_trap_action(tokens) && trap_only_deletes_variables(segment)
+    verb == "trap" && installs_trap_action(tokens) && trap_action_takes_only_variables(segment)
 }
 
-/// Does every command of this `trap`'s action delete only operands that start
-/// with `$` (`rm -rf "$tmp"`, `rm -f $a ${b}`)? Read standalone, so a variable
-/// stays the reference it is. This only tells a variable from a path; the
-/// action's deletions are judged by the operand walk like any other, where a
-/// variable that is not a fresh `mktemp` path keeps the block.
-fn trap_only_deletes_variables(segment: &str) -> bool {
+/// Is every word after the head of each command in this `trap`'s action,
+/// options aside, one that starts with `$` (`rm -rf "$tmp"`, `rm -f $a ${b}`)?
+/// Read standalone, so a variable stays the reference it is. This tells a
+/// variable from a path, and it also refuses a redirect, whose operator and
+/// target are not variables (`trap 'rm -rf "$tmp" > note.md' EXIT`). The
+/// action's commands are segments of the operand walk too and are judged
+/// there like any other: a deletion of a variable that is not a fresh
+/// `mktemp` path, or a command that is not inert, keeps the block.
+fn trap_action_takes_only_variables(segment: &str) -> bool {
     segment_scripts(segment).iter().all(|script| {
         command_segments(script).iter().all(|inner| {
             let tokens = executable_tokens(inner);
             let argv = peel_command_runners(&tokens);
-            head_deletes(argv)
-                && argv[1..]
-                    .iter()
-                    .filter(|arg| !arg.starts_with('-'))
-                    .all(|arg| arg.starts_with('$'))
+            argv.iter()
+                .skip(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .all(|arg| arg.starts_with('$'))
         })
     })
 }
@@ -3515,6 +3518,12 @@ mod tests {
             ),
             (r#"t=$(mktemp); cat note.md > "$t"; rm -f "$t""#, Allow),
             ("mktemp; rm /tmp/x", Allow),
+            // A trap whose action hands its commands only variables, deleting
+            // or not; the walk judges those commands where they stand.
+            (
+                r#"tmp=$(mktemp -d); trap 'echo "$tmp"' EXIT; rm -rf "$tmp""#,
+                Allow,
+            ),
             // No variable, `-p`, `--tmpdir`, or a path in the call.
             (r#"rm -f "$t""#, Block),
             (r#"t=$(mktemp -p .); rm "$t""#, Block),
@@ -3600,10 +3609,6 @@ mod tests {
             ("mktemp -t /vault/x.XXXX; rm /tmp/x", Block),
             // A trap whose action deletes more than variables.
             (r#"tmp=$(mktemp -d); trap 'rm -rf build' EXIT"#, Block),
-            (
-                r#"tmp=$(mktemp -d); trap 'echo "$tmp"' EXIT; rm -rf "$tmp""#,
-                Block,
-            ),
             (
                 r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"; rm note.md' EXIT"#,
                 Block,
