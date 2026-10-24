@@ -1085,9 +1085,23 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn check_allows_when_cwd_is_not_a_git_repo() {
-        // /tmp has no git remote — unresolvable → allow silently.
-        let result = WarnIssueTracker.run(&make_bash_with_cwd("gh issue create --title x", "/tmp"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        // /tmp has no git remote — unresolvable → allow silently. The run
+        // reads the owner list and hosts, so it holds the env lock like its
+        // siblings do.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_EXTRA_HOSTS", None),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+                ("GH_HOST", None),
+            ],
+            || {
+                let result =
+                    WarnIssueTracker.run(&make_bash_with_cwd("gh issue create --title x", "/tmp"));
+                assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+            },
+        );
     }
 
     // ---- owner-scope tests (#727) ----

@@ -11,10 +11,11 @@ use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, CommandWordVariables, ExpansionWork, GhRepoFlag, LOOP_PATTERN, TRANSPARENT,
-    brace_expansion_overflows, carries_substitution, command_segments, command_segments_with_dirs,
-    command_word, contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
-    host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
-    split_segments_with_ops, strip_quotes, tokenize,
+    UnreadEval, brace_expansion_overflows, carries_substitution, command_segments,
+    command_segments_with_dirs_reading, command_word, contains_ignoring_ascii_case,
+    gh_canonical_verb, gh_command_path, gh_repo_flags, host_and_repo_from_url, may_spell_word,
+    parse_gh_repo_value, parse_work_dir, requote_words, split_segments_with_ops, strip_quotes,
+    tokenize,
 };
 use cadence_hooks_core::shell::{
     UNRESOLVABLE_DIR, apply_cd_target, executable_tokens, skip_env_assignment_operands,
@@ -4186,7 +4187,10 @@ impl Check for GhWriteGuard {
                 .map(|segment| (segment, dir.clone()))
                 .collect()
         };
-        let own = || command_segments_with_dirs(command, cwd);
+        // An `eval` of text the guard cannot read (`eval "$(direnv export
+        // bash)"`) is judged where the guard read the shell to be, unless it
+        // read something in it that moves (cadence-ecosystem ADR-0046 rule 3).
+        let own = || command_segments_with_dirs_reading(command, cwd, UnreadEval::StaysPut);
         let mut judged = WriteJudgments::default();
         let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
         for reading in readings {
@@ -4529,7 +4533,7 @@ fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
 ///
 /// `segments` is one reading of `command`: every [`command_segments`] segment
 /// in the whole-command directory, or each in the directory its own segment
-/// runs in ([`command_segments_with_dirs`]). The `GH_HOST`/`GH_REPO` a write
+/// runs in ([`command_segments_with_dirs_reading`]). The `GH_HOST`/`GH_REPO` a write
 /// inherits is tracked along the reading's own order.
 fn judge_write_segments(
     command: &str,
@@ -6240,12 +6244,12 @@ mod tests {
 
     #[test]
     fn write_after_an_unread_eval_prints_no_control_byte() {
-        // `eval "$S"` may change directory, so the write's own directory is
-        // the sentinel, while the checkout itself is owned. The block stands;
-        // only its text changed.
+        // `eval "cd $D"` changes directory to a place the guard cannot read,
+        // so the write's own directory is the sentinel, while the checkout
+        // itself is owned. The block stands; only its text changed.
         with_env(&owners_env(), || {
             let result = GhWriteGuard.run(&input_with(
-                r#"eval "$S"; gh pr create --title t --body b"#,
+                r#"eval "cd $D"; gh pr create --title t --body b"#,
                 OWNED_DIR,
             ));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -6364,10 +6368,13 @@ mod tests {
     use cadence_hooks_core::HookInput;
 
     // GhWriteGuard.run() reads CADENCE_ALLOWED_OWNERS / CADENCE_ALLOWED_REPOS
-    // / CADENCE_EXTRA_HOSTS via process-global env vars. Serialize all
-    // metadata-shape tests via the crate-shared with_env/CADENCE_ENV_TEST_LOCK
-    // so they don't race each other or the same globals mutated in
-    // guard_push_remote / warn_issue_tracker (#446).
+    // / CADENCE_EXTRA_HOSTS, and also GH_HOST and GH_REPO, via process-global
+    // env vars. Serialize all metadata-shape tests via the crate-shared
+    // with_env/CADENCE_ENV_TEST_LOCK so they don't race each other or the same
+    // globals mutated in guard_push_remote / warn_issue_tracker (#446). Holding
+    // the lock does not stop a value the shell exported from moving a verdict:
+    // a test that GH_HOST or GH_REPO can flip lists it in its with_env vars as
+    // None.
 
     fn input_with(command: &str, cwd: &str) -> HookInput {
         // Build via JSON to avoid private-field gymnastics; the real hook
@@ -6409,6 +6416,7 @@ mod tests {
                 ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
+                ("GH_REPO", None),
             ],
             || {
                 // No -R + cwd is /tmp (no git remote) → Unresolvable.
@@ -7375,6 +7383,7 @@ mod tests {
                 ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
+                ("GH_REPO", None),
             ],
             || {
                 use cadence_hooks_core::Outcome::{Allow, Block};
@@ -7542,11 +7551,14 @@ mod tests {
         });
     }
 
-    fn owners_env_212() -> [(&'static str, Option<&'static str>); 5] {
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // CDPATH changes where a `cd` lands, so an exported one moves the
+            // directory the guard judges the write from.
+            ("CDPATH", None),
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
@@ -7621,11 +7633,14 @@ mod tests {
     // so it exercises the cwd-remote fallback the bypass relied on.
     const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-    fn owners_env() -> [(&'static str, Option<&'static str>); 5] {
+    fn owners_env() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // CDPATH changes where a `cd` lands, so an exported one moves the
+            // directory the guard judges the write from.
+            ("CDPATH", None),
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
@@ -7871,6 +7886,7 @@ mod tests {
                 ),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", Some("evil.example.com")),
+                ("GH_REPO", None),
             ],
             || {
                 let input = input_with(
@@ -9946,6 +9962,7 @@ mod tests {
                 ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", Some("evil-host.example")),
+                ("GH_REPO", None),
             ],
             || {
                 let result = GhWriteGuard.run(&input_with(
@@ -11557,14 +11574,18 @@ mod tests {
                     false,
                 ),
                 ("eval $(ssh-agent -s) && gh pr create -t x", &osub, false),
-                // Twins: another eval, a second command, a redefined tool, a
-                // `cd`-defining flag, a direnv export, an unowned cwd.
-                ("eval \"$(cat x)\"; gh pr create -t x", &osub, true),
+                // Any other eval of text the guard cannot read stays put too,
+                // unless it read something that moves (cadence-ecosystem
+                // ADR-0046 rule 3).
+                ("eval \"$(cat x)\"; gh pr create -t x", &osub, false),
                 (
                     "eval \"$(direnv export bash)\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
+                ("eval '$(ssh-agent -s)'; gh pr create -t x", &osub, false),
+                // Twins: a second command, a redefined tool, a `cd`-defining
+                // flag, an unowned cwd.
                 (
                     "eval \"$(ssh-agent -s; cd {U})\"; gh pr create -t x",
                     &osub,
@@ -11600,7 +11621,6 @@ mod tests {
                     &osub,
                     true,
                 ),
-                ("eval '$(ssh-agent -s)'; gh pr create -t x", &osub, true),
                 ("eval \"$(ssh-agent -s)\"; gh pr create -t x", &usub, true),
                 // 4. `popd` returns to where the matching `pushd` left.
                 (
@@ -11798,7 +11818,6 @@ mod tests {
                 ("trap 'cd {U}' DEBUG; gh pr create -t x", true),
                 // Unreadable: the shell is somewhere this walk cannot name.
                 ("cd {U}; popd; gh pr create -t x", true),
-                ("eval \"$S\"; gh pr create -t x", true),
                 // Controls: the same forms into the owned checkout, or
                 // forms that move nothing.
                 ("cd {O} && gh pr create -t x", false),
@@ -11823,6 +11842,10 @@ mod tests {
                     false,
                 ),
                 ("eval 'echo hi'; gh pr create -t x", false),
+                // An eval of text the guard cannot read: judged where the
+                // guard read the shell to be (cadence-ecosystem ADR-0046
+                // rule 3).
+                ("eval \"$S\"; gh pr create -t x", false),
                 ("trap 'rm -f x' EXIT; gh pr create -t x", false),
             ] {
                 let command = command.replace("{O}", o).replace("{U}", u);
@@ -11831,6 +11854,83 @@ mod tests {
                     matches!(result.outcome, cadence_hooks_core::Outcome::Block),
                     blocks,
                     "{command}: {:?}",
+                    result.message
+                );
+            }
+        });
+    }
+
+    /// An `eval` of text the guard cannot read no longer makes the write's
+    /// directory unresolvable: the write is judged in the directory the
+    /// guard read (cadence-ecosystem ADR-0046 rule 3). Every target the
+    /// guard did read still decides: an unowned `origin`, a literal `cd`,
+    /// `pushd`, `env -C` or `git -C` root into an unowned checkout, a
+    /// `GH_REPO` or `-R`, and a `cd` in the eval's own words or in the value
+    /// the command gave the variable it evals.
+    // Embeds native paths in a POSIX shell string or uses Unix-only temp roots;
+    // Windows paths lose their backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
+    #[test]
+    fn gh_write_after_an_unread_eval_is_judged_where_it_was_read() {
+        let owned = origin_checkout("https://github.com/cameronsjo/demo.git");
+        let unowned = origin_checkout("https://github.com/evil/demo.git");
+        let o = owned.path().to_str().unwrap();
+        let u = unowned.path().to_str().unwrap();
+        with_env(&owners_env(), || {
+            for (command, cwd, blocks) in [
+                ("gh pr create --fill", o, false),
+                ("eval \"$S\"; gh pr create --title t --body b", o, false),
+                (
+                    "eval \"$(direnv export bash)\"; gh pr create --fill",
+                    o,
+                    false,
+                ),
+                (
+                    "eval \"$(direnv export zsh)\" && gh pr create --fill",
+                    o,
+                    false,
+                ),
+                // The same in an unowned checkout.
+                ("eval \"$S\"; gh pr create --title t --body b", u, true),
+                (
+                    "eval \"$(direnv export bash)\"; gh pr create --fill",
+                    u,
+                    true,
+                ),
+                // A directory change or target the guard read.
+                (
+                    "eval \"$(direnv export bash)\"; cd {U} && gh pr create --fill",
+                    o,
+                    true,
+                ),
+                ("eval \"$S\"; pushd {U} && gh pr create --fill", o, true),
+                ("eval \"$S\"; env -C {U} gh pr create --fill", o, true),
+                (
+                    "eval \"$S\"; cd \"$(git -C {U} rev-parse --show-toplevel)\" && gh pr create --fill",
+                    o,
+                    true,
+                ),
+                ("cd {U}; eval \"$S\"; gh pr create --fill", o, true),
+                (
+                    "eval \"$(direnv export bash)\"; GH_REPO=evil/x gh pr create --fill",
+                    o,
+                    true,
+                ),
+                (
+                    "eval \"$(direnv export bash)\"; gh pr create --fill -R evil/x",
+                    o,
+                    true,
+                ),
+                ("eval \"cd {U}; $S\"; gh pr create --fill", o, true),
+                ("S='cd {U}'; eval \"$S\"; gh pr create --fill", o, true),
+                ("f() { cd {U}; }; eval \"$S\"; gh pr create --fill", o, true),
+            ] {
+                let command = command.replace("{U}", u);
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    blocks,
+                    "{command} (from {cwd}): {:?}",
                     result.message
                 );
             }
