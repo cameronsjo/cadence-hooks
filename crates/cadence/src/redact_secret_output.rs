@@ -354,12 +354,17 @@ pub fn redact(text: &str) -> Option<String> {
     let plain = strip_ansi(text);
     collect_mapped(text, &plain, &mut names, &mut spans);
     let plain_masks = merge(std::mem::take(&mut spans));
-    // An escape inside a plain-pass mask adds nothing when decoded: the text
-    // it could expose is masked already, and any pair beyond the mask that
-    // only decoding reveals has escapes of its own outside it, which still
-    // open a window (a window spans the whole line). Skipping these keeps
-    // dense escaped output (`"PASSWORD=x\n"…`, `\"PASSWORD=x\"…`) to one pass.
+    // An escape adds nothing when decoded if one plain-pass mask runs from it
+    // to the end of its line: every character from the escape on, where the
+    // decoded text differs and a pair it starts would sit, is masked already.
+    // A mask that ends mid-line settles nothing. A weak `=` value stops at the
+    // first blank, so in `x auth=abc\npassword: <secret>` the mask covers the
+    // `\n` but not ` <secret>`, and only the decoded window reads
+    // `password: <secret>` at a line start (#1538). Skipping the settled ones
+    // keeps dense lines a line-start mask covers (`PASSWORD=x\nPASSWORD=x…`)
+    // to one pass. The line end is cached, so a long line is read once.
     let mut cursor = 0usize;
+    let mut line = (usize::MAX, 0usize);
     let settled = |p: usize| {
         let Some(o) = plain.orig(p) else {
             return false;
@@ -367,7 +372,14 @@ pub fn redact(text: &str) -> Option<String> {
         while cursor < plain_masks.len() && plain_masks[cursor].end <= o {
             cursor += 1;
         }
-        plain_masks.get(cursor).is_some_and(|m| m.start <= o)
+        let Some(mask) = plain_masks.get(cursor).filter(|m| m.start <= o) else {
+            return false;
+        };
+        let eol = line_end(&plain.text, p, &mut line);
+        // `p` is a backslash, so the line holds at least that byte.
+        plain
+            .orig(eol.max(p + 1) - 1)
+            .is_some_and(|last| mask.end > last)
     };
     let windows = escape_windows(&plain.text, settled);
     spans = plain_masks;
@@ -2700,6 +2712,39 @@ mod tests {
 
     fn masked(text: &str) -> String {
         redact(text).unwrap_or_else(|| text.to_string())
+    }
+
+    /// cameronsjo/cadence-hooks#1538: an escape inside a mask that ends
+    /// mid-line opens its decoded window, so a pair only decoding reveals past
+    /// the mask is masked. The issue's two rows, exactly, then other masks that
+    /// stop at a blank (weak names, a query string) and other escapes.
+    #[test]
+    fn an_escape_inside_a_mid_line_mask_still_decodes() {
+        let p = pw();
+        let m = NAMED_MARK;
+        for (input, want) in [
+            (
+                format!("x auth=abc\\npassword: {p}\n"),
+                format!("x auth={m} {m}\n"),
+            ),
+            (
+                format!("INFO auth=abc\\npassword: {p}\n"),
+                format!("INFO auth={m} {m}\n"),
+            ),
+        ] {
+            assert_eq!(masked(&input), want, "{input}");
+        }
+        for input in [
+            format!("x basic_auth=abc\\npassword: {p}\n"),
+            format!("x db_pass=abc\\npassword: {p}\n"),
+            format!("x ssh_key=abc\\r\\npassword: {p}\r\n"),
+            format!("x license_key=abc\\ntoken: {p}\n"),
+            format!("GET /a?token=abc\\npassword: {p} HTTP/1.1\n"),
+            format!("{{\"log\":\"x auth=abc\\npassword: {p}\"}}\n"),
+            format!("\x1b[2mx auth=abc\\npassword: {p}\x1b[m\n"),
+        ] {
+            assert!(!masked(&input).contains(&p), "{input}");
+        }
     }
 
     /// Each input carries one of the canaries; none may survive. Includes
