@@ -628,6 +628,23 @@ fn assigns_a_bare_star(command: &str) -> bool {
     })
 }
 
+/// Does a `$(mktemp …)` call run a second command before its first `)`, as
+/// `$(mktemp -d; ls)` or `$(mktemp -d && pwd)` do? Core cuts the deletion's
+/// segment at that `;`, `&`, `|` or newline, so the segment ends in
+/// `$(mktemp -d` and [`unquoted_fresh_temp_span`] would close the call with
+/// the trimmed `)`, while the shell also deletes what the second command
+/// prints: `rm -rf $(mktemp -d; pwd)` deletes the cwd. A substring test that
+/// can only keep a block.
+fn mktemp_call_runs_more(command: &str) -> bool {
+    command.match_indices("$(").any(|(at, _)| {
+        let body = command[at + 2..].trim_start();
+        body.starts_with("mktemp")
+            && body
+                .find([')', ';', '&', '|', '\n'])
+                .is_some_and(|end| body.as_bytes()[end] != b')')
+    })
+}
+
 /// Does an `&&` or `||` come straight before an assignment word?
 fn assigns_after_logical_operator(command: &str) -> bool {
     ["&&", "||"].iter().any(|operator| {
@@ -673,8 +690,10 @@ fn is_fresh_temp_word(word: &str) -> bool {
 /// ends in the word `$(mktemp`, and `rm -rf $(mktemp -d)` in `$(mktemp` and
 /// `-d`. The call is put back together from its words: each must be
 /// unquoted (a quoted `'$(mktemp'` is a file name), and the first `)` must
-/// end one of them. When the words run out first, the trimmed `)` closed it.
-/// A call that does not end the segment is one word already.
+/// end one of them. When the words run out first, the trimmed `)` closed it,
+/// or core cut the segment at a second command inside the call
+/// (`$(mktemp -d; ls)`), which [`mktemp_call_runs_more`] refuses before this
+/// runs. A call that does not end the segment is one word already.
 ///
 /// Unquoted, the shell splits and globs what the call prints, which is one
 /// path except under GNU's `--help` and `--version` (or an abbreviation):
@@ -983,8 +1002,9 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
     }
     let listed = ListedSegments::new(&segments);
     // A variable assigned from `mktemp` holds the path it just made unless
-    // something in the command can change or skip the assignment.
-    let fresh_temps = !assigns_unseen(command, &segments);
+    // something in the command can change or skip the assignment, and a call
+    // is read only when it runs nothing else.
+    let fresh_temps = !assigns_unseen(command, &segments) && !mktemp_call_runs_more(command);
     let mut judged = 0;
     for segment in &segments {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
@@ -3624,6 +3644,14 @@ mod tests {
             (r#"rm -f $(mktemp --help)"#, Block),
             (r#"rm -f $(mktemp --ver)"#, Block),
             (r#"rm -f '$(mktemp' '-d)'"#, Block),
+            // A call that runs a second command deletes what that prints too.
+            (r#"rm -rf $(mktemp -d; ls)"#, Block),
+            (r#"rm -rf $(mktemp -d && pwd)"#, Block),
+            (r#"rm -f $(mktemp & echo note.md)"#, Block),
+            (r#"rm -f $(mktemp | cat)"#, Block),
+            ("rm -rf $(mktemp -d\nls)", Block),
+            (r#"rm -rf $( mktemp -d; ls )"#, Block),
+            (r#"sh -c 'rm -rf $(mktemp -d; ls)'"#, Block),
             (r#"t=$(mktemp); rm -f "$t" "$u""#, Block),
             (r#"t=$(mktemp); rm -f "$t"; rm note.md"#, Block),
             // A sibling that moves, copies or links files, or a redirect to
