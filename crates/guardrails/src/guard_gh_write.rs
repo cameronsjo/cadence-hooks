@@ -9900,7 +9900,7 @@ mod tests {
                 "{repo}: {segment}"
             );
         }
-        // The command's own `$r` is not reused either (round 10, CodeRabbit
+        // The command's own `$r` is not reused either (round 9, CodeRabbit
         // 4368133188): whoever spelled an expanded name, the fix is a command
         // the model runs.
         for name in ["$r", "${r}"] {
@@ -9948,7 +9948,7 @@ mod tests {
             }
         }
         // Round 8: the remote's name inside the command's own quoted text is
-        // not the command naming the target. Round 10 (CodeRabbit
+        // not the command naming the target. Round 9 (CodeRabbit
         // 4368133188): nor is the remote's whole `owner/name` there.
         for (url, command) in [
             ("git@git.example:work-org/`make clean`", PR_WITH_A_CODE_SPAN),
@@ -9989,7 +9989,7 @@ mod tests {
     fn an_expanded_target_the_command_spells_gets_repo_in_the_fix() {
         // Each spelling holds the target's whole `evil/$r`, and none keeps the
         // `$r`: an expanded name is never reused, whoever spelled it (round
-        // 10, CodeRabbit 4368133188). Round 9 kept it for these.
+        // 9, CodeRabbit 4368133188). Round 8 kept it for these.
         for (command, expected) in [
             (
                 r#"gh issue create -R "evil/$r" --title t --body b"#,
