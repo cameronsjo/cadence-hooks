@@ -3886,6 +3886,8 @@ mod tests {
                 format!("_posts/2026-10-24-x.md-3-password: {p}\n"),
                 format!("_posts/2026-10-24-x.md-3-password: {m}\n"),
             ),
+            // A plain glued key may start with `_`.
+            (format!("+_password={p}\n"), format!("+_password={m}\n")),
         ];
         for (input, want) in &masks {
             assert_eq!(masked(input), *want, "{input:?}");
@@ -3926,6 +3928,21 @@ mod tests {
             "--- a/config/db.yml\n",
             "**Note:** rotate the password monthly\n",
             "+**Second pass:** done\n",
+            // A glued name that is not secret leaves its line alone, so a
+            // bare `pass:` after it is read as on that line.
+            "+user=admin pass: hunter2\n",
+            "+note: x pass: hunter2\n",
+            "docs/a.md:3:user=admin pass: hunter2\n",
+            "**Note:** pass: hunter2\n",
+            "**Status:** pass: hunter2\n",
+            "*Note:* pass: hunter2\n",
+            // Not a grep prefix: an empty path, a dash that starts the line,
+            // digits that no dash closes.
+            ":3:password: x\n",
+            "-1-password: x\n",
+            "a-1/token: b\n",
+            // An emphasized name starts with a letter.
+            "**_token:** b\n",
             // A `-digits-` run is a context separator only when the name
             // after it holds no later one.
             "docs/plans/2026-07-09-pre-push-secret-scan-237.md-7-next: \"Task 0 built\"\n",
