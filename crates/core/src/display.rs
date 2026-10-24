@@ -29,6 +29,46 @@ pub fn sanitize_field(s: &str, max: usize) -> String {
     out
 }
 
+/// `s` with the userinfo of every `scheme://userinfo@host` in it replaced by
+/// `***`. The scheme, host, port and path are kept.
+///
+/// A remote URL can carry a credential: CI checkouts and some credential
+/// helpers write `https://x-access-token:<token>@github.com/owner/repo.git`
+/// into `.git/config`. A hook that prints the URL as is puts the token into
+/// the text the model reads (cameronsjo/cadence-hooks#1541). The whole
+/// userinfo is masked, user name included, because a token is often the user
+/// name alone (`https://<token>@github.com/…`).
+///
+/// The authority ends at the first `/`, `?`, `#` or whitespace after `://`,
+/// and its userinfo ends at the last `@` before that. An scp-style address
+/// (`git@github.com:owner/repo`) is left as is: git reads the part before its
+/// first `:` as the host, so the form has no place for a password, and its
+/// user name goes to ssh, which never takes a token there.
+///
+/// Run this before [`sanitize_field`], so a long userinfo cannot push the host
+/// past the length cut.
+#[must_use]
+pub fn mask_url_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        rest = match tail[..authority_end].rfind('@') {
+            Some(userinfo_end) => {
+                out.push_str("***");
+                &tail[userinfo_end..]
+            }
+            None => tail,
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Wrap `s` in single quotes for safe inclusion in a rendered shell command,
 /// escaping any embedded single quote via the POSIX `'\''` idiom (close, emit
 /// an escaped quote, reopen).
@@ -464,5 +504,63 @@ mod tests {
         let hostile = "ok.txt\nenforce-worktree: actually, this is fine";
         let out = sanitize_field(hostile, MAX_PATH_DISPLAY);
         assert!(!out.contains('\n'), "no newline survives: {out}");
+    }
+
+    /// cameronsjo/cadence-hooks#1541: every userinfo is masked, and the
+    /// scheme, host, port and path are kept.
+    #[test]
+    fn url_userinfo_is_masked() {
+        // Built so no provider-shaped literal sits in source.
+        let token = ["gh", "p_"].concat() + &"a".repeat(36);
+        for (url, shown) in [
+            (
+                format!("https://x-access-token:{token}@github.com/work-org/thing.git"),
+                "https://***@github.com/work-org/thing.git".to_string(),
+            ),
+            (
+                format!("https://{token}@github.com/work-org/thing"),
+                "https://***@github.com/work-org/thing".to_string(),
+            ),
+            (
+                format!("https://oauth2:{token}@gitlab.example:8443/g/r.git"),
+                "https://***@gitlab.example:8443/g/r.git".to_string(),
+            ),
+            (
+                "ssh://git@github.com/o/r.git".to_string(),
+                "ssh://***@github.com/o/r.git".to_string(),
+            ),
+            // The last `@` before the path ends the userinfo.
+            (
+                "https://a@b:c@github.com/o/r".to_string(),
+                "https://***@github.com/o/r".to_string(),
+            ),
+            // No host part at all.
+            ("https://u:p@".to_string(), "https://***@".to_string()),
+            // Two URLs in one value.
+            (
+                "https://u:p@h/x?next=https://v:q@k/y".to_string(),
+                "https://***@h/x?next=https://***@k/y".to_string(),
+            ),
+        ] {
+            assert_eq!(mask_url_userinfo(&url), shown, "{url}");
+        }
+    }
+
+    /// A value with no userinfo comes back unchanged: an `@` in the path, an
+    /// scp-style address, a plain word, or text after a space.
+    #[test]
+    fn a_value_without_userinfo_is_unchanged() {
+        for value in [
+            "https://github.com/o/r.git",
+            "https://github.com/o/r@v1",
+            "https://github.com/o?u=a@b",
+            "git@github.com:o/r.git",
+            "origin",
+            "$R",
+            "https://host x@y",
+            "",
+        ] {
+            assert_eq!(mask_url_userinfo(value), value);
+        }
     }
 }

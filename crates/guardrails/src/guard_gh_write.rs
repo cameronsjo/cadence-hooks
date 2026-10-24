@@ -3671,12 +3671,16 @@ fn judge_resolution(
             format!(
                 "🚫 git-guardrails: gh write names a target repo this guard cannot read\n   \
                  Command: {segment}\n   \
-                 Target:  {value}\n   \
+                 Target:  {shown}\n   \
                  gh reads a repo as a URL or `[HOST/]OWNER/REPO`; this value is neither, or \
                  is spelled in a way this guard cannot split exactly as gh does, so it cannot \
                  be checked for ownership.\n   \
                  Fix: spell the target as `{}`",
                 target_spelling(segment, "owner/repo"),
+                // The value can be a `GH_REPO` inherited from the environment,
+                // and a URL's userinfo can hold a token
+                // (cameronsjo/cadence-hooks#1541).
+                shown = crate::messages::shown_url(&value),
             ),
             BlockMetadata {
                 rule_id: "gh-write-target-unresolvable".to_string(),
@@ -3783,7 +3787,7 @@ fn judge_resolution(
                          Target:  {shown} (an unexpanded shell expansion — its value is only known \
                          when the shell runs)\n   \
                          Fix: pass the target as a literal `{literal}`",
-                        shown = sanitize_field(&repo, MAX_PATH_DISPLAY),
+                        shown = crate::messages::shown_url(&repo),
                     ),
                     BlockMetadata {
                         rule_id: "gh-write-target-unresolvable".to_string(),
@@ -6238,6 +6242,43 @@ mod tests {
             let message = result.message.unwrap_or_default();
             assert!(!has_control_byte(&message), "{message:?}");
             assert!(message.contains("Directory: unknown ("), "{message}");
+        });
+    }
+
+    #[test]
+    fn a_token_in_an_unreadable_target_url_is_masked() {
+        // cameronsjo/cadence-hooks#1541: a URL with three path parts is one gh
+        // takes and this guard cannot split, so the block prints it as its
+        // `Target:`. Inherited as `GH_REPO`, it is nowhere in the command, so
+        // the block was the only place its token showed. The `-R` row prints
+        // the same `Target:`; its `Command:` line still shows what was typed.
+        let token = ["gh", "p_"].concat() + &"a1B2".repeat(9);
+        let url = format!("https://x:{token}@github.com/cameronsjo/r/extra");
+        let target = "Target:  https://***@github.com/cameronsjo/r/extra";
+        let inherited = [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", None),
+            ("GH_HOST", None),
+            ("GH_REPO", Some(url.as_str())),
+        ];
+        with_env(&inherited, || {
+            let result = GhWriteGuard.run(&input_with("gh issue create -t t -b b", OWNED_DIR));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let message = result.message.unwrap_or_default();
+            assert!(message.contains(target), "{message:?}");
+            assert!(!message.contains(&token), "{message:?}");
+        });
+        with_env(&owners_env(), || {
+            let command = format!("gh issue create -R {url} -t t -b b");
+            let result = GhWriteGuard.run(&input_with(&command, OWNED_DIR));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let message = result.message.unwrap_or_default();
+            let line = message
+                .lines()
+                .find(|l| l.trim_start().starts_with("Target:"))
+                .unwrap_or_default();
+            assert_eq!(line.trim_start(), target, "{message:?}");
         });
     }
 
