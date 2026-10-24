@@ -4316,6 +4316,9 @@ fn combine_heads(heads: &[Option<String>]) -> ShipHead {
 /// repo spelling in the rest of that segment reads as unreadable rather than
 /// trusted. So a new gh flag can cost a spurious advisory, never a silent
 /// allow.
+///
+/// [`gh_repo_flags`] also reads the boolean half of a grammar, for the verbs
+/// [`repo_flag_grammar`] names, so a `-R` after one of them is certain.
 struct FlagGrammar {
     short_values: &'static str,
     short_bools: &'static str,
@@ -4361,6 +4364,16 @@ const READY_FLAGS: FlagGrammar = FlagGrammar {
     short_bools: "h",
     long_values: &[],
     long_bools: &["help", "undo"],
+    reads_head: false,
+};
+
+/// `gh pr review`'s flags (gh 2.89.0 `--help`, and gh's trunk source). Not a
+/// ship anchor: only [`gh_repo_flags`] reads it, through [`repo_flag_grammar`].
+const REVIEW_FLAGS: FlagGrammar = FlagGrammar {
+    short_values: "bF",
+    short_bools: "achr",
+    long_values: &["body", "body-file"],
+    long_bools: &["approve", "comment", "help", "request-changes"],
     reads_head: false,
 };
 
@@ -4845,6 +4858,19 @@ const GH_BOOLEAN_LONG_FLAGS: &[&str] = &[
     "yes",
 ];
 
+/// The grammar of the verb `argv` runs, for the verbs whose no-value flags
+/// [`gh_repo_flags`] may trust beyond [`GH_BOOLEAN_LONG_FLAGS`]. Those flags
+/// take a value under another verb (`-a` is `--assignee` under `pr create`,
+/// `--comment` takes text under `pr close`), so they can only be trusted once
+/// the verb is known. Every other verb keeps the conservative reading.
+fn repo_flag_grammar(argv: &[String]) -> Option<&'static FlagGrammar> {
+    match gh_command_path(argv, 2).as_slice() {
+        ["pr", "review"] => Some(&REVIEW_FLAGS),
+        ["pr", "ready"] => Some(&READY_FLAGS),
+        _ => None,
+    }
+}
+
 /// Read every repo override in a gh argv (`argv[0]` is `gh` itself), with
 /// gh's own grammar: every spelling [`read_gh_repo_flag`] reads, in ANY
 /// position — cobra takes the persistent `-R` before the command group as
@@ -4855,13 +4881,16 @@ const GH_BOOLEAN_LONG_FLAGS: &[&str] = &[
 /// as a value (and no `--` before it could have ended the flags — a `--`
 /// after a flag that may take a value is that value or the terminator): that
 /// token is `gh`, a positional, a flag with its value
-/// attached (`--x=y`), or a value a certain separate `-R` already took. After
-/// any other flag (`--body -Ro/r`, `-t -Ro/r`) the reading is uncertain,
+/// attached (`--x=y`), a value a certain separate `-R` already took, or a
+/// flag that takes no value: one in [`GH_BOOLEAN_LONG_FLAGS`], or one the
+/// verb's [`repo_flag_grammar`] lists as boolean (`gh pr review 1 -a -R o/r`).
+/// After any other flag (`--body -Ro/r`, `-t -Ro/r`) the reading is uncertain,
 /// since the flag may take a value. A separate `-R` that is itself uncertain
 /// does not consume its value here, so a repo override hiding behind it
 /// (`--body -R -Revil/x`) is still read.
 pub fn gh_repo_flags(argv: &[String]) -> GhRepoFlags {
     let mut out = GhRepoFlags::default();
+    let grammar = repo_flag_grammar(argv);
     let mut prev_may_consume = false;
     let mut past_possible_terminator = false;
     let mut i = 1;
@@ -4896,14 +4925,19 @@ pub fn gh_repo_flags(argv: &[String]) -> GhRepoFlags {
             continue;
         }
         prev_may_consume = if let Some(long) = token.strip_prefix("--") {
-            !long.contains('=') && !GH_BOOLEAN_LONG_FLAGS.contains(&long)
+            !long.contains('=')
+                && !GH_BOOLEAN_LONG_FLAGS.contains(&long)
+                && !grammar.is_some_and(|g| g.long_bools.contains(&long))
         } else if let Some(cluster) = token.strip_prefix('-').filter(|c| !c.is_empty()) {
             // Only letters before an `=` are flags; after it, all is value.
             let letters = cluster.split('=').next().unwrap_or("");
             if letters.chars().skip(1).any(|c| c == 'R') {
                 out.unattributable = true;
             }
+            // A cluster of the verb's boolean letters (`-a`, `-ac`) takes
+            // nothing.
             !cluster.contains('=')
+                && !grammar.is_some_and(|g| cluster.chars().all(|c| g.short_bools.contains(c)))
         } else {
             false
         };
@@ -18862,6 +18896,68 @@ mod tests {
             "-R other repo".to_string(),
         ];
         assert_eq!(gh_repo_flags(&prose).resolve(), target("own/a"));
+    }
+
+    /// cadence-hooks#1528: a flag that takes no value under its verb leaves
+    /// the `-R` after it certain. The same spelling under a verb where it takes
+    /// a value, or is unknown, keeps the reading uncertain.
+    #[test]
+    fn gh_repo_flags_trust_a_verbs_no_value_flags() {
+        let target = |v: &str| GhRepoFlag::Target(v.to_string());
+        let maybe = |v: &str| GhRepoFlag::TargetOrAbsent(v.to_string());
+        for (command, expected) in [
+            // `gh pr review`'s booleans, long and short.
+            ("gh pr review 1 --approve -R own/a", target("own/a")),
+            ("gh pr review 1 -a -R own/a", target("own/a")),
+            ("gh pr review 1 --comment -R own/a", target("own/a")),
+            ("gh pr review 1 -c -R own/a", target("own/a")),
+            ("gh pr review 1 --request-changes -R own/a", target("own/a")),
+            ("gh pr review 1 -r -R own/a", target("own/a")),
+            ("gh pr review 1 -h -R own/a", target("own/a")),
+            ("gh pr review 1 --help -R own/a", target("own/a")),
+            ("gh pr review 1 -ac -R own/a", target("own/a")),
+            ("gh pr review -a --repo=own/a", target("own/a")),
+            // `gh pr ready`'s.
+            ("gh pr ready 5 --undo -R own/a", target("own/a")),
+            ("gh pr ready 5 -h -R own/a", target("own/a")),
+            // The verb is found the way cobra finds it.
+            ("gh -R evil/b pr review 1 -a -R own/a", target("own/a")),
+            (
+                "gh pr -R evil/b review 1 --approve -R own/a",
+                target("own/a"),
+            ),
+            // Certain readings are last-wins.
+            (
+                "gh pr review 1 -R evil/b --approve -R own/a",
+                target("own/a"),
+            ),
+            // A token another flag took as its value takes nothing either.
+            ("gh pr review 1 -b -a -R own/a", target("own/a")),
+            // After a boolean, `--` ends the flags.
+            ("gh pr review 1 --approve -- -R evil/b", GhRepoFlag::Absent),
+            // The verb's value flags still may take the `-R`.
+            ("gh pr review 1 -b -R own/a", maybe("own/a")),
+            ("gh pr review 1 --body -R own/a", maybe("own/a")),
+            ("gh pr review 1 -F -R own/a", maybe("own/a")),
+            ("gh pr review 1 -ab -R own/a", maybe("own/a")),
+            // Another verb's flag is not this verb's.
+            ("gh pr review 1 --undo -R own/a", maybe("own/a")),
+            ("gh pr ready 5 --approve -R own/a", maybe("own/a")),
+            ("gh pr ready 5 -a -R own/a", maybe("own/a")),
+            // The same spellings take a value under other verbs.
+            ("gh pr create -a -R own/a", maybe("own/a")),
+            ("gh pr close 1 --comment -R own/a", maybe("own/a")),
+            ("gh issue close 1 -c -R own/a", maybe("own/a")),
+            ("gh pr comment 1 -a -R own/a", maybe("own/a")),
+            // A cluster with R after its first letter still needs more.
+            ("gh pr review 1 -aRown/a", GhRepoFlag::Ambiguous),
+        ] {
+            assert_eq!(
+                gh_repo_flags(&argv(command)).resolve(),
+                expected,
+                "{command}"
+            );
+        }
     }
 
     /// cadence-hooks#1077: the group and verb, found the way cobra finds them.
