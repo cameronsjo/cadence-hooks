@@ -371,9 +371,14 @@ pub fn redact(text: &str) -> Option<String> {
     };
     let windows = escape_windows(&plain.text, settled);
     spans = plain_masks;
+    // A glued key's mask settles no escape. Its weak `=` value runs to the
+    // first blank, so `+auth=abc\npassword: x` would cover the `\n` whose
+    // decoded window reads `password: x` (#1537).
+    glued_spans(text, &plain, &mut names, &mut spans);
     for (start, end) in windows {
         let window = unescape_window(&plain, start, end, text.len());
         collect_mapped(text, &window, &mut names, &mut spans);
+        glued_spans(text, &window, &mut names, &mut spans);
     }
     if spans.is_empty() {
         return None;
@@ -417,8 +422,8 @@ fn merge(mut spans: Vec<Span>) -> Vec<Span> {
     merged
 }
 
-/// Run every detector over `view` and map its spans back to `original`, then
-/// read the keys glued to a prefix ([`glued_spans`]).
+/// Run every detector but [`glued_spans`] over `view` and map its spans back
+/// to `original`.
 ///
 /// A span's end maps to just past the original char its last byte came from
 /// (a two-byte escape counts whole), so a colour reset right after a masked
@@ -437,7 +442,6 @@ fn collect_mapped(original: &str, view: &View<'_>, names: &mut Names, spans: &mu
     npmrc_spans(t, &mut local);
     line_spans(t, names, &mut local);
     map_spans(original, view.map.as_deref(), &local, spans);
-    glued_spans(original, view, names, spans);
 }
 
 /// Map spans found in a view to `original` through the view's `map` (`None`
@@ -1949,7 +1953,9 @@ type Edit = (usize, usize, &'static str);
 /// credential (#1449). The twin's spans map back into its own line, so a line
 /// with no glued secret-named key is never changed here. Every such line goes
 /// into one twin, which [`inline_spans`] reads a line at a time, so a 5 MB
-/// diff costs one more pass, not one per line.
+/// diff costs one more pass, not one per line. [`redact`] calls this after
+/// the plain pass has chosen which escapes to decode, so a glued mask never
+/// stops an escape from opening its window.
 fn glued_spans(original: &str, view: &View<'_>, names: &mut Names, spans: &mut Vec<Span>) {
     let t: &str = &view.text;
     let mut edits = Vec::new();
@@ -3811,6 +3817,16 @@ mod tests {
             (
                 format!("Café **Password:** {p}\n"),
                 format!("Café **Password:** {m}\n"),
+            ),
+            // An escape inside a glued weak key's mask still opens its
+            // decoded window, so a secret that only decoding reveals masks.
+            (
+                format!("+auth=abc\\npassword: {p}\n"),
+                format!("+auth={m} {m}\n"),
+            ),
+            (
+                format!("src/a.env:3:db_pass=abc\\tPASSWORD: {p}\n"),
+                format!("src/a.env:3:db_pass={m} {m}\n"),
             ),
         ];
         for (input, want) in &masks {
