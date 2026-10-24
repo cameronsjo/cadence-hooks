@@ -2481,14 +2481,19 @@ mod tests {
 
     #[test]
     fn a_directory_line_cuts_a_long_directory_name() {
-        let message = cannot_resolve(&format!("/w/{}", "d".repeat(MAX_PATH_DISPLAY + 50)))
-            .message
-            .unwrap_or_default();
-        assert!(message.contains("d…\n"), "{message}");
-        assert!(
-            !message.contains(&"d".repeat(MAX_PATH_DISPLAY + 1)),
-            "{message}"
-        );
+        // Two of the sites: `cannot_resolve` and `unowned_message`, which
+        // every "Push target is not yours" block goes through.
+        let long = format!("/w/{}", "d".repeat(MAX_PATH_DISPLAY + 50));
+        for message in [
+            cannot_resolve(&long).message.unwrap_or_default(),
+            unowned_message("https://github.com/evil/y.git", &long, &[], &[], &[]),
+        ] {
+            assert!(message.contains("d…\n"), "{message}");
+            assert!(
+                !message.contains(&"d".repeat(MAX_PATH_DISPLAY + 1)),
+                "{message}"
+            );
+        }
     }
 
     // --- #1095: a push that runs somewhere `parse_work_dir` cannot see ---
