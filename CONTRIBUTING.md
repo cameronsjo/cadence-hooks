@@ -177,7 +177,9 @@ check-author's debugging loop.
 1. Start with `cadence-hooks try <namespace> <hook>` to confirm the hook's
    event and see a working sample payload
 2. Copy that payload into a fixture file and switch to raw piping:
-   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`
+   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`.
+   Export `CADENCE_METRICS_DIR="$(mktemp -d)"` first, so the guard's logged
+   outcome does not land in your real `denials.jsonl` (`try` already does this)
 3. Change one `tool_input` field at a time to isolate what trips the check
 4. If version drift is suspected, run both binaries against the same fixture:
    `cadence-hooks --version` (installed) vs
