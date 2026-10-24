@@ -2035,8 +2035,8 @@ fn glue_edits(line: &str, names: &mut Names, edits: &mut Vec<Edit>) {
         let tally = close.is_some() && strength == Strength::Tally;
         (close, if tally { words } else { label })
     };
-    if let Some((at, dashes)) = grep_prefix(line) {
-        if let Some(key) = glued_key(line, at, names) {
+    if let Some(found) = grep_prefix(line, |at| glued_key(line, at, names)) {
+        if let Some((at, dashes, key)) = found {
             if let Some((a, b)) = dashes {
                 edits.push((a, a + 1, ":"));
                 edits.push((b, b + 1, ":"));
@@ -2083,11 +2083,20 @@ fn push_key(
     }
 }
 
-/// A grep prefix that starts `line`: where the text after it starts, and for
-/// a context line (`path-3-`) the two dashes. A match line is `path:3:` or
+/// A grep prefix that starts `line`, read by `key` at the text after it:
+/// `None` when `line` has no such prefix, and otherwise where that text
+/// starts, for a context line (`path-3-`) the two dashes, and what `key`
+/// found there, when it found something. A match line is `path:3:` or
 /// `path:3:5:`; the path holds no blank or colon. A context line's path ends
-/// at the first `-`, digits, `-` before any colon or blank.
-fn grep_prefix(line: &str) -> Option<(usize, Option<(usize, usize)>)> {
+/// at a `-`, digits, `-` before any colon or blank. A path can hold such a
+/// run itself (`logs/2026-10-24.log-12-`), so each is tried in turn until
+/// `key` finds something after one, but only where the name after it holds
+/// no later run: that name would run through the real separator
+/// (`2026-07-09-pre-push-secret-scan-237.md-7-next` is not a key).
+fn grep_prefix<T>(
+    line: &str,
+    mut key: impl FnMut(usize) -> Option<T>,
+) -> Option<Option<(usize, Option<(usize, usize)>, T)>> {
     let bytes = line.as_bytes();
     let path_end = bytes
         .iter()
@@ -2104,13 +2113,15 @@ fn grep_prefix(line: &str) -> Option<(usize, Option<(usize, usize)>)> {
     if path_end > 0 && bytes.get(path_end) == Some(&b':') && n > 0 && bytes.get(end) == Some(&b':')
     {
         let col = digits(end + 1);
-        let key = if col > 0 && bytes.get(end + 1 + col) == Some(&b':') {
+        let at = if col > 0 && bytes.get(end + 1 + col) == Some(&b':') {
             end + 2 + col
         } else {
             end + 1
         };
-        return Some((key, None));
+        return Some(key(at).map(|k| (at, None, k)));
     }
+    let mut found = false;
+    let mut pending: Option<(usize, usize)> = None;
     let mut from = 1;
     while let Some(i) = bytes[from.min(path_end)..path_end]
         .iter()
@@ -2119,11 +2130,25 @@ fn grep_prefix(line: &str) -> Option<(usize, Option<(usize, usize)>)> {
         let a = from + i;
         let n = digits(a + 1);
         if n > 0 && a + 1 + n < path_end && bytes[a + 1 + n] == b'-' {
-            return Some((a + 2 + n, Some((a, a + 1 + n))));
+            found = true;
+            if let Some((pa, pb)) = pending
+                && line
+                    .get(pb + 1..a)
+                    .is_some_and(|gap| gap.contains(|c: char| !is_name_char(c)))
+                && let Some(k) = key(pb + 1)
+            {
+                return Some(Some((pb + 1, Some((pa, pb)), k)));
+            }
+            pending = Some((a, a + 1 + n));
         }
         from = a + 1 + n;
     }
-    None
+    if let Some((pa, pb)) = pending
+        && let Some(k) = key(pb + 1)
+    {
+        return Some(Some((pb + 1, Some((pa, pb)), k)));
+    }
+    found.then_some(None)
 }
 
 /// A secret-named key glued to a prefix at `at`, plain (followed by `:` or
@@ -3852,6 +3877,15 @@ mod tests {
                 format!("Status: **Pass:** {p}\n"),
                 format!("Status: **Pass:** {m}\n"),
             ),
+            // A context line whose path holds a `-digits-` run of its own.
+            (
+                format!("logs/2026-10-24.log-12-password: {p}\n"),
+                format!("logs/2026-10-24.log-12-password: {m}\n"),
+            ),
+            (
+                format!("_posts/2026-10-24-x.md-3-password: {p}\n"),
+                format!("_posts/2026-10-24-x.md-3-password: {m}\n"),
+            ),
         ];
         for (input, want) in &masks {
             assert_eq!(masked(input), *want, "{input:?}");
@@ -3892,6 +3926,9 @@ mod tests {
             "--- a/config/db.yml\n",
             "**Note:** rotate the password monthly\n",
             "+**Second pass:** done\n",
+            // A `-digits-` run is a context separator only when the name
+            // after it holds no later one.
+            "docs/plans/2026-07-09-pre-push-secret-scan-237.md-7-next: \"Task 0 built\"\n",
             // Emphasis opens only at the line start or after a blank.
             "KEYS user*token:* 0\n",
         ];
