@@ -5735,8 +5735,10 @@ mod tests {
             ("gh api -X DELETE repos/o/../x", None),
             ("gh api -X DELETE repos/o/*/x", None),
             ("gh api -X DELETE repos/-o/r", None),
-            // The verdict keeps GitHub's owner set, though the advice lines
-            // check only the name (code review N1 on #1539).
+            // The strict owner set here is pre-existing behavior, and this
+            // PR does not change it: the literal-path loop reader refuses an
+            // owner with `_`, such as the managed-user login `mona_acme`,
+            // even when the allowlist holds it. #1554 tracks that.
             ("gh api -X DELETE repos/mona_acme/r/x", None),
             ("gh api -X DELETE orgs/o/repos", None),
             ("gh pr comment 1 --body repos/o/r", None),
