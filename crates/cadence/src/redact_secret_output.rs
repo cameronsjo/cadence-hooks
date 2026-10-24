@@ -2096,7 +2096,10 @@ fn push_key(
 /// run itself (`logs/2026-10-24.log-12-`), so each is tried in turn until
 /// `key` finds something after one, but only where the name after it holds
 /// no later run: that name would run through the real separator
-/// (`2026-07-09-pre-push-secret-scan-237.md-7-next` is not a key).
+/// (`2026-07-09-pre-push-secret-scan-237.md-7-next` is not a key). When `key`
+/// finds nothing after any run, the line is not read as a context line, so a
+/// diff line whose value holds such a run is still read as a diff line
+/// (`+DB_PASSWORD=Zq9v-2026-Kh7w`).
 fn grep_prefix<T>(
     line: &str,
     mut key: impl FnMut(usize) -> Option<T>,
@@ -2124,7 +2127,6 @@ fn grep_prefix<T>(
         };
         return Some(key(at).map(|k| (at, None, k)));
     }
-    let mut found = false;
     let mut pending: Option<(usize, usize)> = None;
     let mut from = 1;
     while let Some(i) = bytes[from.min(path_end)..path_end]
@@ -2134,7 +2136,6 @@ fn grep_prefix<T>(
         let a = from + i;
         let n = digits(a + 1);
         if n > 0 && a + 1 + n < path_end && bytes[a + 1 + n] == b'-' {
-            found = true;
             if let Some((pa, pb)) = pending
                 && line
                     .get(pb + 1..a)
@@ -2152,7 +2153,7 @@ fn grep_prefix<T>(
     {
         return Some(Some((pb + 1, Some((pa, pb)), k)));
     }
-    found.then_some(None)
+    None
 }
 
 /// A secret-named key glued to a prefix at `at`, plain (followed by `:` or
@@ -3907,6 +3908,12 @@ mod tests {
             ),
             // A plain glued key may start with `_`.
             (format!("+_password={p}\n"), format!("+_password={m}\n")),
+            // A diff line whose value holds a `-digits-` run is read as a
+            // diff line when no key follows the run.
+            (
+                "+DB_PASSWORD=Zq9v-2026-Kh7w\n".to_string(),
+                format!("+DB_PASSWORD={m}\n"),
+            ),
         ];
         for (input, want) in &masks {
             assert_eq!(masked(input), *want, "{input:?}");
