@@ -1721,14 +1721,16 @@ fn host_is_read(host: &str) -> bool {
 /// compares it, but `$H` and `$h` are different shell variables, so a message
 /// that names an expanded host shows the text the command spelled (#1503).
 ///
-/// The host is looked for where gh takes it from, in gh's order: the target's
-/// own `HOST/` part, then the host the command selects
-/// ([`selected_gh_host`]). The target is the `-R` or `--repo` value, and an
-/// inline `GH_REPO` only where [`resolve_target_repos_on`] reads one: with no
-/// `-R`, or beside a `-R` gh may ignore. A `-R` that decides the target
-/// leaves `GH_REPO` unread, as gh does. A host the segment does not spell,
-/// such as the hook's own `GH_HOST`, is shown as given. Message only: no
-/// verdict reads it.
+/// The host is looked for in the target's own `HOST/` part, then in the host
+/// the command selects ([`selected_gh_host`]). The target is the `-R` or
+/// `--repo` value, and an inline `GH_REPO` only where
+/// [`resolve_target_repos_on`] reads one: with no `-R`, or beside a `-R` gh
+/// may ignore. A `-R` that decides the target leaves `GH_REPO` unread, as gh
+/// does. A `gh repo` argument is not read: its host is shown as given, unless
+/// the command selects the same host in another case, which is then shown
+/// (`GH_HOST=$h gh repo archive "$H/evil/x"` shows `$h`, though gh takes
+/// `$H`). A host the segment does not spell, such as the hook's own
+/// `GH_HOST`, is shown as given. Message only: no verdict reads it.
 fn host_as_typed(segment: &str, host: &str) -> String {
     let typed_in = |text: &str| {
         let at = text.to_ascii_lowercase().find(host)?;
