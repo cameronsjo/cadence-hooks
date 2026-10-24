@@ -1539,6 +1539,19 @@ fn line_end(text: &str, from: usize, cache: &mut (usize, usize)) -> usize {
     }
 }
 
+/// Offset from `from` of the first `,` or `)` before `eol`, the end of
+/// `from`'s line. `cache` holds the last search's start and the delimiter it
+/// found (or `eol` when none), so a run of matches on one line, each starting
+/// before that delimiter, reads the text up to it once: a fresh search per
+/// match walks a long tail once per match (#1508).
+fn arg_end(text: &str, from: usize, eol: usize, cache: &mut (usize, usize)) -> Option<usize> {
+    if from < cache.0 || from > cache.1 {
+        let at = text[from..eol].find([',', ')']).map_or(eol, |i| from + i);
+        *cache = (from, at);
+    }
+    (cache.1 < eol).then(|| cache.1 - from)
+}
+
 fn at_line_start(text: &str, at: usize) -> bool {
     at == 0 || text.as_bytes()[at - 1] == b'\n'
 }
@@ -1550,6 +1563,7 @@ fn at_line_start(text: &str, at: usize) -> bool {
 fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     let mut done = 0;
     let mut eol_cache = (usize::MAX, 0);
+    let mut arg_cache = (usize::MAX, 0);
     let mut parens = Parens::default();
     for m in INLINE_EQ.find_iter(text) {
         let head = m.as_str();
@@ -1573,7 +1587,7 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         // no closing `,`/`)` (`INFO (pid 12 token=…`) — takes the normal path.
         if parens.depth_at(text, name_at) > 0
             && !matches!(text[start..].chars().next(), Some('"' | '\''))
-            && let Some(len) = text[start..eol].find([',', ')'])
+            && let Some(len) = arg_end(text, start, eol, &mut arg_cache)
         {
             let value = &text[start..start + len];
             let name = tail_name(&head[..head.len() - 1]);
@@ -3595,6 +3609,10 @@ mod tests {
             format!("{}{}", "x pass: 5 ".repeat(1_000), " ".repeat(4 * MB)),
             format!("x{}{}", " pass: 5".repeat(1_000), " ".repeat(4 * MB)),
             format!("x{}{}", " lastpass: 5".repeat(1_000), " ".repeat(4 * MB)),
+            // #1508: inside an open paren, each `=` match looks for the `,` or
+            // `)` that ends its value. With none on the line, that search may
+            // not walk the blank run once per match.
+            format!("f(x{}{}", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
