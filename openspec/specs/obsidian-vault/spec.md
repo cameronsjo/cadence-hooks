@@ -17,7 +17,7 @@ Protection for an Obsidian vault's recoverability: `cadence-hooks obsidian trash
 - **THEN** the hook exits 0
 
 ### Requirement: Deleting commands in the vault block
-`trash-guard` SHALL block (exit 2) a Bash command that runs `rm`, `git rm`, `unlink`, `shred`, `truncate`, `find ... -delete` or `find ... -exec rm` on a vault file: a relative operand from a cwd inside the vault, an operand naming a vault path (quoted or not), an ancestor of the vault, or a path that reaches the vault through `..` or a symlinked parent. The message MUST contain `Obsidian vault detected` and suggest `mkdir -p <vault>/.trash && mv <file> <vault>/.trash/`.
+`trash-guard` SHALL block (exit 2) a Bash command that runs `rm`, `git rm` (without `--cached`), `unlink`, `shred`, `truncate`, `find ... -delete` or `find ... -exec rm` on a vault file: a relative operand from a cwd inside the vault, an operand naming a vault path (quoted or not), an ancestor of the vault, or a path that reaches the vault through `..` or a symlinked parent. The message MUST contain `Obsidian vault detected` and suggest `mkdir -p <vault>/.trash && mv <file> <vault>/.trash/`.
 
 #### Scenario: Relative delete inside the vault
 - **WHEN** the cwd is `/vault/notes` and a Bash call runs `rm old.md`
@@ -163,4 +163,19 @@ A deletion the guard reads behind a wrapper SHALL keep the cwd verdict, a block,
 
 #### Scenario: Wrapped delete behind xargs
 - **WHEN** the cwd is the vault and a Bash call runs `echo note.md | xargs flock /tmp/l rm`
+- **THEN** the hook exits 2
+
+### Requirement: A git rm that leaves the file on disk is allowed
+A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The rule holds for the bare command, behind a runner or wrapper, as a `find -exec` action, and from outside the vault.
+
+#### Scenario: Index-only git rm in the vault
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md`, `git rm -r --cached sub/` or `git -C . rm --cached note.md`
+- **THEN** the hook exits 0
+
+#### Scenario: git rm that deletes the file
+- **WHEN** the cwd is the vault and a Bash call runs `git rm note.md`, `git rm -- --cached` or `git rm --cached --no-cached note.md`
+- **THEN** the hook exits 2
+
+#### Scenario: A deleting command beside it
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md; rm note.md`
 - **THEN** the hook exits 2
