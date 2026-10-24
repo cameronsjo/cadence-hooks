@@ -5830,10 +5830,13 @@ mod tests {
     use cadence_hooks_core::HookInput;
 
     // GhWriteGuard.run() reads CADENCE_ALLOWED_OWNERS / CADENCE_ALLOWED_REPOS
-    // / CADENCE_EXTRA_HOSTS via process-global env vars. Serialize all
-    // metadata-shape tests via the crate-shared with_env/CADENCE_ENV_TEST_LOCK
-    // so they don't race each other or the same globals mutated in
-    // guard_push_remote / warn_issue_tracker (#446).
+    // / CADENCE_EXTRA_HOSTS, and also GH_HOST and GH_REPO, via process-global
+    // env vars. Serialize all metadata-shape tests via the crate-shared
+    // with_env/CADENCE_ENV_TEST_LOCK so they don't race each other or the same
+    // globals mutated in guard_push_remote / warn_issue_tracker (#446). Holding
+    // the lock does not stop a value the shell exported from moving a verdict:
+    // a test that GH_HOST or GH_REPO can flip lists it in its with_env vars as
+    // None.
 
     fn input_with(command: &str, cwd: &str) -> HookInput {
         // Build via JSON to avoid private-field gymnastics; the real hook
@@ -5875,6 +5878,7 @@ mod tests {
                 ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
+                ("GH_REPO", None),
             ],
             || {
                 // No -R + cwd is /tmp (no git remote) → Unresolvable.
@@ -6841,6 +6845,7 @@ mod tests {
                 ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
+                ("GH_REPO", None),
             ],
             || {
                 use cadence_hooks_core::Outcome::{Allow, Block};
@@ -7008,11 +7013,14 @@ mod tests {
         });
     }
 
-    fn owners_env_212() -> [(&'static str, Option<&'static str>); 5] {
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // CDPATH changes where a `cd` lands, so an exported one moves the
+            // directory the guard judges the write from.
+            ("CDPATH", None),
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
@@ -7087,11 +7095,14 @@ mod tests {
     // so it exercises the cwd-remote fallback the bypass relied on.
     const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-    fn owners_env() -> [(&'static str, Option<&'static str>); 5] {
+    fn owners_env() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
             ("CADENCE_ALLOWED_REPOS", None),
             ("CADENCE_EXTRA_HOSTS", None),
+            // CDPATH changes where a `cd` lands, so an exported one moves the
+            // directory the guard judges the write from.
+            ("CDPATH", None),
             // GH_HOST moves the default host a bare allowlist entry matches,
             // so pin it under the same lock as the rest (#938).
             ("GH_HOST", None),
@@ -7337,6 +7348,7 @@ mod tests {
                 ),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", Some("evil.example.com")),
+                ("GH_REPO", None),
             ],
             || {
                 let input = input_with(
@@ -9412,6 +9424,7 @@ mod tests {
                 ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", Some("evil-host.example")),
+                ("GH_REPO", None),
             ],
             || {
                 let result = GhWriteGuard.run(&input_with(

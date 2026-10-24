@@ -395,6 +395,11 @@ pub(crate) const PANEL_STANZA: &str = "a settled Panel: line";
 /// `Loop: none — <reason>`. The detector checks only that the heading exists,
 /// never what sits under it (cameronsjo/cadence-hooks#1281).
 pub(crate) const LOOP_STANZA: &str = "a ## Loop section";
+/// The template's `## Concessions` section: one row per place the plan works
+/// around something a platform it builds on cannot do, or the single line
+/// `Concessions: none — <reason>`. The detector checks only that the heading
+/// exists, never what sits under it (cameronsjo/cadence-hooks#1450).
+pub(crate) const CONCESSIONS_STANZA: &str = "a ## Concessions section";
 pub(crate) const ALTERNATIVES_STANZA: &str = "an Alternatives-declined stanza";
 pub(crate) const CHECKBOX_STANZA: &str = "checkbox tasks";
 pub(crate) const GLOBAL_CONSTRAINTS_STANZA: &str = "a ## Global Constraints section";
@@ -414,6 +419,7 @@ pub(crate) const TEMPLATE_POINTER: &str =
 pub(crate) const TEMPLATE_SHAPED_PLAN: &str = "# T\n\n\
     Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n\
     ## Loop\n\nLoop: none — nothing outlives the work\n\n\
+    ## Concessions\n\nConcessions: none — nothing is worked around\n\n\
     ## Alternatives declined\n\n- none\n\n\
     ## Global Constraints\n\n- keep it small\n\n\
     ## Orchestrator\n\n**Driver:** sonnet\n\n\
@@ -434,13 +440,29 @@ pub(crate) fn template_shaped_plan_without_loop() -> String {
     plan
 }
 
+/// [`TEMPLATE_SHAPED_PLAN`] with its `## Concessions` section removed: a plan
+/// that lacks exactly [`CONCESSIONS_STANZA`]. Panics when the section is not
+/// there to strip, for the reason [`template_shaped_plan_without_loop`] does.
+#[cfg(test)]
+pub(crate) fn template_shaped_plan_without_concessions() -> String {
+    let plan = TEMPLATE_SHAPED_PLAN.replace(
+        "## Concessions\n\nConcessions: none — nothing is worked around\n\n",
+        "",
+    );
+    assert_ne!(
+        plan, TEMPLATE_SHAPED_PLAN,
+        "the fixture must carry a Concessions section to strip"
+    );
+    plan
+}
+
 /// The ONE plan-shape detector both gates consume: the plan template's
 /// stanzas `body` lacks, the `Panel:` line first and the rest in template
-/// order (`## Loop`, Alternatives declined, `## Global Constraints`,
-/// `## Orchestrator`, `## Tasks`, checkbox tasks). Only the `Panel:` line
-/// blocks at call time;
-/// the rest nudge, `## Loop` included (cadence-hooks#1019,
-/// cadence-hooks#1281). Empty for a template-shaped
+/// order (`## Loop`, `## Concessions`, Alternatives declined,
+/// `## Global Constraints`, `## Orchestrator`, `## Tasks`, checkbox tasks).
+/// Only the `Panel:` line blocks at call time;
+/// the rest nudge, `## Loop` and `## Concessions` included
+/// (cadence-hooks#1019, cadence-hooks#1281, cadence-hooks#1450). Empty for a template-shaped
 /// plan. Two scanners drifted once already (the #675 polish), which is why
 /// persist-time and call-time share this single entry point rather than
 /// each composing the list inline.
@@ -453,6 +475,11 @@ pub(crate) fn missing_stanzas(body: &str) -> Vec<&'static str> {
     // author's to write, so what sits below the heading is never judged.
     if !section_heading_present(body, "## Loop") {
         missing.push(LOOP_STANZA);
+    }
+    // Heading only, matched the way `## Loop` is: a table or
+    // `Concessions: none — <reason>` under it is the author's to write.
+    if !section_heading_present(body, "## Concessions") {
+        missing.push(CONCESSIONS_STANZA);
     }
     if !alternatives_stanza_present(body) {
         missing.push(ALTERNATIVES_STANZA);
@@ -2126,6 +2153,7 @@ mod tests {
             vec![
                 PANEL_STANZA,
                 LOOP_STANZA,
+                CONCESSIONS_STANZA,
                 ALTERNATIVES_STANZA,
                 GLOBAL_CONSTRAINTS_STANZA,
                 ORCHESTRATOR_STANZA,
@@ -2137,6 +2165,7 @@ mod tests {
             missing_stanzas("# T\n\nPanel: none — no seat warranted\n\nprose\n"),
             vec![
                 LOOP_STANZA,
+                CONCESSIONS_STANZA,
                 ALTERNATIVES_STANZA,
                 GLOBAL_CONSTRAINTS_STANZA,
                 ORCHESTRATOR_STANZA,
@@ -2166,6 +2195,7 @@ mod tests {
         // nudge teaches the `## Orchestrator` + `Driver:` form (deliverable 7).
         let body = "---\nrecommended_model: sonnet\n---\n\n# T\n\n\
                     Panel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — nothing created\n\n\
+                    ## Concessions\n\nConcessions: none — nothing conceded\n\n\
                     ## Alternatives declined\n\n- none\n\n\
                     ## Global Constraints\n\n- c\n\n## Tasks\n\n- [ ] task\n";
         assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
@@ -2175,6 +2205,7 @@ mod tests {
     #[test]
     fn missing_stanzas_deeper_heading_does_not_satisfy_section_detector() {
         let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Loop\n\nLoop: none — nothing created\n\n\
+                    ## Concessions\n\nConcessions: none — nothing conceded\n\n\
                     ## Alternatives declined\n\n\
                     - none\n\n### Global Constraints\n\n- c\n\n## Orchestrator\n\n\
                     **Driver:** sonnet\n\n## Tasks\n\n- [ ] task\n";
@@ -2266,6 +2297,100 @@ mod tests {
             missing_stanzas(TEMPLATE_SHAPED_PLAN).is_empty(),
             "none form"
         );
+    }
+
+    // --- the `## Concessions` stanza (cadence-hooks#1450) ---
+
+    #[test]
+    fn missing_stanzas_reports_only_concessions_when_the_heading_is_absent() {
+        assert_eq!(
+            missing_stanzas(&template_shaped_plan_without_concessions()),
+            vec![CONCESSIONS_STANZA]
+        );
+    }
+
+    /// `decoy` placed where the Concessions section would sit, in a plan that
+    /// has every other stanza: the heading must still read as missing.
+    fn without_concessions_but_with(decoy: &str) -> String {
+        let plan = TEMPLATE_SHAPED_PLAN.replace(
+            "## Concessions\n\nConcessions: none — nothing is worked around\n\n",
+            decoy,
+        );
+        assert!(
+            plan.contains(decoy),
+            "the decoy must be in the plan under test"
+        );
+        plan
+    }
+
+    #[test]
+    fn missing_stanzas_concessions_heading_match_is_exact() {
+        for (label, decoy) in [
+            (
+                "longer heading",
+                "## Concessions made\n\nConcessions: none — x\n\n",
+            ),
+            (
+                "deeper heading",
+                "### Concessions\n\nConcessions: none — x\n\n",
+            ),
+            (
+                "fenced example",
+                "```markdown\n## Concessions\n\nConcessions: none — x\n```\n\n",
+            ),
+            (
+                "indented heading",
+                " ## Concessions\n\nConcessions: none — x\n\n",
+            ),
+            (
+                "lowercase heading",
+                "## concessions\n\nConcessions: none — x\n\n",
+            ),
+            ("none line, no heading", "Concessions: none — x\n\n"),
+        ] {
+            assert_eq!(
+                missing_stanzas(&without_concessions_but_with(decoy)),
+                vec![CONCESSIONS_STANZA],
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_stanzas_concessions_heading_tolerates_trailing_whitespace() {
+        for heading in ["## Concessions  ", "## Concessions\t"] {
+            let plan =
+                without_concessions_but_with(&format!("{heading}\n\nConcessions: none — x\n\n"));
+            assert!(
+                missing_stanzas(&plan).is_empty(),
+                "trailing whitespace after the heading must still count: {heading:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_stanzas_accepts_the_concessions_table_and_the_none_line() {
+        let table = TEMPLATE_SHAPED_PLAN.replace(
+            "## Concessions\n\nConcessions: none — nothing is worked around\n\n",
+            "## Concessions\n\n| Concession | Kept | Score | Route |\n|---|---|---|---|\n| polling | poll the queue | 4 | fix first |\n\n",
+        );
+        assert!(table.contains("| polling | poll the queue | 4 | fix first |"));
+        assert!(missing_stanzas(&table).is_empty(), "table form");
+        // The fixture itself uses the `Concessions: none — <reason>` form.
+        assert!(TEMPLATE_SHAPED_PLAN.contains("Concessions: none — "));
+        assert!(
+            missing_stanzas(TEMPLATE_SHAPED_PLAN).is_empty(),
+            "none form"
+        );
+    }
+
+    #[test]
+    fn missing_stanzas_flags_a_plan_that_has_loop_but_no_concessions() {
+        // The shape every plan written before the template gained the section
+        // has: a `## Loop` heading and nothing after it.
+        let plan = template_shaped_plan_without_concessions();
+        assert!(plan.contains("## Loop"), "the Loop section is still there");
+        assert_eq!(missing_stanzas(&plan), vec![CONCESSIONS_STANZA]);
     }
 
     // --- hidden positions: comment, nested fence, frontmatter (cadence-hooks#1283) ---
@@ -2364,6 +2489,8 @@ mod tests {
 
     const PANEL_LINE: &str = "Panel: r ran — 1 finding, 1 folded in, 0 declined\n";
     const LOOP_SECTION: &str = "## Loop\n\nLoop: none — nothing outlives the work\n";
+    const CONCESSIONS_SECTION: &str =
+        "## Concessions\n\nConcessions: none — nothing is worked around\n";
 
     #[test]
     fn panel_line_in_each_hidden_position_reads_as_missing_table() {
@@ -2407,6 +2534,24 @@ mod tests {
     }
 
     #[test]
+    fn concessions_section_in_each_hidden_position_reads_as_missing_table() {
+        for (label, decoy, visible) in positions(CONCESSIONS_SECTION) {
+            let plan = without_concessions_but_with(&decoy);
+            // An unterminated span hides the rest of the plan too, so a
+            // hidden case asserts this stanza is missing, not that it alone is.
+            let missing = missing_stanzas(&plan);
+            if visible {
+                assert!(missing.is_empty(), "{label}: {missing:?} in {plan:?}");
+            } else {
+                assert!(
+                    missing.contains(&CONCESSIONS_STANZA),
+                    "{label}: {missing:?} in {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stanzas_inside_leading_frontmatter_read_as_missing() {
         // A YAML comment line is legal frontmatter, so a `## Loop` there is
         // hidden with the block.
@@ -2415,6 +2560,14 @@ mod tests {
             template_shaped_plan_without_loop()
         );
         assert_eq!(missing_stanzas(&loop_in_fm), vec![LOOP_STANZA]);
+        let concessions_in_fm = format!(
+            "---\nstatus: in-flight\n## Concessions\n---\n{}",
+            template_shaped_plan_without_concessions()
+        );
+        assert_eq!(
+            missing_stanzas(&concessions_in_fm),
+            vec![CONCESSIONS_STANZA]
+        );
         let without_panel = TEMPLATE_SHAPED_PLAN
             .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
         let panel_in_fm = format!("---\n{PANEL_LINE}---\n{without_panel}");

@@ -20,7 +20,12 @@ their semantic assertions in the normal suite. The shared scaling helper also
 runs both its small and large input sizes. Their wall-clock budget and scaling
 assertions are enabled only by `CADENCE_TIMING_TESTS=1`; an unset variable or any
 other value leaves them off. This setting lives in test helpers and does not
-change production hook deadlines.
+change production hook deadlines. The enforce-worktree line-continuation test
+counts `plain_of` segmenter calls in the normal suite and compares two
+timings only under the opt-in. The credential-scan 200 KB adversarial test
+(`perf_200kb_adversarial`) checks in the normal suite that each scan finds
+nothing, and checks its 5 s debug and 0.5 s release budgets only under the
+opt-in, unscaled on every platform.
 
 Run the opted-in budgets in release mode with one test thread:
 
@@ -39,10 +44,13 @@ depend on available CPU time.
 
 One deadline test is gated differently. `wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline`
 asserts exit 2 from the real `cadence-hooks group`, which fails open past its
-4000 ms deadline (exit 0, or exit 1 with "did not finish within N ms and did not
-block" on stderr). Without `CADENCE_TIMING_TESTS=1`, a run that took at least the
-deadline and shows that signature passes as load; a bare exit 1, a panic, or a
-faster non-block still fails. With the variable set, only the block passes.
+4000 ms deadline. It prints "did not finish within N ms and did not block" where
+its exit code puts it: on stdout, in the envelope's `additionalContext`, for exit 0
+(a member that finished nudged, as git-safety does on a heredoc flood), and on
+stderr for exit 1 (no member that finished had anything to say). Without `CADENCE_TIMING_TESTS=1`, a
+run that took at least the deadline and shows that signature on its exit code's
+channel passes as load; a bare exit 1, a panic, or a faster non-block still
+fails. With the variable set, only the block passes.
 A debug-only test (`the_real_group_fail_open_is_accepted_only_without_timing_opt_in`) drives the real group
 with `CADENCE_HOOK_DEADLINE_MS=1` and `CADENCE_TEST_GROUP_STALL_MS=5000` to prove the helper accepts the real
 fail-open output; the stall knob does not exist in release builds, so release runs ignore that test.
@@ -177,7 +185,9 @@ check-author's debugging loop.
 1. Start with `cadence-hooks try <namespace> <hook>` to confirm the hook's
    event and see a working sample payload
 2. Copy that payload into a fixture file and switch to raw piping:
-   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`
+   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`.
+   Export `CADENCE_METRICS_DIR="$(mktemp -d)"` first, so the guard's logged
+   outcome does not land in your real `denials.jsonl` (`try` already does this)
 3. Change one `tool_input` field at a time to isolate what trips the check
 4. If version drift is suspected, run both binaries against the same fixture:
    `cadence-hooks --version` (installed) vs

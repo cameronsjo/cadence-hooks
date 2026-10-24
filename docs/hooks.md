@@ -74,7 +74,7 @@ Rules for wiring:
 - **Members are `<namespace>/<hook>`** and must be PreToolUse or PostToolUse checks. Loggers, CLI actions, and SessionStart hooks are refused, and `doctor` reports them.
 - **Only group hooks with the same matcher and no `if:`.** A group entry has one matcher and one `if:`, so a hook whose prefilter differs from the others keeps its own entry.
 - **Keep a hook that starts a slow external tool in its own entry** (`markdown-lint` runs the Node `markdownlint` CLI). Grouping saves it nothing, and its own entry keeps its own timeout.
-- **A binary older than `group`** is handled by `run-cadence-hooks.sh`: it replays the payload to each member in turn, so every guard still runs and still blocks until the binary is upgraded.
+- **A binary older than 0.103.0** does not know the `group` subcommand. The wrapper no longer replays the payload to each member, so upgrade the binary.
 
 ## cadence
 
@@ -293,7 +293,7 @@ id.
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths | self-disable |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time | run |
 | `warn-branch-intent` | PreToolUse (Edit, Write) | Nudge once per session when new work starts on a stale feature branch whose name shares nothing with the declared intent | run |
-| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one | run |
+| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one; also nudge when a plain `git commit --no-edit` would land a conflicted merge's `# Conflicts:` block below the message's trailers, advising an amend of the landed commit before it is pushed, and only where `git log -1 --format=%B` still shows the block and `git reflog -1 --format=%gs` starts with `commit (merge):` (necessary, not sufficient; an amend also commits anything staged): `git commit --amend --no-edit --cleanup=strip` (which drops every `#` line, not only the block), or `git commit --amend -F` on a copy of `git log -1 --format=%B` cut at the block for a message with other `#` lines | run |
 | `persist-plan-approval` | PostToolUse (every tool) | On `ExitPlanMode`, persist the approved plan into the repo's plans dir, merging its frontmatter and nudging when it carries no settled `Panel:` line (`CADENCE_NO_PERSIST_PLAN` opts out); on every call, refresh this session's liveness heartbeat, throttled | self-disable |
 | `backstop-warn` | SessionStart | Warn once when the last session left loose ends, then clear the marker | self-disable |
 | `backstop-record` | SessionEnd | Record loose ends (uncommitted changes, unpushed commits, stashes, other worktrees with unpushed work) for the next `session start` to surface, only when no live peer remains in the checkout | self-disable |
