@@ -24999,6 +24999,9 @@ mod tests {
             ),
             ("eval `direnv export bash`; gh pr create", "/cwd", true),
             ("eval $(cat x); gh pr create", "/cwd", true),
+            // Quoted, it is not the `ssh-agent` idiom, so `MayMove` does not
+            // exempt it.
+            ("eval '$(ssh-agent -s)'; gh pr create", "/cwd", true),
             ("if true; then eval \"$S\"; fi; gh pr create", "/cwd", true),
             ("cd /u; eval \"$S\"; gh pr create", "/u", true),
             // Something it read moves, or something in it is not read.
