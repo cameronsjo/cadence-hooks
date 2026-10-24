@@ -39,10 +39,13 @@ depend on available CPU time.
 
 One deadline test is gated differently. `wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline`
 asserts exit 2 from the real `cadence-hooks group`, which fails open past its
-4000 ms deadline (exit 0, or exit 1 with "did not finish within N ms and did not
-block" on stderr). Without `CADENCE_TIMING_TESTS=1`, a run that took at least the
-deadline and shows that signature passes as load; a bare exit 1, a panic, or a
-faster non-block still fails. With the variable set, only the block passes.
+4000 ms deadline. It prints "did not finish within N ms and did not block" where
+its exit code puts it: on stdout, in the envelope's `additionalContext`, for exit 0
+(a member that finished nudged, as git-safety does on a heredoc flood), and on
+stderr for exit 1 (every member timed out). Without `CADENCE_TIMING_TESTS=1`, a
+run that took at least the deadline and shows that signature on its exit code's
+channel passes as load; a bare exit 1, a panic, or a faster non-block still
+fails. With the variable set, only the block passes.
 A debug-only test (`the_real_group_fail_open_is_accepted_only_without_timing_opt_in`) drives the real group
 with `CADENCE_HOOK_DEADLINE_MS=1` and `CADENCE_TEST_GROUP_STALL_MS=5000` to prove the helper accepts the real
 fail-open output; the stall knob does not exist in release builds, so release runs ignore that test.
