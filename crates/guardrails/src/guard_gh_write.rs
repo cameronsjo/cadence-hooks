@@ -2478,9 +2478,12 @@ fn gh_write_is_user_scoped(segment: &str) -> bool {
 
 /// The `gh pr` and `gh issue` write verbs whose argument may be a PR or issue
 /// URL, with the long flags and shorthand letters that take a value under
-/// each. Read from cli/cli `pkg/cmd/{pr,issue}/*` (trunk, 2026-10-24); `-R`
-/// is the `pr`/`issue` group's own flag. A flag missing here is read as
-/// boolean, so a URL given as its value would be judged as the argument.
+/// each. Read from cli/cli `pkg/cmd/{pr,issue}/*` (trunk, 2026-10-24), and
+/// `--attach` from `attachments.AddFlag`; `-R` is the `pr`/`issue` group's
+/// own flag. A flag missing here is read as boolean, so a URL given as its
+/// value would be judged as the argument, and the value itself takes the
+/// argument's place: the real argument after it is never read, and the write
+/// is judged as before.
 const SELECTOR_VERBS: &[(&str, &str, &[&str], &str)] = &[
     (
         "pr",
@@ -2495,7 +2498,12 @@ const SELECTOR_VERBS: &[(&str, &str, &[&str], &str)] = &[
         "bFtA",
     ),
     ("pr", "close", &["--comment"], "c"),
-    ("pr", "comment", &["--body", "--body-file"], "bF"),
+    (
+        "pr",
+        "comment",
+        &["--body", "--body-file", "--attach"],
+        "bF",
+    ),
     ("pr", "edit", EDIT_VALUE_FLAGS, "tbFBm"),
     ("pr", "review", &["--body", "--body-file"], "bF"),
     ("pr", "ready", &[], ""),
@@ -2508,7 +2516,12 @@ const SELECTOR_VERBS: &[(&str, &str, &[&str], &str)] = &[
         &["--comment", "--reason", "--duplicate-of"],
         "cr",
     ),
-    ("issue", "comment", &["--body", "--body-file"], "bF"),
+    (
+        "issue",
+        "comment",
+        &["--body", "--body-file", "--attach"],
+        "bF",
+    ),
     ("issue", "edit", EDIT_VALUE_FLAGS, "tbFm"),
     ("issue", "reopen", &["--comment"], "c"),
     ("issue", "delete", &[], ""),
@@ -2523,6 +2536,7 @@ const EDIT_VALUE_FLAGS: &[&str] = &[
     "--title",
     "--body",
     "--body-file",
+    "--attach",
     "--base",
     "--milestone",
     "--type",
@@ -11590,6 +11604,10 @@ mod tests {
             (format!("gh pr merge -- {URL_W}"), w()),
             (format!("gh pr merge -R cameronsjo/x {URL_W}"), w()),
             (format!("gh -R cameronsjo/x pr merge {URL_W}"), w()),
+            // `--attach` takes a file name (cli/cli `attachments.AddFlag`).
+            (format!("gh pr comment --attach a.png {URL_W}"), w()),
+            (format!("gh issue comment --attach a.png {ISSUE_W}"), w()),
+            (format!("gh pr edit --attach a.png {URL_W}"), w()),
             // Found wherever `gh` sits, as every resolver reads it (`gh_argv`).
             (format!("xargs gh pr merge {URL_W}"), w()),
             // `-m` merges and `-c` comments: booleans under these verbs.
@@ -11603,6 +11621,7 @@ mod tests {
             (format!("gh pr comment 5 -b {URL_W}"), vec![]),
             (format!("gh pr comment -b {URL_W} 5"), vec![]),
             (format!("gh pr comment --body {URL_W} 5"), vec![]),
+            (format!("gh pr comment --attach {URL_W} 5"), vec![]),
             (format!("gh pr close -c {URL_W} 5"), vec![]),
             (format!("gh pr close 5 -c {URL_W}"), vec![]),
             (format!("gh pr merge 5 -t {URL_W}"), vec![]),
