@@ -559,10 +559,18 @@ mod tests {
         ];
         for input in &inputs {
             let start = std::time::Instant::now();
-            let _ = scan(input);
+            let hits = scan(input);
             let dt = start.elapsed();
-            let limit = if cfg!(debug_assertions) { 5.0 } else { 0.5 };
-            assert!(dt.as_secs_f64() < limit, "{dt:?} on {} bytes", input.len());
+            // Token prefixes that never form a whole token: the scan finishes
+            // and reports nothing, in every run.
+            assert!(hits.is_empty(), "{hits:?} on {} bytes", input.len());
+            // The budget is wall-clock, so a loaded machine can miss it. It is
+            // checked only under CADENCE_TIMING_TESTS=1, with the other flood
+            // budgets (cadence-hooks#1366).
+            if cadence_hooks_core::test_builders::timing_tests_enabled() {
+                let limit = if cfg!(debug_assertions) { 5.0 } else { 0.5 };
+                assert!(dt.as_secs_f64() < limit, "{dt:?} on {} bytes", input.len());
+            }
         }
     }
 }
