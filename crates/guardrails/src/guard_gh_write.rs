@@ -1908,8 +1908,13 @@ enum LoopWriteDecision {
 /// those conditions every iteration's gh resolves to the same repo the hook
 /// sees — identical trust to a single command.
 ///
-/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block, but include the
-/// resolved repo as a copy-paste `-R` suggestion when available.
+/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block.
+///
+/// In either mode a block suggests the cwd's repo as the `-R` fix only when
+/// that repo is owned and the loop body provably stays in it; otherwise the
+/// fix gets a placeholder. The caller also drops the suggestion when gh may
+/// send a looped write elsewhere for a reason this judgment does not see
+/// ([`loop_fix_may_name_dir_repo`]).
 fn judge_loop_write(
     strict: bool,
     body_mutates_cwd: Option<bool>,
