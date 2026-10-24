@@ -1943,6 +1943,10 @@ type Edit = (usize, usize, &'static str);
 /// the name's strength.
 type GluedKey = (Option<(usize, usize, usize)>, Strength);
 
+/// What [`grep_prefix`] read after a prefix: where the text after it starts,
+/// a context line's two dashes, and what its `key` found there.
+type GrepKey<T> = (usize, Option<(usize, usize)>, T);
+
 /// Mask the value of a secret-named key glued to what comes before it, which
 /// no other detector reads: a mid-line name needs a blank, a quote or a
 /// bracket before it, and a line-start name may follow only blanks and spaced
@@ -2096,7 +2100,7 @@ fn push_key(
 fn grep_prefix<T>(
     line: &str,
     mut key: impl FnMut(usize) -> Option<T>,
-) -> Option<Option<(usize, Option<(usize, usize)>, T)>> {
+) -> Option<Option<GrepKey<T>>> {
     let bytes = line.as_bytes();
     let path_end = bytes
         .iter()
