@@ -696,16 +696,20 @@ fn is_fresh_temp_word(word: &str) -> bool {
 /// runs. A call that does not end the segment is one word already.
 ///
 /// Unquoted, the shell splits and globs what the call prints, which is one
-/// path except under GNU's `--help` and `--version` (or an abbreviation):
-/// `rm -f $(mktemp --help)` deletes any file named `a` or `file`. This does
-/// not put such a call back together, so that spelling keeps the block.
+/// path except under GNU's `--help` and `--version` (or an abbreviation) and
+/// its undocumented `-V`, alone or in a group (`-dV`): `rm -f $(mktemp --help)`
+/// deletes any file named `a` or `file`. This does not put such a call back
+/// together, so that spelling keeps the block.
 fn unquoted_fresh_temp_span(words: &[String], unquoted_prefix_lens: &[usize]) -> Option<usize> {
     if !words.first()?.starts_with("$(") {
         return None;
     }
     let mut call = String::new();
     for (count, (word, &len)) in words.iter().zip(unquoted_prefix_lens).enumerate() {
-        if len < word.len() || word.starts_with("--h") || word.starts_with("--v") {
+        let prints_text = word.starts_with("--h")
+            || word.starts_with("--v")
+            || (word.starts_with('-') && !word.starts_with("--") && word.contains('V'));
+        if len < word.len() || prints_text {
             return None;
         }
         if count > 0 {
@@ -3643,6 +3647,8 @@ mod tests {
             // and a quoted word is a file name, not a call.
             (r#"rm -f $(mktemp --help)"#, Block),
             (r#"rm -f $(mktemp --ver)"#, Block),
+            (r#"rm -f $(mktemp -V)"#, Block),
+            (r#"rm -f $(mktemp -dV)"#, Block),
             (r#"rm -f '$(mktemp' '-d)'"#, Block),
             // A call that runs a second command deletes what that prints too.
             (r#"rm -rf $(mktemp -d; ls)"#, Block),
