@@ -2852,6 +2852,10 @@ mod tests {
             ("+ lftp -u u,Zq9vKh7wR3xPq h\n", "Zq9vKh7wR3xPq"),
             ("ngrok authtoken Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
             ("+ htpasswd -b f user Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            // A value that only opens like a placeholder is a secret: the
+            // `(sensitive value)` form needs its `)`, the `<x>` form its `>`.
+            ("DB_PASSWORD=(sensitive)Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("DB_PASSWORD=<Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
         ];
         let mut cases = cases;
         for (input, canary) in round2 {
@@ -3474,6 +3478,11 @@ mod tests {
             "GITHUB_TOKEN=\n",
             "password: '***'\n",
             "password: [REDACTED]\n",
+            // A plan's value it cannot know yet, and a placeholder after an
+            // auth scheme.
+            "  + password = (known after apply)\n",
+            "token=Bearer <token>\n",
+            "password: token ***\n",
             "require_auth: true\n",
             "max_tokens: 4096\n",
             "token_type: bearer\n",
@@ -3669,8 +3678,10 @@ mod tests {
         let tail = " ".repeat(64);
         let m = "[redacted: secret-named value]";
         let cases = [
-            // A variable passed along skips the rest of the run.
+            // A variable passed along skips the rest of the run. Its path
+            // may hold `::`.
             (format!("Client(token=self.token{tail})\n"), None),
+            (format!("f(x token=settings::defaults.token{tail})\n"), None),
             (
                 format!("f(x auth=a token=self.token{tail})\n"),
                 Some(format!("f(x auth={m} token=self.token{tail})\n")),
@@ -3739,7 +3750,7 @@ mod tests {
             ),
             (format!("f(x auth= \"a\" token= \"{tail}\" )\n"), None),
             // The value ends before its trailing blanks, in quotes or not:
-            // `<x>` and `true` are no secret.
+            // `<x>`, `true` and an empty pair of quotes are no secret.
             (format!("f(x token=true{tail})\n"), None),
             (
                 format!("f(x auth=a token=<x>{tail})\n"),
@@ -3748,6 +3759,10 @@ mod tests {
             (
                 format!("f(x auth=a token= \"<x>{tail}\" )\n"),
                 Some(format!("f(x auth={m} token= \"<x>{tail}\" )\n")),
+            ),
+            (
+                format!("f(x auth=a token= \"\"{tail})\n"),
+                Some(format!("f(x auth={m} token= \"\"{tail})\n")),
             ),
         ];
         for (input, want) in cases {
