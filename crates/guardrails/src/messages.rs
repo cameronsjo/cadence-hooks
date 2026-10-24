@@ -15,16 +15,20 @@ use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 pub const WORKTREE_CREATE_RECIPE: &str =
     "`git worktree add .claude/worktrees/<slug> -b feat/<slug>` (or EnterWorktree)";
 
+/// The longest host name DNS allows.
+const MAX_HOST_NAME: usize = 253;
+
 /// The text after `Host scope:` that `guard_push_remote` and `guard_gh_write`
 /// print when a target's host is neither `default` nor in
 /// `CADENCE_EXTRA_HOSTS`.
 ///
 /// The host is often read from a remote URL in `.git/config`. The settings
 /// this offers are text to copy, so they reuse the host only when it is a
-/// plain host name ([`is_safe_host`]). Any other host is named flattened, with
-/// no setting (cameronsjo/cadence-hooks#1526).
+/// plain host name ([`is_safe_host`]) of at most 253 characters, the longest
+/// DNS allows. Any other host is named flattened, with no setting
+/// (cameronsjo/cadence-hooks#1526; the bound is code review N2 on #1539).
 pub fn host_scope_advice(default: &str, host: &str) -> String {
-    if is_safe_host(host) {
+    if host.len() <= MAX_HOST_NAME && is_safe_host(host) {
         format!(
             "bare entries match `{default}` only — for `{host}`, qualify them (`{host}/<owner>`) \
              or set `CADENCE_EXTRA_HOSTS={host}`"

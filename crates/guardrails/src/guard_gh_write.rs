@@ -3502,11 +3502,15 @@ fn is_github_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+/// The longest repository name GitHub accepts.
+const MAX_GITHUB_REPO_NAME: usize = 100;
+
 /// True when a line that tells the model what to run may reuse `repo`, an
 /// `owner/name` read from `.git/config`: the name after its first `/` is
-/// [`is_github_name`]. A repo from there can hold shell syntax
-/// (cameronsjo/cadence-hooks#1526), so the advice lines print a placeholder
-/// for any other repo.
+/// [`is_github_name`] and at most 100 characters, GitHub's limit. A repo
+/// from there can hold shell syntax (cameronsjo/cadence-hooks#1526), and a
+/// name of any length (code review N2 on #1539), so the advice lines print a
+/// placeholder for any other repo.
 ///
 /// Only the name is checked. The unowned fix reuses the name alone, under an
 /// allowlist owner. The loop's `-R` and the fork block's `Use -R` print a repo
@@ -3515,7 +3519,7 @@ fn is_github_name(name: &str) -> bool {
 /// such as the managed-user login `mona_acme` (code review N1 on #1539).
 fn advice_may_reuse(repo: &str) -> bool {
     repo.split_once('/')
-        .is_some_and(|(_, name)| is_github_name(name))
+        .is_some_and(|(_, name)| name.len() <= MAX_GITHUB_REPO_NAME && is_github_name(name))
 }
 
 /// Classify the reconstructed argv retained by loop analysis.
@@ -5743,6 +5747,13 @@ mod tests {
         ] {
             assert_eq!(advice_may_reuse(repo), reused, "{repo:?}");
         }
+        // GitHub stops a name at 100 characters, and a longer one would make
+        // the line as long as the remote likes (code review N2 on #1539).
+        assert!(advice_may_reuse(&format!("cameronsjo/{}", "b".repeat(100))));
+        assert!(!advice_may_reuse(&format!(
+            "cameronsjo/{}",
+            "b".repeat(101)
+        )));
     }
 
     #[test]
@@ -5978,6 +5989,52 @@ mod tests {
         }
     }
 
+    /// The env for the advice rows below: `cameronsjo` owns, and `owners`
+    /// replaces the allowlist when given. `git.example` is an extra host, so
+    /// a made-up host no `insteadOf` rewrites stands in for github.com.
+    #[cfg(unix)]
+    fn advice_env(owners: Option<&'static str>) -> [(&'static str, Option<&'static str>); 6] {
+        [
+            ("CADENCE_ALLOWED_OWNERS", owners.or(Some("cameronsjo"))),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", Some("git.example")),
+            ("GH_HOST", None),
+            ("GH_REPO", None),
+            ("CADENCE_GH_STRICT_LOOPS", None),
+        ]
+    }
+
+    /// Assert that `command` blocks in a new checkout with `remotes` under
+    /// `env`, and that the block, read as Claude Code gets it, has a line
+    /// starting with `advice`. Returns that text.
+    #[cfg(unix)]
+    fn assert_advice_line(
+        env: &[(&str, Option<&str>)],
+        command: &str,
+        remotes: &[(&str, &str)],
+        advice: &str,
+    ) -> String {
+        let checkout = crate::repo_with_remotes(remotes);
+        let cwd = checkout.path().to_str().expect("utf-8 path");
+        let mut text = String::new();
+        with_env(env, || {
+            let result = GhWriteGuard.run(&input_with(command, cwd));
+            assert!(blocks(&result), "{command}: {:?}", result.message);
+            text = cadence_hooks_core::render_result(
+                &result,
+                cadence_hooks_core::HookEvent::PreToolUse,
+            )
+            .1
+            .unwrap_or_default();
+        });
+        assert!(
+            text.lines()
+                .any(|line| line.trim_start().starts_with(advice)),
+            "{command} in {remotes:?}: {advice:?} is missing: {text:?}"
+        );
+        text
+    }
+
     // Unix only, like the hostile rows above, whose helpers it shares.
     #[cfg(unix)]
     #[test]
@@ -5987,16 +6044,8 @@ mod tests {
         // login `mona_acme`, keeps its fix too, since only the name is remote
         // text there (code review N1 on #1539). Each row is `(env, command,
         // remotes, the advice line)`.
-        let base = [
-            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-            ("CADENCE_ALLOWED_REPOS", None),
-            ("CADENCE_EXTRA_HOSTS", Some("git.example")),
-            ("GH_HOST", None),
-            ("GH_REPO", None),
-            ("CADENCE_GH_STRICT_LOOPS", None),
-        ];
-        let mut mona = base;
-        mona[0].1 = Some("cameronsjo,mona_acme");
+        let base = advice_env(None);
+        let mona = advice_env(Some("cameronsjo,mona_acme"));
         let write = "gh pr create --title t --body b";
         let looped = "for n in 1 2; do cd .; gh pr comment $n --body x; done";
         let mona_tool = "git@git.example:mona_acme/tool";
@@ -6005,13 +6054,13 @@ mod tests {
                 &base,
                 write,
                 vec![("origin", mona_tool)],
-                "Fix: -R cameronsjo/tool".to_string(),
+                "Fix: -R cameronsjo/tool",
             ),
             (
                 &mona,
                 looped,
                 vec![("origin", mona_tool)],
-                "Fix: add `-R mona_acme/tool` to each command".to_string(),
+                "Fix: add `-R mona_acme/tool` to each command",
             ),
             (
                 &mona,
@@ -6020,26 +6069,50 @@ mod tests {
                     ("origin", mona_tool),
                     ("upstream", "git@git.example:work-org/thing"),
                 ],
-                "Use -R mona_acme/tool to target your fork".to_string(),
+                "Use -R mona_acme/tool to target your fork",
             ),
         ] {
-            let checkout = crate::repo_with_remotes(&remotes);
-            let cwd = checkout.path().to_str().expect("utf-8 path");
-            with_env(&env[..], || {
-                let result = GhWriteGuard.run(&input_with(command, cwd));
-                assert!(blocks(&result), "{command}: {:?}", result.message);
-                let text = cadence_hooks_core::render_result(
-                    &result,
-                    cadence_hooks_core::HookEvent::PreToolUse,
-                )
-                .1
-                .unwrap_or_default();
-                assert!(
-                    text.lines()
-                        .any(|line| line.trim_start().starts_with(&advice)),
-                    "{command} in {remotes:?}: {advice:?} is missing: {text:?}"
-                );
-            });
+            assert_advice_line(env, command, &remotes, advice);
+        }
+    }
+
+    // Unix only, like the hostile rows above, whose helpers it shares.
+    #[cfg(unix)]
+    #[test]
+    fn remote_repo_advice_leaves_out_a_name_past_githubs_limit() {
+        // A plain name of 400 characters gets each advice line's placeholder,
+        // as a hostile name does, so no advice line runs that long (code
+        // review N2 on #1539). The fork block prints the flattened copy, cut
+        // at 200 characters, so it would offer a cut name as a target.
+        let env = advice_env(None);
+        let long = "a".repeat(400);
+        let mine = format!("git@git.example:cameronsjo/{long}");
+        let theirs = format!("git@git.example:work-org/{long}");
+        for (command, remotes, advice) in [
+            (
+                "gh pr create --title t --body b",
+                vec![("origin", theirs.as_str())],
+                "Fix: -R cameronsjo/<repo>",
+            ),
+            (
+                "for n in 1 2; do cd .; gh pr comment $n --body x; done",
+                vec![("origin", mine.as_str())],
+                "Fix: add `-R <owner>/<repo>` to each command",
+            ),
+            (
+                "gh pr create --title t --body b",
+                vec![
+                    ("origin", mine.as_str()),
+                    ("upstream", "git@git.example:work-org/thing"),
+                ],
+                "No -R target is offered for your fork: its repo is not a GitHub repo name",
+            ),
+        ] {
+            let text = assert_advice_line(&env, command, &remotes, advice);
+            assert!(
+                !text.contains(&"a".repeat(201)),
+                "{command}: a line holds more than 200 of the name: {text:?}"
+            );
         }
     }
 
@@ -6088,6 +6161,18 @@ mod tests {
                     message.contains("qualify them"),
                     offered,
                     "{host}: {message:?}"
+                );
+            }
+            // DNS stops a host name at 253 characters, and the plain-host text
+            // prints the host three times (code review N2 on #1539).
+            for (letters, offered) in [(245, true), (246, false)] {
+                let host = format!("{}.example", "h".repeat(letters));
+                let message = disallowed_message(&host, "work-org/thing", &[], &[], &[]);
+                assert_eq!(
+                    message.contains("CADENCE_EXTRA_HOSTS="),
+                    offered,
+                    "{} characters: {message:?}",
+                    host.len()
                 );
             }
         });
