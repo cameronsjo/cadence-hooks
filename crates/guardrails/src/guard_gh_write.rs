@@ -10069,6 +10069,9 @@ mod tests {
                 "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
                 "$GH_HOST/cameronsjo/x",
             ),
+            // With the name expanded too, `Target:` names the expanded name,
+            // as it did before.
+            (single(r#"-R "$h/evil/$r""#), "evil/$r"),
         ];
         for (command, target) in &unresolvable {
             for cwd in ["/tmp", OWNED_DIR] {
