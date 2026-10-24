@@ -9924,6 +9924,12 @@ mod tests {
                 r"find . -maxdepth 0 -exec gh issue create -R work-org/thing -t x -b y \; -exec gh pr merge 5 -R work-org/thing \;",
                 dash_r,
             ),
+            // The guard does not split `fd -x` into one segment per command,
+            // so this segment's own gh writes must all keep the name.
+            (
+                r"fd . -x gh issue create -R work-org/thing -t x -b y \; -x gh pr merge 5 -R work-org/thing",
+                dash_r,
+            ),
             // A script read in its runner's directory blocks first; the fix
             // still reads the whole command, not only that script.
             (
