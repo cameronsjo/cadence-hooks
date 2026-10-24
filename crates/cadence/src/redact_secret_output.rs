@@ -3716,7 +3716,10 @@ mod tests {
                 None,
             ),
             // `****` marks the run as `redacted` does, and a mark flush
-            // against the delimiter is inside the run.
+            // against the delimiter is inside the run. These rows keep a
+            // value that masks on its own without the parenthesis, so they
+            // keep a secret too, for #1552's reason; the fix for #1552
+            // changes their expected output.
             (
                 "f(x auth=**** token=Zq9vKh7wR3xPq     )\n".to_string(),
                 None,
@@ -3725,6 +3728,9 @@ mod tests {
             ("f(x auth=a auth=****)\n".to_string(), None),
             // A new run, at another parenthesis or on the next line, looks
             // for its own mark: the first run holds none, so its value masks.
+            // The second run's value would mask without the parenthesis, so
+            // it is kept for #1552's reason too; the fix for #1552 changes
+            // these expected outputs.
             (
                 "f(x auth=Zq9vKh7wR3xPq) g(y auth=Zq9vKh7wR3xPq ****)\n".to_string(),
                 Some(format!("f(x auth={m} g(y auth=Zq9vKh7wR3xPq ****)\n")),
