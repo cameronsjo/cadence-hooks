@@ -3870,6 +3870,12 @@ mod tests {
                 format!("src/a.env:3:db_pass=abc\\tPASSWORD: {p}\n"),
                 format!("src/a.env:3:db_pass={m} {m}\n"),
             ),
+            // A glued key on a later line of an escaped string is read in
+            // that string's decoded window too.
+            (
+                format!("{{\"diff\":\"x\\n+password: {p}\\n\"}}\n"),
+                format!("{{\"diff\":\"x\\n+password: {m}\\n\"}}\n"),
+            ),
             // Behind a prefix, an emphasized bare `pass` is judged as in
             // prose, so a credential-shaped first word still masks.
             (format!("+**Pass:** {p}\n"), format!("+**Pass:** {m}\n")),
