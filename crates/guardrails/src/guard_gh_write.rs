@@ -9658,7 +9658,7 @@ mod tests {
             format!("for r in a b; do {}; done", body.join("; "))
         };
         // (flags, the `Found:` list the block names)
-        let unowned: [(&[&str], &str); 18] = [
+        let unowned: [(&[&str], &str); 19] = [
             (&[r#"-R "evil/$r""#], r#""evil/$r""#),
             (&["-R evil/$r"], "evil/$r"),
             // Digits and `_` are owner characters too.
@@ -9679,6 +9679,10 @@ mod tests {
             (&[r#"-R "evil"/"$r""#], r#""evil"/"$r""#),
             // No expansion at all: the unowned message, as before.
             (&[r#"-R "evil""#], r#""evil""#),
+            // `tokenize` keeps this backslash, so the owner read is
+            // `cameronsjo\`, which the allowlist rejects. With no expansion
+            // in the word, it is unowned, not unresolvable.
+            (&[r#"-R "cameronsjo"\/x"#], r#""cameronsjo"\/x"#),
             // `$'…'` and `$"…"` are quotes, and the owner past them is read
             // as a single command reads it, not as a shell parameter.
             (&["-R $'work-org/tool'"], "$'work-org/tool'"),
