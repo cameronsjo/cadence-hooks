@@ -6104,6 +6104,22 @@ mod tests {
     // Unix only, like the hostile rows above, whose helpers it shares.
     #[cfg(unix)]
     #[test]
+    fn gh_placeholders_get_the_repo_placeholder_in_an_ordinary_checkout() {
+        // gh fills `{owner}/{repo}` from the cwd remote, but the guard judges
+        // the command as written: `{owner}` is an unowned owner, and `{repo}`
+        // is not a GitHub name. So the fix names `<repo>`, in an owned
+        // checkout as in any other (code review N4 on #1539).
+        assert_advice_line(
+            &advice_env(None),
+            "gh api -X POST repos/{owner}/{repo}/issues -f title=x",
+            &[("origin", "git@git.example:cameronsjo/thing")],
+            "Fix: gh api repos/cameronsjo/<repo>/…",
+        );
+    }
+
+    // Unix only, like the hostile rows above, whose helpers it shares.
+    #[cfg(unix)]
+    #[test]
     fn remote_repo_advice_leaves_out_a_name_past_githubs_limit() {
         // A plain name of 400 characters gets each advice line's placeholder,
         // as a hostile name does, so no advice line runs that long (code
