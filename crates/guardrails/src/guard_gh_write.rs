@@ -110,6 +110,18 @@ const REPO_TARGET_VERBS: &[&str] = &[
 /// `-R`. `fork` lands under the operator's account, and `clone` is a read.
 const REPO_ARGUMENT_VERBS: &[&str] = &["archive", "delete", "edit", "create"];
 
+/// The write verbs among [`WRITE_ACTIONS`] and [`WRITE_ACTIONS_EXTRA`] whose
+/// unowned-target fix may keep the repo's name under an allowed owner
+/// (`Fix: -R cameronsjo/thing`): they add something new, so a rerun on an
+/// owned repo of that name adds it there. Every other verb changes or removes
+/// something that already exists (`delete`, `edit`, `merge`, `close`,
+/// `comment`, `rename`, `archive`, `set`, `upload`, `run` and the rest), and a
+/// fix for it names `<repo>`: with the name reused, rerunning the fix would act
+/// on the operator's own repo of that name (cameronsjo/cadence-hooks#1506).
+/// The alias `new` reads as `create` ([`gh_command_path`]). Two creates whose
+/// rerun is costly keep no name ([`write_keeps_repo_name`]).
+const NAME_KEEPING_VERBS: &[&str] = &["create"];
+
 /// `owner/repo` from a `gh api` endpoint PATH. Anchored to the start: an
 /// unanchored search matched anywhere in the token, which let a query-string
 /// decoy stand in for the real target (see [`api_repos_target`]).
@@ -234,13 +246,19 @@ fn argv_names_write(segment: &str) -> bool {
     };
     (start..tokens.len())
         .filter(|&at| token_is_gh(&tokens[at]))
-        .any(|at| {
-            let [group, verb] = gh_command_path(&tokens[at..], 2)[..] else {
-                return false;
-            };
-            let canonical = format!("gh {group} {verb}");
-            WRITE_ACTIONS.is_match(&canonical) || WRITE_ACTIONS_EXTRA.is_match(&canonical)
-        })
+        .any(|at| argv_write_path(&tokens[at..]).is_some())
+}
+
+/// The group and verb of the gh invocation `argv` (`argv[0]` is `gh`), found
+/// the way cobra finds them ([`gh_command_path`]), when they name a write.
+/// `None` for anything else, `gh api` included: it has no verb.
+fn argv_write_path(argv: &[String]) -> Option<[&str; 2]> {
+    let [group, verb] = gh_command_path(argv, 2)[..] else {
+        return None;
+    };
+    let canonical = format!("gh {group} {verb}");
+    (WRITE_ACTIONS.is_match(&canonical) || WRITE_ACTIONS_EXTRA.is_match(&canonical))
+        .then_some([group, verb])
 }
 
 /// What a segment's `gh` invocation says about its `-R`/`--repo` target.
@@ -3735,8 +3753,12 @@ fn fork_block_message(origin: (&str, &str, bool), upstream: (&str, &str, bool)) 
 /// when the segment targets a repo outside the allowlist (or one that can't be
 /// resolved), `None` when it's allowed. Per-segment resolution is what stops a
 /// benign first `-R` from covering an unowned write later in the same chain.
+/// `whole` is every segment of the command it came from, which the fix reads
+/// ([`fix_keeps_repo_name`]).
+#[allow(clippy::too_many_arguments)]
 fn judge_write_segment(
     segment: &str,
+    whole: &[String],
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
@@ -3750,6 +3772,7 @@ fn judge_write_segment(
             judge_resolution(
                 resolution,
                 segment,
+                whole,
                 work_dir,
                 allowed_owners,
                 allowed_repos,
@@ -3772,10 +3795,90 @@ fn target_spelling(segment: &str, owner_repo: &str) -> String {
     }
 }
 
+/// True when the fix for an unowned target may keep the target's repo name
+/// under an allowed owner: the segment that blocked keeps it
+/// ([`segment_keeps_repo_name`]), and so does every write among `whole`, the
+/// [`command_segments`] of the whole command ([`every_write_keeps_repo_name`]).
+/// The block shows one fix for the whole command, so in `gh pr create … && gh
+/// pr merge …` the merge must not inherit the create's name: a model that puts
+/// the fix on every command reruns the merge on the operator's own repo of
+/// that name (cameronsjo/cadence-hooks#1506 review).
+///
+/// Read only when a block is built, never for a verdict. A segment without the
+/// text `gh` is skipped unread, which keeps a flood of other commands in front
+/// of the write cheap.
+fn fix_keeps_repo_name(segment: &str, whole: &[String]) -> bool {
+    segment_keeps_repo_name(segment) && every_write_keeps_repo_name(whole, 0)
+}
+
+/// True when every gh write among `segments` keeps the name, the writes in a
+/// script a runner runs in another directory included: [`command_segments`]
+/// does not split `sudo -D DIR sh -c '…'`, so that script's writes are not
+/// among `segments` (#1506 review). [`scripts_run_elsewhere`] reads them as
+/// the write walk does, wherever the runner sits. From `.`, every runner that
+/// names a directory moves it, so this reads at least each script the walk
+/// reads. Past [`MAX_RUNNER_HOPS`] nested scripts, or once the expansion
+/// allowance runs out and a script may be read only in part, nothing keeps
+/// the name.
+fn every_write_keeps_repo_name(segments: &[String], depth: usize) -> bool {
+    segments
+        .iter()
+        .filter(|s| contains_ignoring_ascii_case(s, "gh"))
+        .all(|s| {
+            let write = is_write_command(s) || is_write_command(&requote_words(s));
+            (!write || segment_keeps_repo_name(s))
+                && scripts_run_elsewhere(s, ".").is_none_or(|(_, scripts)| {
+                    depth < MAX_RUNNER_HOPS
+                        && scripts.iter().all(|script| {
+                            let inner = command_segments(script);
+                            !ExpansionWork::spent()
+                                && every_write_keeps_repo_name(&inner, depth + 1)
+                        })
+                })
+        })
+}
+
+/// True when the segment's gh invocations spell at least one write verb, and
+/// every write they spell keeps the name ([`write_keeps_repo_name`]). A `gh
+/// api` write has no verb, and neither does a segment this guard cannot read a
+/// gh invocation from, so neither keeps the name. [`command_segments`] reads a
+/// `gh api` inside `eval`, `find -exec`, `xargs` or `$(…)` as a segment of its
+/// own, so a create beside it does not hide it.
+fn segment_keeps_repo_name(segment: &str) -> bool {
+    let Some((tokens, start)) = gh_command_tokens(segment) else {
+        return false;
+    };
+    let writes: Vec<(&[String], [&str; 2])> = (start..tokens.len())
+        .filter(|&at| token_is_gh(&tokens[at]))
+        .filter_map(|at| argv_write_path(&tokens[at..]).map(|path| (&tokens[at..], path)))
+        .collect();
+    !writes.is_empty()
+        && writes
+            .iter()
+            .all(|&(argv, path)| write_keeps_repo_name(path, argv))
+}
+
+/// True when the unowned fix for one gh write, the argv `argv` whose group and
+/// verb are `path`, may keep the target's repo name: the verb is in
+/// [`NAME_KEEPING_VERBS`] and a rerun is cheap to undo. Not `gh release
+/// create`, which can publish a release and start the repo's release
+/// workflows, and not `gh label create --force` (`-f`), which overwrites a
+/// label of that name.
+fn write_keeps_repo_name([group, verb]: [&str; 2], argv: &[String]) -> bool {
+    match (group, verb) {
+        ("release", "create") => false,
+        ("label", "create") => !argv
+            .iter()
+            .any(|t| t.starts_with("--force") || t.starts_with("-f")),
+        _ => NAME_KEEPING_VERBS.contains(&verb),
+    }
+}
+
 /// The verdict on one repo a write segment may land on.
 fn judge_resolution(
     resolution: RepoResolution,
     segment: &str,
+    whole: &[String],
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
@@ -3918,17 +4021,17 @@ fn judge_resolution(
                     .unwrap_or("owner");
                 // Reuse the repo *name* under an allowed owner so the fix lands
                 // on the same project — `evil/cool-tool` becomes
-                // `cameronsjo/cool-tool`, not a placeholder. Not for the
-                // `gh repo` verbs that change or remove the repo they name:
-                // their fix is a command that runs, and rerun as written it
-                // would act on the operator's own repo of that name.
-                let repo_name = if matches!(
-                    repo_argument_verb(segment).as_deref(),
-                    Some("edit" | "archive" | "delete")
-                ) {
-                    "<repo>"
-                } else {
+                // `cameronsjo/cool-tool`, not a placeholder. Only when every
+                // write in the command creates something
+                // ([`fix_keeps_repo_name`]). A verb that changes or removes
+                // something, a `gh api` write, and a segment this guard cannot
+                // read a verb from name `<repo>`, wherever they sit in the
+                // command: rerun as written, a fix naming the repo would act
+                // on the operator's own repo of that name (#1506).
+                let repo_name = if fix_keeps_repo_name(segment, whole) {
                     repo.split('/').next_back().unwrap_or(repo.as_str())
+                } else {
+                    "<repo>"
                 };
                 // An unresolved GH_HOST is not fixed by any `-R` (#548).
                 let fix = if host == UNRESOLVED_GH_HOST {
@@ -4309,11 +4412,15 @@ impl Check for GhWriteGuard {
         // finds (cameronsjo/cadence-hooks#1137).
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
+        // Read once, for the whole-command reading below and for the fix of
+        // an unowned block, which reads every write in the command
+        // ([`fix_keeps_repo_name`]).
+        let whole_segments = command_segments(command);
         let whole = || {
             let dir: std::rc::Rc<str> = std::rc::Rc::from(work_dir.as_str());
-            command_segments(command)
-                .into_iter()
-                .map(|segment| (segment, dir.clone()))
+            whole_segments
+                .iter()
+                .map(|segment| (segment.clone(), dir.clone()))
                 .collect()
         };
         let own = || command_segments_with_dirs(command, cwd);
@@ -4326,6 +4433,7 @@ impl Check for GhWriteGuard {
             }
             if let Some(block) = judge_write_segments(
                 command,
+                &whole_segments,
                 segments,
                 &work_dir,
                 &allowed_owners,
@@ -4473,7 +4581,10 @@ fn too_many_dirs_block(
     )
 }
 
-/// Runner hops [`dir_after_runners`] follows before it gives up.
+/// Runner hops [`dir_after_runners`] follows before it gives up. It is also
+/// the depth of nested runner scripts [`every_write_keeps_repo_name`] reads
+/// before the unowned fix drops the repo name, so changing it moves both
+/// limits.
 const MAX_RUNNER_HOPS: usize = 16;
 
 /// The short options of `env` and `sudo` that take a value (the directory
@@ -4612,6 +4723,24 @@ fn dir_after_runners(segment: &str, dir: &str) -> String {
     peel_runners(segment, dir).0
 }
 
+/// The directory a runner in front of `segment` moves `dir` to, and the
+/// scripts it hands a shell there (`env -C DIR sh -c '…'`, `sudo -D DIR sh -c
+/// '…'`), which the write walk judges in that directory (cadence-hooks#1141).
+/// `None` when no runner moves the directory.
+fn scripts_run_elsewhere(segment: &str, dir: &str) -> Option<(String, Vec<String>)> {
+    let (moved, peeled) = peel_runners(segment, dir);
+    if moved == dir {
+        return None;
+    }
+    let mut scripts = wrapped_scripts(&peeled);
+    for script in wrapped_scripts(&executable_tokens(segment)) {
+        if !scripts.contains(&script) {
+            scripts.push(script);
+        }
+    }
+    Some((moved, scripts))
+}
+
 /// [`dir_after_runners`]'s directory, and the words left once the runners in
 /// front are peeled (the runner itself when the peel gave up).
 fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
@@ -4660,9 +4789,14 @@ fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
 /// `segments` is one reading of `command`: every [`command_segments`] segment
 /// in the whole-command directory, or each in the directory its own segment
 /// runs in ([`command_segments_with_dirs`]). The `GH_HOST`/`GH_REPO` a write
-/// inherits is tracked along the reading's own order.
+/// inherits is tracked along the reading's own order. `whole` is every
+/// [`command_segments`] segment of the command the hook was given, which the
+/// fix reads ([`fix_keeps_repo_name`]); for a script read in a runner's
+/// directory, `command` is that script and `whole` is still the whole command.
+#[allow(clippy::too_many_arguments)]
 fn judge_write_segments(
     command: &str,
+    whole: &[String],
     segments: Reading,
     whole_dir: &str,
     allowed_owners: &[AllowEntry],
@@ -4688,14 +4822,7 @@ fn judge_write_segments(
         // (cadence-hooks#1141). Judge the script's segments in the runner's
         // directory as well; this only ever adds a verdict, so the reading
         // in the original directory still stands.
-        let (moved, peeled) = peel_runners(&segment, &dir);
-        if moved != *dir {
-            let mut scripts = wrapped_scripts(&peeled);
-            for script in wrapped_scripts(&executable_tokens(&segment)) {
-                if !scripts.contains(&script) {
-                    scripts.push(script);
-                }
-            }
+        if let Some((moved, scripts)) = scripts_run_elsewhere(&segment, &dir) {
             let moved: std::rc::Rc<str> = std::rc::Rc::from(moved.as_str());
             for body in scripts {
                 let inner: Reading = command_segments(&body)
@@ -4704,6 +4831,7 @@ fn judge_write_segments(
                     .collect();
                 if let Some(block) = judge_write_segments(
                     &body,
+                    whole,
                     inner,
                     whole_dir,
                     allowed_owners,
@@ -4863,6 +4991,7 @@ fn judge_write_segments(
                 }
                 if let Some(block) = judge_write_segment(
                     &segment,
+                    whole,
                     &dir,
                     allowed_owners,
                     allowed_repos,
@@ -6172,7 +6301,7 @@ mod tests {
         assert!(!msg(&result).contains("-R"), "{}", msg(&result));
         let meta = result.block_metadata.expect("structured block");
         assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        assert_eq!(meta.fix, "gh api repos/someone-else/forgectl/…");
+        assert_eq!(meta.fix, "gh api repos/someone-else/<repo>/…");
     }
 
     #[test]
@@ -6234,7 +6363,7 @@ mod tests {
         let api = "gh api -X DELETE repos/x/y/z";
         let pr = "gh pr create --title t";
         let fix = |resolution, segment| {
-            judge_resolution(resolution, segment, "/tmp", &o, &[], &[])
+            judge_resolution(resolution, segment, &[], "/tmp", &o, &[], &[])
                 .and_then(|r| r.block_metadata)
                 .expect("structured block")
                 .fix
@@ -9559,6 +9688,317 @@ mod tests {
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
                 assert_eq!(meta.fix, fix, "{command} in {cwd}");
             }
+        }
+    }
+
+    /// The unowned block's fix for `command`, run from `cwd` with
+    /// `cameronsjo` allowed.
+    fn unowned_fix(command: &str, cwd: &str) -> String {
+        let result = run_1491(command, cwd, false);
+        assert!(blocks(&result), "{command} in {cwd}");
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+        meta.fix
+    }
+
+    #[test]
+    fn unowned_fix_keeps_the_repo_name_only_for_a_create_verb() {
+        // #1506: a fix that names a concrete owned repo, rerun as written,
+        // would act on the operator's own repo of that name. A verb that
+        // changes or removes something names `<repo>`; a verb that creates
+        // something keeps the name.
+        for (command, fix) in [
+            // The issue's example, and the rest of the change-shaped verbs.
+            (
+                "gh release delete v1 -R work-org/thing --yes",
+                "-R cameronsjo/<repo>",
+            ),
+            ("gh pr merge 5 -R work-org/thing", "-R cameronsjo/<repo>"),
+            ("gh issue close 5 -R work-org/thing", "-R cameronsjo/<repo>"),
+            (
+                "gh pr comment 5 -R work-org/thing --body x",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh repo rename other -R work-org/thing --yes",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh secret set TOKEN -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh release upload v1 f.tgz -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label clone work-org/src -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh workflow run ci.yml -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            // The flag before the group, and the other spellings of the flag.
+            ("gh -R work-org/thing issue close 5", "-R cameronsjo/<repo>"),
+            (
+                "gh issue close 5 --repo=work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            // A `gh api` write has no verb, so its method decides what it does.
+            (
+                "gh api -X DELETE repos/work-org/thing/git/refs/heads/x",
+                "gh api repos/cameronsjo/<repo>/…",
+            ),
+            // The create verbs, in every spelling of the verb.
+            (
+                "gh issue create -R work-org/thing -t x -b y",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "gh pr create -R work-org/thing --title t --body b",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "gh label create bug -R work-org/thing",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "gh repo create work-org/thing --private",
+                "gh repo create cameronsjo/thing",
+            ),
+            (
+                "gh issue new -R work-org/thing -t x -b y",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "gh -R work-org/thing issue create -t x -b y",
+                "-R cameronsjo/thing",
+            ),
+            // Two creates whose rerun is costly: a release can publish and
+            // start release workflows, and `--force` overwrites a label.
+            (
+                "gh release create v1 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh release new v1 -R work-org/thing --notes x",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label create bug --force -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label create bug -f -c ff0000 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            // `-f` at the head of a cluster, and `--force=…`, force too.
+            (
+                "gh label create bug -fc ff0000 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label create bug --force=true -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            // A gh named by a variable assigned after the function that uses
+            // it, which only the segment that blocked spells as `gh`, and a
+            // lone create in `bash -c`, whose wrapper segment the guard reads
+            // no verb from.
+            (
+                "f() { $G pr merge 5 -R work-org/thing; }; G=gh; f",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "bash -c 'gh issue create -R work-org/thing -t x -b y'",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y && gh release create v1 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                assert_eq!(unowned_fix(command, cwd), fix, "{command} in {cwd}");
+            }
+        }
+    }
+
+    #[test]
+    fn unowned_fix_for_a_cwd_target_follows_the_same_split() {
+        // No `-R`: the target is the checkout's own origin, and the fix is
+        // spelled the same way.
+        let unowned = origin_checkout("https://github.com/work-org/thing.git");
+        let cwd = unowned.path().to_str().expect("utf-8 path");
+        for (command, fix) in [
+            ("gh pr merge 5", "-R cameronsjo/<repo>"),
+            ("gh release delete v1 --yes", "-R cameronsjo/<repo>"),
+            ("gh issue create -t x -b y", "-R cameronsjo/thing"),
+        ] {
+            assert_eq!(unowned_fix(command, cwd), fix, "{command}");
+        }
+    }
+
+    #[test]
+    fn unowned_fix_for_a_looped_repo_argument_follows_the_same_split() {
+        // The loop's name is an expansion, not a real repo; the split is the
+        // same one. A loop of creates keeps `$r`.
+        for (command, fix) in [
+            (
+                r#"for r in a b; do gh repo delete "work-org/$r" --yes; done"#,
+                "gh repo delete cameronsjo/<repo>",
+            ),
+            (
+                r#"for r in a b; do gh repo create "work-org/$r" --private; done"#,
+                "gh repo create cameronsjo/$r",
+            ),
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                assert_eq!(unowned_fix(command, cwd), fix, "{command} in {cwd}");
+            }
+        }
+    }
+
+    #[test]
+    fn unowned_fix_keeps_the_name_only_when_every_write_in_the_command_creates() {
+        // The block shows one fix for the whole command, and the model may put
+        // it on every command that names the target. So a create followed by
+        // a change must not hand the change the create's name, whichever write
+        // blocks first. A `gh api` write has no verb and counts as a change
+        // (#1506 review).
+        let dash_r = "-R cameronsjo/<repo>";
+        let api = "gh api repos/cameronsjo/<repo>/…";
+        for (command, fix) in [
+            (
+                "gh release create v2 -R work-org/thing --notes x && gh release delete v1 -R work-org/thing --yes",
+                dash_r,
+            ),
+            (
+                "gh pr create -R work-org/thing --fill; gh pr merge -R work-org/thing --auto --squash",
+                dash_r,
+            ),
+            (
+                "gh label create new -R work-org/thing && gh label delete old -R work-org/thing --yes",
+                dash_r,
+            ),
+            (
+                "GH_REPO=work-org/thing gh issue create -t x -b y && GH_REPO=work-org/thing gh issue close 5",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y | gh pr merge 5 -R work-org/thing",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y\ngh pr merge 5 -R work-org/thing",
+                dash_r,
+            ),
+            (
+                "( gh issue create -R work-org/thing -t x -b y; gh pr merge 5 -R work-org/thing )",
+                dash_r,
+            ),
+            (
+                "if gh issue create -R work-org/thing -t x -b y; then gh pr merge 5 -R work-org/thing; fi",
+                dash_r,
+            ),
+            (
+                "bash -c 'gh issue create -R work-org/thing -t x -b y; gh pr merge 5 -R work-org/thing'",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y && gh api -X DELETE repos/work-org/thing/releases/1",
+                dash_r,
+            ),
+            // One segment holding a create and a `gh api` write, or a create
+            // and a merge.
+            (
+                "eval 'gh api -X DELETE repos/work-org/thing/releases/1; gh issue create -R work-org/thing -t x -b y'",
+                api,
+            ),
+            (
+                r"find . -maxdepth 0 -exec gh issue create -R work-org/thing -t x -b y \; -exec gh api -X DELETE repos/work-org/thing/releases/1 \;",
+                dash_r,
+            ),
+            (
+                r"find . -maxdepth 0 -exec gh issue create -R work-org/thing -t x -b y \; -exec gh pr merge 5 -R work-org/thing \;",
+                dash_r,
+            ),
+            // The guard does not split `fd -x` into one segment per command,
+            // so this segment's own gh writes must all keep the name.
+            (
+                r"fd . -x gh issue create -R work-org/thing -t x -b y \; -x gh pr merge 5 -R work-org/thing",
+                dash_r,
+            ),
+            // A script read in its runner's directory blocks first; the fix
+            // still reads the whole command, not only that script.
+            (
+                "env -C /tmp sh -c 'gh issue create -R work-org/thing -t x -b y' && gh release delete v1 -R work-org/thing --yes",
+                dash_r,
+            ),
+            // The whole command's segments do not split `sudo -D DIR` or
+            // `--chdir=DIR`, so the fix reads the script that runner runs,
+            // whichever side of it the create sits on.
+            (
+                "sudo -D /opt sh -c 'gh -R work-org/thing issue create -t x -b y; gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "sudo --chdir=/opt sh -c 'gh -R work-org/thing issue create -t x -b y; gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "sudo -D /opt sh -c 'gh -R work-org/thing issue create -t x -b y; gh -R work-org/thing release delete v1 --yes'",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y; sudo -D /opt sh -c 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "gh -R work-org/thing issue create -t x -b y && sudo --chdir=/opt sh -c 'gh -R work-org/thing release delete v1 --yes'",
+                dash_r,
+            ),
+            // tmux's `\;` chain hands the runner two scripts, a create and a
+            // merge. The name stays only when every script keeps it.
+            (
+                r"gh issue create -R work-org/thing -t x -b y; sudo -D /opt tmux new -d 'gh -R work-org/thing issue create -t x -b y' \; new-window 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                r#"for r in a b; do gh repo create "work-org/$r" --private; gh repo delete "work-org/$r" --yes; done"#,
+                "gh repo create cameronsjo/<repo>",
+            ),
+            // Every write creates: the name stays. A `gh api` read is no write.
+            (
+                "gh issue create -R work-org/thing -t x -b y && gh pr create -R work-org/thing --title t --body b",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y && gh api repos/work-org/thing/issues",
+                "-R cameronsjo/thing",
+            ),
+            (
+                "sudo -D /opt sh -c 'gh -R work-org/thing issue create -t x -b y'",
+                "-R cameronsjo/thing",
+            ),
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                assert_eq!(unowned_fix(command, cwd), fix, "{command} in {cwd}");
+            }
+        }
+        // From an owned checkout, a loop body that creates and then merges.
+        let looped =
+            "for r in a b; do gh issue create -R work-org/thing -t x -b y; gh pr merge 5; done";
+        assert_eq!(unowned_fix(looped, OWNED_DIR), dash_r);
+        // The cwd target: the checkout's own `origin` is unowned.
+        let unowned = origin_checkout("https://github.com/work-org/thing.git");
+        let cwd = unowned.path().to_str().expect("utf-8 path");
+        for command in [
+            "gh pr create --fill && gh pr merge --auto --squash",
+            "gh issue create -t x -b y && gh pr merge 5 --squash",
+        ] {
+            assert_eq!(unowned_fix(command, cwd), dash_r, "{command}");
         }
     }
 
