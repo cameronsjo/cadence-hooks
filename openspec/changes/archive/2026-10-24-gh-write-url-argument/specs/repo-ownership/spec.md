@@ -18,7 +18,7 @@
 ## ADDED Requirements
 
 ### Requirement: gh write named by a PR or issue URL argument
-On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host that a PR or issue URL in that argument names, read as gh reads it, before `-R`, `GH_REPO` and the checkout, and under `gh issue transfer` as well as them. An unowned one SHALL block with a fix that names no target. A URL given as a flag's value SHALL NOT count.
+On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host a PR or issue URL there names before `-R`, `GH_REPO` and the checkout, and under `gh issue transfer` as well as them. A loop check SHALL still read `-R`, or without one the checkout, first. A URL it cannot read for certain SHALL be judged as before. An unowned URL SHALL block with a fix that names no target. A flag's value SHALL NOT count.
 
 #### Scenario: Unowned PR URL past an owned target
 - **WHEN** the command is `gh pr merge https://github.com/evil/repo/pull/1 --squash -R cameronsjo/tool`, in a checkout of `cameronsjo/tool`
@@ -35,6 +35,10 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 #### Scenario: Owned issue URL in a transfer from an unowned checkout
 - **WHEN** the command is `gh issue transfer https://github.com/cameronsjo/tool/issues/3 evil/repo`, in a checkout of `evil/repo`
 - **THEN** the hook exits 2 naming `evil/repo`
+
+#### Scenario: Owned PR URL in a loop from an unowned checkout
+- **WHEN** the command is `for n in 1 2; do gh pr merge https://github.com/cameronsjo/tool/pull/$n; done`, in a checkout of `evil/repo`
+- **THEN** the hook exits 2
 
 #### Scenario: Percent sign in the query
 - **WHEN** the command is `gh pr merge 'https://github.com/evil/repo/pull/1/files?file-filters%5B%5D=.rs'`, in a checkout of `cameronsjo/tool`
