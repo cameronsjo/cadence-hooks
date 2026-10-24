@@ -3723,14 +3723,35 @@ fn repo_has_unexpanded_expansion(repo: &str) -> bool {
 /// for an upstream off the allowlist sent the operator straight into this
 /// guard's own unowned-target block (#1032), so an unowned remote instead gets
 /// the path that actually works: the user runs that write themselves.
-fn fork_block_message(origin: (&str, &str, bool), upstream: (&str, &str, bool)) -> String {
+///
+/// An owned remote keeps its repo name only when `keep_name` says every write
+/// in the command creates something ([`fix_keeps_repo_name`]). The write was
+/// aimed at the other remote, so a fix naming this one, rerun as written,
+/// would merge, close or delete there; it names `<repo>` instead (#1525). The
+/// fix is spelled for `segment`'s verb ([`target_spelling`]): `gh repo edit`
+/// and the other argument verbs have no `-R`.
+fn fork_block_message(
+    origin: (&str, &str, bool),
+    upstream: (&str, &str, bool),
+    segment: &str,
+    keep_name: bool,
+) -> String {
     let (origin_host, origin_repo, origin_owned) = origin;
     let (upstream_host, upstream_repo, upstream_owned) = upstream;
     let line = |label: &str, repo: &str, owned: bool| {
         if repo.is_empty() {
             format!("The {label} remote URL could not be parsed, so it cannot be targeted here")
         } else if owned {
-            format!("Use -R {repo} to target {label}")
+            let target = if keep_name {
+                repo.to_string()
+            } else {
+                let owner = repo.split('/').next().unwrap_or("owner");
+                format!("{owner}/<repo>")
+            };
+            format!(
+                "Use {} to target {label}",
+                target_spelling(segment, &target)
+            )
         } else {
             format!(
                 "{repo} is not on your allowlist, so `-R {repo}` is blocked too — if the user \
@@ -3796,7 +3817,8 @@ fn target_spelling(segment: &str, owner_repo: &str) -> String {
 }
 
 /// True when the fix for an unowned target may keep the target's repo name
-/// under an allowed owner: the segment that blocked keeps it
+/// under an allowed owner, and the fork block may name an owned remote in
+/// full ([`fork_block_message`]): the segment that blocked keeps it
 /// ([`segment_keeps_repo_name`]), and so does every write among `whole`, the
 /// [`command_segments`] of the whole command ([`every_write_keeps_repo_name`]).
 /// The block shows one fix for the whole command, so in `gh pr create … && gh
@@ -3938,6 +3960,8 @@ fn judge_resolution(
                 Some(CheckResult::block(fork_block_message(
                     (&origin_host, &origin, owned(&origin_host, &origin)),
                     (&upstream_host, &upstream, owned(&upstream_host, &upstream)),
+                    segment,
+                    fix_keeps_repo_name(segment, whole),
                 )))
             }
         }
@@ -10748,6 +10772,8 @@ mod tests {
         let message = fork_block_message(
             ("github.com", "cameronsjo/x", true),
             ("github.com", "other/x", false),
+            "gh pr create --fill",
+            true,
         );
         assert!(message.contains("Use -R cameronsjo/x to target your fork"));
         assert!(!message.contains("Use -R other/x"), "{message}");
@@ -10759,12 +10785,60 @@ mod tests {
         let message = fork_block_message(
             ("github.com", "other/x", false),
             ("github.com", "cameronsjo/x", true),
+            "gh pr create --fill",
+            true,
         );
         assert!(message.contains("Use -R cameronsjo/x to target upstream"));
         assert!(!message.contains("Use -R other/x"), "{message}");
-        let unparsed = fork_block_message(("", "", false), ("github.com", "other/x", false));
+        let unparsed = fork_block_message(
+            ("", "", false),
+            ("github.com", "other/x", false),
+            "gh pr create --fill",
+            true,
+        );
         assert!(!unparsed.contains("Use -R"), "{unparsed}");
         assert!(unparsed.contains("could not be parsed"), "{unparsed}");
+    }
+
+    #[test]
+    fn fork_message_names_an_owned_remote_only_for_a_create() {
+        // #1525: the write was aimed at the other remote, so naming an owned
+        // one in full sends a merge or a delete there. Either remote may be
+        // the owned one.
+        for (origin, upstream, label) in [
+            (
+                ("github.com", "cameronsjo/x", true),
+                ("github.com", "other/x", false),
+                "your fork",
+            ),
+            (
+                ("github.com", "other/x", false),
+                ("github.com", "cameronsjo/x", true),
+                "upstream",
+            ),
+        ] {
+            for (segment, keep, line) in [
+                ("gh pr create --fill", true, "Use -R cameronsjo/x to target"),
+                (
+                    "gh release delete v1 --yes",
+                    false,
+                    "Use -R cameronsjo/<repo> to target",
+                ),
+                (
+                    "gh repo edit --enable-issues",
+                    false,
+                    "Use gh repo edit cameronsjo/<repo> to target",
+                ),
+            ] {
+                let message = fork_block_message(origin, upstream, segment, keep);
+                let want = format!("{line} {label}");
+                assert!(
+                    message.lines().any(|l| l.trim() == want),
+                    "{segment}: {message}"
+                );
+                assert!(!message.contains("Use -R other/x"), "{message}");
+            }
+        }
     }
 
     #[test]
@@ -10800,6 +10874,58 @@ mod tests {
             assert!(message.contains("Write operation in a fork"), "{message}");
             assert!(message.contains("Use -R cameronsjo/x"), "{message}");
             assert!(!message.contains("Use -R other/x"), "{message}");
+        });
+    }
+
+    #[test]
+    fn fork_block_names_the_fork_only_when_every_write_creates() {
+        // #1525: from a fork whose upstream is unowned, the write was aimed at
+        // upstream. Rerun as `-R cameronsjo/x`, a merge or a delete lands in
+        // the operator's fork. The split is #1506's, for the whole command.
+        let fork = origin_checkout("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            fork.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/other/x.git",
+            ],
+        );
+        let cwd = fork.path().to_str().expect("utf-8 path");
+        let keep = "Use -R cameronsjo/x to target your fork";
+        let placeholder = "Use -R cameronsjo/<repo> to target your fork";
+        with_env(&owners_env(), || {
+            for (command, line) in [
+                ("gh pr create --fill", keep),
+                ("gh pr new -t a -b b", keep),
+                ("gh issue create -t t -b b", keep),
+                ("gh label create bug", keep),
+                ("gh release delete v1 --yes", placeholder),
+                ("gh pr merge 5", placeholder),
+                ("gh issue close 5", placeholder),
+                ("gh pr comment 5 --body x", placeholder),
+                ("gh secret set X --body y", placeholder),
+                ("gh release create v1", placeholder),
+                ("gh label create bug --force", placeholder),
+                (
+                    "gh pr create --fill && gh pr merge --auto --squash",
+                    placeholder,
+                ),
+                (
+                    "gh repo edit --enable-issues",
+                    "Use gh repo edit cameronsjo/<repo> to target your fork",
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert!(blocks(&result), "{command}");
+                let message = msg(&result);
+                assert!(message.contains("Write operation in a fork"), "{message}");
+                assert!(
+                    message.lines().any(|l| l.trim() == line),
+                    "{command}: {message}"
+                );
+            }
         });
     }
 
