@@ -2639,10 +2639,16 @@ fn selector_url_is_the_only_target(segment: &str) -> bool {
 /// lookup's `tryParseIssueFromURL`): an `http`/`https` URL whose path starts
 /// `/OWNER/REPO/pull/N` (or `/issues/N`), the host lowercased less a leading
 /// `www.`. `None` for anything else, and for any URL Go may decode or reject
-/// differently (`%`, a backslash, whitespace, userinfo, an odd host), which
-/// is then judged as before. A `$` may stand for the number.
+/// differently (a `%` before any `?` or `#`, a backslash, whitespace,
+/// userinfo, an odd host), which is then judged as before. Go decodes only
+/// the path, so a `%` in the query or fragment is read. A `$` may stand for
+/// the number.
 fn selector_url_target(word: &str, issue_paths: bool) -> Option<(String, String)> {
-    if word.contains(['%', '\\']) || word.contains(|c: char| c.is_whitespace() || c.is_control()) {
+    let before_query = word.split(['?', '#']).next().unwrap_or_default();
+    if before_query.contains('%')
+        || word.contains('\\')
+        || word.contains(|c: char| c.is_whitespace() || c.is_control())
+    {
         return None;
     }
     let (scheme, rest) = word.split_once("://")?;
@@ -11579,6 +11585,17 @@ mod tests {
                 gh("o/r"),
             ),
             ("https://github.com/o/r/pull/1?w=1", false, gh("o/r")),
+            // Go decodes only the path, so a `%` after `?` or `#` is read.
+            (
+                "https://github.com/o/r/pull/7/files?file-filters%5B%5D=.rs",
+                false,
+                gh("o/r"),
+            ),
+            (
+                "https://github.com/o/r/pull/7#discussion_r%41",
+                false,
+                gh("o/r"),
+            ),
             ("http://github.com/o/r/pull/1", false, gh("o/r")),
             ("HTTPS://github.com/o/r/pull/1", false, gh("o/r")),
             ("https://www.GitHub.com/o/r/pull/1", false, gh("o/r")),
@@ -11672,6 +11689,10 @@ mod tests {
                 ),
                 (format!("gh issue comment {} --body hi", ISSUE_W), &*owned),
                 (format!("gh issue delete {} --yes", ISSUE_W), &*owned),
+                (
+                    format!("gh pr merge '{URL_W}/files?file-filters%5B%5D=.rs' --squash"),
+                    &*owned,
+                ),
             ] {
                 let result = GhWriteGuard.run(&input_with(&command, cwd));
                 assert!(blocks(&result), "{command} in {cwd}");

@@ -346,3 +346,11 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 #### Scenario: Owned issue URL in a transfer from an unowned checkout
 - **WHEN** the command is `gh issue transfer https://github.com/cameronsjo/tool/issues/3 evil/repo`, in a checkout of `evil/repo`
 - **THEN** the hook exits 2 naming `evil/repo`
+
+#### Scenario: Percent sign in the query
+- **WHEN** the command is `gh pr merge 'https://github.com/evil/repo/pull/1/files?file-filters%5B%5D=.rs'`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2 naming `github.com/evil/repo`
+
+#### Scenario: Percent sign in the path
+- **WHEN** the command is `gh pr merge https://github.com/evil%2Drepo/x/pull/1`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows, judging the checkout as before
