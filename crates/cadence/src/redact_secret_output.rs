@@ -3797,6 +3797,9 @@ mod tests {
             (format!("+password: {p}\n"), format!("+password: {m}\n")),
             (format!("-DB_PASSWORD={p}\n"), format!("-DB_PASSWORD={m}\n")),
             (format!("+pass: {p}\n"), format!("+pass: {m}\n")),
+            // A plain glued bare `pass` is in key position, so a value that
+            // is not credential-shaped masks too, as after `+ pass:`.
+            ("+pass: hunter2\n".to_string(), format!("+pass: {m}\n")),
             // Emphasis around the key and its colon.
             (
                 format!("**Password:** {p}\n"),
@@ -3895,6 +3898,12 @@ mod tests {
             (
                 format!("_posts/2026-10-24-x.md-3-password: {p}\n"),
                 format!("_posts/2026-10-24-x.md-3-password: {m}\n"),
+            ),
+            // ...and one with a later `-digits-` run in its value. The path
+            // holds a `/`, so no line-start name runs over it.
+            (
+                "config/app.env-3-TOKEN=abc-2026-10-24\n".to_string(),
+                format!("config/app.env-3-TOKEN={m}\n"),
             ),
             // A plain glued key may start with `_`.
             (format!("+_password={p}\n"), format!("+_password={m}\n")),
