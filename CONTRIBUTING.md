@@ -22,7 +22,10 @@ assertions are enabled only by `CADENCE_TIMING_TESTS=1`; an unset variable or an
 other value leaves them off. This setting lives in test helpers and does not
 change production hook deadlines. The enforce-worktree line-continuation test
 counts `plain_of` segmenter calls in the normal suite and compares two
-timings only under the opt-in.
+timings only under the opt-in. The credential-scan 200 KB adversarial test
+(`perf_200kb_adversarial`) checks in the normal suite that each scan finds
+nothing, and checks its 5 s debug and 0.5 s release budgets only under the
+opt-in, unscaled on every platform.
 
 Run the opted-in budgets in release mode with one test thread:
 
