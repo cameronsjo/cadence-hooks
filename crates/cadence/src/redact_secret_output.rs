@@ -3684,7 +3684,7 @@ mod tests {
                 format!("f(x token=a.b c{tail})\n"),
                 Some(format!("f(x token={m}\n")),
             ),
-            // A placeholder after an auth scheme is no secret.
+            // A placeholder or a variable after an auth scheme is no secret.
             (format!("f(x token=Bearer [REDACTED]{tail},\n"), None),
             (format!("f(x token=Bearer ${{TOKEN}}{tail})\n"), None),
             // A placeholder anywhere in the value skips the rest of the run.
@@ -3703,6 +3703,24 @@ mod tests {
             (
                 format!("f(x auth=a token=Zq9vKh7wR3xPq <REDACTED>{tail})\n"),
                 None,
+            ),
+            // `****` marks the run as `redacted` does, and a mark flush
+            // against the delimiter is inside the run.
+            (
+                "f(x auth=**** token=Zq9vKh7wR3xPq     )\n".to_string(),
+                None,
+            ),
+            ("f(x auth=Zq9vKh7wR3xPq ****)\n".to_string(), None),
+            ("f(x auth=a auth=****)\n".to_string(), None),
+            // A new run, at another parenthesis or on the next line, looks
+            // for its own mark: the first run holds none, so its value masks.
+            (
+                "f(x auth=Zq9vKh7wR3xPq) g(y auth=Zq9vKh7wR3xPq ****)\n".to_string(),
+                Some(format!("f(x auth={m} g(y auth=Zq9vKh7wR3xPq ****)\n")),
+            ),
+            (
+                "f(x auth=Zq9vKh7wR3xPq)\nf(x auth=Zq9vKh7wR3xPq ****)\n".to_string(),
+                Some(format!("f(x auth={m}\nf(x auth=Zq9vKh7wR3xPq ****)\n")),
             ),
             // Otherwise each value is judged in turn.
             (
