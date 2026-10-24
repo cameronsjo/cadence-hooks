@@ -10000,10 +10000,13 @@ mod tests {
                 format!(r#"while read -r n; do gh pr merge "$n" {flag} --squash; done < ids.txt"#),
             ]
         };
+        // A URL with one part past its host names no repo either, so it is
+        // left out too.
         for flag in [
             "--repo=cameronsjo/{,x}",
             "-Rcameronsjo/{,x}",
             r#"--repo="cameronsjo"/{,x}"#,
+            "-R {cameronsjo/x,https://github.com/work-org}",
         ] {
             for command in bodies(flag) {
                 for (cwd, strict) in contexts {
