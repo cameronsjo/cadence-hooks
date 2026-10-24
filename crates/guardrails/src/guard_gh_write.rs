@@ -6060,14 +6060,21 @@ mod tests {
         // The controls for the table above: a remote whose name is plain gets
         // it back in the advice. An owner with `_`, such as the managed-user
         // login `mona_acme`, keeps its fix too, since only the name is remote
-        // text there (code review N1 on #1539). Each row is `(env, command,
-        // remotes, the advice line)`.
+        // text there (code review N1 on #1539). The first row is the loop
+        // gate's keep arm, which no other test reaches (security review N2).
+        // Each row is `(env, command, remotes, the advice line)`.
         let base = advice_env(None);
         let mona = advice_env(Some("cameronsjo,mona_acme"));
         let write = "gh pr create --title t --body b";
         let looped = "for n in 1 2; do cd .; gh pr comment $n --body x; done";
         let mona_tool = "git@git.example:mona_acme/tool";
         for (env, command, remotes, advice) in [
+            (
+                &base,
+                looped,
+                vec![("origin", "git@git.example:cameronsjo/thing")],
+                "Fix: add `-R cameronsjo/thing` to each command",
+            ),
             (
                 &base,
                 write,
