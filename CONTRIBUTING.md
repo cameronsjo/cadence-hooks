@@ -20,7 +20,9 @@ their semantic assertions in the normal suite. The shared scaling helper also
 runs both its small and large input sizes. Their wall-clock budget and scaling
 assertions are enabled only by `CADENCE_TIMING_TESTS=1`; an unset variable or any
 other value leaves them off. This setting lives in test helpers and does not
-change production hook deadlines.
+change production hook deadlines. The enforce-worktree line-continuation test
+counts segmenter runs in the normal suite and compares two timings only under
+the opt-in.
 
 Run the opted-in budgets in release mode with one test thread:
 
