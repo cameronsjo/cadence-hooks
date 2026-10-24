@@ -2601,6 +2601,10 @@ fn selector_url_targets(segment: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The fix on an unowned URL argument's block (cadence-hooks#1529).
+const SELECTOR_URL_FIX: &str =
+    "ask the user to run it themselves; gh writes to the URL's repo whatever -R says";
+
 /// The `(host, owner/repo)` of a PR URL, or with `issue_paths` an issue or PR
 /// URL, read as gh reads one (cli/cli `pr/shared.ParseURL` and the issue
 /// lookup's `tryParseIssueFromURL`): an `http`/`https` URL whose path starts
@@ -3875,14 +3879,14 @@ fn judge_resolution(
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 return None;
             }
-            // gh reads the URL before `-R`, so the fix replaces it, and names
-            // no repo of the same name: that is a different project.
-            let owner = allowed_owners.first().map_or("owner", |e| e.owner.as_str());
+            // gh reads the URL before `-R`, so no `-R` moves the write, and
+            // the URL's number names another PR or issue in any other repo:
+            // the fix names no target.
             Some(CheckResult::block_structured(
                 disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
                 BlockMetadata {
                     rule_id: "gh-write-unauthorized-target".to_string(),
-                    fix: format!("replace the URL with the number and -R {owner}/<repo>"),
+                    fix: SELECTOR_URL_FIX.to_string(),
                     allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                     severity: "error",
                 },
@@ -11631,6 +11635,7 @@ mod tests {
                     "/tmp",
                 ),
                 (format!("gh issue comment {} --body hi", ISSUE_W), &*owned),
+                (format!("gh issue delete {} --yes", ISSUE_W), &*owned),
             ] {
                 let result = GhWriteGuard.run(&input_with(&command, cwd));
                 assert!(blocks(&result), "{command} in {cwd}");
@@ -11638,10 +11643,10 @@ mod tests {
                 assert!(msg(&result).contains("github.com/work-org/x"), "{command}");
                 let meta = result.block_metadata.expect("structured block");
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-                assert_eq!(
-                    meta.fix,
-                    "replace the URL with the number and -R cameronsjo/<repo>"
-                );
+                // The URL's number names another PR or issue in an owned
+                // repo, so the fix names no target to retry on.
+                assert!(meta.fix.contains("ask the user"), "{}", meta.fix);
+                assert!(!meta.fix.contains("cameronsjo/"), "{}", meta.fix);
             }
         });
     }

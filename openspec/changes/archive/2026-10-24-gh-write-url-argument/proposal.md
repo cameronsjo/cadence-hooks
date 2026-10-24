@@ -5,7 +5,7 @@ gh takes the repo and host from a PR or issue URL argument before `-R`, `GH_REPO
 ## What Changes
 
 - On the `gh pr` and `gh issue` write verbs that take a `<number> | <url> | <branch>` argument, a URL argument names the target, read as gh reads it: the repo and host from an `http`/`https` URL whose path starts `/OWNER/REPO/pull/N` (and `/issues/N` on the issue verbs and `gh pr lock|unlock`). It wins over `-R`, `GH_REPO` and the checkout, as in gh.
-- An unowned URL blocks with the usual "you don't own" reason; the fix names `-R <owner>/<repo>` with the number in place of the URL. An owned URL is allowed from any directory.
+- An unowned URL blocks with the usual "you don't own" reason; the fix asks the user to run the command, since gh writes to the URL's repo whatever `-R` says, and names no target. An owned URL is allowed from any directory.
 - A URL given as a flag's value (`--body`, `--duplicate-of`, `--parent`) is not read. The loop checks, the `inject-gh-write-context` nudge and the `gh issue transfer` destination are unchanged.
 
 Surfaces: `guard-gh-write` (PreToolUse, Bash), its exit code (0 to 2 for an unowned URL argument, 2 to 0 for an owned one outside an owned checkout) and its block payload's `fix`. No hooks.json change in cameronsjo/cadence.

@@ -329,11 +329,11 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 - **THEN** the hook exits 0 with a nudge that says a bare push was checked against the branch checked out now
 
 ### Requirement: gh write named by a PR or issue URL argument
-On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host that a PR or issue URL in that argument names, read as gh reads it, before `-R`, `GH_REPO` and the checkout. An unowned one SHALL block with a fix naming `-R <owner>/<repo>` in place of the URL. A URL given as a flag's value SHALL NOT count.
+On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host that a PR or issue URL in that argument names, read as gh reads it, before `-R`, `GH_REPO` and the checkout. An unowned one SHALL block with a fix that names no target. A URL given as a flag's value SHALL NOT count.
 
 #### Scenario: Unowned PR URL past an owned target
 - **WHEN** the command is `gh pr merge https://github.com/evil/repo/pull/1 --squash -R cameronsjo/tool`, in a checkout of `cameronsjo/tool`
-- **THEN** the hook exits 2 naming `github.com/evil/repo`, and the fix names `-R cameronsjo/<repo>` in place of the URL
+- **THEN** the hook exits 2 naming `github.com/evil/repo`, and the fix asks the user to run the command and names no `cameronsjo/` repo
 
 #### Scenario: Owned issue URL outside an owned checkout
 - **WHEN** the command is `gh issue close https://github.com/cameronsjo/tool/issues/3`, in a checkout of `evil/repo` or in `/tmp`
