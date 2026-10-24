@@ -20,7 +20,7 @@ None.
 
 ### Modified Capabilities
 
-- `secret-writes`: "A git rm that leaves the file on disk is allowed" is added.
+- `secret-writes`: "A git rm that leaves the file on disk is allowed" is added, and "Writer verbs targeting a secret file block" points to it.
 
 ## Impact
 
