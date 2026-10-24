@@ -3484,10 +3484,11 @@ struct GhPrInvocation<'a> {
 /// | `guard_gh_write::repo_flag` (guardrails crate) | [`gh_repo_flags`] + [`parse_gh_repo_value`], blocks when unreadable |
 ///
 /// `scan_ship_flags` (here) is the one walker that keeps its own cluster
-/// reading, because it has what the shared parser deliberately lacks: a
-/// per-subcommand flag table for `gh pr create`/`ready`/`merge`, which lets it
-/// read `-fRother/r` precisely. Its values still split through
-/// [`gh_repo_value_parts`].
+/// reading, because it reads every flag through a per-subcommand table for
+/// `gh pr create`/`ready`/`merge`, which lets it read `-fRother/r`
+/// precisely. The shared parser has such a table only for `gh pr review` and
+/// `gh pr ready` ([`repo_flag_grammar`]), and reads only their no-value flags
+/// from it. Its values still split through [`gh_repo_value_parts`].
 ///
 /// `git push --repo` is deliberately NOT a sibling: it is a different
 /// executable's flag (`PUSH_SEPARATE_VALUE_LONG_OPTS`, this file), spelled
@@ -4368,7 +4369,9 @@ const READY_FLAGS: FlagGrammar = FlagGrammar {
 };
 
 /// `gh pr review`'s flags (gh 2.89.0 `--help`, and gh's trunk source). Not a
-/// ship anchor: only [`gh_repo_flags`] reads it, through [`repo_flag_grammar`].
+/// ship anchor: only [`gh_repo_flags`] reads it, through [`repo_flag_grammar`],
+/// and it reads only the no-value halves (`short_bools`, `long_bools`). The
+/// value halves are listed so the table matches gh's; no code reads them.
 const REVIEW_FLAGS: FlagGrammar = FlagGrammar {
     short_values: "bF",
     short_bools: "achr",
@@ -4844,7 +4847,9 @@ impl GhRepoFlags {
 /// delete`, `--web` everywhere). A name belongs here only if no subcommand
 /// takes a value for it: a wrong entry
 /// would read another flag's value as the target, which is the fail-open
-/// direction. Anything absent is treated as possibly value-taking.
+/// direction. Anything absent is treated as possibly value-taking, unless
+/// the verb's [`repo_flag_grammar`] lists it as a no-value flag
+/// (`--approve` under `gh pr review`).
 const GH_BOOLEAN_LONG_FLAGS: &[&str] = &[
     "admin",
     "auto",
