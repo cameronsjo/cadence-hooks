@@ -5850,7 +5850,9 @@ mod tests {
             let theirs = crate::repo_with_remotes(&[("origin", &theirs_url)]);
             let fork =
                 crate::repo_with_remotes(&[("origin", &mine_url), ("upstream", &theirs_url)]);
-            let expansion = theirs_url.replace("work-org/", "work-org/$");
+            // An owner the guard cannot read as a literal, so the repo is
+            // judged as an expansion, not as an unowned owner's.
+            let expansion = theirs_url.replace("work-org/", "$o/");
             let dollar = crate::repo_with_remotes(&[("origin", &expansion)]);
             let mine = crate::repo_with_remotes(&[("origin", &mine_url)]);
             let name = theirs_shown.trim_start_matches("work-org/");
@@ -5884,7 +5886,7 @@ mod tests {
                     "Cannot determine target repo",
                     "gh pr create --title t --body b",
                     path(&dollar),
-                    format!("Target:  work-org/${name} (an unexpanded"),
+                    format!("Target:  $o/{name} (an unexpanded"),
                     "Fix: pass the target as a literal `-R owner/repo`".to_string(),
                     1,
                 ),
