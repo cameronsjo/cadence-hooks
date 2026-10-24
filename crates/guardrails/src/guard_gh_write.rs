@@ -11640,9 +11640,10 @@ mod tests {
             // Go rejects a bad escape in the fragment, and gh reads no URL.
             ("https://github.com/o/r/pull/7#f%zz", false, None),
             ("https://github.com/o/r/pull/7#%", false, None),
-            // One bad escape is enough, a hex letter is a digit, and one
-            // digit at the end is not two.
+            // One bad escape is enough, first or last, a hex letter is a
+            // digit, and one digit at the end is not two.
             ("https://github.com/o/r/pull/7#a%41b%zz", false, None),
+            ("https://github.com/o/r/pull/7#a%zzb%41", false, None),
             ("https://github.com/o/r/pull/7#x%4f", false, gh("o/r")),
             ("https://github.com/o/r/pull/7#x%4", false, None),
         ] {
