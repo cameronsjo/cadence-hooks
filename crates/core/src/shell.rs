@@ -13640,6 +13640,37 @@ pub fn skip_git_global_options(argv: &[String]) -> &[String] {
     skip_runner_flags("git", argv).unwrap_or(argv)
 }
 
+/// Does this `git rm` (the words after `rm`) take the path out of the index
+/// and leave the working-tree file alone? That is `--cached`, which git reads
+/// among the options in any order and ahead of any `--` (or `--end-of-options`),
+/// beside `-r`, `-q`, `-f`. git takes an unambiguous prefix of a long option, so
+/// `--cach` and `--c` are `--cached`, and `--no-cached` (`--no-c`) turns it
+/// off again; the last of the two wins. There is no short form, and after `--`
+/// the word is a file named `--cached`, which `git rm` does delete.
+///
+/// Shared by `obsidian-trash-guard` and `prevent_secret_writes::writer_targets`,
+/// so the two readers of `git rm` cannot disagree about it (#1535).
+///
+/// A word that is the value of an option such as `--pathspec-from-file` is
+/// read as an option here, which no one types.
+pub fn git_rm_keeps_the_tree(args: &[String]) -> bool {
+    let mut cached = false;
+    for arg in args {
+        if arg == "--" || arg == "--end-of-options" {
+            break;
+        }
+        let Some(name) = arg.strip_prefix("--") else {
+            continue;
+        };
+        if "cached".starts_with(name) {
+            cached = true;
+        } else if name.len() > "no-".len() && "no-cached".starts_with(name) {
+            cached = false;
+        }
+    }
+    cached
+}
+
 /// `git push` long options whose value is a SEPARATE following word.
 ///
 /// Measured against git 2.55.0 by pointing pushes at nonexistent local paths and
@@ -17072,6 +17103,37 @@ mod tests {
                 Some(want_head),
                 "{command}"
             );
+        }
+    }
+
+    /// The words after `git rm`, and whether git leaves the file on disk.
+    /// Both readers of `git rm` (trash-guard, prevent-secret-writes) ask this.
+    #[test]
+    fn git_rm_keeps_the_tree_reads_cached_as_git_does() {
+        for (args, keeps) in [
+            ("--cached note.md", true),
+            ("-r --cached sub/", true),
+            ("--cached -r .", true),
+            ("note.md --cached", true),
+            ("--cached -- note.md", true),
+            ("--cach note.md", true),
+            ("--c note.md", true),
+            ("--no-cached --cached note.md", true),
+            // `--n` and `--no-` are ambiguous to git, which refuses the line.
+            ("--cached --n note.md", true),
+            ("--cached --no- note.md", true),
+            ("note.md", false),
+            ("-r sub/", false),
+            ("", false),
+            ("-- --cached", false),
+            ("--end-of-options --cached", false),
+            ("./--cached", false),
+            ("cached", false),
+            ("--cached --no-cached note.md", false),
+            ("--cached --no-c note.md", false),
+            ("--cachedx note.md", false),
+        ] {
+            assert_eq!(git_rm_keeps_the_tree(&words(args)), keeps, "git rm {args}");
         }
     }
 

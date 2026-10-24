@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`trash-guard` allows `git rm --cached`.** It read every `git rm` as a deletion, so `git rm --cached note.md`, `git rm -r --cached sub/`, `git rm --cached -r .` and `git -C . rm --cached note.md` blocked from inside a vault, though `--cached` takes the path out of the index and leaves the file on disk. A `git rm` with `--cached` among its options now allows, in any order with `-r`, `-q` and `-f`, as git reads it: before any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`). It allows behind a runner, a wrapper and `find -exec` too, and from outside the vault. A plain `git rm`, `git rm -- --cached` (a file named `--cached`), `git rm --cached --no-cached note.md` and a deleting command beside the `git rm --cached` still block. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
 
+- **`prevent-secret-writes` allows `git rm --cached` on a secret file.** It read every `git rm` as `rm`, so `git rm --cached .env`, `git rm --cached -r .env` and `git -C . rm --cached .env` blocked, though `--cached` takes the file out of the index and leaves it on disk. It now reads `git rm` through the same core test as `trash-guard`, so the two cannot disagree: `--cached` counts in any order before `--` or `--end-of-options`, as an unambiguous prefix (`--cach`), and a later `--no-cached` undoes it. `git rm .env`, `git rm -- --cached .env`, `git rm --cached --no-cached .env` and a writing or deleting command beside the `git rm --cached` still block. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
