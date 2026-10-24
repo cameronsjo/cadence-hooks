@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: A fresh mktemp path holds no vault file
-From a cwd inside the vault, `trash-guard` SHALL read a bare `$(mktemp …)` operand, or a variable the same command assigned from one or from a backtick `mktemp`, quoted or not, as a fresh path that holds no vault file whatever the call's options, template or `TMPDIR`, and allow its deletion and the commands that make or fill it. A call it does not read, a reassignment, an assignment that may not have run, a suffix, another operand and a sibling that is not inert MUST keep the block.
+From a cwd inside the vault, `trash-guard` SHALL read a bare `$(mktemp …)` operand, or a variable the command assigned from one or a backtick `mktemp`, quoted or not, as a fresh path holding no vault file, whatever its options, template or `TMPDIR`, and allow deleting it and what makes or fills it. A call it does not read, a reassignment to anything else, an assignment that may be skipped, a suffix, an operand that may be a vault file and a sibling that is not inert MUST keep the block.
 
 #### Scenario: Fresh path made, filled and deleted
 - **WHEN** the cwd is the vault and a Bash call runs `t=$(mktemp); echo x > "$t"; rm -f "$t"`, `tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT`, `t=$(mktemp); rm -f $t` or `t=$(mktemp -p .); rm "$t"`
