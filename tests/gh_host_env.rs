@@ -26,6 +26,8 @@ fn guard(command: &str, gh_host: &str) -> i32 {
         .env_remove("CADENCE_DISABLE")
         .env_remove("CADENCE_ALLOWED_REPOS")
         .env_remove("CADENCE_EXTRA_HOSTS")
+        // The guard reads GH_REPO, so an exported one would move these verdicts.
+        .env_remove("GH_REPO")
         .env("CADENCE_ALLOWED_OWNERS", "cameronsjo")
         .env("CADENCE_METRICS_DIR", scratch.path())
         .env("GH_HOST", gh_host)
