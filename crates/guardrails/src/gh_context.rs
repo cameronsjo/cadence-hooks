@@ -209,10 +209,13 @@ mod tests {
 
     #[test]
     fn render_from_env_carries_the_rule_whatever_the_env_holds() {
-        // Env vars may or may not be set in the test process; assert the shape
-        // every caller relies on, not the allowlist content.
-        let msg = render_from_env();
-        assert!(msg.contains("git-guardrails"));
-        assert!(msg.contains("`-R owner/repo`"));
+        // Assert the shape every caller relies on, not the allowlist content.
+        // The env is cleared under the crate's lock, so an export in the shell
+        // or a concurrent `with_env` cannot change what the read sees.
+        crate::with_env(&crate::GH_CONTEXT_ENV_CLEARED, || {
+            let msg = render_from_env();
+            assert!(msg.contains("git-guardrails"));
+            assert!(msg.contains("`-R owner/repo`"));
+        });
     }
 }
