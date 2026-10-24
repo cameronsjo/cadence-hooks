@@ -3663,7 +3663,7 @@ mod tests {
     /// to it. The run keeps their trimmed end (also inside a closing quote)
     /// and its last `redacted` or `****`, and each value is judged as a read
     /// of it up to that delimiter would judge it. Every expected output here
-    /// is what the code before #1532 gave.
+    /// is what the code before #1532 gave, a known gap included (#1552).
     #[test]
     fn values_sharing_a_far_paren_delimiter_are_judged_as_before() {
         let tail = " ".repeat(64);
@@ -3684,7 +3684,14 @@ mod tests {
                 format!("f(x token=a.b c{tail})\n"),
                 Some(format!("f(x token={m}\n")),
             ),
+            // A placeholder after an auth scheme is no secret.
+            (format!("f(x token=Bearer [REDACTED]{tail},\n"), None),
+            (format!("f(x token=Bearer ${{TOKEN}}{tail})\n"), None),
             // A placeholder anywhere in the value skips the rest of the run.
+            // These rows keep a value that masks on its own, so they pin a
+            // known gap, not intended behavior: one placeholder hides every
+            // value in the stretch up to the delimiter (#1552). The fix for
+            // that rewrites them.
             (
                 format!("f(x auth=redacted token=Zq9vKh7wR3xPq{tail})\n"),
                 None,
@@ -3697,8 +3704,6 @@ mod tests {
                 format!("f(x auth=a token=Zq9vKh7wR3xPq <REDACTED>{tail})\n"),
                 None,
             ),
-            (format!("f(x token=Bearer [REDACTED]{tail},\n"), None),
-            (format!("f(x token=Bearer ${{TOKEN}}{tail})\n"), None),
             // Otherwise each value is judged in turn.
             (
                 format!("f(x auth=a token=Zq9vKh7wR3xPq{tail})\n"),
