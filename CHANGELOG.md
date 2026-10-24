@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` no longer prints a NUL byte in its "Cannot determine target repo" block.** After a directory change the guard cannot read (`eval "$S"`, `popd`, `pushd a b`), its per-segment check tracks the write's directory as an internal sentinel that starts with a NUL byte. The block printed it as is, so `eval "$S"; gh pr create --title t --body b` in an owned checkout showed `Directory: ` followed by a NUL. It now says `Directory: unknown`, followed by why. The verdict is unchanged.
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
