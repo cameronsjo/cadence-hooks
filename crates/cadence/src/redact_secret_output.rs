@@ -2027,7 +2027,12 @@ fn glued_spans(original: &str, view: &View<'_>, names: &mut Names, spans: &mut V
 ///
 /// - a grep prefix glued to the key, `path:3:` or `path:3:5:`, gets a blank
 ///   after it; a context line's `path-3-` also has its dashes read as colons;
-/// - a diff marker, a `+` or `-` that starts the line, gets `: ` after it;
+/// - a diff marker, a `+` or `-` that starts the line, gets `: ` after it.
+///   When the line's first word reads as a grep prefix with no key after it
+///   (`+DB_PASSWORD=Zq9v-2026-Kh7w`, `+DB_PASSWORD=Zq9v:12:Kh7w`), only a
+///   plain `=` key is read there. A `:` key or an emphasized key is not: its
+///   value would run to the end of the line, so a value of several words
+///   would spend an emphasized key after it (`+password-1-x: **Token:** x`);
 /// - emphasis that opens right after such a prefix is dropped; elsewhere, at
 ///   the line start or after a blank, it becomes `: `. Its close, right
 ///   before or after the colon, is dropped.
@@ -2051,17 +2056,19 @@ fn glue_edits(line: &str, names: &mut Names, edits: &mut Vec<Edit>) {
         let tally = close.is_some() && strength == Strength::Tally;
         (close, if tally { words } else { label })
     };
-    if let Some(found) = grep_prefix(line, |at| glued_key(line, at, names)) {
-        if let Some((at, dashes, key)) = found {
-            if let Some((a, b)) = dashes {
-                edits.push((a, a + 1, ":"));
-                edits.push((b, b + 1, ":"));
-            }
-            let (close, with) = label(key, " ", " x x ");
-            done = push_key(edits, at, close, with);
+    let prefix = grep_prefix(line, |at| glued_key(line, at, names));
+    if let Some(Some((at, dashes, key))) = prefix {
+        if let Some((a, b)) = dashes {
+            edits.push((a, a + 1, ":"));
+            edits.push((b, b + 1, ":"));
         }
+        let (close, with) = label(key, " ", " x x ");
+        done = push_key(edits, at, close, with);
     } else if matches!(bytes.first(), Some(b'+' | b'-'))
         && let Some(key) = glued_key(line, 1, names)
+        // Behind a grep prefix with no key, only a plain `=` key.
+        && (prefix.is_none()
+            || (key.0.is_none() && line[1..].trim_start_matches(is_name_char).starts_with('=')))
     {
         let (close, with) = label(key, ": ", " x x ");
         done = push_key(edits, 1, close, with);
@@ -2108,10 +2115,10 @@ fn push_key(
 /// run itself (`logs/2026-10-24.log-12-`), so each is tried in turn until
 /// `key` finds something after one, but only where the name after it holds
 /// no later run: that name would run through the real separator
-/// (`2026-07-09-pre-push-secret-scan-237.md-7-next` is not a key). When `key`
-/// finds nothing after any run, the line is not read as a context line, so a
-/// diff line whose value holds such a run is still read as a diff line
-/// (`+DB_PASSWORD=Zq9v-2026-Kh7w`).
+/// (`2026-07-09-pre-push-secret-scan-237.md-7-next` is not a key). A match
+/// line with nothing found after it, or a line with such a run and nothing
+/// found after any run, is `Some(None)`: a grep prefix with no key, after
+/// which [`glue_edits`] reads a diff marker only for a plain `=` key.
 fn grep_prefix<T>(
     line: &str,
     mut key: impl FnMut(usize) -> Option<T>,
@@ -2139,6 +2146,7 @@ fn grep_prefix<T>(
         };
         return Some(key(at).map(|k| (at, None, k)));
     }
+    let mut found = false;
     let mut pending: Option<(usize, usize)> = None;
     let mut from = 1;
     while let Some(i) = bytes[from.min(path_end)..path_end]
@@ -2148,6 +2156,7 @@ fn grep_prefix<T>(
         let a = from + i;
         let n = digits(a + 1);
         if n > 0 && a + 1 + n < path_end && bytes[a + 1 + n] == b'-' {
+            found = true;
             if let Some((pa, pb)) = pending
                 && line
                     .get(pb + 1..a)
@@ -2165,7 +2174,7 @@ fn grep_prefix<T>(
     {
         return Some(Some((pb + 1, Some((pa, pb)), k)));
     }
-    None
+    found.then_some(None)
 }
 
 /// A secret-named key glued to a prefix at `at`, plain (followed by `:` or
@@ -3959,6 +3968,47 @@ mod tests {
                 "+DB_PASSWORD=Zq9v-2026-Kh7w\n".to_string(),
                 format!("+DB_PASSWORD={m}\n"),
             ),
+            // There, a `:` key or an emphasized key whose name holds the run
+            // is not read, so its value of several words does not spend an
+            // emphasized key later on the line.
+            (
+                format!("+password-1-x: **Token:** {p}\n"),
+                format!("+password-1-x: **Token:** {m}\n"),
+            ),
+            (
+                format!("+token-2-v: see **Secret:** {p}\n"),
+                format!("+token-2-v: see **Secret:** {m}\n"),
+            ),
+            (
+                format!("+**password-1-x:** a **Token:** {p}\n"),
+                format!("+**password-1-x:** a **Token:** {m}\n"),
+            ),
+            (
+                format!("+db_pass-1-x: *Secret*: {p}\n"),
+                format!("+db_pass-1-x: *Secret*: {m}\n"),
+            ),
+            (
+                format!("-a.log-12-token-2026-10:\tsee-2-docs now *Secret*: {p}\n"),
+                format!("-a.log-12-token-2026-10:\tsee-2-docs now *Secret*: {m}\n"),
+            ),
+            // A `:digits:` run makes the first word read as a match line's
+            // path: a plain `=` key is read as on a diff line...
+            (
+                "+DB_PASSWORD=Zq9v:12:Kh7w\n".to_string(),
+                format!("+DB_PASSWORD={m}\n"),
+            ),
+            ("+TOKEN=ab:1:cd\n".to_string(), format!("+TOKEN={m}\n")),
+            ("-API_KEY=x:1:y\n".to_string(), format!("-API_KEY={m}\n")),
+            // ...and a `:` key is not, so a later emphasized key is read.
+            (
+                format!("+password:12:x **Token:** {p}\n"),
+                format!("+password:12:x **Token:** {m}\n"),
+            ),
+            // A real match line with a key after it is read as before.
+            (
+                "docs/a.md:12:password: x\n".to_string(),
+                format!("docs/a.md:12:password: {m}\n"),
+            ),
         ];
         for (input, want) in &masks {
             assert_eq!(masked(input), *want, "{input:?}");
@@ -4019,6 +4069,8 @@ mod tests {
             "docs/plans/2026-07-09-pre-push-secret-scan-237.md-7-next: \"Task 0 built\"\n",
             // Emphasis opens only at the line start or after a blank.
             "KEYS user*token:* 0\n",
+            // A name that is not secret leaves a `:digits:` line alone.
+            "+TOKEN_EXPIRES=12:30:45\n",
         ];
         for input in kept {
             assert_eq!(redact(input), None, "{input:?}");
