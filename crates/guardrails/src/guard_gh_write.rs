@@ -9950,6 +9950,12 @@ mod tests {
                 "gh -R work-org/thing issue create -t x -b y && sudo --chdir=/opt sh -c 'gh -R work-org/thing release delete v1 --yes'",
                 dash_r,
             ),
+            // tmux's `\;` chain hands the runner two scripts, a create and a
+            // merge. The name stays only when every script keeps it.
+            (
+                r"gh issue create -R work-org/thing -t x -b y; sudo -D /opt tmux new -d 'gh -R work-org/thing issue create -t x -b y' \; new-window 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
             (
                 r#"for r in a b; do gh repo create "work-org/$r" --private; gh repo delete "work-org/$r" --yes; done"#,
                 "gh repo create cameronsjo/<repo>",
