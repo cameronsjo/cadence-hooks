@@ -184,6 +184,8 @@ fn word_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// the verb and the subcommand, so `git -C . rm note.md` is read past them
 /// rather than resolving its subcommand to `-C` (#528 review I2). A `git rm`
 /// that is told `--cached` ([`git_rm_keeps_the_tree`]) deletes nothing from disk.
+/// `writer_targets` does not honor `--cached` yet (#1535), so the two readers
+/// disagree there: `git rm --cached .env` still blocks in prevent-secret-writes.
 fn head_deletes(argv: &[String]) -> bool {
     let Some(first) = argv.first() else {
         return false;
