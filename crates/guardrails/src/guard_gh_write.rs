@@ -9980,6 +9980,22 @@ mod tests {
                 dash_r,
             ),
             (
+                "gh issue create -R work-org/thing -t x -b y || sudo -D /opt sh -c 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y | sudo -D /opt sh -c 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y & sudo -D /opt sh -c 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y\nsudo -D /opt sh -c 'gh -R work-org/thing pr merge 5'",
+                dash_r,
+            ),
+            (
                 "gh -R work-org/thing issue create -t x -b y && sudo --chdir=/opt sh -c 'gh -R work-org/thing release delete v1 --yes'",
                 dash_r,
             ),
