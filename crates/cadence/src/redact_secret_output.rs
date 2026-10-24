@@ -979,6 +979,11 @@ const STRONG_WORDS: &[&str] = &[
 // Value policy
 // ---------------------------------------------------------------------------
 
+/// What makes a value a placeholder wherever it sits in it (`[REDACTED]`,
+/// `gho_****…`), spelled in lowercase and matched in any case. [`maskable`]
+/// and [`ArgRun::mark()`] both look for these, so a new one goes here, once.
+const PLACEHOLDER_MARKS: [&str; 2] = ["redacted", "****"];
+
 /// Can this value be a secret at all? False only for empty, boolean/null,
 /// obvious placeholders and variable references.
 fn maskable(value: &str) -> bool {
@@ -988,7 +993,7 @@ fn maskable(value: &str) -> bool {
     .is_some_and(|(a, b)| {
         maskable_trimmed(&value[a..b], &mut |s: &str| {
             let lower = s.to_ascii_lowercase();
-            lower.contains("redacted") || lower.contains("****")
+            PLACEHOLDER_MARKS.iter().any(|mark| lower.contains(mark))
         })
     })
 }
@@ -1583,8 +1588,8 @@ struct ArgRun {
     /// `(to, end)`: the end of `text[from..to]` with its trailing blanks
     /// dropped, for `to` = `at` and for one other `to` (inside a quote).
     ends: [(usize, usize); 2],
-    /// Start of the last `redacted` (any case) or `****` in `text[from..at]`,
-    /// once looked for.
+    /// Start of the last [`PLACEHOLDER_MARKS`] entry in `text[from..at]`, in
+    /// any case, once looked for.
     mark: Option<Option<usize>>,
 }
 
@@ -1631,7 +1636,11 @@ impl ArgRun {
                 hay.windows(needle.len())
                     .rposition(|w| w.eq_ignore_ascii_case(needle))
             };
-            last(b"redacted").max(last(b"****")).map(|p| from + p)
+            PLACEHOLDER_MARKS
+                .iter()
+                .filter_map(|needle| last(needle.as_bytes()))
+                .max()
+                .map(|p| from + p)
         })
     }
 
@@ -1640,7 +1649,8 @@ impl ArgRun {
     /// answer is theirs for `text[start..at]`, read without walking the run's
     /// tail again. Past the trimmed end there are only blanks and at most one
     /// quote, so a mark that starts at or after a piece's start lies inside
-    /// that piece.
+    /// that piece. Keeping the mark's position is more than this caller
+    /// needs: a run that holds a mark is skipped whole at its first value.
     fn skips(&mut self, text: &str, start: usize, name: &str) -> bool {
         let end = self.trimmed_end(text, self.at).max(start);
         if is_arg_reference(&text[start..end], name) {
