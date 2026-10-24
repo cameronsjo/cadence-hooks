@@ -6,6 +6,10 @@
 # A green test suite is evidence about the class it samples; this samples the
 # class the fix targets AND the class the fix could break.
 set -uo pipefail
+# Log to a scratch dir: a deny piped at the real binary otherwise lands in the
+# real denials.jsonl, where the usage census reads it as a session outcome.
+export CADENCE_METRICS_DIR="$(mktemp -d)"
+trap 'rm -rf "$CADENCE_METRICS_DIR"' EXIT
 
 FIX_BIN="${FIX_BIN:?set FIX_BIN}"
 CTL_BIN="${CTL_BIN:?set CTL_BIN}"
@@ -15,7 +19,7 @@ export CADENCE_ALLOWED_OWNERS=cameronsjo
 unset CADENCE_ALLOWED_REPOS CADENCE_EXTRA_HOSTS GH_HOST 2>/dev/null || true
 
 payload=$(mktemp)
-trap 'rm -f "$payload"' EXIT
+trap 'rm -rf "$CADENCE_METRICS_DIR" "$payload"' EXIT
 
 verdict() { # $1=binary $2=command
   python3 - "$2" "$REPO" >"$payload" <<'PY'
