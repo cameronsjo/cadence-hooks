@@ -3541,6 +3541,8 @@ mod tests {
             (r#"rm -f "$(mktemp)""#, Allow),
             (r#"t=$(mktemp -u); rm -f "$t""#, Allow),
             (r#"t=$(mktemp --suffix=.md); rm -f "$t""#, Allow),
+            // A `V` in a long option's value is not GNU's `-V`.
+            (r#"rm -f $(mktemp --suffix=-V)"#, Allow),
             (r#"t=$(mktemp --); rm -f "$t""#, Allow),
             (r#"tmp=$(mktemp -d); trap 'rm -rf "${tmp}"' EXIT"#, Allow),
             // An unquoted operand. A call that ends the segment loses its `)`
@@ -3576,6 +3578,12 @@ mod tests {
                 Allow,
             ),
             (r#"t=$(mktemp); cat note.md > "$t"; rm -f "$t""#, Allow),
+            // A second command inside a substitution that is not a `mktemp`
+            // call leaves the reading on.
+            (
+                r#"t=$(mktemp); echo "$(ls; pwd)" > "$t"; rm -f "$t""#,
+                Allow,
+            ),
             ("mktemp; rm /tmp/x", Allow),
             ("mktemp -t /vault/x.XXXX; rm /tmp/x", Allow),
             // A trap whose action hands its commands only variables, deleting
@@ -3677,6 +3685,8 @@ mod tests {
             (r#"rm -f $(mktemp | cat)"#, Block),
             ("rm -rf $(mktemp -d\nls)", Block),
             (r#"rm -rf $( mktemp -d; ls )"#, Block),
+            // Every call is read, not only the first.
+            (r#"rm -rf $(mktemp -d) $(mktemp -d; ls)"#, Block),
             (r#"sh -c 'rm -rf $(mktemp -d; ls)'"#, Block),
             (r#"t=$(mktemp); rm -f "$t" "$u""#, Block),
             (r#"t=$(mktemp); rm -f "$t"; rm note.md"#, Block),
