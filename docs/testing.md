@@ -63,9 +63,14 @@ To pipe a payload by hand, match the shape to the hook's event
 | Loggers (metrics, heartbeat) | `{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"git status"}}` |
 
 ```bash
+export CADENCE_METRICS_DIR="$(mktemp -d)"   # keep probe outcomes out of your real log
 echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' \
   | cadence-hooks guardrails guard-push-remote
 ```
+
+Point `CADENCE_METRICS_DIR` at a scratch dir first, as above. A piped deny,
+ask, or nudge is logged like one from a session, so without it every probe
+lands in your real `denials.jsonl`, where it reads as a session outcome.
 
 Writing or debugging a check? See
 [CONTRIBUTING.md → Reproducing a Check by Hand](../CONTRIBUTING.md#reproducing-a-check-by-hand)

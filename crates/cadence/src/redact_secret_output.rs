@@ -31,6 +31,9 @@
 //! prose-shaped forms ([`secret_like`]). A bare `PASS`/`FAIL` is a test
 //! runner's status word, and `Token expired` (a name, a space, a word, at the
 //! start of a line outside a `.netrc`/vault table) is prose, not a pair. A
+//! bare `pass:` after an ordinary word on its line (`one record per pass: x`)
+//! masks its unquoted value only when the value's first word looks like a
+//! credential ([`pass_key_position`], [`first_word`], [`secret_like`]). A
 //! corpus test holds everyday output (test runners, builds, git over code,
 //! listings, error prose) at zero masks.
 //!
@@ -585,7 +588,11 @@ pub enum Strength {
     /// [`Strength::Strong`] is, except an unquoted value of at most six digits
     /// in a plain `pass=5` / `pass: 5` form, which is a test runner's tally
     /// (`pass=5 fail=0`). A quoted or JSON value, a `--pass` flag and a query
-    /// string's `&pass=` all mask, as does a longer number.
+    /// string's `&pass=` all mask, as does a longer number. In the mid-line
+    /// colon form, out of key position ([`pass_key_position`]), an unquoted
+    /// value masks only when, on top of those rules, its first word
+    /// ([`first_word`]) is credential-shaped ([`secret_like`]); a quoted value
+    /// keeps those rules alone.
     Tally,
 }
 
@@ -835,7 +842,9 @@ fn leading_count_len(value: &str, max_digits: Option<usize>) -> Option<usize> {
     }
     let after = &value[digits..];
     let next = after.trim_start_matches([' ', '\t']);
-    let complete = after.trim_end().is_empty()
+    // Read from the front: this runs once per match, and a trim from the end
+    // would walk a long trailing blank run each time.
+    let complete = after.chars().all(char::is_whitespace)
         || closes_count(after)
         || (next.len() < after.len() && starts_key_field(next));
     complete.then_some(digits)
@@ -1166,7 +1175,9 @@ fn is_header_name(name: &str) -> bool {
 
 /// For a WEAK name in a prose-shaped form: the value must look like a
 /// credential — one word of at least 8 characters that is not a plain word,
-/// number, duration, or identifier/type expression.
+/// number, duration, or identifier/type expression. A bare `pass:` out of key
+/// position is judged the same way on the first word of its unquoted value
+/// ([`first_word`]).
 fn secret_like(value: &str) -> bool {
     let v = value.trim().trim_end_matches([',', ';']);
     if !maskable(v) || v.chars().any(char::is_whitespace) || v.chars().count() < 8 {
@@ -1638,6 +1649,13 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         let Some(strength) = names.get(tail_name(&head[..colon])) else {
             continue;
         };
+        // A bare `pass:` after another word on its line may be prose ("one
+        // record per pass: x"). Its unquoted value keeps every rule of its
+        // `Strength::Tally` (the short count skip, the value test) and, on top
+        // of them, masks only when the value's first word looks like a
+        // credential ("DB pass: <secret> (rotate)", #1449). A quoted value
+        // keeps the rules alone.
+        let weak_pass = strength == Strength::Tally && !pass_key_position(text, name_at);
         let eol = line_end(text, start, &mut eol_cache);
         let rest = &text[start..eol];
         if rest.starts_with("//") {
@@ -1661,8 +1679,41 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
                     done = start + n;
                     continue;
                 }
+                // The unquoted value runs to the end of the line, so a note or
+                // a next field after the secret is part of it: judge its first
+                // word (`first_word`). When that word is not credential-shaped,
+                // nothing masks and only that word is spent, so a secret-named
+                // field later on the line is still read ("Admin pass: hunter2,
+                // DB pass: <secret>"). This runs once per match, so it and the
+                // short count test above read the value from its front and
+                // stop early; a trim from the end would walk a long blank run
+                // once per match. The search reads to the end of the line only
+                // when no word there qualifies, and then no bare `pass:` that
+                // runs this search is left on it: such a `pass:` starts its own
+                // word, which qualifies, and a name inside a tag word
+                // (`</x(pass:>`) follows an opener, so it is in key position.
+                // When the word passes, the value starts at it: markup
+                // before it is kept, and a line that ends in a tag
+                // (`<p><b>DB pass:</b> <secret></p>`) is not read as a
+                // placeholder from `</b>` to `</p>`.
+                let mut from = 0;
+                if weak_pass {
+                    match first_word(rest) {
+                        Some((word, end)) if secret_like(word) => from = end - word.len(),
+                        first => {
+                            done = start + first.map_or(rest.len(), |(_, end)| end);
+                            continue;
+                        }
+                    }
+                }
                 let tally = (strength == Strength::Counter).then(|| tally_len(rest));
-                (0, tally.flatten().unwrap_or(rest.trim_end().len()), false)
+                // Trim only when no count ends the value: a run of counts
+                // (`lastpass: 5 lastpass: 5 …`) reaches here once per match.
+                (
+                    from,
+                    tally.flatten().unwrap_or_else(|| rest.trim_end().len()),
+                    false,
+                )
             }
         };
         done = start + ve;
@@ -1691,6 +1742,116 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
             }
         }
     }
+}
+
+/// Is the bare `pass` starting at `name_at` in key position for the mid-line
+/// colon form (#1449)? It is when:
+///
+/// - two or more blanks, or a tab, come right before it (indentation or a
+///   column: `grep -n`'s `3:  pass:`, `cat -n`, `git blame`, a table row);
+/// - only blanks, list, diff and quote markers (`- * > < +`, `"`, `'`) or
+///   comment leaders (`#`, `/`) come before it on its line;
+/// - it follows `{ , ; & ? ( [` or a quote (blanks between allowed), as in a
+///   map, an argument list, a query or a quoted string;
+/// - the word before it ends in `:` (a `file:line:` prefix or a label),
+///   starts with `-` (a flag, `-passout pass:x`, or a dash, `x -- pass: y`),
+///   or is a field's value (`user: admin pass: x`, `user=admin pass: x`,
+///   Go's `{User:admin Pass:x}`).
+///
+/// After any other word it may be prose, as in "the second pass: done", and
+/// the caller masks its unquoted value only when the value's first word
+/// ([`first_word`]) looks like a credential, besides its usual rules. A quoted
+/// value, every other name and the `pass=` form keep their rules.
+///
+/// Each scan stops at a newline, a blank or the first byte that does not
+/// qualify, and reads at most two words back, so a long line stays linear.
+fn pass_key_position(text: &str, name_at: usize) -> bool {
+    let before = &text.as_bytes()[..name_at];
+    let blank = |b: u8| matches!(b, b' ' | b'\t');
+    let gap = before.iter().rev().take_while(|&&b| blank(b));
+    if gap.clone().count() >= 2 || gap.clone().any(|&b| b == b'\t') {
+        return true;
+    }
+    let opener = before.iter().rev().copied().find(|&b| !blank(b));
+    if matches!(
+        opener,
+        Some(b'{' | b',' | b';' | b'&' | b'?' | b'(' | b'[' | b'"' | b'\'')
+    ) {
+        return true;
+    }
+    let markers_only = before.iter().rev().take_while(|&&b| b != b'\n').all(|&b| {
+        blank(b)
+            || matches!(
+                b,
+                b'-' | b'*' | b'>' | b'<' | b'+' | b'"' | b'\'' | b'#' | b'/'
+            )
+    });
+    if markers_only {
+        return true;
+    }
+    // The word before `pass`, and the one before that, with any opener glued
+    // to its front (`{User:admin`, `&{User:admin`) dropped.
+    let skip_blanks = |mut i: usize| {
+        while i > 0 && blank(before[i - 1]) {
+            i -= 1;
+        }
+        i
+    };
+    let word_start = |mut i: usize| {
+        while i > 0 && !blank(before[i - 1]) && before[i - 1] != b'\n' {
+            i -= 1;
+        }
+        i
+    };
+    let field = |word: &str| starts_key_field(word.trim_start_matches(['{', '(', '[', '&']));
+    let end = skip_blanks(before.len());
+    let start = word_start(end);
+    let Ok(word) = std::str::from_utf8(&before[start..end]) else {
+        return false;
+    };
+    if word.ends_with(':') || word.starts_with('-') || field(word) {
+        return true;
+    }
+    let prev_end = skip_blanks(start);
+    if prev_end == start || prev_end == 0 || before[prev_end - 1] == b'\n' {
+        return false;
+    }
+    std::str::from_utf8(&before[word_start(prev_end)..prev_end])
+        .is_ok_and(|prev| prev.ends_with([':', '=']) && field(prev))
+}
+
+/// The first blank-separated word of `value` that holds a letter or a digit
+/// and is not an HTML tag, and the byte offset in `value` where it ends. A
+/// markup mark, a cell border, an arrow, an emoji or a tag before a secret
+/// (`**`, `|`, `->`, `🔑`, `<b>`, `</b>`) is not a word to judge. A tag word
+/// is one or more tags back to back, each `<name>` or `</name>`: an opening
+/// tag (`<b>`, `<span>`), a closing one, nested tags (`<b><i>`, `</i></b>`)
+/// and a custom element (`</my-label>`) all count. A value wrapped in tags
+/// (`<b>secret</b>`) does not, so it is still the word judged. The value
+/// test reads a tag word as a
+/// placeholder and never passes it, so skipping one only moves the test to
+/// the next word. When no word qualifies, the first blank-separated word is
+/// judged, so a value of symbols only is still read. The search stops at the
+/// first word that qualifies, and only a line with no such word left is read
+/// to its end, so the cost is bounded by the text up to that word.
+fn first_word(value: &str) -> Option<(&str, usize)> {
+    // Only tags, back to back: `<b>`, `</b>`, `</i></b>`; not `<b>secret</b>`.
+    let tag = |w: &str| {
+        w.strip_prefix('<')
+            .and_then(|t| t.strip_suffix('>'))
+            .is_some_and(|t| {
+                t.split("><").all(|name| {
+                    !name.contains(['<', '>']) && !name.strip_prefix('/').unwrap_or(name).is_empty()
+                })
+            })
+    };
+    let word = value
+        .split_whitespace()
+        .find(|w| w.chars().any(char::is_alphanumeric) && !tag(w))
+        .or_else(|| value.split_whitespace().next())?;
+    // `word` is a subslice of `value`, so the pointer difference is its offset.
+    let end = word.as_ptr() as usize - value.as_ptr() as usize + word.len();
+    Some((word, end))
 }
 
 /// Parenthesis depth on the current line at a byte offset, advanced
@@ -2767,6 +2928,337 @@ mod tests {
         }
     }
 
+    /// cameronsjo/cadence-hooks#1449: a bare `pass:` after an ordinary word on
+    /// its line may be prose (an iteration, a review round), so there its value
+    /// masks only when it looks like a credential. In key position any value
+    /// masks as before, and so does every longer name.
+    #[test]
+    fn issue_1449_pass_in_prose_passes_through() {
+        let kept = [
+            // The issue's three rows, as the `git diff` lines it reported.
+            "+ // one record per pass: x\n",
+            "+ // the second pass: done\n",
+            "+ // one record per run: its seconds\n",
+            "Second Pass: complete\n",
+            "// MARK: one record per pass: x\n",
+            "first pass: done, second pass: done\n",
+            "The final pass: emit code.\n",
+            "* Review pass: looks good to me\n",
+            "lint pass: ok\n",
+            "optimizer pass: inline (12 functions)\n",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+        // Six characters, so not shaped like a credential even with a closing
+        // `)` or `]` glued on: it masks only where `pass` is a key.
+        let w = "hunt3r";
+        let keys = [
+            // Line start after blanks, markers, a quote or a comment leader.
+            format!("pass: {w}\n"),
+            format!("  pass: {w}\n"),
+            format!("+ pass: {w}\n"),
+            format!("- pass: {w}\n"),
+            format!("\"pass: {w}\"\n"),
+            format!("# pass: {w}\n"),
+            format!("// pass: {w}\n"),
+            // Glued markers, which the line-start pass does not read.
+            format!("-- pass: {w}\n"),
+            format!("** pass: {w}\n"),
+            format!(">> pass: {w}\n"),
+            format!("<< pass: {w}\n"),
+            format!("++ pass: {w}\n"),
+            format!("\"- pass: {w}\n"),
+            format!("'- pass: {w}\n"),
+            format!("+- pass: {w}\n"),
+            // After a map, list, argument or query opener, or a quote.
+            format!("{{ pass: {w} }}\n"),
+            format!("{{pass: {w}}}\n"),
+            format!("a, pass: {w}\n"),
+            format!("a; pass: {w}\n"),
+            format!("a & pass: {w}\n"),
+            format!("a? pass: {w}\n"),
+            format!("connect(pass: {w})\n"),
+            format!("x [pass: {w}]\n"),
+            format!("x' pass: {w}\n"),
+            format!("x\" pass: {w}\n"),
+            format!("echo \"pass: {w}\"\n"),
+            format!("msg='pass: {w}'\n"),
+            // After a field's value, Go's `%+v` included.
+            format!("user: admin pass: {w}\n"),
+            format!("user=admin pass: {w}\n"),
+            format!("user= admin pass: {w}\n"),
+            format!("login: root   pass: {w}\n"),
+            format!("{{user: admin pass: {w}}}\n"),
+            format!("{{User:admin Pass:{w}}}\n"),
+            format!("&{{User:admin Pass:{w} Host:db}}\n"),
+            format!("[User:admin Pass:{w}]\n"),
+            format!("(user:admin pass:{w})\n"),
+            // Indentation or a column: two blanks or a tab before it.
+            format!("x  pass: {w}\n"),
+            format!("x\tpass: {w}\n"),
+            format!("host  db.internal  user  admin  pass: {w}\n"),
+            format!("     3\t  pass: {w}\n"),
+            format!("   3 │   pass: {w}\n"),
+            format!("^abc1234 (Cam 2026-10-21 12:00:00 +0000 3)   pass: {w}\n"),
+            // After a word ending in `:`: grep's `file:line:`, a label.
+            format!("config/db.yml:3: pass: {w}\n"),
+            format!("config/db.yml:3:  pass: {w}\n"),
+            format!("config/db.yml:  pass: {w}\n"),
+            format!("config/db.yml-3-  pass: {w}\n"),
+            format!("3:  pass: {w}\n"),
+            format!("src/mail.js:12:    pass: '{w}',\n"),
+            // After a word starting with `-`: an `openssl` continuation line,
+            // a dash, a mid-line SQL comment.
+            format!("x - pass: {w}\n"),
+            format!("SELECT 1; -- pass: {w}\n"),
+            format!("x -passout pass:{w}\n"),
+            format!("  -passout pass:{w} \\\n"),
+            format!("scripts/cert.sh:14:  -passout pass:{w} \\\n"),
+            format!("  -passin pass:{w} \\\n"),
+            format!("x -pass pass:{w}\n"),
+        ];
+        for input in &keys {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(w), "{input:?} -> {out:?}");
+        }
+        let p = pw();
+        let masks = [
+            // After an ordinary word, a credential-shaped value masks.
+            format!("DB pass: {p}\n"),
+            format!("Admin pass: {p}\n"),
+            format!("MySQL root pass: {p}\n"),
+            format!("Generated pass: {p}\n"),
+            format!("SMTP user: bob, SMTP pass: {p}\n"),
+            format!("user: bob  db pass: {p}\n"),
+            format!("DB user: app / DB pass: {p}\n"),
+            format!("Credentials -> user: admin | pass: {p}\n"),
+            format!("login=admin | pass: {p}\n"),
+            format!("INFO  Using pass: {p}\n"),
+            format!("[debug] pass: {p}\n"),
+            format!("{{\"log\":\"DB pass: {p}\\n\"}}\n"),
+            format!("{{\"msg\":\"user: bob pass: {p}\"}}\n"),
+            format!("* WiFi pass: {p}\n"),
+            format!("- Router pass: {p}\n"),
+            format!("> Admin pass: {p}\n"),
+            format!("+ echo pass: {p}\n"),
+            format!("++ export pass: {p}\n"),
+            format!("Host db1  User admin  pass: {p}\n"),
+            format!("x pass:{p}\n"),
+            format!("x Pass: {p}\n"),
+            format!("Connecting as root with pass: {p}\n"),
+            format!("2026-10-21T12:00:00Z pass: {p}\n"),
+            format!("Enter pass: {p}\n"),
+            // The `=` and JSON forms keep their rules.
+            format!("pass={p}\n"),
+            format!("x pass={p}\n"),
+            format!("user=admin pass={p}\n"),
+            format!("{{\"pass\": \"{p}\"}}\n"),
+            // Longer names mask after any word, as before.
+            format!("the password: {p}\n"),
+            format!("one record per passwd: {p}\n"),
+            format!("x db_pass: {p}\n"),
+            format!("PASSWORD={p}\n"),
+        ];
+        for input in &masks {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(&p), "{input:?} -> {out:?}");
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1449: out of key position the unquoted value
+    /// of a bare `pass:` runs to the end of the line, so a note, a next field
+    /// or a closing `|` after the secret is part of it. The value is judged by
+    /// its first word that holds a letter or a digit and is not an HTML tag
+    /// (with none, its first word), on top of every rule a bare `pass` has in
+    /// key position. When that word is not a credential, only it is spent, so
+    /// a secret-named field later on the line is read. A quoted value is not
+    /// judged by its first word.
+    #[test]
+    fn issue_1449_pass_value_is_judged_by_its_first_word() {
+        let p = pw();
+        let masks = [
+            // Paired fields: the next field follows the secret.
+            format!("SMTP user: bob, SMTP pass: {p}, port: 587\n"),
+            format!("DB user: app, DB pass: {p}, DB host: db1\n"),
+            format!("user: bob db pass: {p} host: db1\n"),
+            format!("redis pass: {p} db: 0\n"),
+            format!("- Router pass: {p}, admin user: root\n"),
+            // A note after the secret: parenthesis, dash, comment, more words.
+            format!("Admin pass: {p} (change on first login)\n"),
+            format!("Generated admin pass: {p} - store it safely\n"),
+            format!("Created user bob with pass: {p} (expires in 24h)\n"),
+            format!("DB pass: {p}  # rotate monthly\n"),
+            format!("Root pass: {p} for host db1\n"),
+            format!("Your new pass: {p} \u{2014} keep it secret\n"),
+            format!("> Admin pass: {p} <- change this\n"),
+            // Logs.
+            format!("[INFO] admin pass: {p}, expires: 2026-10-22\n"),
+            format!("INFO  Using pass: {p} for user admin\n"),
+            format!("{{\"msg\": \"DB pass: {p}\", \"level\": \"info\"}}\n"),
+            format!("{{\"event\": \"admin pass: {p}\", \"logger\": \"setup\"}}\n"),
+            // Tables and prefixes.
+            format!("| admin | pass: {p} |\n"),
+            format!("| admin pass: {p} |\n"),
+            format!("\u{2502} smtp \u{2502} bob \u{2502} pass: {p} \u{2502}\n"),
+            format!("    12\tAdmin pass: {p} (rotate)\n"),
+            format!("+Admin pass: {p} (rotate)\n"),
+            // A tab ends the first word as a blank does.
+            format!("Admin pass: {p}\t(rotate)\n"),
+            format!("DB pass: {p}\t# rotate monthly\n"),
+            // A first word that is not a credential spends only itself, so a
+            // secret-named field later on the line is still read.
+            format!("Admin pass: hunter2, DB pass: {p}\n"),
+            format!("first pass: done, second pass: {p}\n"),
+            format!("lint pass: ok, password: {p}\n"),
+            format!("lint pass: ok password: {p}\n"),
+            format!("build pass: yes, DB password: {p}\n"),
+            format!("Admin pass: admin / DB pass: {p}\n"),
+            format!("x pass: hunter2 and DB pass: {p}\n"),
+            format!("a pass: x, b pass: y, c pass: {p}\n"),
+            format!("{}DB pass: {p}\n", "x pass: y ".repeat(1_000)),
+            // Marks, borders and arrows are not the first word: skip them.
+            format!("**DB pass:** {p}\n"),
+            format!("`DB pass:` {p}\n"),
+            format!("| DB pass: | {p} |\n"),
+            format!("| pass: | {p} |\n"),
+            format!("Admin pass: -> {p}\n"),
+            format!("Admin pass: - {p}\n"),
+            format!("Admin pass: | {p}\n"),
+            format!("Admin pass: \u{2192} {p}\n"),
+            format!("Admin pass: \u{1F511} {p}\n"),
+            // Nor is an HTML tag, opening or closing, whatever its name:
+            // nested tags closed together, a custom element.
+            format!("<b>DB pass:</b> {p}\n"),
+            format!("<code>DB pass:</code> {p}\n"),
+            format!("<b><i>DB pass:</i></b> {p}\n"),
+            format!("<my-label>DB pass:</my-label> {p}\n"),
+            format!("Admin pass: <b> {p}\n"),
+            format!("<b>DB pass:</b> <i> {p}\n"),
+            format!("Admin pass: <br> {p}\n"),
+            format!("Admin pass: <i> {p} (rotate)\n"),
+            // The value starts at the judged word, so a tag that ends the line
+            // does not make it read as a placeholder.
+            format!("<p><b>DB pass:</b> {p}</p>\n"),
+            format!("<td><b>DB pass:</b> {p}</td>\n"),
+            format!("<b>DB pass:</b> {p}<br>\n"),
+            format!("<b>Admin pass:</b> {p} <i>(rotate)</i>\n"),
+            // A quoted value keeps the rules of a bare `pass` alone.
+            format!("Admin pass: \"{p}\"\n"),
+        ];
+        for input in &masks {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(&p), "{input:?} -> {out:?}");
+        }
+        // Passwords that are not `p`. With no word that holds a letter or a
+        // digit, the first word is judged: a password of symbols only. A digit
+        // counts as a letter does, and so does a letter outside ASCII; each row
+        // with a note fails if its half is dropped, since the note would then
+        // be judged in place of the password.
+        let symbols = "~!@#$%^&*()_+";
+        let digits = "8675309!";
+        // `пароль_секрет`
+        let cyrillic =
+            "\u{43f}\u{430}\u{440}\u{43e}\u{43b}\u{44c}_\u{441}\u{435}\u{43a}\u{440}\u{435}\u{442}";
+        let others = [
+            (format!("Admin pass: {symbols}\n"), symbols),
+            (format!("WiFi pass: {digits}\n"), digits),
+            (format!("WiFi pass: {digits} (guest)\n"), digits),
+            (format!("Admin pass: {cyrillic}\n"), cyrillic),
+            (format!("Admin pass: {cyrillic} (new)\n"), cyrillic),
+        ];
+        for (input, secret) in &others {
+            let out = redact(input).unwrap_or_else(|| panic!("{input:?} was not masked"));
+            assert!(!out.contains(secret), "{input:?} -> {out:?}");
+        }
+        // A later field after a tag-wrapped secret is masked too: the mask
+        // runs from the secret to the end of the line.
+        let later = masked(&format!(
+            "<p><b>Admin pass:</b> {p}, DB password: hunter22</p>\n"
+        ));
+        assert!(
+            !later.contains(&p) && !later.contains("hunter22"),
+            "{later:?}"
+        );
+        // A value wrapped in tags is the word judged, not a tag to skip: the
+        // note after it must not be masked in its place, leaving the secret.
+        let wrapped = redact(&format!("DB pass: <b>{p}</b> (rotate)\n"));
+        assert!(
+            wrapped.as_ref().is_none_or(|out| !out.contains(&p)),
+            "{wrapped:?}"
+        );
+        // A rule of a symbol other than `=` is read like a password of symbols
+        // only, and masks.
+        assert_eq!(
+            masked("Second pass: ##########\n"),
+            format!("Second pass: {NAMED_MARK}\n")
+        );
+        // The mask runs to the end of the line, notes included, and starts at
+        // the judged word, so markup before it is kept.
+        assert_eq!(
+            masked(&format!("DB pass: {p}\n")),
+            format!("DB pass: {NAMED_MARK}\n")
+        );
+        assert_eq!(
+            masked(&format!("Admin pass: {p} (change on first login)\n")),
+            format!("Admin pass: {NAMED_MARK}\n")
+        );
+        assert_eq!(
+            masked(&format!("**DB pass:** {p}\n")),
+            format!("**DB pass:** {NAMED_MARK}\n")
+        );
+        assert_eq!(
+            masked(&format!("<p><b>DB pass:</b> {p}</p>\n")),
+            format!("<p><b>DB pass:</b> {NAMED_MARK}\n")
+        );
+        // A quoted value is not judged by its first word: this one is shorter
+        // than a credential and still masks.
+        let short = masked("Admin pass: \"hunt3\"\n");
+        assert!(!short.contains("hunt3"), "{short:?}");
+        let kept = [
+            // The issue's prose rows, and a multi-word value.
+            "+ // one record per pass: x\n",
+            "+ // the second pass: done\n",
+            "x pass: 5 hunter2\n",
+            "lint pass: ok and the build is green\n",
+            // No word holds a letter or a digit: the first word is judged. These
+            // are shorter than a credential (`->`, `...`, `--`, `**`), a
+            // placeholder (`********`), or a value that starts with `=`, which
+            // the value test refuses (`========`).
+            "Admin pass: ->\n",
+            "the second pass: ...\n",
+            "lint pass: --\n",
+            "Second pass: ========\n",
+            "x pass: ** **\n",
+            "x pass: ********\n",
+            // The first word is judged, not a later one: `->` is too short.
+            "Admin pass: -> ~!@#$%^&*()_+\n",
+            // Prose after tags of any name, opening or closing.
+            "<b><i>Second pass:</i></b> done\n",
+            "<my-label>Lint pass:</my-label> ok\n",
+            "<b><i>Test pass:</i></b> 42/42\n",
+            "Second pass: <b> done\n",
+            "<b>Second pass:</b> <i> done\n",
+            "Lint pass: <span> ok\n",
+            // Code, which the value test refuses: a type, an expression closing
+            // a field.
+            "  private pass: string|null;\n",
+            "  readonly pass: string|undefined;\n",
+            "+  public pass: Buffer|null;\n",
+            "src/a.ts:3:  declare pass: string|null;\n",
+            "  static pass: getPass(),\n",
+            "    mail pass: env.SMTP_PASS2,\n",
+            "x pass: config.get('pass'),\n",
+            // A test runner's tally: the short count is skipped before the value
+            // is read.
+            "x pass: 5,fail=0\n",
+            "x pass: 123456,fail=0\n",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+    }
+
     /// cameronsjo/cadence-hooks#1274's false-positive subset: pagination and
     /// idempotency handles, MySQL's 1045 message, and glued `…pass` words that
     /// are not credentials. The neighbouring credential shapes still mask.
@@ -3088,6 +3580,21 @@ mod tests {
                 format!("  {}\n", "x".repeat(60)).repeat(5 * MB / 63)
             ),
             "a:".repeat(5 * MB / 2),
+            // #1449: every bare `pass:` here looks back for its key position.
+            "one more pass: x ".repeat(5 * MB / 17),
+            format!(" {} pass:", "w".repeat(4096)).repeat(5 * MB / 4103),
+            format!(" {}u:a pass:", "{".repeat(4096)).repeat(5 * MB / 4106),
+            "x \t pass: ".repeat(5 * MB / 10),
+            // #1449: a first word that is no credential spends only itself. A
+            // blank run after the last of these matches must not be walked
+            // once per match.
+            format!("{}{}", "x pass: y ".repeat(1_000), " ".repeat(4 * MB)),
+            // A value that starts with a digit is first tried as a count, once
+            // per match; neither that test nor a count that ends the value may
+            // walk back over the blank run at the end of the line.
+            format!("{}{}", "x pass: 5 ".repeat(1_000), " ".repeat(4 * MB)),
+            format!("x{}{}", " pass: 5".repeat(1_000), " ".repeat(4 * MB)),
+            format!("x{}{}", " lastpass: 5".repeat(1_000), " ".repeat(4 * MB)),
         ];
         for input in inputs {
             let started = std::time::Instant::now();

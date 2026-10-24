@@ -84,8 +84,14 @@ mod tests {
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::make_bash;
 
+    /// The verdict with the allowlist env cleared: a nudge renders it
+    /// (`render_from_env`), and that read belongs under the crate's env lock.
     fn outcome(command: &str) -> Outcome {
-        InjectGhWriteContext.run(&make_bash(command)).outcome
+        let mut outcome = Outcome::Allow;
+        crate::with_env(&crate::GH_CONTEXT_ENV_CLEARED, || {
+            outcome = InjectGhWriteContext.run(&make_bash(command)).outcome;
+        });
+        outcome
     }
 
     // --- guard clauses: nothing to advise on ---
@@ -188,10 +194,13 @@ mod tests {
 
     #[test]
     fn nudge_message_carries_the_dash_r_rule() {
-        let msg = InjectGhWriteContext
-            .run(&make_bash("gh pr create --title x"))
-            .message
-            .expect("nudge always carries a message");
+        let mut result = None;
+        crate::with_env(&crate::GH_CONTEXT_ENV_CLEARED, || {
+            result = InjectGhWriteContext
+                .run(&make_bash("gh pr create --title x"))
+                .message;
+        });
+        let msg = result.expect("nudge always carries a message");
         assert!(
             msg.contains("`-R owner/repo`"),
             "nudge should carry the -R rule verbatim from render_context: {msg}"
