@@ -2669,7 +2669,7 @@ fn closing_paren(chars: &[char], from: usize) -> Option<usize> {
 }
 
 /// The `-c` script of a shell invocation whose options [`command_segments`]
-/// does not walk (`bash -o pipefail -c '…'`, `bash +x -c '…'`).
+/// does not walk (`bash -oe pipefail -c '…'`, `ksh -o pipefail -c '…'`).
 fn shell_c_script(argv: &[String]) -> Option<&str> {
     let options = shell_options(argv);
     options
@@ -6980,6 +6980,27 @@ mod tests {
             .filter(|c| SecretLeaksGuard::default().run(&make_bash_input(c)).outcome != expected)
             .collect();
         assert!(bad.is_empty(), "{bad:?} not {expected:?}: {why}");
+    }
+
+    #[test]
+    fn a_shell_c_script_after_an_option_value_is_read() {
+        // Core reads past a shell option's value (`-o pipefail`), so each
+        // script reaches this guard as a segment of its own. Each allowed
+        // before: core read the value as the script or stopped at it, which
+        // also kept this guard's own option walk from running. Each runs
+        // `cat .env` on the real shell.
+        assert_bash(
+            &[
+                "bash -co pipefail 'cat .env'",
+                "bash -ceuo pipefail 'cat .env'",
+                "bash -co pipefail -- 'cat .env'",
+                "bash -cO extglob 'cat .env'",
+                "zsh +O -c 'cat .env'",
+                "bash -euo pipefail <<< 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a shell script behind an option value",
+        );
     }
 
     #[test]
