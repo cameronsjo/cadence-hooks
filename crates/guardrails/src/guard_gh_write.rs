@@ -1628,39 +1628,38 @@ fn flag_value_is_owned(
     }
 }
 
-/// The loop's raw `-R` word with its quotes removed, as the shell hands it to
-/// gh, when it carries a quote. The loop parser keeps the word's text as
-/// typed, so `-R "cameronsjo/tool"` arrives with both quotes on, and the
-/// owner it reads is `"cameronsjo` (#1504). The single-command arm never sees
-/// them: [`tokenize`] has removed them by then.
+/// The words the loop's raw `-R` word becomes once its quotes are removed,
+/// as the shell hands them to gh, when it carries a quote. The loop parser
+/// keeps the word's text as typed, so `-R "cameronsjo/tool"` arrives with
+/// both quotes on, and the owner it reads is `"cameronsjo` (#1504). The
+/// single-command arm never sees them: [`tokenize`] has removed them by then.
 ///
 /// An expansion stays in the text (`"cameronsjo/$r"` reads `cameronsjo/$r`),
 /// and the ownership check judges it as it judges an unquoted `-R` value: a
 /// literal allowed owner is owned, and `$o/$r` or `$h/cameronsjo/x` is not.
 /// [`loop_target_is_unresolvable`] still reads the raw text for the message.
+/// A brace expansion is several words (`"cameronsjo"/{a,b}`).
 ///
-/// `None` leaves the word as it is:
-///
-/// - It carries no quote: nothing to remove.
-/// - [`tokenize`] does not read it as exactly one word: a brace expansion
-///   (`"cameronsjo"/{a,b}`) or a stray compound keyword.
+/// `None` leaves the word as it is: it carries no quote, so there is nothing
+/// to remove, or [`tokenize`] reads no word in it.
 ///
 /// Quote removal is the tokenizer's, not a second copy of its rules, so a
-/// backslash, a quote inside the other kind, or `$'…'` reads as it does for
-/// a single command.
-fn unquoted_literal_loop_repo(word: &str) -> Option<String> {
+/// backslash, a quote inside the other kind, `$'…'` or a brace reads as it
+/// does for a single command.
+fn unquoted_loop_repo_words(word: &str) -> Option<Vec<String>> {
     if !word.contains(['"', '\'']) {
         return None;
     }
-    let mut words = tokenize(word);
-    let only = words.pop()?;
-    words.is_empty().then_some(only)
+    let words = tokenize(word);
+    (!words.is_empty()).then_some(words)
 }
 
 /// [`flag_value_is_owned`] for a loop's raw `-R` word: a quoted word is
 /// judged without its quotes, so `-R "cameronsjo/tool"` and
-/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). Any
-/// other word is judged as typed.
+/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A
+/// quoted word the shell expands to several words is owned only when each of
+/// them is, whichever one gh takes as the repo. Any other word is judged as
+/// typed.
 ///
 /// This gate can only add a block. Once it passes, the per-segment pass
 /// judges every looped write again, as a single command, so reading the word
@@ -1671,13 +1670,12 @@ fn loop_flag_value_is_owned(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
-    let unquoted = unquoted_literal_loop_repo(word);
-    flag_value_is_owned(
-        unquoted.as_deref().unwrap_or(word),
-        dh,
-        allowed_owners,
-        allowed_repos,
-    )
+    match unquoted_loop_repo_words(word) {
+        Some(words) => words
+            .iter()
+            .all(|w| flag_value_is_owned(w, dh, allowed_owners, allowed_repos)),
+        None => flag_value_is_owned(word, dh, allowed_owners, allowed_repos),
+    }
 }
 
 /// For a blocked target that carries a shell expansion: true when it still
@@ -9755,6 +9753,10 @@ mod tests {
             // Quote removal is the shell's, word by word.
             r#"-R "cameronsjo"/"tool""#,
             r#"-R cameron"sjo/tool""#,
+            // A brace expansion is two words. Both name the allowed owner
+            // `cameronsjo`, so whichever one gh takes is owned.
+            r#"-R "cameronsjo"/{tool,evil}"#,
+            r#"--repo="cameronsjo"/{tool,evil}"#,
             // The unquoted form, which allowed before.
             "-R cameronsjo/tool",
         ] {
@@ -9805,10 +9807,16 @@ mod tests {
                 r#"-R "https://evil.example/cameronsjo/tool""#,
                 r#""https://evil.example/cameronsjo/tool""#,
             ),
-            // A brace expansion is two words, so it is left as typed.
+            // A brace expansion blocks when any word it expands to is a repo
+            // the allowlist rejects.
+            (r#"-R "work-org"/{tool,x}"#, r#""work-org"/{tool,x}"#),
             (
-                r#"-R "cameronsjo"/{tool,evil}"#,
-                r#""cameronsjo"/{tool,evil}"#,
+                r#"-R {"work-org/x","cameronsjo/x"}"#,
+                r#"{"work-org/x","cameronsjo/x"}"#,
+            ),
+            (
+                r#"-R {"cameronsjo/x","work-org/x"}"#,
+                r#"{"cameronsjo/x","work-org/x"}"#,
             ),
         ] {
             for (cwd, strict) in contexts {
