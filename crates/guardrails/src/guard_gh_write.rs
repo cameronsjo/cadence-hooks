@@ -1549,7 +1549,8 @@ fn resolve_target_repo_on(
 ///
 /// A PR or issue URL argument comes before all of these: gh takes the repo
 /// and host from it and never reads `-R`, `GH_REPO` or the checkout
-/// (cadence-hooks#1529).
+/// (cadence-hooks#1529). Under `gh issue transfer` it is added in front of
+/// them instead ([`selector_url_is_the_only_target`]).
 fn resolve_target_repos_on(
     command: &str,
     work_dir: &str,
@@ -1557,12 +1558,12 @@ fn resolve_target_repos_on(
     env_host: &str,
     env_repo: &str,
 ) -> Vec<RepoResolution> {
-    let urls = selector_url_targets(command);
-    if !urls.is_empty() {
-        return urls
-            .into_iter()
-            .map(|(host, repo)| RepoResolution::SelectorUrl { host, repo })
-            .collect();
+    let mut resolutions: Vec<RepoResolution> = selector_url_targets(command)
+        .into_iter()
+        .map(|(host, repo)| RepoResolution::SelectorUrl { host, repo })
+        .collect();
+    if !resolutions.is_empty() && selector_url_is_the_only_target(command) {
+        return resolutions;
     }
     let dh = gh_command_host(command, env_host);
 
@@ -1575,12 +1576,18 @@ fn resolve_target_repos_on(
     } else {
         repo_flag(command)
     };
-    let mut resolutions = match flag {
-        RepoFlag::Target(repo) => return vec![flag_value_resolution(&repo, &dh)],
-        RepoFlag::Ambiguous => return vec![RepoResolution::AmbiguousFlags],
-        RepoFlag::TargetOrAbsent(repo) => vec![flag_value_resolution(&repo, &dh)],
-        RepoFlag::Absent => Vec::new(),
-    };
+    match flag {
+        RepoFlag::Target(repo) => {
+            resolutions.push(flag_value_resolution(&repo, &dh));
+            return resolutions;
+        }
+        RepoFlag::Ambiguous => {
+            resolutions.push(RepoResolution::AmbiguousFlags);
+            return resolutions;
+        }
+        RepoFlag::TargetOrAbsent(repo) => resolutions.push(flag_value_resolution(&repo, &dh)),
+        RepoFlag::Absent => {}
+    }
     if let Some(repo) = inline_gh_repo(command) {
         resolutions.push(flag_value_resolution(&repo, &dh));
     } else if !env_repo.is_empty() {
@@ -2618,6 +2625,14 @@ fn selector_url_targets(segment: &str) -> Vec<(String, String)> {
 /// The fix on an unowned URL argument's block (cadence-hooks#1529).
 const SELECTOR_URL_FIX: &str =
     "ask the user to run it themselves; gh writes to the URL's repo whatever -R says";
+
+/// False under `gh issue transfer`, which also writes the destination repo
+/// its second argument names. This guard does not read that argument, so
+/// there a URL adds a target, and the `-R` or checkout judged before
+/// cadence-hooks#1529 still stands in for the destination.
+fn selector_url_is_the_only_target(segment: &str) -> bool {
+    gh_argv(segment).is_none_or(|argv| gh_command_path(&argv, 2) != ["issue", "transfer"])
+}
 
 /// The `(host, owner/repo)` of a PR URL, or with `issue_paths` an issue or PR
 /// URL, read as gh reads one (cli/cli `pr/shared.ParseURL` and the issue
@@ -11539,15 +11554,17 @@ mod tests {
         vec![("github.com".to_string(), "work-org/x".to_string())]
     }
 
-    /// A checkout whose `origin` is `https://github.com/evil/x.git`.
-    fn unowned_checkout() -> tempfile::TempDir {
+    /// A checkout whose `origin` is `origin`.
+    fn checkout_of(origin: &str) -> tempfile::TempDir {
         let repo = tempfile::tempdir().expect("create git fixture");
         cadence_hooks_core::git_fixtures::init_repo(repo.path());
-        cadence_hooks_core::git_fixtures::git_in(
-            repo.path(),
-            &["remote", "add", "origin", "https://github.com/evil/x.git"],
-        );
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", origin]);
         repo
+    }
+
+    /// A checkout whose `origin` is `https://github.com/evil/x.git`.
+    fn unowned_checkout() -> tempfile::TempDir {
+        checkout_of("https://github.com/evil/x.git")
     }
 
     #[test]
@@ -11667,6 +11684,37 @@ mod tests {
                 assert!(meta.fix.contains("ask the user"), "{}", meta.fix);
                 assert!(!meta.fix.contains("cameronsjo/"), "{}", meta.fix);
             }
+        });
+    }
+
+    /// `gh issue transfer` also writes the repo its second argument names,
+    /// which the guard does not read. An owned URL adds a target, so the
+    /// `-R` or checkout judged before #1529 still decides. The first row is
+    /// "move cameronsjo/x#3 here", typed in a checkout of the destination.
+    #[test]
+    fn owned_url_leaves_an_issue_transfer_judged_on_the_checkout() {
+        with_env(&owners_env(), || {
+            let work_app = checkout_of("https://github.com/work-org/app.git");
+            let work_app = work_app.path().to_string_lossy();
+            let owned = crate::github_origin_repo();
+            let owned = owned.path().to_string_lossy();
+            let url = "https://github.com/cameronsjo/x/issues/3";
+            for (command, cwd) in [
+                (format!("gh issue transfer {url} work-org/app"), &*work_app),
+                (format!("gh issue transfer {url} work-org/app"), "/tmp"),
+                (
+                    format!("gh issue transfer {url} work-org/app -R evil/z"),
+                    &*owned,
+                ),
+                // The URL is still judged.
+                (format!("gh issue transfer {ISSUE_W} cameronsjo/y"), &*owned),
+            ] {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert!(blocks(&result), "{command} in {cwd}");
+            }
+            let command = format!("gh issue transfer {url} cameronsjo/y");
+            let result = GhWriteGuard.run(&input_with(&command, &owned));
+            assert!(!blocks(&result), "{command}: {}", msg(&result));
         });
     }
 
