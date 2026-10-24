@@ -118,7 +118,8 @@ const REPO_ARGUMENT_VERBS: &[&str] = &["archive", "delete", "edit", "create"];
 /// `comment`, `rename`, `archive`, `set`, `upload`, `run` and the rest), and a
 /// fix for it names `<repo>`: with the name reused, rerunning the fix would act
 /// on the operator's own repo of that name (cameronsjo/cadence-hooks#1506).
-/// The alias `new` reads as `create` ([`gh_command_path`]).
+/// The alias `new` reads as `create` ([`gh_command_path`]). Two creates whose
+/// rerun is costly keep no name ([`write_keeps_repo_name`]).
 const NAME_KEEPING_VERBS: &[&str] = &["create"];
 
 /// `owner/repo` from a `gh api` endpoint PATH. Anchored to the start: an
@@ -3816,23 +3817,39 @@ fn fix_keeps_repo_name(segment: &str, whole: &[String]) -> bool {
 }
 
 /// True when the segment's gh invocations spell at least one write verb, and
-/// every write verb they spell is in [`NAME_KEEPING_VERBS`]. A `gh api` write
-/// has no verb, and neither does a segment this guard cannot read a gh
-/// invocation from, so neither keeps the name. [`command_segments`] reads a
+/// every write they spell keeps the name ([`write_keeps_repo_name`]). A `gh
+/// api` write has no verb, and neither does a segment this guard cannot read a
+/// gh invocation from, so neither keeps the name. [`command_segments`] reads a
 /// `gh api` inside `eval`, `find -exec`, `xargs` or `$(…)` as a segment of its
 /// own, so a create beside it does not hide it.
 fn segment_keeps_repo_name(segment: &str) -> bool {
     let Some((tokens, start)) = gh_command_tokens(segment) else {
         return false;
     };
-    let writes: Vec<[&str; 2]> = (start..tokens.len())
+    let writes: Vec<(&[String], [&str; 2])> = (start..tokens.len())
         .filter(|&at| token_is_gh(&tokens[at]))
-        .filter_map(|at| argv_write_path(&tokens[at..]))
+        .filter_map(|at| argv_write_path(&tokens[at..]).map(|path| (&tokens[at..], path)))
         .collect();
     !writes.is_empty()
         && writes
             .iter()
-            .all(|[_, verb]| NAME_KEEPING_VERBS.contains(verb))
+            .all(|&(argv, path)| write_keeps_repo_name(path, argv))
+}
+
+/// True when the unowned fix for one gh write, the argv `argv` whose group and
+/// verb are `path`, may keep the target's repo name: the verb is in
+/// [`NAME_KEEPING_VERBS`] and a rerun is cheap to undo. Not `gh release
+/// create`, which can publish a release and start the repo's release
+/// workflows, and not `gh label create --force` (`-f`), which overwrites a
+/// label of that name.
+fn write_keeps_repo_name([group, verb]: [&str; 2], argv: &[String]) -> bool {
+    match (group, verb) {
+        ("release", "create") => false,
+        ("label", "create") => !argv
+            .iter()
+            .any(|t| t.starts_with("--force") || t.starts_with("-f")),
+        _ => NAME_KEEPING_VERBS.contains(&verb),
+    }
 }
 
 /// The verdict on one repo a write segment may land on.
@@ -9711,10 +9728,6 @@ mod tests {
                 "-R cameronsjo/thing",
             ),
             (
-                "gh release create v1 -R work-org/thing",
-                "-R cameronsjo/thing",
-            ),
-            (
                 "gh repo create work-org/thing --private",
                 "gh repo create cameronsjo/thing",
             ),
@@ -9725,6 +9738,28 @@ mod tests {
             (
                 "gh -R work-org/thing issue create -t x -b y",
                 "-R cameronsjo/thing",
+            ),
+            // Two creates whose rerun is costly: a release can publish and
+            // start release workflows, and `--force` overwrites a label.
+            (
+                "gh release create v1 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh release new v1 -R work-org/thing --notes x",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label create bug --force -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh label create bug -f -c ff0000 -R work-org/thing",
+                "-R cameronsjo/<repo>",
+            ),
+            (
+                "gh issue create -R work-org/thing -t x -b y && gh release create v1 -R work-org/thing",
+                "-R cameronsjo/<repo>",
             ),
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
