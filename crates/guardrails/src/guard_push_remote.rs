@@ -2590,9 +2590,6 @@ mod tests {
         }
     }
 
-    // Embeds a native path in a POSIX shell string; Windows paths lose their
-    // backslashes to shell escaping, as in real bash.
-    #[cfg(unix)]
     #[test]
     fn a_url_the_command_names_prints_flattened() {
         // The three "owner cannot be determined" blocks print a URL typed in
@@ -2605,12 +2602,18 @@ mod tests {
         let there = crate::github_origin_repo();
         let h = here.path().to_str().expect("utf-8 path");
         let t = there.path().to_str().expect("utf-8 path");
+        let mut commands = vec![
+            format!("git push '{url}' main"),
+            format!("git -c 'remote.pushDefault={url}' push main"),
+        ];
+        // The third row puts a native path in a shell string (`git -C '…'`).
+        // It runs on Unix only, a precaution that matches the tests beside it
+        // that do the same; no Windows run has checked it.
+        if cfg!(unix) {
+            commands.push(format!("git -C '{t}' push '{url}' main"));
+        }
         with_env(&owners_only(), || {
-            for command in [
-                format!("git push '{url}' main"),
-                format!("git -c 'remote.pushDefault={url}' push main"),
-                format!("git -C '{t}' push '{url}' main"),
-            ] {
+            for command in commands {
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, h));
                 assert!(
                     result.outcome == cadence_hooks_core::Outcome::Block,
