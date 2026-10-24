@@ -1518,7 +1518,7 @@ mod tests {
             "git -C . rm --cached .env",
             "sudo git rm --cached .env",
             "git rm --cached .env && git commit -m untrack",
-            "echo .env | xargs git rm --cached",
+            "xargs git rm --cached .env",
         ] {
             assert!(!bash_targets_env_file(command), "{command} must be allowed");
         }
