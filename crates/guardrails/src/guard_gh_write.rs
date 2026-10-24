@@ -11120,6 +11120,20 @@ mod tests {
                 r#"for r in a b; do gh api -X DELETE "repos/{owner}/$r/releases/1"; done"#,
                 api,
             ),
+            // `{repo}` alone is not the path gh fills from the checkout.
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/work-org/{repo}/releases/$r"; done"#,
+                api,
+            ),
+            // Every api write must be `repos/{owner}/{repo}/…`, in either order.
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/{owner}/{repo}/releases/1"; gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
+                api,
+            ),
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/work-org/$r/releases/1"; gh api -X DELETE "repos/{owner}/{repo}/releases/1"; done"#,
+                api,
+            ),
             // Beside a command that takes `-R`, that command keeps the name.
             (
                 r#"for r in a b; do gh pr merge 5; gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
