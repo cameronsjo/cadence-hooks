@@ -667,17 +667,19 @@ fn is_fresh_temp_word(word: &str) -> bool {
 }
 
 /// How many words an unquoted `$(mktemp …)` operand at the head of `words`
-/// spans, when it is one ([`is_fresh_temp_word`]). [`tokenize`] cuts an
-/// unquoted substitution at its blanks (`$(mktemp -d)` is `$(mktemp` and
-/// `-d)`), and a segment's last `)` is trimmed as a group closer, so
-/// `rm -f $(mktemp)` ends in the word `$(mktemp`. The call is put back
-/// together from its words: each must be unquoted, and the first `)` must end
-/// one of them. When the words run out first, the trimmed `)` closed it.
+/// spans, when it is one ([`is_fresh_temp_word`]). A segment's last `)` is
+/// trimmed as a group closer, so a call that ends the segment loses its own,
+/// and [`tokenize`] then cuts what is left at its blanks: `rm -f $(mktemp)`
+/// ends in the word `$(mktemp`, and `rm -rf $(mktemp -d)` in `$(mktemp` and
+/// `-d`. The call is put back together from its words: each must be
+/// unquoted (a quoted `'$(mktemp'` is a file name), and the first `)` must
+/// end one of them. When the words run out first, the trimmed `)` closed it.
+/// A call that does not end the segment is one word already.
 ///
 /// Unquoted, the shell splits and globs what the call prints, which is one
 /// path except under GNU's `--help` and `--version` (or an abbreviation):
-/// `rm -f $(mktemp --help)` deletes any file named `a` or `file`. A call
-/// with one of those is not read.
+/// `rm -f $(mktemp --help)` deletes any file named `a` or `file`. This does
+/// not put such a call back together, so that spelling keeps the block.
 fn unquoted_fresh_temp_span(words: &[String], unquoted_prefix_lens: &[usize]) -> Option<usize> {
     if !words.first()?.starts_with("$(") {
         return None;
@@ -3513,8 +3515,9 @@ mod tests {
             (r#"t=$(mktemp --suffix=.md); rm -f "$t""#, Allow),
             (r#"t=$(mktemp --); rm -f "$t""#, Allow),
             (r#"tmp=$(mktemp -d); trap 'rm -rf "${tmp}"' EXIT"#, Allow),
-            // An unquoted operand: the call is read whole, though the words
-            // split at its blanks and the segment's last `)` is trimmed.
+            // An unquoted operand. A call that ends the segment loses its `)`
+            // to the group-closer trim and splits at its blanks, so it is put
+            // back together; one that does not is one word already.
             (r#"t=$(mktemp); rm -f $t"#, Allow),
             (r#"rm -f $(mktemp)"#, Allow),
             (r#"rm -rf $(mktemp -d)"#, Allow),
@@ -3616,9 +3619,11 @@ mod tests {
             (r#"t=$(mktemp -d -t "$(cat note.md)"); rm -rf "$t""#, Block),
             (r#"t=$(mktemp); rm -f "$t" note.md"#, Block),
             (r#"rm -rf $(mktemp -d) note.md"#, Block),
-            // Unquoted, a call that prints text, not a path, is not read.
+            // A call that prints text, not a path, is not put back together,
+            // and a quoted word is a file name, not a call.
             (r#"rm -f $(mktemp --help)"#, Block),
             (r#"rm -f $(mktemp --ver)"#, Block),
+            (r#"rm -f '$(mktemp' '-d)'"#, Block),
             (r#"t=$(mktemp); rm -f "$t" "$u""#, Block),
             (r#"t=$(mktemp); rm -f "$t"; rm note.md"#, Block),
             // A sibling that moves, copies or links files, or a redirect to
