@@ -780,11 +780,14 @@ fn is_fresh_temp_bookkeeping(tokens: &[String], argv: &[String], segment: &str) 
 /// Is every word after the head of each command in this `trap`'s action,
 /// options aside, one that starts with `$` (`rm -rf "$tmp"`, `rm -f $a ${b}`)?
 /// Read standalone, so a variable stays the reference it is. This tells a
-/// variable from a path, and it also refuses a redirect, whose operator and
-/// target are not variables (`trap 'rm -rf "$tmp" > note.md' EXIT`). The
-/// action's commands are segments of the operand walk too and are judged
-/// there like any other: a deletion of a variable that is not a fresh
-/// `mktemp` path, or a command that is not inert, keeps the block.
+/// variable from a path. It does not own redirects: the clobber check blocks
+/// one over an existing vault file wherever it sits, and one to a new file
+/// only creates it. It still refuses a redirect (`2>/dev/null`) and the `]`
+/// of a `[` test, which are not variables, so those cleanup lines keep the
+/// block though they delete no vault file; cameronsjo/cadence-hooks#1536
+/// lists them. The action's commands are segments of the operand walk too
+/// and are judged there like any other: a deletion of a variable that is not
+/// a fresh `mktemp` path, or a command that is not inert, keeps the block.
 fn trap_action_takes_only_variables(segment: &str) -> bool {
     segment_scripts(segment).iter().all(|script| {
         command_segments(script).iter().all(|inner| {
