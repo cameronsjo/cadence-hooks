@@ -3620,7 +3620,11 @@ mod tests {
                 r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; ls; tmp=*"#,
                 Block,
             ),
-            // The `*` can be a trap's whole action.
+            // The `*` can sit before a terminator, or be a trap's whole action.
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*; ls"#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*&& ls"#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*|cat"#, Block),
+            ("t=$(mktemp -d); trap 'rm -rf $t' EXIT\nt=*\nls", Block),
             (
                 r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; trap 'tmp=*' INT"#,
                 Block,
@@ -3629,6 +3633,9 @@ mod tests {
                 r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; trap "tmp=*" INT"#,
                 Block,
             ),
+            // A `*` that is not a whole value assigned to a name is not one.
+            (r#"t=$(mktemp); echo a=*.md > "$t"; rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); echo "x =* y" > "$t"; rm -f "$t""#, Allow),
             // An assignment that may not have run (`assigns_unseen`: a
             // parameter default, an `&&` or `||` before it), one that does not
             // reach the deletion (a subshell, a prefix), or one that is not the
