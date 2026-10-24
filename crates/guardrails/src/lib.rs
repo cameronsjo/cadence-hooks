@@ -119,7 +119,9 @@ pub(crate) fn hostile_named_dir(root: &std::path::Path, name: &str) -> std::path
 
 /// Assert that `message` prints a [`HOSTILE_DIR_NAMES`] name flattened, as
 /// `displayed`: no carriage return, escape or right-to-left override survives,
-/// and no line starts with the forged text.
+/// no line starts with the forged text, and the flattened name is there. The
+/// line check runs before the name check so that a raw line feed is reported
+/// as the forged line it makes.
 #[cfg(all(test, unix))]
 pub(crate) fn assert_hostile_dir_flattened(message: &str, displayed: &str, context: &str) {
     for (c, name) in [
@@ -133,14 +135,14 @@ pub(crate) fn assert_hostile_dir_flattened(message: &str, displayed: &str, conte
         );
     }
     assert!(
-        message.contains(displayed),
-        "{context}: the flattened name is missing: {message:?}"
-    );
-    assert!(
         !message
             .lines()
             .any(|line| line.trim_start().starts_with("Fix: gh repo delete")),
         "{context}: the name forged a line: {message:?}"
+    );
+    assert!(
+        message.contains(displayed),
+        "{context}: the flattened name is missing: {message:?}"
     );
 }
 
