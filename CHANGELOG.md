@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`prevent-secret-push` names a `git tag` with options in the same call as the push.** When a push names a tag that the same command creates, the warning says to run `git tag` in one call and the push in the next. That advice appeared only for a bare `git tag NAME`. A signed or annotated tag (`git tag -s vX -m "…" && git push origin refs/tags/vX`), the usual release form, got only the generic "could not resolve" text. The advice now appears whenever `git tag` names a tag after its creation options. The list, delete and verify forms still get none. Only the message changes (cameronsjo/cadence-hooks#1511).
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
