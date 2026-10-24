@@ -3835,6 +3835,13 @@ mod tests {
             format!("f(x{}{})", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
             format!("f(x{}{},", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
             format!("f(x{})", " auth=a".repeat(140_000)),
+            // A quoted value ends before the blanks ahead of its closing
+            // quote, and that end is also found once per run.
+            format!(
+                "f(x{}{}\" )",
+                " auth= \"a".repeat(1_000),
+                " ".repeat(4 * MB)
+            ),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
