@@ -180,8 +180,9 @@ fn is_safe_name(part: &str) -> bool {
 }
 
 /// A host name the hook will pass to gh: ASCII letters, digits, `.`, `-`,
-/// and no leading `-`.
-fn is_safe_host(part: &str) -> bool {
+/// and no leading `-`. [`crate::messages::host_scope_advice`] uses it too, to
+/// decide whether a host may be printed as setting text.
+pub(crate) fn is_safe_host(part: &str) -> bool {
     !part.is_empty()
         && !part.starts_with('-')
         && part
