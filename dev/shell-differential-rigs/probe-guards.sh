@@ -2,6 +2,9 @@
 # Scratch probe — end-to-end guard verdicts for the five issue repros.
 # Every payload row is paired with a positive control that MUST block.
 set -uo pipefail
+# Log to a scratch dir: a deny piped at the real binary otherwise lands in the
+# real denials.jsonl, where the usage census reads it as a session outcome.
+export CADENCE_METRICS_DIR="$(mktemp -d)"
 BIN=/tmp/wt-shellcluster/target/release/cadence-hooks
 PY=$(command -v python3)
 
