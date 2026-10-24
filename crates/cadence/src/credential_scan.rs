@@ -561,7 +561,7 @@ mod tests {
             let start = std::time::Instant::now();
             let hits = scan(input);
             let dt = start.elapsed();
-            // Token prefixes that never form a whole token: the scan finishes
+            // Floods that never form a whole token: the scan finishes
             // and reports nothing, in every run.
             assert!(hits.is_empty(), "{hits:?} on {} bytes", input.len());
             // The budget is wall-clock, so a loaded machine can miss it. It is
