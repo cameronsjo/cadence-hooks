@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` judges the repo a PR or issue URL argument names.** gh takes the repo and host from an argument like `https://github.com/<owner>/<repo>/pull/1` before `-R`, `GH_REPO` and the checkout, and the guard never read it. So `gh pr merge <url> --squash` to a repo you do not own was allowed from an owned checkout, or from anywhere with an owned `-R`. The guard now reads that argument for `gh pr merge|close|comment|edit|review|ready|reopen|lock|unlock` and `gh issue close|comment|edit|reopen|delete|lock|unlock|transfer`, as gh does. An unowned URL blocks, with a fix to pass the number and `-R` instead. An owned one is allowed from any directory, past an unowned `-R`, except in a loop: the loop check still reads `-R`, and without one the checkout, before the URL. A URL given as a flag's value (`--body`, `--duplicate-of`) is not read. (#1529)
+
 ## [0.131.0] - 2026-10-21
 
 ### Added
