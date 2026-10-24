@@ -1696,8 +1696,11 @@ fn host_is_read(host: &str) -> bool {
 /// that names an expanded host shows the text the command spelled (#1503).
 ///
 /// The host is looked for where gh takes it from, in gh's order: the target's
-/// own `HOST/` part (`-R`, `--repo`, an inline `GH_REPO`), then the host the
-/// command selects ([`selected_gh_host`]). A host the segment does not spell,
+/// own `HOST/` part, then the host the command selects
+/// ([`selected_gh_host`]). The target is the `-R` or `--repo` value, and an
+/// inline `GH_REPO` only where [`resolve_target_repos_on`] reads one: with no
+/// `-R`, or beside a `-R` gh may ignore. A `-R` that decides the target
+/// leaves `GH_REPO` unread, as gh does. A host the segment does not spell,
 /// such as the hook's own `GH_HOST`, is shown as given. Message only: no
 /// verdict reads it.
 fn host_as_typed(segment: &str, host: &str) -> String {
@@ -1711,13 +1714,15 @@ fn host_as_typed(segment: &str, host: &str) -> String {
     } else {
         repo_flag(segment)
     };
-    let flag_value = match flag {
-        RepoFlag::Target(value) | RepoFlag::TargetOrAbsent(value) => Some(value),
-        RepoFlag::Absent | RepoFlag::Ambiguous => None,
+    let (flag_value, gh_repo) = match flag {
+        RepoFlag::Target(value) => (Some(value), None),
+        RepoFlag::TargetOrAbsent(value) => (Some(value), inline_gh_repo(segment)),
+        RepoFlag::Absent => (None, inline_gh_repo(segment)),
+        RepoFlag::Ambiguous => (None, None),
     };
     flag_value
         .into_iter()
-        .chain(inline_gh_repo(segment))
+        .chain(gh_repo)
         .filter(|value| {
             parse_gh_repo_value(value)
                 .and_then(|spec| spec.host)
@@ -10165,6 +10170,13 @@ mod tests {
             (
                 "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
                 "$GH_HOST/cameronsjo/x",
+            ),
+            // A `-R` that decides the target leaves `GH_REPO` unread, as gh
+            // does, so the host shown is the inline `GH_HOST` that decided.
+            (
+                r#"GH_REPO="$H/z/y" GH_HOST=$h gh issue create -R evil/x --title t --body b"#
+                    .to_string(),
+                "$h/evil/x",
             ),
             // With the name expanded too, `Target:` names the expanded name,
             // as it did before.
