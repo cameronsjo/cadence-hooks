@@ -1629,25 +1629,27 @@ fn flag_value_is_owned(
 }
 
 /// The loop's raw `-R` word with its quotes removed, as the shell hands it to
-/// gh, when it is a quoted literal. The loop parser keeps the word's text
-/// as typed, so `-R "cameronsjo/tool"` arrives with both quotes on, and the
+/// gh, when it carries a quote. The loop parser keeps the word's text as
+/// typed, so `-R "cameronsjo/tool"` arrives with both quotes on, and the
 /// owner it reads is `"cameronsjo` (#1504). The single-command arm never sees
 /// them: [`tokenize`] has removed them by then.
 ///
-/// `None` leaves the word as it is, which is the verdict it had before:
+/// An expansion stays in the text (`"cameronsjo/$r"` reads `cameronsjo/$r`),
+/// and the ownership check judges it as it judges an unquoted `-R` value: a
+/// literal allowed owner is owned, and `$o/$r` or `$h/cameronsjo/x` is not.
+/// [`loop_target_is_unresolvable`] still reads the raw text for the message.
+///
+/// `None` leaves the word as it is:
 ///
 /// - It carries no quote: nothing to remove.
-/// - It carries an expansion (`$`, a backtick). Only the running shell knows
-///   its value, and [`loop_target_is_unresolvable`] judges it from the raw
-///   text.
 /// - [`tokenize`] does not read it as exactly one word: a brace expansion
 ///   (`"cameronsjo"/{a,b}`) or a stray compound keyword.
 ///
 /// Quote removal is the tokenizer's, not a second copy of its rules, so a
-/// backslash or a quote inside the other kind reads as it does for a single
-/// command.
+/// backslash, a quote inside the other kind, or `$'…'` reads as it does for
+/// a single command.
 fn unquoted_literal_loop_repo(word: &str) -> Option<String> {
-    if !word.contains(['"', '\'']) || repo_has_unexpanded_expansion(word) {
+    if !word.contains(['"', '\'']) {
         return None;
     }
     let mut words = tokenize(word);
@@ -1655,9 +1657,14 @@ fn unquoted_literal_loop_repo(word: &str) -> Option<String> {
     words.is_empty().then_some(only)
 }
 
-/// [`flag_value_is_owned`] for a loop's raw `-R` word: a quoted literal is
-/// judged without its quotes, so `-R "cameronsjo/tool"` is as owned as
-/// `-R cameronsjo/tool` (#1504). Any other word is judged as typed.
+/// [`flag_value_is_owned`] for a loop's raw `-R` word: a quoted word is
+/// judged without its quotes, so `-R "cameronsjo/tool"` and
+/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). Any
+/// other word is judged as typed.
+///
+/// This gate can only add a block. Once it passes, the per-segment pass
+/// judges every looped write again, as a single command, so reading the word
+/// as the shell does cannot allow what a single command blocks.
 fn loop_flag_value_is_owned(
     word: &str,
     dh: &str,
@@ -9672,10 +9679,10 @@ mod tests {
         // Otherwise an expanded value stays unresolvable: an owner only the
         // shell knows, behind any host or scheme; a variable holding the whole
         // `owner/repo` behind a host, which leaves a host or scheme in the
-        // owner slot; a variable host; a `/` inside a substitution; and an
-        // allowed owner, which the loop gate rejects only because its quotes
-        // are still on, so "you don't own" would be false.
-        let unresolvable: [&[&str]; 24] = [
+        // owner slot; a variable host; and a `/` inside a substitution. An
+        // allowed owner beside an expanded name is owned, quoted or not:
+        // [`issue_1504_quoted_literal_dash_r_in_a_loop_is_judged_without_its_quotes`].
+        let unresolvable: [&[&str]; 20] = [
             &[r#"-R "$r""#],
             &[r#"-R "/$r""#],
             &[r#"-R "$o/$r""#],
@@ -9696,10 +9703,8 @@ mod tests {
             &[r#"-R "$h/evil/x""#],
             &[r#"-R "https://$h/evil/x""#],
             &[r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#],
-            &[r#"-R "cameronsjo/$r""#],
-            &["-R 'cameronsjo/$r'"],
-            &[r#"-R "cameronsjo"/"$r""#],
-            &[r#"-R "https://github.com/cameronsjo/$r""#],
+            // An owned target beside an unresolvable one: only the
+            // unresolvable one is left to name.
             &[r#"-R "cameronsjo/$r""#, r#"-R "$o/$r""#],
             &[r#"-R "$o/$r""#, r#"-R "$r""#],
         ];
@@ -9833,15 +9838,44 @@ mod tests {
             );
             assert!(!message.contains("cameronsjo/tool"), "{cwd}: {message}");
         }
-        // A quoted value with an expansion is not a literal: it keeps its
-        // verdict, "cannot resolve", though its owner is allowed.
+        // A quoted value with an expansion after an allowed owner is owned,
+        // as it is unquoted and as a single command. Single quotes and
+        // `$'…'` expand nothing, so gh gets the literal text, which still
+        // names the allowed owner.
         for flag in [
             r#"-R "cameronsjo/$r""#,
-            "-R 'cameronsjo/$r'",
             r#"-R "cameronsjo/${r}""#,
+            r#"-R "cameronsjo"/"$r""#,
+            r#"-R "cameronsjo/`x`""#,
             r#"-R "https://github.com/cameronsjo/$r""#,
+            "-R 'cameronsjo/$r'",
             "-R $'cameronsjo/tool'",
+            r#"-R $"cameronsjo/tool""#,
         ] {
+            for (cwd, strict) in contexts {
+                let command = for_close(flag);
+                let result = run_1491(&command, cwd, strict);
+                assert_eq!(
+                    result.outcome,
+                    cadence_hooks_core::Outcome::Allow,
+                    "{command} in {cwd} (strict {strict}): {:?}",
+                    result.message
+                );
+            }
+        }
+        let create =
+            r#"for r in a b; do gh issue create -R "cameronsjo/$r" --title t --body b; done"#;
+        for (cwd, strict) in contexts {
+            let result = run_1491(create, cwd, strict);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{cwd} (strict {strict}): {:?}",
+                result.message
+            );
+        }
+        // An owner or host only the shell knows still cannot be resolved.
+        for flag in [r#"-R "$o/$r""#, r#"-R "$h/cameronsjo/x""#] {
             for (cwd, strict) in contexts {
                 let command = for_close(flag);
                 let result = run_1491(&command, cwd, strict);
