@@ -592,6 +592,10 @@ fn read_short_value(rest: &[char], next: Option<&String>) -> ClusterScan {
 enum RepoResolution {
     /// Fully resolved: host + "owner/repo"
     Resolved { host: String, repo: String },
+    /// Named by a PR or issue URL argument ([`selector_url_targets`]). Judged
+    /// as [`RepoResolution::Resolved`] is; only the fix differs, since gh
+    /// reads the URL before `-R` and adding one would not move the write.
+    SelectorUrl { host: String, repo: String },
     /// Fork detected: both origin and upstream remotes present, each with its
     /// own host so ownership can be judged per-remote.
     Fork {
@@ -1544,6 +1548,11 @@ fn resolve_target_repo_on(
 /// - Without one, an `env_repo` the gh process inherits — exported earlier in
 ///   the command, see [`GhHostEnv::for_repo`] — adds its value the same way
 ///   (cadence-hooks#1129). Empty means none.
+///
+/// A PR or issue URL argument comes before all of these: gh takes the repo
+/// and host from it and never reads `-R`, `GH_REPO` or the checkout
+/// (cadence-hooks#1529). Under `gh issue transfer` it is added in front of
+/// them instead ([`selector_url_is_the_only_target`]).
 fn resolve_target_repos_on(
     command: &str,
     work_dir: &str,
@@ -1551,6 +1560,13 @@ fn resolve_target_repos_on(
     env_host: &str,
     env_repo: &str,
 ) -> Vec<RepoResolution> {
+    let mut resolutions: Vec<RepoResolution> = selector_url_targets(command)
+        .into_iter()
+        .map(|(host, repo)| RepoResolution::SelectorUrl { host, repo })
+        .collect();
+    if !resolutions.is_empty() && selector_url_is_the_only_target(command) {
+        return resolutions;
+    }
     let dh = gh_command_host(command, env_host);
 
     // 1. Explicit -R / --repo flag. `gh api` has none (gh rejects it), so on
@@ -1562,12 +1578,18 @@ fn resolve_target_repos_on(
     } else {
         repo_flag(command)
     };
-    let mut resolutions = match flag {
-        RepoFlag::Target(repo) => return vec![flag_value_resolution(&repo, &dh)],
-        RepoFlag::Ambiguous => return vec![RepoResolution::AmbiguousFlags],
-        RepoFlag::TargetOrAbsent(repo) => vec![flag_value_resolution(&repo, &dh)],
-        RepoFlag::Absent => Vec::new(),
-    };
+    match flag {
+        RepoFlag::Target(repo) => {
+            resolutions.push(flag_value_resolution(&repo, &dh));
+            return resolutions;
+        }
+        RepoFlag::Ambiguous => {
+            resolutions.push(RepoResolution::AmbiguousFlags);
+            return resolutions;
+        }
+        RepoFlag::TargetOrAbsent(repo) => resolutions.push(flag_value_resolution(&repo, &dh)),
+        RepoFlag::Absent => {}
+    }
     if let Some(repo) = inline_gh_repo(command) {
         resolutions.push(flag_value_resolution(&repo, &dh));
     } else if !env_repo.is_empty() {
@@ -2482,6 +2504,213 @@ fn gh_write_is_user_scoped(segment: &str) -> bool {
     at(1) == Some("gist") || (at(1) == Some("repo") && at(2) == Some("fork"))
 }
 
+/// The `gh pr` and `gh issue` write verbs whose argument may be a PR or issue
+/// URL, with the long flags and shorthand letters that take a value under
+/// each. Read from cli/cli `pkg/cmd/{pr,issue}/*` (trunk, 2026-10-24), and
+/// `--attach` from `attachments.AddFlag`; `-R` is the `pr`/`issue` group's
+/// own flag. A flag missing here is read as boolean, so a URL given as its
+/// value would be judged as the argument, and the value itself takes the
+/// argument's place: the real argument after it is never read, and the write
+/// is judged as before.
+const SELECTOR_VERBS: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "pr",
+        "merge",
+        &[
+            "--body",
+            "--body-file",
+            "--subject",
+            "--match-head-commit",
+            "--author-email",
+        ],
+        "bFtA",
+    ),
+    ("pr", "close", &["--comment"], "c"),
+    (
+        "pr",
+        "comment",
+        &["--body", "--body-file", "--attach"],
+        "bF",
+    ),
+    ("pr", "edit", EDIT_VALUE_FLAGS, "tbFBm"),
+    ("pr", "review", &["--body", "--body-file"], "bF"),
+    ("pr", "ready", &[], ""),
+    ("pr", "reopen", &["--comment"], "c"),
+    ("pr", "lock", &["--reason"], "r"),
+    ("pr", "unlock", &[], ""),
+    (
+        "issue",
+        "close",
+        &["--comment", "--reason", "--duplicate-of"],
+        "cr",
+    ),
+    (
+        "issue",
+        "comment",
+        &["--body", "--body-file", "--attach"],
+        "bF",
+    ),
+    ("issue", "edit", EDIT_VALUE_FLAGS, "tbFm"),
+    ("issue", "reopen", &["--comment"], "c"),
+    ("issue", "delete", &[], ""),
+    ("issue", "lock", &["--reason"], "r"),
+    ("issue", "unlock", &[], ""),
+    ("issue", "transfer", &[], ""),
+];
+
+/// Value-taking long flags of `gh pr edit` and `gh issue edit`, unioned: no
+/// name takes a value under one and not the other.
+const EDIT_VALUE_FLAGS: &[&str] = &[
+    "--title",
+    "--body",
+    "--body-file",
+    "--attach",
+    "--base",
+    "--milestone",
+    "--type",
+    "--parent",
+    "--add-reviewer",
+    "--remove-reviewer",
+    "--add-assignee",
+    "--remove-assignee",
+    "--add-label",
+    "--remove-label",
+    "--add-project",
+    "--remove-project",
+    "--add-sub-issue",
+    "--remove-sub-issue",
+    "--add-blocked-by",
+    "--remove-blocked-by",
+    "--add-blocking",
+    "--remove-blocking",
+];
+
+/// Every `(host, owner/repo)` a [`SELECTOR_VERBS`] write names by a PR or
+/// issue URL argument, which gh reads before `-R`, `GH_REPO` and the checkout
+/// (cadence-hooks#1529). Only the first argument is a selector, except under
+/// `gh issue edit`, which takes several. Empty when no argument is one.
+fn selector_url_targets(segment: &str) -> Vec<(String, String)> {
+    let Some(argv) = gh_argv(segment) else {
+        return Vec::new();
+    };
+    let path = gh_command_path(&argv, 2);
+    let Some(&(noun, verb, longs, shorts)) =
+        SELECTOR_VERBS.iter().find(|(n, v, ..)| path == [*n, *v])
+    else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let word = argv[i].as_str();
+        if word == "--" {
+            args.extend(&argv[i + 1..]);
+            break;
+        }
+        if word.starts_with("--") {
+            i += long_flag_stride(word, word == "--repo" || longs.contains(&word));
+            continue;
+        }
+        if let Some(cluster) = word.strip_prefix('-')
+            && !cluster.is_empty()
+        {
+            let shorts = format!("R{shorts}");
+            i += if cluster_consumes_next(cluster, &shorts) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        args.push(&argv[i]);
+        i += 1;
+    }
+    // The first two words are the noun and the verb cobra found; any other
+    // reading of the flags is not gh's, so judge as before.
+    if args.len() < 2 || args[0] != noun || args[1] != verb {
+        return Vec::new();
+    }
+    let selectors = &args[2..];
+    let selectors = if verb == "edit" && noun == "issue" {
+        selectors
+    } else {
+        &selectors[..selectors.len().min(1)]
+    };
+    let issue_paths = noun == "issue" || matches!(verb, "lock" | "unlock");
+    selectors
+        .iter()
+        .filter_map(|word| selector_url_target(word, issue_paths))
+        .collect()
+}
+
+/// The fix on an unowned URL argument's block (cadence-hooks#1529).
+const SELECTOR_URL_FIX: &str =
+    "ask the user to run it themselves; gh writes to the URL's repo whatever -R says";
+
+/// False under `gh issue transfer`, which also writes the destination repo
+/// its second argument names. This guard does not read that argument, so
+/// there a URL adds a target, and the `-R` or checkout judged before
+/// cadence-hooks#1529 still stands in for the destination.
+fn selector_url_is_the_only_target(segment: &str) -> bool {
+    gh_argv(segment).is_none_or(|argv| gh_command_path(&argv, 2) != ["issue", "transfer"])
+}
+
+/// The `(host, owner/repo)` of a PR URL, or with `issue_paths` an issue or PR
+/// URL, read as gh reads one (cli/cli `pr/shared.ParseURL` and the issue
+/// lookup's `tryParseIssueFromURL`): an `http`/`https` URL whose path starts
+/// `/OWNER/REPO/pull/N` (or `/issues/N`), the host lowercased less a leading
+/// `www.`. `None` for anything else, and for any URL Go may decode or reject
+/// differently (a `%` before any `?` or `#`, a backslash, whitespace,
+/// userinfo, an odd host), which is then judged as before. Go keeps the
+/// query as typed, so any `%` there is read. It decodes the fragment and
+/// rejects a `%` there that two hex digits do not follow; gh then reads no
+/// URL, so neither does this. A `$` may stand for the number.
+fn selector_url_target(word: &str, issue_paths: bool) -> Option<(String, String)> {
+    let before_query = word.split(['?', '#']).next().unwrap_or_default();
+    let fragment = word.split_once('#').map_or("", |(_, fragment)| fragment);
+    let bad_fragment_escape = fragment.split('%').skip(1).any(|after| {
+        !after
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    });
+    if before_query.contains('%')
+        || bad_fragment_escape
+        || word.contains('\\')
+        || word.contains(|c: char| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let (scheme, rest) = word.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_at(rest.find('/')?);
+    let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !plain(host) || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts = path[1..].splitn(4, '/');
+    let (owner, repo, kind, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let kind_matches = kind == "pull" || (issue_paths && kind == "issues");
+    let numbered = number.starts_with(|c: char| c.is_ascii_digit() || c == '$');
+    if !plain(owner) || !plain(repo) || !kind_matches || !numbered {
+        return None;
+    }
+    let host = host
+        .strip_prefix("www.")
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    Some((host, format!("{owner}/{repo}")))
+}
+
 /// True when `segment` is `gh issue create` with `--web`/`-w`: gh opens the
 /// new-issue form in the browser and creates nothing, so the person reviews
 /// and submits it there (cameronsjo/cadence-hooks#1351). `gh pr create --web`
@@ -2724,6 +2953,10 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// complement stays exact: a `repos/<owner>/<repo>` path or a `gh repo archive`
 /// phrase that appears only inside a quoted argument names no target for
 /// resolution, and must not silence the nudge either (#463).
+///
+/// A PR or issue URL argument ([`selector_url_targets`]) does not count here
+/// yet, though resolution reads it first: the loop gates do not read it
+/// either, so such a write keeps the nudge and the strict-loop block.
 pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
     repo_flag(segment) == RepoFlag::Absent
         && gh_api_endpoint(segment).is_none_or(|endpoint| api_repos_target(&endpoint).is_none())
@@ -3776,6 +4009,23 @@ fn judge_resolution(
                 BlockMetadata {
                     rule_id: "gh-write-target-unresolvable".to_string(),
                     fix,
+                    allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                    severity: "error",
+                },
+            ))
+        }
+        RepoResolution::SelectorUrl { host, repo } => {
+            if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
+                return None;
+            }
+            // gh reads the URL before `-R`, so no `-R` moves the write, and
+            // the URL's number names another PR or issue in any other repo:
+            // the fix names no target.
+            Some(CheckResult::block_structured(
+                disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
+                BlockMetadata {
+                    rule_id: "gh-write-unauthorized-target".to_string(),
+                    fix: SELECTOR_URL_FIX.to_string(),
                     allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                     severity: "error",
                 },
@@ -12104,6 +12354,318 @@ mod tests {
                 "{:?}",
                 result.message
             );
+        });
+    }
+
+    // --- #1529: a PR or issue URL argument names the target ---
+
+    const URL_W: &str = "https://github.com/work-org/x/pull/1";
+    const ISSUE_W: &str = "https://github.com/work-org/x/issues/1";
+
+    fn work_org() -> Vec<(String, String)> {
+        vec![("github.com".to_string(), "work-org/x".to_string())]
+    }
+
+    /// A checkout whose `origin` is `origin`.
+    fn checkout_of(origin: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("create git fixture");
+        cadence_hooks_core::git_fixtures::init_repo(repo.path());
+        cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", origin]);
+        repo
+    }
+
+    /// A checkout whose `origin` is `https://github.com/evil/x.git`.
+    fn unowned_checkout() -> tempfile::TempDir {
+        checkout_of("https://github.com/evil/x.git")
+    }
+
+    #[test]
+    fn selector_url_target_reads_a_url_as_gh_does() {
+        let gh = |owner_repo: &str| Some(("github.com".to_string(), owner_repo.to_string()));
+        for (word, issue_paths, want) in [
+            ("https://github.com/o/r/pull/1", false, gh("o/r")),
+            ("https://github.com/o/r/pull/12/files", false, gh("o/r")),
+            (
+                "https://github.com/o/r/pull/1#issuecomment-9",
+                false,
+                gh("o/r"),
+            ),
+            ("https://github.com/o/r/pull/1?w=1", false, gh("o/r")),
+            // Go keeps the query as typed and decodes a valid escape in the
+            // fragment, so these are read.
+            (
+                "https://github.com/o/r/pull/7/files?file-filters%5B%5D=.rs",
+                false,
+                gh("o/r"),
+            ),
+            ("https://github.com/o/r/pull/1?x=%zz", false, gh("o/r")),
+            (
+                "https://github.com/o/r/pull/7#discussion_r%41",
+                false,
+                gh("o/r"),
+            ),
+            ("http://github.com/o/r/pull/1", false, gh("o/r")),
+            ("HTTPS://github.com/o/r/pull/1", false, gh("o/r")),
+            ("https://www.GitHub.com/o/r/pull/1", false, gh("o/r")),
+            ("https://github.com:443/o/r/pull/1", false, gh("o/r")),
+            ("https://github.com/o/r/pull/$n", false, gh("o/r")),
+            ("https://github.com/o/r/issues/3", true, gh("o/r")),
+            ("https://github.com/o/r/pull/3", true, gh("o/r")),
+            (
+                "https://ghe.example.com/o/r/pull/3",
+                false,
+                Some(("ghe.example.com".to_string(), "o/r".to_string())),
+            ),
+            // gh's PR parser takes only `/pull/`.
+            ("https://github.com/o/r/issues/3", false, None),
+            ("https://github.com/o/r/pull/", false, None),
+            ("https://github.com/o/r/pull/x1", false, None),
+            ("https://github.com/o/r/pull", false, None),
+            ("https://github.com/o/r", false, None),
+            ("https://github.com//o/r/pull/1", false, None),
+            ("ftp://github.com/o/r/pull/1", false, None),
+            ("github.com/o/r/pull/1", false, None),
+            // Spellings Go may decode or reject: judged as before.
+            ("https://github.com/o%2Fx/r/pull/1", false, None),
+            ("https://u@github.com/o/r/pull/1", false, None),
+            ("https://[::1]/o/r/pull/1", false, None),
+            ("https://github.com:44x/o/r/pull/1", false, None),
+            ("https:///o/r/pull/1", false, None),
+            ("https://github.com/$o/r/pull/1", false, None),
+            ("https://github.com/o/r/pull/1 ", false, None),
+            ("https://github.com/o/r/pull/1%zz", false, None),
+            // Go rejects a bad escape in the fragment, and gh reads no URL.
+            ("https://github.com/o/r/pull/7#f%zz", false, None),
+            ("https://github.com/o/r/pull/7#%", false, None),
+            // One bad escape is enough, first or last, a hex letter is a
+            // digit, and one digit at the end is not two.
+            ("https://github.com/o/r/pull/7#a%41b%zz", false, None),
+            ("https://github.com/o/r/pull/7#a%zzb%41", false, None),
+            ("https://github.com/o/r/pull/7#x%4f", false, gh("o/r")),
+            ("https://github.com/o/r/pull/7#x%4", false, None),
+        ] {
+            assert_eq!(selector_url_target(word, issue_paths), want, "{word}");
+        }
+    }
+
+    #[test]
+    fn selector_url_targets_reads_the_argument_not_a_flag_value() {
+        let w = || work_org();
+        for (command, want) in [
+            (format!("gh pr merge {URL_W} --squash"), w()),
+            (format!("gh pr merge --squash {URL_W}"), w()),
+            (format!("gh pr merge -- {URL_W}"), w()),
+            (format!("gh pr merge -R cameronsjo/x {URL_W}"), w()),
+            (format!("gh pr merge --repo cameronsjo/x {URL_W}"), w()),
+            (format!("gh -R cameronsjo/x pr merge {URL_W}"), w()),
+            // `--attach` takes a file name (cli/cli `attachments.AddFlag`).
+            (format!("gh pr comment --attach a.png {URL_W}"), w()),
+            (format!("gh issue comment --attach a.png {ISSUE_W}"), w()),
+            (format!("gh pr edit --attach a.png {URL_W}"), w()),
+            // Found wherever `gh` sits, as every resolver reads it (`gh_argv`).
+            (format!("xargs gh pr merge {URL_W}"), w()),
+            // `-m` merges and `-c` comments: booleans under these verbs.
+            (format!("gh pr merge -m {URL_W}"), w()),
+            (format!("gh pr review -c {URL_W}"), w()),
+            (format!("gh pr lock {ISSUE_W}"), w()),
+            (format!("gh issue close {ISSUE_W}"), w()),
+            (format!("gh issue edit 5 {ISSUE_W}"), w()),
+            // A flag's value, a second argument, a read or another verb.
+            (format!("gh pr comment 5 --body {URL_W}"), vec![]),
+            (format!("gh pr comment 5 -b {URL_W}"), vec![]),
+            (format!("gh pr comment -b {URL_W} 5"), vec![]),
+            (format!("gh pr comment --body {URL_W} 5"), vec![]),
+            (format!("gh pr comment --attach {URL_W} 5"), vec![]),
+            (format!("gh pr close -c {URL_W} 5"), vec![]),
+            (format!("gh pr close 5 -c {URL_W}"), vec![]),
+            (format!("gh pr merge 5 -t {URL_W}"), vec![]),
+            (format!("gh pr merge 5 {URL_W}"), vec![]),
+            (format!("gh issue close 5 --duplicate-of {URL_W}"), vec![]),
+            (format!("gh issue edit 5 --parent {URL_W}"), vec![]),
+            (format!("gh pr view {URL_W}"), vec![]),
+            (format!("gh pr create --body {URL_W}"), vec![]),
+            // Flags this scan reads differently from cobra: judged as before.
+            (format!("gh issue --x y edit {ISSUE_W}"), vec![]),
+            (format!("gh pr merge {ISSUE_W}"), vec![]),
+        ] {
+            assert_eq!(selector_url_targets(&command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn unowned_url_argument_blocks_from_an_owned_checkout_and_past_dash_r() {
+        with_env(&owners_env(), || {
+            let owned = crate::github_origin_repo();
+            let owned = owned.path().to_string_lossy();
+            for (command, cwd) in [
+                (format!("gh pr merge {URL_W} --squash"), &*owned),
+                (
+                    format!("gh pr merge {URL_W} --squash -R cameronsjo/x"),
+                    "/tmp",
+                ),
+                (
+                    format!("for n in 1; do gh pr merge {URL_W} -R cameronsjo/x; done"),
+                    "/tmp",
+                ),
+                (format!("gh issue comment {} --body hi", ISSUE_W), &*owned),
+                (format!("gh issue delete {} --yes", ISSUE_W), &*owned),
+                (
+                    format!("gh pr merge '{URL_W}/files?file-filters%5B%5D=.rs' --squash"),
+                    &*owned,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert!(blocks(&result), "{command} in {cwd}");
+                assert!(msg(&result).contains("you don't own"), "{command}");
+                assert!(msg(&result).contains("github.com/work-org/x"), "{command}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+                // The URL's number names another PR or issue in an owned
+                // repo, so the fix names no target to retry on.
+                assert!(meta.fix.contains("ask the user"), "{}", meta.fix);
+                assert!(!meta.fix.contains("cameronsjo/"), "{}", meta.fix);
+            }
+        });
+    }
+
+    /// `gh issue transfer` also writes the repo its second argument names,
+    /// which the guard does not read. An owned URL adds a target, so the
+    /// `-R` or checkout judged before #1529 still decides. The first row is
+    /// "move cameronsjo/x#3 here", typed in a checkout of the destination.
+    ///
+    /// The URL stays judged beside every later source: an owned `-R`, a `-R`
+    /// that may be another flag's value, an inline `GH_REPO` and an inherited
+    /// one are each added to it, never put in its place. Only an unowned URL
+    /// beside an owned one of these tells the two apart.
+    #[test]
+    fn owned_url_leaves_an_issue_transfer_judged_on_the_checkout() {
+        with_env(&owners_env(), || {
+            let work_app = checkout_of("https://github.com/work-org/app.git");
+            let work_app = work_app.path().to_string_lossy();
+            let owned = crate::github_origin_repo();
+            let owned = owned.path().to_string_lossy();
+            let unowned = unowned_checkout();
+            let unowned = unowned.path().to_string_lossy();
+            let url = "https://github.com/cameronsjo/x/issues/3";
+            for (command, cwd) in [
+                (format!("gh issue transfer {url} work-org/app"), &*work_app),
+                (format!("gh issue transfer {url} work-org/app"), "/tmp"),
+                (
+                    format!("gh issue transfer {url} work-org/app -R evil/z"),
+                    &*owned,
+                ),
+                // The URL is still judged.
+                (format!("gh issue transfer {ISSUE_W} cameronsjo/y"), &*owned),
+                (
+                    format!("gh issue transfer {ISSUE_W} cameronsjo/y -R cameronsjo/y"),
+                    &*owned,
+                ),
+                (
+                    format!("gh issue transfer {ISSUE_W} cameronsjo/y --repo cameronsjo/y"),
+                    &*owned,
+                ),
+                (
+                    format!("gh issue transfer {ISSUE_W} cameronsjo/y --unknown -R cameronsjo/y"),
+                    &*owned,
+                ),
+                (
+                    format!("GH_REPO=cameronsjo/y gh issue transfer {ISSUE_W} cameronsjo/y"),
+                    &*owned,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert!(blocks(&result), "{command} in {cwd}");
+            }
+            // Flags that may name two repos still leave the unowned URL
+            // judged: the block is the unowned-repo one, not the two-repo
+            // one. `work-org/x` is no test: the two-repo message echoes the
+            // command, URL included.
+            let command = format!(
+                "gh issue transfer {ISSUE_W} cameronsjo/y -R cameronsjo/y --body -Rcameronsjo/z"
+            );
+            let result = GhWriteGuard.run(&input_with(&command, &owned));
+            assert!(blocks(&result), "{command}");
+            assert!(
+                msg(&result).contains("you don't own"),
+                "{command}: {}",
+                msg(&result)
+            );
+            // An owned `-R` outranks an unowned checkout, as on main.
+            for (command, cwd) in [
+                (format!("gh issue transfer {url} cameronsjo/y"), &*owned),
+                (
+                    format!("gh issue transfer {url} cameronsjo/y -R cameronsjo/y"),
+                    &*unowned,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert!(!blocks(&result), "{command} in {cwd}: {}", msg(&result));
+            }
+        });
+        let inherited = owners_env().map(|(key, value)| match key {
+            "GH_REPO" => (key, Some("cameronsjo/y")),
+            _ => (key, value),
+        });
+        with_env(&inherited, || {
+            let owned = crate::github_origin_repo();
+            let owned = owned.path().to_string_lossy();
+            let command = format!("gh issue transfer {ISSUE_W} cameronsjo/y");
+            let result = GhWriteGuard.run(&input_with(&command, &owned));
+            assert!(blocks(&result), "{command} with GH_REPO inherited");
+        });
+    }
+
+    #[test]
+    fn owned_url_on_an_extra_host_allows() {
+        let command = "gh pr merge https://ghe.example.com/cameronsjo/x/pull/1 --squash";
+        with_env(&owners_env(), || {
+            assert!(blocks(&GhWriteGuard.run(&input_with(command, "/tmp"))));
+        });
+        let extras = owners_env().map(|(key, value)| match key {
+            "CADENCE_EXTRA_HOSTS" => (key, Some("ghe.example.com")),
+            _ => (key, value),
+        });
+        with_env(&extras, || {
+            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+            assert!(!blocks(&result), "{}", msg(&result));
+        });
+    }
+
+    #[test]
+    fn owned_url_argument_allows_from_any_directory() {
+        with_env(&owners_env(), || {
+            let unowned = unowned_checkout();
+            let unowned = unowned.path().to_string_lossy();
+            let url = "https://github.com/cameronsjo/x/pull/1";
+            for command in [
+                format!("gh pr merge {url} --squash"),
+                format!("gh pr merge {url} --squash -R evil/x"),
+                format!("gh issue close {}", url.replace("pull", "issues")),
+            ] {
+                for cwd in [&*unowned, "/tmp"] {
+                    let result = GhWriteGuard.run(&input_with(&command, cwd));
+                    assert!(!blocks(&result), "{command} in {cwd}: {}", msg(&result));
+                }
+            }
+            // Without the URL the checkout still decides.
+            let result = GhWriteGuard.run(&input_with("gh pr merge 1 --squash", &unowned));
+            assert!(blocks(&result));
+        });
+    }
+
+    #[test]
+    fn url_flag_value_leaves_the_checkout_as_the_target() {
+        with_env(&owners_env(), || {
+            let owned = crate::github_origin_repo();
+            let owned = owned.path().to_string_lossy();
+            for command in [
+                format!("gh pr comment 5 --body {URL_W}"),
+                format!("gh pr close 5 -c {URL_W}"),
+                format!("gh issue close 5 --duplicate-of {URL_W}"),
+            ] {
+                let result = GhWriteGuard.run(&input_with(&command, &owned));
+                assert!(!blocks(&result), "{command}: {}", msg(&result));
+            }
         });
     }
 }
