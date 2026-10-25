@@ -10286,8 +10286,9 @@ mod tests {
 
     #[test]
     fn unowned_fix_for_a_looped_repo_argument_follows_the_same_split() {
-        // The loop's name is an expansion, not a real repo; the split is the
-        // same one. A loop of creates keeps `$r`.
+        // The loop's name is an expansion, not a real repo. A loop of deletes
+        // gets `<repo>` by the split. A loop of creates gets it too: a fix
+        // never reuses an expanded name, since `$r` runs as shell.
         for (command, fix) in [
             (
                 r#"for r in a b; do gh repo delete "work-org/$r" --yes; done"#,
@@ -10295,7 +10296,7 @@ mod tests {
             ),
             (
                 r#"for r in a b; do gh repo create "work-org/$r" --private; done"#,
-                "gh repo create cameronsjo/$r",
+                "gh repo create cameronsjo/<repo>",
             ),
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
@@ -11002,7 +11003,7 @@ mod tests {
                 host: host.to_string(),
                 repo: repo.to_string(),
             };
-            let meta = judge_resolution(resolution, segment, "/tmp", &o, &[], &[])
+            let meta = judge_resolution(resolution, segment, &[], "/tmp", &o, &[], &[])
                 .and_then(|r| r.block_metadata)
                 .expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{repo}");
