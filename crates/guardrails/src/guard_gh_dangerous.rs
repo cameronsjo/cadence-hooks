@@ -1307,6 +1307,13 @@ mod tests {
             "echo 'gh repo delete o/r --yes' | /bin/bash",
             "echo x | tee log | echo 'gh repo delete o/r --yes' | bash",
             "echo 'echo \"gh repo delete o/r --yes\" | bash' | bash",
+            // `pipefail` is the value of `-o`, not a script file, so the shell
+            // still reads its script from stdin.
+            "echo 'gh repo delete o/r --yes' | bash -euo pipefail",
+            "echo 'gh repo delete o/r --yes' | zsh -euo pipefail",
+            // `-s` reads stdin even with a value and an operand after it.
+            "echo 'gh repo delete o/r --yes' | bash -so pipefail x",
+            "echo 'gh repo delete o/r --yes' | bash -O extglob",
         ] {
             let result = GhDangerousGuard.run(&make_bash(command));
             assert_eq!(
@@ -1321,6 +1328,10 @@ mod tests {
             "echo 'gh repo delete o/r --yes' > notes.md",
             "echo 'gh pr list' | bash",
             "cat notes.md | bash",
+            // A script file after the value makes stdin data again.
+            "echo 'gh repo delete o/r --yes' | bash -euo pipefail script.sh",
+            // zsh's `-O` is a plain flag: zsh runs the file `extglob`.
+            "echo 'gh repo delete o/r --yes' | zsh -O extglob",
         ] {
             let result = GhDangerousGuard.run(&make_bash(command));
             assert_eq!(

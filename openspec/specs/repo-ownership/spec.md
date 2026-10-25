@@ -107,7 +107,7 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook allows
 
 ### Requirement: gh write to a repository the operator does not own
-`guard-gh-write` (PreToolUse, Bash) SHALL block (exit 2, `gh write targets repo you don't own`) a `gh` write on a repository outside the allowlist, judging each segment of a chain on its own target. The target SHALL be read from `-R`/`--repo`, a `GH_REPO` assignment, a `gh repo` verb's positional `owner/repo`, a `gh api repos/<owner>/<repo>/...` path, and otherwise the git remotes of the directory the segment runs in. Reads SHALL be allowed whatever the target.
+`guard-gh-write` (PreToolUse, Bash) SHALL block (exit 2, `gh write targets repo you don't own`) a `gh` write on a repository outside the allowlist, judging each segment of a chain on its own target. The target SHALL be read from a PR or issue URL argument, `-R`/`--repo`, a `GH_REPO` assignment, a `gh repo` verb's positional `owner/repo`, a `gh api repos/<owner>/<repo>/...` path, and otherwise the git remotes of the directory the segment runs in. Reads SHALL be allowed whatever the target.
 
 #### Scenario: Ordinary write with an owned target
 - **WHEN** the command is `gh pr create -R cameronsjo/tool --title t --body-file b.md` and `cameronsjo` is allowed
@@ -120,6 +120,10 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 #### Scenario: Read on an unowned repo
 - **WHEN** the command is `gh pr view 5 -R someone/else` or `gh repo clone someone/else`
 - **THEN** the hook allows
+
+#### Scenario: Repo created from an owned template
+- **WHEN** the command is `gh repo create --template cameronsjo/tpl work-org/x --private`
+- **THEN** the hook exits 2 naming `work-org/x`, because under `gh repo create` `--template` and `-p` take the template as their value and the argument is the new repository
 
 ### Requirement: What counts as a gh write
 `guard-gh-write` SHALL treat as writes: `gh pr|issue|release|label|repo|gist|workflow` with a mutating verb (`create`, `merge`, `close`, `comment`, `edit`, `delete`, `review`, `ready`, `reopen`, `lock`, `archive`, `rename`, `transfer`, `fork`, `run`, `enable`, `disable`), `gh secret|variable set|delete`, `gh release upload`, `gh label clone`, and `gh api` with a mutating `-X`/`--method`, a field flag or `--input`, unless an explicit `GET` method is given.
@@ -148,7 +152,7 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook exits 2 with `Not configured`
 
 ### Requirement: gh writes allowed without an ownership check
-`guard-gh-write` SHALL allow `gh gist` writes and `gh repo fork` (they land under the operator's account) and `gh issue create --web`/`-w` unless the command sets `BROWSER=` or `GH_BROWSER=`. A loop of writes with no `-R` SHALL be allowed when its body never changes directory and the directory resolves to an owned non-fork repository; with `CADENCE_GH_STRICT_LOOPS=1` it MUST block and suggest the resolved `-R`. An ownership probe past the git-probe deadline MUST allow.
+`guard-gh-write` SHALL allow `gh gist` writes and `gh repo fork` (they land under the operator's account) and `gh issue create --web`/`-w` unless the command sets `BROWSER=` or `GH_BROWSER=`. A loop of writes that name no target SHALL be allowed when its body never changes directory and the directory resolves to an owned non-fork repository; with `CADENCE_GH_STRICT_LOOPS=1` it MUST block and suggest the resolved target. An ownership probe past the git-probe deadline MUST allow.
 
 #### Scenario: Gist from an unowned checkout
 - **WHEN** `gh gist create notes.md` runs in a checkout whose remote is unowned
@@ -266,7 +270,7 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook allows
 
 ### Requirement: gh writes in a loop the parser reads
-In a loop the loop parser reads, `guard-gh-write` MUST block a gh write with no `-R` when the loop body changes directory or the directory does not resolve to an owned non-fork repository, and the reason SHALL name `-R` as the fix.
+In a loop the loop parser reads, `guard-gh-write` MUST block a gh write that names no target when the loop body changes directory or the directory does not resolve to an owned non-fork repository. A write names its target with `-R`, or for `gh repo archive`, `delete`, `edit` and `create`, which take no `-R`, with a repository argument whose owner is spelled out. The reason SHALL name `-R` as the fix, or that argument for those verbs.
 
 #### Scenario: Loop that changes directory
 - **WHEN** the command is `for d in a b; do cd $d; gh issue close 1; done` in an owned checkout
@@ -275,6 +279,26 @@ In a loop the loop parser reads, `guard-gh-write` MUST block a gh write with no 
 #### Scenario: Loop in an unowned checkout
 - **WHEN** the command is `for n in 1 2; do gh issue close $n; done` in a checkout whose remote is unowned
 - **THEN** the hook exits 2
+
+#### Scenario: Loop of repo archives under an allowed owner
+- **WHEN** the command is `for r in a b; do gh repo archive "cameronsjo/$r" --yes; done` in a directory with no git remote
+- **THEN** the hook allows
+
+#### Scenario: Loop of repo archives that changes directory
+- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for d in a b; do cd "$d"; gh repo archive "cameronsjo/$d" --yes; done`
+- **THEN** the hook allows, because the argument names the target wherever the loop runs
+
+#### Scenario: Loop of repo archives under an unowned owner
+- **WHEN** the command is `for r in a b; do gh repo archive "evil/$r" --yes; done`, in any directory
+- **THEN** the hook exits 2, because the per-segment check judges the owner `evil`
+
+#### Scenario: Loop of repo archives with a variable owner
+- **WHEN** the command is `for r in a b; do gh repo archive "$o/$r" --yes; done` in a directory with no git remote
+- **THEN** the hook exits 2 and the reason names the repository argument (`gh repo archive owner/<repo>`), not `-R`
+
+#### Scenario: Loop of repo creates from an owned template
+- **WHEN** the command is `for r in a b; do gh repo create --template cameronsjo/tpl "work-org/$r" --private; done` in a directory with no git remote
+- **THEN** the hook exits 2, because the template is not the target and the new repository's owner `work-org` is not allowed
 
 ### Requirement: Strict loops the parser cannot read
 With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop parser cannot read when it shows a `for … in` or `while …; do` loop and holds a write judged for ownership that has no `-R`, `gh repo` positional `owner/repo` or literal `repos/<owner>/<repo>/…` path; a `GH_REPO` does not count. A write allowed without an ownership check stays allowed.
@@ -327,3 +351,38 @@ With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop
 #### Scenario: Unreadable chain with a branch switch
 - **WHEN** a comment takes `git push origin main && git checkout other && git push` past 12 KB, in an owned checkout
 - **THEN** the hook exits 0 with a nudge that says a bare push was checked against the branch checked out now
+
+### Requirement: gh write named by a PR or issue URL argument
+On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host a PR or issue URL there names before `-R`, `GH_REPO` and the checkout; under `gh issue transfer` the URL is judged in addition to them. A loop check SHALL still read `-R`, or without one the checkout, first. A URL it cannot read for certain SHALL be judged as before. An unowned URL SHALL block with a fix that names no target. A flag's value SHALL NOT count.
+
+#### Scenario: Unowned PR URL past an owned target
+- **WHEN** the command is `gh pr merge https://github.com/evil/repo/pull/1 --squash -R cameronsjo/tool`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2 naming `github.com/evil/repo`, and the fix asks the user to run the command and names no `cameronsjo/` repo
+
+#### Scenario: Owned issue URL outside an owned checkout
+- **WHEN** the command is `gh issue close https://github.com/cameronsjo/tool/issues/3`, in a checkout of `evil/repo` or in `/tmp`
+- **THEN** the hook allows
+
+#### Scenario: URL as a flag's value
+- **WHEN** the command is `gh pr comment 5 --body https://github.com/evil/repo/pull/1`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: Owned issue URL in a transfer from an unowned checkout
+- **WHEN** the command is `gh issue transfer https://github.com/cameronsjo/tool/issues/3 evil/repo`, in a checkout of `evil/repo`
+- **THEN** the hook exits 2 naming `evil/repo`
+
+#### Scenario: Owned PR URL in a loop from an unowned checkout
+- **WHEN** the command is `for n in 1 2; do gh pr merge https://github.com/cameronsjo/tool/pull/$n; done`, in a checkout of `evil/repo`
+- **THEN** the hook exits 2
+
+#### Scenario: Percent sign in the query
+- **WHEN** the command is `gh pr merge 'https://github.com/evil/repo/pull/1/files?file-filters%5B%5D=.rs'`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2 naming `github.com/evil/repo`
+
+#### Scenario: Percent sign in the path
+- **WHEN** the command is `gh pr merge https://github.com/evil%2Drepo/x/pull/1`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows, judging the checkout as before
+
+#### Scenario: Bad escape in the fragment
+- **WHEN** the command is `gh pr merge 'https://github.com/evil/repo/pull/1#f%zz'`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows, judging the checkout as before
