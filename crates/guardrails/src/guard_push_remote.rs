@@ -7,11 +7,11 @@
 use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
-use cadence_hooks_core::push::push_locations;
+use cadence_hooks_core::push::push_locations_reading;
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, LocatedSegment, git_push_count, git_push_segments, host_and_repo_from_url,
-    looks_like_push_url, parse_work_dir, runs_a_git_exec, segment_work_dirs, strip_group_wrappers,
-    strip_quotes,
+    LOOP_PATTERN, LocatedSegment, UnreadEval, git_push_count, git_push_segments,
+    host_and_repo_from_url, looks_like_push_url, parse_work_dir, runs_a_git_exec,
+    segment_work_dirs_reading, strip_group_wrappers, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -528,7 +528,9 @@ fn judge_literal_push_loop(
 /// cannot be known (cadence-hooks#1095). `None` when nothing blocks.
 ///
 /// **An unknowable repository blocks.** The push walk marks it for an `eval`
-/// (whose script can `cd` the parent shell), a `trap` action (which runs
+/// (whose script can `cd` the parent shell: one it can read, or one whose
+/// script it cannot see beside something it read that moves, see
+/// [`UNREAD_EVAL`]), a `trap` action (which runs
 /// wherever the shell has reached when the signal fires), a `--git-dir`/
 /// `--work-tree` or `GIT_DIR=`/`GIT_WORK_TREE=`/`GIT_CONFIG*` redirect, and a
 /// push hidden behind a prefix it cannot peel. Each of those can move the push
@@ -722,7 +724,15 @@ fn check_pushes_elsewhere(
     None
 }
 
-/// [`push_locations`] and [`may_push`] for the command being judged, each
+/// How both walks read an `eval` whose script needs expansion
+/// (`eval "$S"`, `eval "$(direnv export bash)"`): as leaving the shell where
+/// it was, unless something the walk read in it or around it moves. The
+/// guard then judges the push where it read it (cadence-ecosystem ADR-0046
+/// rule 3, cameronsjo/cadence-hooks#1530). An `eval` the walk can read, and
+/// one beside a read move, still leave the repository unknowable.
+const UNREAD_EVAL: UnreadEval = UnreadEval::StaysPut;
+
+/// [`push_locations_reading`] and [`may_push`] for the command being judged, each
 /// worked out at most once. Every caller passes the same verb-normalized
 /// command and start directory. [`may_push`] walks every segment of the
 /// command, and asking it for both the gate and the nudge doubled that walk
@@ -746,11 +756,11 @@ impl PushWalk {
             .get_or_init(|| push_locations_both_readings(command, cwd, self.segments(command, cwd)))
     }
 
-    /// [`segment_work_dirs`] for the command, walked once for both
+    /// [`segment_work_dirs_reading`] for the command, walked once for both
     /// [`push_locations_both_readings`] and [`segments_run_here`].
     fn segments(&self, command: &str, cwd: &str) -> &[LocatedSegment] {
         self.segments
-            .get_or_init(|| segment_work_dirs(command, cwd))
+            .get_or_init(|| segment_work_dirs_reading(command, cwd, UNREAD_EVAL))
     }
 
     fn may_push(&self, command: &str) -> bool {
@@ -758,8 +768,8 @@ impl PushWalk {
     }
 }
 
-/// Every push [`push_locations`] finds, plus every push it places nowhere
-/// the per-segment reading does ([`segment_work_dirs`]): each top-level
+/// Every push [`push_locations_reading`] finds, plus every push it places nowhere
+/// the per-segment reading does ([`segment_work_dirs_reading`]): each top-level
 /// segment walked on its own, in the directory that segment runs in.
 ///
 /// The push walk scopes a subshell only when the whole `( … )` is one
@@ -774,7 +784,7 @@ fn push_locations_both_readings(
     cwd: &str,
     located: &[LocatedSegment],
 ) -> Vec<cadence_hooks_core::push::PushInvocation> {
-    let mut pushes = push_locations(command, cwd);
+    let mut pushes = push_locations_reading(command, cwd, UNREAD_EVAL);
     let mut placed: std::collections::HashSet<(String, Option<String>)> = pushes
         .iter()
         .map(|push| (push.work_dir.clone(), push.repository.clone()))
@@ -791,7 +801,7 @@ fn push_locations_both_readings(
         if !mentions_push(raw) {
             continue;
         }
-        for push in push_locations(strip_group_wrappers(raw), dir) {
+        for push in push_locations_reading(strip_group_wrappers(raw), dir, UNREAD_EVAL) {
             if placed.insert((push.work_dir.clone(), push.repository.clone())) {
                 pushes.push(push);
             }
@@ -881,7 +891,7 @@ fn placed_elsewhere(stripped: &str, dir: &str, segments: &[Vec<String>], work_di
     }) {
         return false;
     }
-    let placed = push_locations(stripped, dir);
+    let placed = push_locations_reading(stripped, dir, UNREAD_EVAL);
     placed.len() == segments.len()
         && placed.iter().all(|push| {
             push.work_dir != work_dir
@@ -3216,9 +3226,12 @@ mod tests {
                     Allow,
                 ),
                 ("eval \"$(zoxide init bash)\"; git push origin feat", Allow),
+                // An `eval` of text the walk cannot see, with nothing read
+                // in it or around it that moves, leaves the push where it
+                // was read (cameronsjo/cadence-hooks#1530).
                 (
                     "eval \"$(direnv export bash)\"; git push origin feat",
-                    Block,
+                    Allow,
                 ),
                 (
                     "eval \"$(zoxide init bash --cmd cd)\"; git push origin feat",
@@ -3242,7 +3255,8 @@ mod tests {
                     "eval \"$(ssh-agent -s)\" && cd \"$D\" && git push origin feat",
                     Nudge,
                 ),
-                ("eval \"$(cat env.sh)\"; git push origin feat", Block),
+                // #1530, as above.
+                ("eval \"$(cat env.sh)\"; git push origin feat", Allow),
                 // Review of #1132.
                 (
                     "eval \"$(ssh-agent -s)\" > /dev/null && git push origin feat",
@@ -3260,9 +3274,10 @@ mod tests {
                     "eval \"$(ssh-agent -a /tmp/s -t1h -E sha256)\"; git push origin feat",
                     Allow,
                 ),
+                // Not the tool-init idiom, but an unread `eval` (#1530).
                 (
                     "eval \"$(ssh-agent -s mycmd)\"; git push origin feat",
-                    Block,
+                    Allow,
                 ),
                 (
                     "ssh-agent(){ echo 'cd {other}'; }; eval \"$(ssh-agent -s)\"; git push origin feat",
@@ -3292,7 +3307,8 @@ mod tests {
                     "cd '$(git rev-parse --show-toplevel)' && git push origin feat",
                     Nudge,
                 ),
-                ("eval '$(ssh-agent -s)'; git push origin feat", Block),
+                // #1530, as above: quoted, it is not the idiom, and unread.
+                ("eval '$(ssh-agent -s)'; git push origin feat", Allow),
                 (
                     "git -C \"$(git rev-parse --show-toplevel)\" push origin feat",
                     Allow,
@@ -3344,6 +3360,149 @@ mod tests {
                 let command = command.replace("{other}", &other).replace("{cwd}", &cwd);
                 let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, &cwd));
                 assert_eq!(result.outcome, outcome, "{command}: {:?}", result.message);
+            }
+        });
+    }
+
+    /// An `eval` of text the walks cannot see (`eval "$S"`, the direnv
+    /// line) leaves the push where the guard read it, unless something read
+    /// in the `eval` or around it moves (cameronsjo/cadence-hooks#1530,
+    /// cadence-ecosystem ADR-0046 rule 3). Every block that rests on
+    /// something read still holds. Every row is `(command, run from the
+    /// owned checkout?, outcome)`; `{O}` is the owned checkout, `{U}` an
+    /// unowned one.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_after_an_unread_eval_is_judged_where_it_was_read() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let owned = checkout_with_origin("https://github.com/cameronsjo/x.git");
+        let unowned = checkout_with_origin("https://github.com/evil/y.git");
+        for sub in ["a", "b", "c"] {
+            std::fs::create_dir(owned.path().join(sub)).expect("create sub");
+        }
+        let o = owned.path().to_string_lossy().to_string();
+        let u = unowned.path().to_string_lossy().to_string();
+        with_env(&owners_only(), || {
+            for (command, in_owned, outcome) in [
+                // Nothing read moves: judged where it was read.
+                ("eval \"$S\"; git push origin feat", true, Allow),
+                ("eval \"${S}\"; git push origin feat", true, Allow),
+                ("eval -- \"$S\"; git push origin feat", true, Allow),
+                (
+                    "eval \"$(direnv export bash)\"; git push origin feat",
+                    true,
+                    Allow,
+                ),
+                (
+                    "eval \"$(direnv export zsh)\" && git push -u origin HEAD",
+                    true,
+                    Allow,
+                ),
+                (
+                    "eval `direnv export bash`; git push origin feat",
+                    true,
+                    Allow,
+                ),
+                ("eval $(cat x); git push origin feat", true, Allow),
+                (
+                    "if true; then eval \"$S\"; fi; git push origin feat",
+                    true,
+                    Allow,
+                ),
+                ("bash -c 'eval \"$S\"; git push origin feat'", true, Allow),
+                (
+                    "cd {O} && eval \"$S\" && git push origin feat",
+                    false,
+                    Allow,
+                ),
+                // Three pushes in three directories, under the cap of four.
+                (
+                    "eval \"$S\"; git -C a push origin feat && git -C b push origin feat && git -C c push origin feat",
+                    true,
+                    Allow,
+                ),
+                // The same pushes from the unowned checkout.
+                ("eval \"$S\"; git push origin feat", false, Block),
+                (
+                    "eval \"$(direnv export bash)\"; git push origin feat",
+                    false,
+                    Block,
+                ),
+                // Something read moves, or something in the `eval` is not
+                // read.
+                ("eval \"cd $D\"; git push origin feat", true, Block),
+                (
+                    "eval \"$(zoxide init bash --cmd cd)\"; git push origin feat",
+                    true,
+                    Block,
+                ),
+                ("eval \"$S\" pushd /u; git push origin feat", true, Block),
+                ("S='cd {U}'; eval \"$S\"; git push origin feat", true, Block),
+                (
+                    "export S='cd {U}'; eval \"$S\"; git push origin feat",
+                    true,
+                    Block,
+                ),
+                (
+                    "f() { echo hi; }; eval \"$S\"; git push origin feat",
+                    true,
+                    Block,
+                ),
+                (
+                    "PATH=/x:$PATH; eval \"$S\"; git push origin feat",
+                    true,
+                    Block,
+                ),
+                (
+                    "alias g=git; eval \"$S\"; git push origin feat",
+                    true,
+                    Block,
+                ),
+                (
+                    "source .envrc; eval \"$S\"; git push origin feat",
+                    true,
+                    Block,
+                ),
+                ("eval \"$1\"; git push origin feat", true, Block),
+                ("eval \"${S:-cd /u}\"; git push origin feat", true, Block),
+                ("eval \"$S\" 'c\\d /u'; git push origin feat", true, Block),
+                // An `eval` the walk can read still leaves the repository
+                // unknowable: the push walk does not follow its script.
+                ("eval 'echo hi'; git push origin feat", true, Block),
+                ("eval \"cd {U}\"; git push origin feat", true, Block),
+                // A redirect or a read move after the `eval`.
+                (
+                    "eval \"$S\"; GIT_DIR={U}/.git git push origin feat",
+                    true,
+                    Block,
+                ),
+                ("eval \"$S\"; cd {U} && git push origin feat", true, Block),
+                (
+                    "eval \"$S\"; pushd {U} && git push origin feat",
+                    true,
+                    Block,
+                ),
+                ("eval \"$S\"; git -C {U} push origin feat", true, Block),
+                ("eval \"$S\"; env -C {U} git push origin feat", true, Block),
+                (
+                    "eval \"$S\"; git push https://github.com/evil/y.git feat",
+                    true,
+                    Block,
+                ),
+                (
+                    "eval \"$S\"; git push origin feat && git checkout main && git push",
+                    true,
+                    Block,
+                ),
+            ] {
+                let command = command.replace("{O}", &o).replace("{U}", &u);
+                let cwd = if in_owned { &o } else { &u };
+                let result = PushRemoteGuard.run(&make_bash_with_cwd(&command, cwd));
+                assert_eq!(
+                    result.outcome, outcome,
+                    "{command} (from {cwd}): {:?}",
+                    result.message
+                );
             }
         });
     }

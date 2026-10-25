@@ -183,7 +183,10 @@ fn word_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// Same alias, same case-SENSITIVE subcommand spelling, as
 /// `prevent_secret_writes::writer_targets`. `git`'s global options sit between
 /// the verb and the subcommand, so `git -C . rm note.md` is read past them
-/// rather than resolving its subcommand to `-C` (#528 review I2).
+/// rather than resolving its subcommand to `-C` (#528 review I2). A `git rm`
+/// that is told `--cached` ([`git_rm_keeps_the_tree`]) deletes nothing from disk.
+/// `writer_targets` does not honor `--cached` yet (#1535), so the two readers
+/// disagree there: `git rm --cached .env` still blocks in prevent-secret-writes.
 fn head_deletes(argv: &[String]) -> bool {
     let Some(first) = argv.first() else {
         return false;
@@ -192,9 +195,41 @@ fn head_deletes(argv: &[String]) -> bool {
     DESTRUCTIVE_VERBS.contains(&verb.as_ref())
         || (verb == "git"
             && skip_git_global_options(&argv[1..])
-                .first()
-                .map(String::as_str)
-                == Some("rm"))
+                .split_first()
+                .is_some_and(|(sub, rest)| sub == "rm" && !git_rm_keeps_the_tree(rest)))
+}
+
+/// Does this `git rm` (the words after `rm`) take the path out of the index
+/// and leave the working-tree file alone? That is `--cached`, which git reads
+/// among the options in any order and ahead of any `--` (or `--end-of-options`),
+/// beside `-r`, `-q`, `-f`. git takes an unambiguous prefix of a long option, so
+/// `--cach` and `--c` are `--cached`, and `--no-cached` (`--no-c`) turns it
+/// off again; the last of the two wins. There is no short form, and after `--`
+/// the word is a file named `--cached`, which `git rm` does delete.
+///
+/// Only the words git reads as typed count
+/// ([`git_rm_option_words`](cadence_hooks_core::shell::git_rm_option_words)):
+/// in `git rm -f note.md $(git diff --name-only --cached)` the `--cached` is
+/// `git diff`'s, and git deletes the note (cadence-hooks#1556 review N1).
+///
+/// A word that is the value of an option such as `--pathspec-from-file` is
+/// read as an option here, which no one types. A word whose value is known only
+/// when the command runs (a substitution, an unresolved `$o`) is not read, so a
+/// `--no-cached` or `--` it would expand to goes unseen; only a crafted command
+/// spells that (cadence-ecosystem ADR-0046 rule 1).
+fn git_rm_keeps_the_tree(args: &[String]) -> bool {
+    let mut cached = false;
+    for arg in cadence_hooks_core::shell::git_rm_option_words(args) {
+        let Some(name) = arg.strip_prefix("--") else {
+            continue;
+        };
+        if "cached".starts_with(name) {
+            cached = true;
+        } else if name.len() > "no-".len() && "no-cached".starts_with(name) {
+            cached = false;
+        }
+    }
+    cached
 }
 
 /// The command a `coproc` runs, given the `argv` that starts with `coproc`
@@ -555,18 +590,81 @@ fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> boo
 /// Verbs that neither touch the filesystem nor run another command, so a
 /// segment made of one (with no output redirect) cannot change what a
 /// sibling deletion's operand resolves to.
+/// `exit` only ends the shell, so it can stop a later deletion from running
+/// and never moves one (cameronsjo/cadence-hooks#1536). `set` is not here: a
+/// few of its options do reach a deletion, so [`set_toggles_only_strict_mode`]
+/// reads its arguments.
 const INERT_VERBS: &[&str] = &[
-    "echo", "printf", "true", ":", "ls", "cat", "pwd", "test", "[",
+    "echo", "printf", "true", ":", "ls", "cat", "pwd", "test", "[", "exit",
 ];
 
+/// The `set` option letters that mean the same harmless thing in bash, zsh
+/// and ksh: `e` (exit on error), `u` (fail on an unset variable), `x` and `v`
+/// (trace to stderr), and `E` (bash: traps follow functions; zsh: `pushd`
+/// prints less).
+const STRICT_MODE_SET_LETTERS: &str = "euxvE";
+
+/// The `set -o` names of those options, plus `pipefail`, as bash spells them.
+/// zsh ignores case and `_` in a name (`ERR_EXIT`), so a name is compared in
+/// that form.
+const STRICT_MODE_SET_NAMES: &[&str] = &[
+    "errexit", "nounset", "xtrace", "verbose", "errtrace", "pipefail",
+];
+
+/// Is this `set` one a script runs for strict mode, and nothing else
+/// (cameronsjo/cadence-hooks#1536)? `set -euo pipefail`, `set -e`, `set +x`,
+/// `set -o errexit`, and a bare `set` or `set -o` (which print) qualify: each
+/// argument is a `-`/`+` cluster of [`STRICT_MODE_SET_LETTERS`], where a final
+/// `o` takes the next argument as one of [`STRICT_MODE_SET_NAMES`].
+///
+/// Any other `set` keeps the verdict, because some options reach a deletion:
+/// zsh's and ksh's `set -A t note.md` puts `note.md` in `$t`, so a variable
+/// assigned from `mktemp` no longer holds the temp path at `rm -f "$t"`; and
+/// bash's `set -P`, zsh's `set -w` and `set -o physical` make `cd link/..`
+/// land beside the link's target instead of beside the link, so a deletion
+/// placed by that `cd` moves. A positional argument or `--` keeps it too, as
+/// does any letter not listed.
+fn set_toggles_only_strict_mode(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(cluster) = arg.strip_prefix(['-', '+']) else {
+            return false;
+        };
+        let (letters, names_next) = match cluster.strip_suffix('o') {
+            Some(letters) => (letters, true),
+            None => (cluster, false),
+        };
+        if (letters.is_empty() && !names_next)
+            || !letters.chars().all(|c| STRICT_MODE_SET_LETTERS.contains(c))
+        {
+            return false;
+        }
+        if names_next
+            && let Some(name) = args.next()
+            && !STRICT_MODE_SET_NAMES.contains(&name.to_ascii_lowercase().replace('_', "").as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does this command run only an [`INERT_VERBS`] verb, or a `set` that
+/// toggles only strict mode ([`set_toggles_only_strict_mode`])?
+fn runs_inert_verb(argv: &[String]) -> bool {
+    argv.first().is_some_and(|first| {
+        let verb = command_word(first);
+        INERT_VERBS.contains(&verb.as_ref())
+            || (verb == "set" && set_toggles_only_strict_mode(&argv[1..]))
+    })
+}
+
 /// Is this non-deleting segment one that cannot reshape the filesystem before
-/// a sibling deletion runs? An [`INERT_VERBS`] head with no output redirect.
-/// Everything else — `ln`, `mv`, `cp`, `mkdir`, `cd`, `pushd`, a shell wrapper,
-/// `find`, `eval`, a function call, an unknown command — is not.
+/// a sibling deletion runs? An inert head ([`runs_inert_verb`]) with no output
+/// redirect. Everything else — `ln`, `mv`, `cp`, `mkdir`, `cd`, `pushd`, a
+/// shell wrapper, `find`, `eval`, a function call, an unknown command — is not.
 fn is_inert_segment(argv: &[String], segment: &str) -> bool {
-    argv.first()
-        .is_some_and(|first| INERT_VERBS.contains(&command_word(first).as_ref()))
-        && redirect_targets(segment).is_empty()
+    runs_inert_verb(argv) && redirect_targets(segment).is_empty()
 }
 
 /// Can the command give a variable a value that no assignment segment shows,
@@ -2525,6 +2623,13 @@ mod tests {
             ("/home/me/Documents", "rm Vault2/x", Allow),
             ("/home/me/project", "rm -rf ~/.cache/x", Allow),
             ("/home/me", "rm -rf ~other/Documents", Allow),
+            // `--cached` leaves the file on disk, so no operand is deleted.
+            ("/home/me", "git rm -r --cached ~/Documents", Allow),
+            (
+                "/home/me",
+                "git rm -r --cached --no-cached ~/Documents",
+                Block,
+            ),
             // Words that are not deletion operands are not judged.
             ("/home/me", "echo ~/Documents", Allow),
             ("/home/me", "ls ~/Documents; rm x", Allow),
@@ -3464,6 +3569,110 @@ mod tests {
         }
     }
 
+    /// `git rm --cached` takes a path out of the index and leaves the file on
+    /// disk, so it deletes no vault file; a `git rm` without it does. Every
+    /// row was run through `git` 2.43 for what it removes: `--cached` counts
+    /// among the options in any order, an unambiguous prefix of it counts, a
+    /// later `--no-cached` undoes it, and after `--` the word is a file.
+    #[test]
+    fn git_rm_cached_leaves_the_working_tree_file_and_is_allowed() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("git rm --cached note.md", Allow),
+            ("git rm -r --cached sub/", Allow),
+            ("git rm --cached -r .", Allow),
+            ("git -C . rm --cached note.md", Allow),
+            ("git rm -rf --cached .", Allow),
+            ("git rm -r -q --cached sub/", Allow),
+            ("git rm note.md --cached", Allow),
+            ("git rm --cached -- note.md", Allow),
+            ("git rm --cach note.md", Allow),
+            ("git rm --c note.md", Allow),
+            ("git rm --no-cached --cached note.md", Allow),
+            // `--n` and `--no-` are ambiguous to git, which refuses the line.
+            ("git rm --cached --n note.md", Allow),
+            ("git rm --cached --no- note.md", Allow),
+            // Wherever the same `git rm` is read.
+            ("sudo git rm --cached note.md", Allow),
+            ("git ls-files -z | xargs -0 git rm --cached", Allow),
+            (r"find . -name '*.md' -exec git rm --cached {} \;", Allow),
+            ("sh -c 'git rm --cached note.md'", Allow),
+            ("flock /tmp/l git rm --cached note.md", Allow),
+            ("cd sub && git rm --cached note.md", Allow),
+            ("cd /tmp && git rm --cached x", Allow),
+            ("git rm --cached note.md && git commit -m untrack", Allow),
+            // Without `--cached`, or with it past `--`, the file is deleted.
+            ("git rm note.md", Block),
+            ("git rm -r sub/", Block),
+            ("git rm -rf .", Block),
+            ("git -C . rm -r sub/", Block),
+            ("git rm -- --cached", Block),
+            ("git rm -r -- --cached", Block),
+            ("git rm -- note.md --cached", Block),
+            ("git rm --end-of-options --cached", Block),
+            ("git rm ./--cached", Block),
+            ("git rm cached", Block),
+            // `--no-cached`, or an abbreviation of it, undoes an earlier one.
+            ("git rm --cached --no-cached note.md", Block),
+            ("git rm --cached --no-c note.md", Block),
+            ("git rm --cached --no-ca note.md", Block),
+            // The rest of the command is judged as it was.
+            ("git rm --cached note.md; rm note.md", Block),
+            ("sh -c 'git rm --cached note.md; rm note.md'", Block),
+            ("git ls-files | xargs git rm", Block),
+            (r"find . -exec git rm {} \;", Block),
+            ("sudo git rm note.md", Block),
+        ];
+        for &(command, expected) in cases {
+            assert_eq!(
+                outcome_in_vault(command),
+                expected,
+                "cwd=/vault/notes: {command}"
+            );
+        }
+    }
+
+    /// A `--cached` inside a command substitution is the inner command's, so
+    /// the `git rm` around it still deletes (cadence-hooks#1556 review N1).
+    /// A substitution that ends the segment reached the option scan split at
+    /// blanks, so its `--cached` was read as `git rm`'s and the note's
+    /// deletion was allowed. Every row was run through `git` 2.43: the Block
+    /// rows delete `note.md`, the Allow rows leave it on disk.
+    #[test]
+    fn git_rm_reads_no_cached_from_a_command_substitution() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("git rm -f note.md $(git diff --name-only --cached)", Block),
+            ("git rm note.md $(git diff --cached --name-only)", Block),
+            ("git rm -r sub/ $(git diff --cached --name-only)", Block),
+            (
+                "git rm -f note.md $(git diff --name-only --cached) && git commit -m x",
+                Block,
+            ),
+            (
+                "git rm -f note.md $(git diff --name-only --cached); echo ok",
+                Block,
+            ),
+            ("git rm -f note.md `git diff --name-only --cached`", Block),
+            (
+                "git rm -f note.md $(git diff --name-only --cached) x.md",
+                Block,
+            ),
+            // A real `--cached` outside the substitution still counts.
+            ("git rm --cached note.md $(git ls-files -d)", Allow),
+            ("git rm --cached note.md $(printf -- x)", Allow),
+            ("git rm $(git ls-files -d) --cached note.md", Allow),
+            ("git rm --cached -r . `git ls-files -d`", Allow),
+        ];
+        for &(command, expected) in cases {
+            assert_eq!(
+                outcome_in_vault(command),
+                expected,
+                "cwd=/vault/notes: {command}"
+            );
+        }
+    }
+
     #[test]
     fn runner_prefixes_outside_transparent_rm_inside_vault_blocked() {
         // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
@@ -3516,6 +3725,64 @@ mod tests {
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
             );
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1536 step 1: `exit` and a strict-mode `set`
+    /// are inert, so the script shapes that start with one, or bail out with
+    /// one, keep the fresh-`mktemp` relief and the outside-the-vault one. A
+    /// `set` that can move a deletion (zsh's `-A`, bash's `-P`, zsh's `-w`,
+    /// `-o physical`), one with a positional argument, and either verb with a
+    /// redirect keep the block.
+    #[test]
+    fn exit_and_a_strict_mode_set_are_inert() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // The issue's first three rows.
+            (
+                r#"set -euo pipefail; t=$(mktemp); trap 'rm -f "$t"' EXIT; echo x > "$t""#,
+                Allow,
+            ),
+            (r#"set -e; tmp=$(mktemp -d); rm -rf "$tmp""#, Allow),
+            (r#"t=$(mktemp) || exit 1; rm -f "$t""#, Allow),
+            // Other strict-mode spellings, and `exit` in other places.
+            (
+                r#"set -eu; set -o pipefail; t=$(mktemp); rm -f "$t""#,
+                Allow,
+            ),
+            (r#"set -Eeuo pipefail; t=$(mktemp); rm -f "$t""#, Allow),
+            (
+                r#"set -o errexit -o nounset; t=$(mktemp); rm -f "$t""#,
+                Allow,
+            ),
+            (r#"set -o ERR_EXIT; t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"set -x; t=$(mktemp); rm -f "$t"; set +x"#, Allow),
+            (r#"set; t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"set -o; t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); rm -f "$t"; exit $?"#, Allow),
+            ("set -e; rm /tmp/x", Allow),
+            ("rm /tmp/x || exit 1", Allow),
+            // zsh and ksh put the words after `set -A t` in `$t`.
+            (r#"t=$(mktemp); set -A t note.md; rm -f "$t""#, Block),
+            (r#"t=$(mktemp); set +A t note.md; rm -f "$t""#, Block),
+            (r#"t=$(mktemp); set -eA t note.md; rm -f "$t""#, Block),
+            // `-P`, zsh's `-w` and `-o physical` change where `cd ..` lands.
+            ("set -P; rm /tmp/x", Block),
+            ("set -w; rm /tmp/x", Block),
+            ("set -o physical; rm /tmp/x", Block),
+            ("set -o chaselinks; rm /tmp/x", Block),
+            // A positional argument, `--` or a bare `-`.
+            (r#"set -- note.md; t=$(mktemp); rm -f "$t""#, Block),
+            (r#"set -e note.md; t=$(mktemp); rm -f "$t""#, Block),
+            (r#"set -; t=$(mktemp); rm -f "$t""#, Block),
+            // A redirect writes a file, as it does after `echo`.
+            ("exit > note.md; rm /tmp/x", Block),
+            ("set -x 2> note.md; rm /tmp/x", Block),
+        ];
+        for &(command, expected) in cases {
+            let result =
+                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::with(&["/tmp"]));
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
         }
     }
 
