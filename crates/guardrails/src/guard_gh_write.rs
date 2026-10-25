@@ -1447,10 +1447,16 @@ fn mentions_var(word: &str, name: &str) -> bool {
 /// default, or what an `export` earlier in the same command left behind (#548,
 /// see [`GhHostEnv`]). Inline and `--hostname` selections outrank it.
 fn gh_command_host(command: &str, env_host: &str) -> String {
-    let fallback = env_host.to_string();
-    let Some((tokens, gh_index)) = gh_command_tokens(command) else {
-        return fallback;
-    };
+    selected_gh_host(command, str::to_ascii_lowercase).unwrap_or_else(|| env_host.to_string())
+}
+
+/// The host one `gh` invocation selects itself, `--hostname` over an inline
+/// `GH_HOST=`, or `None` when it selects none; see [`gh_command_host`].
+/// `fold` is applied to the host as typed: [`gh_command_host`] folds its case
+/// to compare it, and a message shows it as typed ([`host_as_typed`]). The
+/// [`UNRESOLVED_GH_HOST`] stand-in is never folded.
+fn selected_gh_host(command: &str, fold: fn(&str) -> String) -> Option<String> {
+    let (tokens, gh_index) = gh_command_tokens(command)?;
     let table = host_scan_flags(&tokens[gh_index..]);
 
     // A prefix word whose NAME is not a plain literal (`env GH_HOS${X}T=h gh`)
@@ -1478,7 +1484,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
             .iter()
             .filter_map(|token| token.strip_prefix("GH_HOST="))
             .rfind(|host| !host.is_empty())
-            .map(str::to_ascii_lowercase)
+            .map(fold)
     };
 
     let mut flag_host = None;
@@ -1490,7 +1496,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
         }
         if token == "--hostname" {
             if let Some(host) = tokens.get(index + 1).filter(|host| !host.is_empty()) {
-                flag_host = Some(host.to_ascii_lowercase());
+                flag_host = Some(fold(host));
                 index += 2;
                 continue;
             }
@@ -1498,7 +1504,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
             .strip_prefix("--hostname=")
             .filter(|host| !host.is_empty())
         {
-            flag_host = Some(host.to_ascii_lowercase());
+            flag_host = Some(fold(host));
         } else if token.starts_with("--") {
             // Any other long flag. A value-taking one owns the following token
             // even when that value is the literal `--hostname`; a boolean long
@@ -1515,7 +1521,7 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
         index += 1;
     }
 
-    flag_host.or(inline_host).unwrap_or(fallback)
+    flag_host.or(inline_host)
 }
 
 #[cfg(test)]
@@ -1726,6 +1732,62 @@ fn loop_flag_value_is_owned(
         .all(|w| flag_value_is_owned(w, dh, allowed_owners, allowed_repos))
 }
 
+/// True when a target's host is one this guard can judge: no expansion in it
+/// (no `$` or backtick), and no `*`, which stands for a command substitution
+/// in the globbed reading (`GH_HOST=$(cat h)` and `-R "$(cat h)/o/r"` read as
+/// the host `*`). The [`UNRESOLVED_GH_HOST`] stand-in counts as read, though
+/// its text holds a `$`: its block names the host fix (#548).
+fn host_is_read(host: &str) -> bool {
+    host == UNRESOLVED_GH_HOST || !(repo_has_unexpanded_expansion(host) || host.contains('*'))
+}
+
+/// `host` as `segment` typed it. The guard folds a host's case before it
+/// compares it, but `$H` and `$h` are different shell variables, so a message
+/// that names an expanded host shows the text the command spelled (#1503).
+///
+/// The host is looked for in the target's own `HOST/` part, then in the host
+/// the command selects ([`selected_gh_host`]). The target is the `-R` or
+/// `--repo` value, and an inline `GH_REPO` only where
+/// [`resolve_target_repos_on`] reads one: with no `-R`, or beside a `-R` gh
+/// may ignore. A `-R` that decides the target leaves `GH_REPO` unread, as gh
+/// does. A `gh repo` argument is not read: its host is shown as given, unless
+/// the command selects the same host in another case, which is then shown
+/// (`GH_HOST=$h gh repo archive "$H/evil/x"` shows `$h`, though gh takes
+/// `$H`). A host the segment does not spell, such as the hook's own
+/// `GH_HOST`, is shown as given. Message only: no verdict reads it.
+fn host_as_typed(segment: &str, host: &str) -> String {
+    let typed_in = |text: &str| {
+        let at = text.to_ascii_lowercase().find(host)?;
+        text.get(at..at + host.len()).map(str::to_string)
+    };
+    // `gh api` takes no `-R`, so it never names the host there.
+    let flag = if gh_api_endpoint(segment).is_some() {
+        RepoFlag::Absent
+    } else {
+        repo_flag(segment)
+    };
+    let (flag_value, gh_repo) = match flag {
+        RepoFlag::Target(value) => (Some(value), None),
+        RepoFlag::TargetOrAbsent(value) => (Some(value), inline_gh_repo(segment)),
+        RepoFlag::Absent => (None, inline_gh_repo(segment)),
+        RepoFlag::Ambiguous => (None, None),
+    };
+    flag_value
+        .into_iter()
+        .chain(gh_repo)
+        .filter(|value| {
+            parse_gh_repo_value(value)
+                .and_then(|spec| spec.host)
+                .is_some_and(|value_host| value_host == host)
+        })
+        .find_map(|value| typed_in(&value))
+        .or_else(|| {
+            selected_gh_host(segment, str::to_owned)
+                .filter(|typed| typed.eq_ignore_ascii_case(host))
+        })
+        .unwrap_or_else(|| host.to_string())
+}
+
 /// For a blocked target that carries a shell expansion: true when it still
 /// names a literal owner this guard can read, and the allowlist rejects that
 /// owner. Only then does the block say "targets repo you don't own" rather
@@ -1736,10 +1798,7 @@ fn loop_flag_value_is_owned(
 ///
 /// All three must hold:
 ///
-/// - The host has no expansion: no `$` or backtick, and no `*`, which stands
-///   for a command substitution in the globbed reading (`GH_HOST=$(cat h)`
-///   reads as the host `*`). The [`UNRESOLVED_GH_HOST`] stand-in counts as
-///   read, though its text holds a `$`: its block names the host fix.
+/// - The host is one [`host_is_read`] can judge.
 /// - The owner is non-empty and uses only letters, digits, `-` and `_`. A
 ///   `_` cannot come from a host, a scheme or an expansion fragment, and
 ///   managed-user owners carry one (`mona_acme`). A `.` or `:` there means a
@@ -1759,9 +1818,7 @@ fn names_literal_unowned_owner(
     allowed_repos: &[AllowEntry],
 ) -> bool {
     let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
-    let host_is_read =
-        host == UNRESOLVED_GH_HOST || !(repo_has_unexpanded_expansion(host) || host.contains('*'));
-    host_is_read
+    host_is_read(host)
         && !owner.is_empty()
         && owner
             .chars()
@@ -4312,8 +4369,9 @@ fn judge_resolution(
         RepoResolution::Resolved { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 None
-            } else if repo_has_unexpanded_expansion(&repo)
-                && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos)
+            } else if !host_is_read(&host)
+                || (repo_has_unexpanded_expansion(&repo)
+                    && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos))
             {
                 // The target holds a shell expansion this guard never sees the
                 // value of, and no literal owner can be read past it, so it is
@@ -4322,14 +4380,27 @@ fn judge_resolution(
                 // chose onto `$1` (#757). A literal owner with an expanded
                 // name (`evil/$r`) is judged by its owner and gets the unowned
                 // message (#1491).
+                //
+                // An expansion in the host (`-R "$h/evil/x"`) is as unreadable
+                // as one in the name: the owner and name may be literal, but
+                // the guard cannot say where they live, and the unowned
+                // message's `-R cameronsjo/x` fix would drop the host. The
+                // loop's `-R` arm says the same of that value (#1507).
                 let literal = target_spelling(segment, "owner/repo");
+                // Name the part that expands: with only the host expanded,
+                // `Target:` shows the whole spec, host first, as typed.
+                let target = if repo_has_unexpanded_expansion(&repo) {
+                    repo
+                } else {
+                    format!("{}/{repo}", host_as_typed(segment, &host))
+                };
                 Some(CheckResult::block_structured(
                     format!(
                         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
                          Target:  {shown} (an unexpanded shell expansion — its value is only known \
                          when the shell runs)\n   \
                          Fix: pass the target as a literal `{literal}`",
-                        shown = sanitize_field(&repo, MAX_PATH_DISPLAY),
+                        shown = sanitize_field(&target, MAX_PATH_DISPLAY),
                     ),
                     BlockMetadata {
                         rule_id: "gh-write-target-unresolvable".to_string(),
@@ -9927,6 +9998,54 @@ mod tests {
         );
     }
 
+    /// cadence-hooks#1528: `--approve`, `-a` and `--undo` were read as flags
+    /// that take a value, so an owned `-R` after one also judged the cwd and
+    /// blocked outside an owned checkout. Each row is `(command, blocks?)`,
+    /// run from an unowned checkout and from a directory with no repository.
+    #[test]
+    fn a_verbs_no_value_flag_leaves_the_repo_flag_after_it_certain() {
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let plain = tempfile::tempdir().expect("tempdir");
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                ("gh pr review 1 --approve -R cameronsjo/tool", false),
+                ("gh pr review 1 -a -R cameronsjo/tool", false),
+                ("gh pr ready 5 --undo -R cameronsjo/tool", false),
+                ("gh pr review 1 -b ok --comment -R cameronsjo/tool", false),
+                ("gh pr review 1 -b ok -c -R cameronsjo/tool", false),
+                ("gh pr review 1 -b fix -r -R cameronsjo/tool", false),
+                ("gh pr review 1 --request-changes -R cameronsjo/tool", false),
+                (
+                    "for n in 1 2; do gh pr review $n --approve -R cameronsjo/tool; done",
+                    false,
+                ),
+                (
+                    "for n in 1 2; do gh pr ready $n --undo -R cameronsjo/tool; done",
+                    false,
+                ),
+                // An unowned target still blocks.
+                ("gh pr review 1 --approve -R evil/tool", true),
+                ("gh pr ready 5 --undo -R evil/tool", true),
+                // A flag that may take the `-R` as its value keeps the cwd in
+                // play: under `pr create`, `-a` is `--assignee`.
+                ("gh pr review 1 -b -R cameronsjo/tool", true),
+                ("gh pr close 1 --comment -R cameronsjo/tool", true),
+                ("gh pr create -a -R cameronsjo/tool -t t", true),
+            ] {
+                for cwd in [unowned.path(), plain.path()] {
+                    let cwd = cwd.to_str().expect("utf-8 path");
+                    let result = GhWriteGuard.run(&input_with(command, cwd));
+                    assert_eq!(
+                        matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                        blocks,
+                        "{command} from {cwd}: {:?}",
+                        result.message
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn spaced_repo_prose_in_a_body_does_not_manufacture_ambiguity() {
         // A spec carrying whitespace resolves to no repo at GitHub, so it can
@@ -11223,6 +11342,141 @@ mod tests {
                 assert_eq!(meta.fix, expected, "{command} in {cwd}");
             }
         }
+    }
+
+    #[test]
+    fn issue_1507_host_expansion_in_a_single_target_is_unresolvable() {
+        // An expansion in the host part of a target leaves the guard unable to
+        // say where `owner/repo` lives, whatever the owner is. The loop's `-R`
+        // arm already said so; the single command said "you don't own" with a
+        // fix that dropped the host.
+        let single = |flag: &str| format!("gh issue create {flag} --title t --body b");
+        // (command, the `Target:` line the block shows)
+        let unresolvable = [
+            (single(r#"-R "$h/evil/x""#), "$h/evil/x"),
+            (single(r#"-R "$h/cameronsjo/x""#), "$h/cameronsjo/x"),
+            (single(r#"--repo "$h/evil/x""#), "$h/evil/x"),
+            (single(r#"-R "https://$h/evil/x""#), "$h/evil/x"),
+            (single(r#"-R "${h}/evil/x""#), "${h}/evil/x"),
+            // A command substitution reads as the host `*` here.
+            (single(r#"-R "$(cat h)/evil/x""#), "*/evil/x"),
+            (single(r#"-R "`cat h`/evil/x""#), "*/evil/x"),
+            // The host comes from `--hostname` or an inline `GH_HOST`.
+            (single(r#"--hostname "$h" -R evil/x"#), "$h/evil/x"),
+            (
+                single("-R evil/x").replace("gh issue", "GH_HOST=$h gh issue"),
+                "$h/evil/x",
+            ),
+            // A `gh repo` verb's argument names its host the same way.
+            (
+                r#"gh repo archive "$h/evil/x" --yes"#.to_string(),
+                "$h/evil/x",
+            ),
+            // The host shows as typed: `$H` is not `$h` (#1503). The guard
+            // folds its case only to compare it.
+            (single(r#"-R "$H/evil/x""#), "$H/evil/x"),
+            (single(r#"-R "${GH_HOST}/evil/x""#), "${GH_HOST}/evil/x"),
+            (single(r#"-R "https://$H/evil/x""#), "$H/evil/x"),
+            (single(r#"--hostname "$H" -R evil/x"#), "$H/evil/x"),
+            (single(r#"--hostname="$H" -R evil/x"#), "$H/evil/x"),
+            (
+                "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
+                "$GH_HOST/cameronsjo/x",
+            ),
+            // An inline `GH_REPO` names its host as `-R` does, and so does a
+            // `-R` gh may ignore: one after `-s`, which this guard does not
+            // know takes no value under `gh pr merge`.
+            (
+                r#"GH_REPO="$H/evil/x" gh issue create --title t --body b"#.to_string(),
+                "$H/evil/x",
+            ),
+            (
+                r#"gh pr merge 5 -s -R "$H/evil/x""#.to_string(),
+                "$H/evil/x",
+            ),
+            // Beside that `-R`, gh reads an inline `GH_REPO`, and the host
+            // shown is the one it spells.
+            (
+                r#"GH_REPO="$H/z/y" gh pr merge 5 -s -R cameronsjo/x"#.to_string(),
+                "$H/z/y",
+            ),
+            // A host the command selects that did not decide is not shown in
+            // place of the one that did.
+            (
+                r#"GH_HOST=$z gh repo archive "$H/evil/x" --yes"#.to_string(),
+                "$H/evil/x",
+            ),
+            // A `-R` that decides the target leaves `GH_REPO` unread, as gh
+            // does, so the host shown is the inline `GH_HOST` that decided.
+            (
+                r#"GH_REPO="$H/z/y" GH_HOST=$h gh issue create -R evil/x --title t --body b"#
+                    .to_string(),
+                "$h/evil/x",
+            ),
+            // With the name expanded too, `Target:` names the expanded name,
+            // as it did before.
+            (single(r#"-R "$h/evil/$r""#), "evil/$r"),
+        ];
+        for (command, target) in &unresolvable {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(command, cwd, false);
+                assert!(blocks(&result), "{command} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("Cannot determine target repo"),
+                    "{command} in {cwd}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("Target:  {target} (an unexpanded shell expansion")),
+                    "{command} in {cwd}: {message}"
+                );
+                assert!(!message.contains("don't own"), "{command}: {message}");
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
+                assert!(!meta.fix.contains("cameronsjo/"), "{command}: {}", meta.fix);
+            }
+        }
+        // A host the guard can read keeps the unowned message and its fix.
+        for flag in [
+            r#"-R "evil/x""#,
+            r#"-R "github.com/evil/x""#,
+            r#"-R "https://github.com/evil/x""#,
+            r#"-R "ghe.corp/evil/x""#,
+            r#"--hostname ghe.corp -R evil/x"#,
+        ] {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(&single(flag), cwd, false);
+                assert!(blocks(&result), "{flag} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("gh write targets repo you don't own"),
+                    "{flag} in {cwd}: {message}"
+                );
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{flag}");
+                assert_eq!(meta.fix, "-R cameronsjo/x", "{flag}");
+            }
+        }
+        // A `GH_HOST` this guard cannot read is the stand-in host. Its text
+        // holds a `$`, but it is a host the guard judges: no allowed owner
+        // matches it, and the fix names the host (#548).
+        let result = run_1491(
+            &format!("export GH_HOST=$h; {}", single("-R cameronsjo/x")),
+            "/tmp",
+            false,
+        );
+        assert!(blocks(&result), "{:?}", result.message);
+        assert!(
+            msg(&result).contains("gh write targets repo you don't own"),
+            "{}",
+            msg(&result)
+        );
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        assert_eq!(
+            meta.fix,
+            "name the host on the gh command itself (--hostname <host>)"
+        );
     }
 
     #[test]
