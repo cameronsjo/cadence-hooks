@@ -13917,14 +13917,15 @@ pub fn git_rm_keeps_the_tree(args: &[String]) -> bool {
 /// Only `prevent_secret_writes::writer_targets` asks this (#1547).
 /// `obsidian-trash-guard` does not, so it still reads `git rm -n` as a deletion.
 ///
+/// Only the words git reads as typed count ([`git_rm_option_words`]): in
+/// `git rm -f .env $(head -n 1 list.txt)` the `-n` is `head`'s, and git
+/// deletes `.env`.
+///
 /// A word that is the value of an option such as `--pathspec-from-file` is
 /// read as an option here, which no one types.
 pub fn git_rm_is_dry_run(args: &[String]) -> bool {
     let mut dry_run = false;
-    for arg in args {
-        if arg == "--" || arg == "--end-of-options" {
-            break;
-        }
+    for arg in git_rm_option_words(args) {
         if let Some(name) = arg.strip_prefix("--") {
             if "dry-run".starts_with(name) {
                 dry_run = true;

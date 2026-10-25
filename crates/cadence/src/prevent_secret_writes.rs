@@ -1569,9 +1569,12 @@ mod tests {
     #[test]
     fn bash_git_rm_env_without_dry_run_still_blocked() {
         // After `--` the word is a file, and a later `--no-dry-run` undoes
-        // `-n`; a deleting sibling is judged as it always was.
+        // `-n`; a deleting sibling is judged as it always was. A `-n` inside
+        // a substitution is the inner command's, so git deletes `.env`.
         for command in [
             "git rm -f .env",
+            "git rm -f .env $(head -n 1 list.txt)",
+            "git rm .env `grep -n x notes`",
             "git rm -- -n .env",
             "git rm --end-of-options -n .env",
             "git rm -n --no-dry-run .env",
