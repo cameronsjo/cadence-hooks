@@ -1527,8 +1527,11 @@ mod tests {
     #[test]
     fn bash_git_rm_env_without_cached_still_blocked() {
         // After `--` the word is a file, and a later `--no-cached` undoes
-        // `--cached`; a deleting sibling is judged as it always was.
+        // `--cached`; a deleting sibling is judged as it always was. A
+        // `--cached` inside a substitution is the inner command's, so git
+        // deletes `.env` (cadence-hooks#1556 review N1).
         for command in [
+            "git rm -f .env $(git diff --name-only --cached)",
             "git rm -- --cached .env",
             "git rm --end-of-options --cached .env",
             "git rm --cached --no-cached .env",
