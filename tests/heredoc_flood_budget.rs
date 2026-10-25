@@ -22,8 +22,9 @@ fn scratch_metrics_dir() -> &'static std::path::Path {
         .path()
 }
 
-/// The wired group's hook deadline; past it the group fails open (exit 0, or
-/// exit 1 with degraded text on stderr).
+/// The wired group's hook deadline; past it the group fails open. It says so on
+/// stdout when it exits 0 (a member that finished nudged, so the notice rides
+/// the envelope's `additionalContext`) and on stderr when it exits 1.
 const GROUP_DEADLINE: Duration = Duration::from_millis(4000);
 
 fn run(args: &[&str], command: &str) -> (Output, Duration) {
@@ -139,12 +140,9 @@ fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
                 &command,
             );
             cadence_hooks_core::test_builders::assert_blocked_before_deadline(
-                &format!(
-                    "{name} ({} B); stderr: {}",
-                    command.len(),
-                    String::from_utf8_lossy(&out.stderr)
-                ),
+                &format!("{name} ({} B)", command.len()),
                 out.status.code(),
+                &String::from_utf8_lossy(&out.stdout),
                 &String::from_utf8_lossy(&out.stderr),
                 took,
                 GROUP_DEADLINE,
@@ -158,7 +156,9 @@ fn wired_cadence_group_blocks_nested_heredoc_floods_before_its_deadline() {
 /// makes the group stop waiting after ~1 s, and the debug-only stall keeps
 /// every member busy past that, whatever the machine's speed. The stall knob
 /// does not exist in release builds, so the test is ignored there; the debug
-/// suite runs it on every platform.
+/// suite runs it on every platform. Every member stalls, so none nudges and this
+/// is the exit-1, stderr form; the exit-0, stdout form is pinned by the unit
+/// tests in `test_builders` and by the flood test above under load.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "needs the debug-only group stall")]
 fn the_real_group_fail_open_is_accepted_only_without_timing_opt_in() {
@@ -177,14 +177,19 @@ fn the_real_group_fail_open_is_accepted_only_without_timing_opt_in() {
             ("CADENCE_TEST_GROUP_STALL_MS", "5000"),
         ],
     );
-    let (code, stderr) = (out.status.code(), String::from_utf8_lossy(&out.stderr));
+    let (code, stdout, stderr) = (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     let deadline = Duration::from_millis(1);
     assert!(
-        is_group_fail_open(false, code, &stderr, took, deadline),
-        "the real fail-open was not recognised: exit {code:?} after {took:?}; stderr: {stderr}"
+        is_group_fail_open(false, code, &stdout, &stderr, took, deadline),
+        "the real fail-open was not recognised: exit {code:?} after {took:?}; \
+         stdout: {stdout}; stderr: {stderr}"
     );
     assert!(
-        !is_group_fail_open(true, code, &stderr, took, deadline),
+        !is_group_fail_open(true, code, &stdout, &stderr, took, deadline),
         "strict mode must fail the real fail-open"
     );
 }
