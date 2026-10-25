@@ -9581,6 +9581,54 @@ mod tests {
         );
     }
 
+    /// cadence-hooks#1528: `--approve`, `-a` and `--undo` were read as flags
+    /// that take a value, so an owned `-R` after one also judged the cwd and
+    /// blocked outside an owned checkout. Each row is `(command, blocks?)`,
+    /// run from an unowned checkout and from a directory with no repository.
+    #[test]
+    fn a_verbs_no_value_flag_leaves_the_repo_flag_after_it_certain() {
+        let unowned = origin_checkout("https://github.com/evil/x.git");
+        let plain = tempfile::tempdir().expect("tempdir");
+        with_env(&owners_env(), || {
+            for (command, blocks) in [
+                ("gh pr review 1 --approve -R cameronsjo/tool", false),
+                ("gh pr review 1 -a -R cameronsjo/tool", false),
+                ("gh pr ready 5 --undo -R cameronsjo/tool", false),
+                ("gh pr review 1 -b ok --comment -R cameronsjo/tool", false),
+                ("gh pr review 1 -b ok -c -R cameronsjo/tool", false),
+                ("gh pr review 1 -b fix -r -R cameronsjo/tool", false),
+                ("gh pr review 1 --request-changes -R cameronsjo/tool", false),
+                (
+                    "for n in 1 2; do gh pr review $n --approve -R cameronsjo/tool; done",
+                    false,
+                ),
+                (
+                    "for n in 1 2; do gh pr ready $n --undo -R cameronsjo/tool; done",
+                    false,
+                ),
+                // An unowned target still blocks.
+                ("gh pr review 1 --approve -R evil/tool", true),
+                ("gh pr ready 5 --undo -R evil/tool", true),
+                // A flag that may take the `-R` as its value keeps the cwd in
+                // play: under `pr create`, `-a` is `--assignee`.
+                ("gh pr review 1 -b -R cameronsjo/tool", true),
+                ("gh pr close 1 --comment -R cameronsjo/tool", true),
+                ("gh pr create -a -R cameronsjo/tool -t t", true),
+            ] {
+                for cwd in [unowned.path(), plain.path()] {
+                    let cwd = cwd.to_str().expect("utf-8 path");
+                    let result = GhWriteGuard.run(&input_with(command, cwd));
+                    assert_eq!(
+                        matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                        blocks,
+                        "{command} from {cwd}: {:?}",
+                        result.message
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn spaced_repo_prose_in_a_body_does_not_manufacture_ambiguity() {
         // A spec carrying whitespace resolves to no repo at GitHub, so it can
