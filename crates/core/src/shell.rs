@@ -6051,6 +6051,12 @@ pub enum UnreadEval {
 /// `eval` (its words after `eval`) names `cd`, `pushd`, `popd` or `eval` or
 /// carries a backslash, and each expansion in them is a command substitution
 /// or a variable `mentions` ([`variable_mentions`]) never names.
+///
+/// Not read: what a command substitution prints, and `$_` (the previous
+/// command's last word, which this reads as a variable's name). A command
+/// that hides a `cd` in either (`eval "$(printf 'c%s' d)"`, `echo 'cd /x'
+/// >/dev/null; eval "$_"`) is crafted, which cadence-ecosystem ADR-0046 rule 1
+/// leaves out of scope.
 fn unread_eval_operands_stay_put<'w>(
     operands: impl IntoIterator<Item = &'w str>,
     mentions: &std::collections::HashMap<String, Vec<usize>>,

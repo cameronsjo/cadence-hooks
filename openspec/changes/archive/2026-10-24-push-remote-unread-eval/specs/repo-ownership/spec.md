@@ -22,7 +22,7 @@
 ## ADDED Requirements
 
 ### Requirement: Push after an eval of text built at run time
-`guard-push-remote` SHALL judge a push after an `eval` whose script is built at run time (`eval "$S"`, `eval "$(direnv export bash)"`) in the directory it read. It MUST still refuse the repository when something it read may move: the `eval`'s words name `cd`, `pushd`, `popd` or `eval`, or hold a backslash, a variable the command names, or an expansion other than `$NAME`, `${NAME}` and `$(…)`; or the command defines a function or may replace a tool. A literal `eval` still refuses.
+`guard-push-remote` SHALL judge a push after an `eval` whose script is built at run time (`eval "$S"`, `eval "$(direnv export bash)"`) in the directory it read. It MUST still refuse the repository when something it read may move: the `eval`'s words name `cd`, `pushd`, `popd` or `eval`, or hold a backslash, a variable the command names, or an expansion other than `$NAME`, `${NAME}` and `$(…)`; or the command defines a function, may replace a tool, or names a `GIT_` variable (`GIT_TRACE=1 git push`). A literal `eval` still refuses.
 
 #### Scenario: direnv line in an owned checkout
 - **WHEN** the command is `eval "$(direnv export bash)"; git push origin feat` in a checkout whose `origin` is owned
