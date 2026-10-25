@@ -6955,6 +6955,36 @@ mod tests {
     }
 
     #[test]
+    fn a_token_in_a_target_holding_an_expansion_is_masked() {
+        // The block for a repo holding `$` prints its `Target:` through
+        // `shown_url` too. An inherited `GH_REPO` URL with three path parts
+        // and a `$` lands there, with its token nowhere in the command.
+        let token = ["gh", "p_"].concat() + &"a1B2".repeat(9);
+        let url = format!("https://x:{token}@github.com/cameronsjo/r/$x");
+        let inherited = [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", None),
+            ("GH_HOST", None),
+            ("GH_REPO", Some(url.as_str())),
+        ];
+        with_env(&inherited, || {
+            let result = GhWriteGuard.run(&input_with("gh issue create -t t -b b", OWNED_DIR));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let message = result.message.unwrap_or_default();
+            assert!(
+                message.contains("unexpanded shell expansion"),
+                "{message:?}"
+            );
+            assert!(
+                message.contains("Target:  https://***@github.com/cameronsjo/r/$x ("),
+                "{message:?}"
+            );
+            assert!(!message.contains(&token), "{message:?}");
+        });
+    }
+
+    #[test]
     fn disallowed_message_includes_host_hint_for_self_hosted() {
         // GH_HOST moves the default host; read it under the env lock so a
         // concurrent GH_HOST mutator cannot change it mid-test (#938).
