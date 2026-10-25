@@ -2624,9 +2624,16 @@ impl Drop for EnvCleanup {
 /// Env a post's verdict reads that a Claude session can export. With
 /// `CADENCE_ALLOWED_OWNERS` naming this repo's owner, a post to its own
 /// origin is owned and every skill-id hit goes silent (#684), so a test that
-/// expects a nudge fails when run alone in such a shell.
+/// expects a nudge fails when run alone in such a shell. `GH_HOST` moves
+/// `config::default_host()` off `github.com`, so a slug on the default host
+/// stops matching the owners or the checkout's remotes.
 #[cfg(test)]
-const AMBIENT_POST_ENV: [&str; 3] = ["CADENCE_AUDIENCE", "CADENCE_ALLOWED_OWNERS", "GH_REPO"];
+const AMBIENT_POST_ENV: [&str; 4] = [
+    "CADENCE_AUDIENCE",
+    "CADENCE_ALLOWED_OWNERS",
+    "GH_REPO",
+    "GH_HOST",
+];
 
 /// Clears [`AMBIENT_POST_ENV`] for the outermost hold on [`TERMS_ENV_LOCK`]
 /// and puts each prior value back when dropped, including on unwind. Under a
@@ -2865,6 +2872,41 @@ mod tests {
         let guard = lock_terms_env();
         let _ambient = AmbientPostEnv::clear(&guard);
         RedactExternalContent.run(&make_bash(cmd))
+    }
+
+    #[test]
+    fn a_nested_hold_clears_and_restores_no_ambient_post_env() {
+        let outer = lock_terms_env();
+        assert!(
+            outer.0.is_some(),
+            "the first hold on a thread owns the lock"
+        );
+        let _outer_ambient = AmbientPostEnv::clear(&outer);
+        for k in AMBIENT_POST_ENV {
+            assert!(std::env::var_os(k).is_none(), "{k}: the outer hold clears");
+        }
+        // What the outer test sets for its own verdict. `_outer_ambient`
+        // restores every ambient var when it drops, so this cannot leak.
+        let set = [("GH_HOST", "ghe.example.com"), ("GH_REPO", "me/meta")];
+        // SAFETY: serialized by TERMS_ENV_LOCK, which `outer` holds.
+        unsafe {
+            for (k, v) in set {
+                std::env::set_var(k, v);
+            }
+        }
+        {
+            let nested = lock_terms_env();
+            assert!(nested.0.is_none(), "a second hold shares the first");
+            let nested_ambient = AmbientPostEnv::clear(&nested);
+            assert!(nested_ambient.0.is_empty(), "a nested clear saves nothing");
+            for (k, v) in set {
+                assert_eq!(std::env::var(k).as_deref(), Ok(v), "{k}: kept by clear");
+            }
+            drop(nested_ambient);
+            for (k, v) in set {
+                assert_eq!(std::env::var(k).as_deref(), Ok(v), "{k}: kept by drop");
+            }
+        }
     }
 
     // --- Credential tier (#1022) ---
@@ -5671,6 +5713,9 @@ destinations = ["me/*", "them/exact"]
 
     #[test]
     fn config_for_targets_table() {
+        // Reads `default_host()`, so an ambient `GH_HOST` must not decide it.
+        let guard = lock_terms_env();
+        let _ambient = AmbientPostEnv::clear(&guard);
         let dh = cadence_hooks_core::config::default_host();
         let dir = softening_checkout();
         let base = dir.path().to_str().unwrap();
