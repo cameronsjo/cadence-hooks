@@ -6022,13 +6022,44 @@ pub const UNRESOLVABLE_DIR: &str = "\0unresolvable directory";
 /// The per-segment reading a guard judges alongside the whole-command
 /// [`parse_work_dir`] one; see [`segment_work_dirs`].
 pub fn command_segments_with_dirs(command: &str, cwd: &str) -> Vec<(String, std::rc::Rc<str>)> {
+    command_segments_with_dirs_reading(command, cwd, UnreadEval::MayMove)
+}
+
+/// How [`segment_work_dirs`] reads an `eval` whose script it cannot see
+/// because the script is built by an expansion (`eval "$S"`,
+/// `eval "$(direnv export bash)"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnreadEval {
+    /// The script may change directory, so the segments after it are
+    /// judged in [`UNRESOLVABLE_DIR`] as well.
+    #[default]
+    MayMove,
+    /// The shell stays where the walk read it, unless the walk read
+    /// something in the `eval` that moves: its words name `cd`, `pushd`,
+    /// `popd` or `eval`, or carry a backslash or an expansion other than a
+    /// command substitution or a variable the command never names; the
+    /// command defined a function; or the command may have replaced a tool
+    /// or pointed git elsewhere ([`crate::push::may_redefine_known_commands`],
+    /// a `GIT_` name). The guard then judges the directory it read
+    /// (cadence-ecosystem ADR-0046 rule 3). The gh-write guard reads an
+    /// `eval` this way.
+    StaysPut,
+}
+
+/// [`command_segments_with_dirs`], reading an `eval` of text the walk
+/// cannot see as `unread_eval` says.
+pub fn command_segments_with_dirs_reading(
+    command: &str,
+    cwd: &str,
+    unread_eval: UnreadEval,
+) -> Vec<(String, std::rc::Rc<str>)> {
     // Each distinct segment text is expanded once: a segment that may run in
     // several directories is located once per directory, and a flood repeats
     // one segment (`f; f; …`).
     let mut out = Vec::new();
     let mut expanded: std::collections::HashMap<String, std::rc::Rc<[String]>> =
         std::collections::HashMap::new();
-    for LocatedSegment { raw, dir } in segment_work_dirs(command, cwd) {
+    for LocatedSegment { raw, dir } in segment_work_dirs_reading(command, cwd, unread_eval) {
         let segments = match expanded.get(&raw) {
             Some(segments) => segments.clone(),
             None => {
@@ -6250,6 +6281,8 @@ struct DirWalk {
     /// [`known_commands_are_trusted`] for the whole command, asked at the first
     /// segment that needs it: each ask scans the command.
     known_commands: std::cell::OnceCell<bool>,
+    /// How an `eval` of text this walk cannot see is read.
+    unread_eval: UnreadEval,
 }
 
 /// Most checkout-root lookups one walk makes (each reads the disk); past it a
@@ -6788,6 +6821,13 @@ fn verb_target(words: &[MarkedToken]) -> VerbTarget {
     }
 }
 
+/// One `$` expansion in a word: `${NAME}` (group 1), `$NAME` (group 2), or
+/// the character after any other `$` (group 3: `(`, `{`, `1`, `@`, `'`, …).
+static PARAMETER_EXPANSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(.))")
+        .expect("pattern should compile")
+});
+
 /// Does a `trap` action change directory? Its action runs later — before
 /// every command under `DEBUG` — in the parent shell.
 fn trap_action_moves(words: &[MarkedToken], functions: &DirWalk) -> bool {
@@ -6958,15 +6998,11 @@ impl DirWalk {
     /// `for c in …`, `${c:=…}`, `c+=…`, a value with an expansion, or a word
     /// gluing a set variable to more text (`${c}d`) is not read here.
     fn expansion_may_name_a_mover(&mut self, word: &str) -> bool {
-        static EXPANSION: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(.))")
-                .expect("pattern should compile")
-        });
         if word.contains('`') || word.contains("$(") {
             return true;
         }
         let mut set_values = Vec::new();
-        for caps in EXPANSION.captures_iter(word) {
+        for caps in PARAMETER_EXPANSION.captures_iter(word) {
             let Some(name) = caps.get(1).or(caps.get(2)) else {
                 // `$1`, `$@`, `${x:-…}`, `$'…'`.
                 return true;
@@ -7007,7 +7043,7 @@ impl DirWalk {
                 set_values.push(values.clone());
             }
         }
-        let whole_word = EXPANSION
+        let whole_word = PARAMETER_EXPANSION
             .find(word)
             .is_some_and(|m| m.as_str().len() == word.len());
         match set_values.as_slice() {
@@ -7053,6 +7089,37 @@ impl DirWalk {
         *self
             .known_commands
             .get_or_init(|| known_commands_are_trusted(&self.command))
+    }
+
+    /// Does this `eval` (its `words`, `eval` first), whose script needs
+    /// expansion to read, leave the shell where it was? Only under
+    /// [`UnreadEval::StaysPut`], and only when the walk read nothing in it
+    /// or before it that moves: see there.
+    fn unread_eval_stays_put(&mut self, words: &[MarkedToken]) -> bool {
+        if self.unread_eval != UnreadEval::StaysPut
+            || !self.functions.is_empty()
+            || trap_action_moves(words, self)
+            || !self.known_commands_trusted()
+        {
+            return false;
+        }
+        let command = &self.command;
+        let mentions = self
+            .mentions
+            .get_or_insert_with(|| variable_mentions(command));
+        words.iter().skip(1).all(|word| {
+            !word.text.contains('\\')
+                && PARAMETER_EXPANSION.captures_iter(&word.text).all(|caps| {
+                    match caps.get(1).or(caps.get(2)) {
+                        // One the command never names comes from the
+                        // environment; one it names may hold a `cd`.
+                        Some(name) => !mentions.contains_key(name.as_str()),
+                        // A command substitution, read by its words above.
+                        // `$1`, `$@`, `${x:-…}` and `$'…'` are not read.
+                        None => caps.get(3).is_some_and(|c| c.as_str() == "("),
+                    }
+                })
+        })
     }
 
     fn emit(&mut self, raw: &str, dirs: &mut DirSet) {
@@ -7203,7 +7270,7 @@ impl DirWalk {
                     return;
                 }
                 if script.iter().any(|word| word.contains(['$', '`', '\\'])) {
-                    if !own_process {
+                    if !own_process && !self.unread_eval_stays_put(words) {
                         dirs.add_unresolvable();
                     }
                     return;
@@ -7472,7 +7539,8 @@ fn group_depth_change(raw: &str) -> isize {
 ///   gap (cameronsjo/cadence-hooks#1171);
 /// - an `eval`'d script runs in this shell, so its segments are walked in
 ///   line, in the directory in effect; one that needs expansion to read is
-///   [`UNRESOLVABLE_DIR`];
+///   [`UNRESOLVABLE_DIR`] ([`UnreadEval`] says when a guard may read it as
+///   staying put);
 /// - a function body is recorded where it is defined and walked where the
 ///   function is called, so `f() { cd /u; }; f` moves to `/u`;
 /// - a `cd` inside `if`/`case`/`while`/`until`/`for` runs in THIS shell,
@@ -7503,16 +7571,27 @@ fn group_depth_change(raw: &str) -> isize {
 /// unpaired `)`, skipping quoted text and escaped characters
 /// ([`segment_shape`]).
 pub fn segment_work_dirs(command: &str, cwd: &str) -> Vec<LocatedSegment> {
-    let env_cdpath = std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty());
-    segment_work_dirs_with_cdpath(command, cwd, env_cdpath)
+    segment_work_dirs_reading(command, cwd, UnreadEval::MayMove)
 }
 
-/// [`segment_work_dirs`] with the process's `CDPATH` given rather than read,
-/// so a test pins it without touching the environment.
+/// [`segment_work_dirs`], reading an `eval` of text the walk cannot see as
+/// `unread_eval` says.
+fn segment_work_dirs_reading(
+    command: &str,
+    cwd: &str,
+    unread_eval: UnreadEval,
+) -> Vec<LocatedSegment> {
+    let env_cdpath = std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty());
+    segment_work_dirs_with_cdpath(command, cwd, env_cdpath, unread_eval)
+}
+
+/// [`segment_work_dirs_reading`] with the process's `CDPATH` given rather
+/// than read, so a test pins it without touching the environment.
 fn segment_work_dirs_with_cdpath(
     command: &str,
     cwd: &str,
     env_cdpath: bool,
+    unread_eval: UnreadEval,
 ) -> Vec<LocatedSegment> {
     // Each reading from the same start ([`split_segment_readings`]). Where
     // there are two, neither is what the shell surely runs, and each can
@@ -7531,6 +7610,7 @@ fn segment_work_dirs_with_cdpath(
         let mut walk = DirWalk {
             command: command.to_string(),
             env_cdpath,
+            unread_eval,
             ..DirWalk::default()
         };
         let mut dirs = DirSet::new(cwd);
@@ -13083,7 +13163,8 @@ fn parameter_word_end(
 /// <script>` argument, return the script. The command word may be a bare name
 /// or a path (`/bin/sh`). The `-c` may stand alone or appear in a short cluster
 /// such as `-lc` (login shell + command); the script is the token following the
-/// flag that carries `c`.
+/// flag that carries `c`, or its value (`-co pipefail`). An option value before
+/// it (`-o pipefail`) is skipped, see [`shell_option_takes_value`].
 ///
 /// The segment goes through [`executable_tokens`], not a bare [`tokenize`]:
 /// [`tokenize`] glues `(` onto the word behind it and `)` onto the word in
@@ -13967,13 +14048,15 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
         other => return wrapper_utility_script(other, &tokens[1..]),
     }
     let mut script_file = false;
+    // The previous option takes this word as its value (`-o pipefail`).
+    let mut option_value = false;
     for (i, raw) in tokens.iter().enumerate().skip(1) {
         // A redirection is not an operand: `bash <<< 'x' -c y` still runs
         // `y`, and `bash 2>/dev/null script.sh` still names a file.
         if is_redirect_token(raw) || i > 1 && is_redirect_operator_alone(&tokens[i - 1]) {
             continue;
         }
-        if script_file {
+        if script_file || std::mem::take(&mut option_value) {
             continue;
         }
         // **The `-c` test reads the word the SHELL hands the wrapper.** Compared
@@ -13988,6 +14071,9 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
         let carries_c =
             tok == "-c" || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('c'));
         if carries_c {
+            // `bash -co pipefail 'x'` takes the option's value first, then
+            // the script.
+            let i = i + usize::from(shell_option_takes_value(&verb, tok));
             // `--` ends the shell's own option parsing, so with it present the
             // script is one token further along. Returning the `--` handed
             // guards a segment of two dashes and left the real script inside a
@@ -14007,10 +14093,15 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
             // literal survives this one unescape (cameronsjo/cadence-hooks#1231).
             return tokens.get(i + 1).map(|s| unescape_word(s).into_owned());
         }
+        if shell_option_takes_value(&verb, tok) {
+            option_value = true;
+            continue;
+        }
         // First non-flag token without a `-c` means this isn't the `-c` form
         // (e.g. `sh script.sh`) — no inline script to expand. Unless `-s`
         // made the operands positional parameters, stdin is then data too.
-        if !tok.starts_with('-') {
+        // A `+…` word is an option too: `bash +e -c 'x'` runs `x`.
+        if !tok.starts_with(['-', '+']) {
             if !reads_script_from_stdin(&tokens[1..i]) {
                 return None;
             }
@@ -14018,6 +14109,37 @@ fn shell_c_argument_tokens(tokens: &[String], view: Backslashes) -> Option<Strin
         }
     }
     shell_here_string(&tokens[1..])
+}
+
+/// Whether `shell`'s option `word` takes the next word as its value, so that
+/// word is neither the script nor a script file. `shell` is the command word
+/// as [`command_word`] gives it (`bash`, not `/bin/bash`).
+///
+/// `bash -euo pipefail -c 'rm note.md'` runs `rm note.md`, but the `-c` walk
+/// in [`shell_c_argument_tokens`] read `pipefail` as the first operand and
+/// returned no script, so no guard saw the `rm`. Every walker over a shell's
+/// options reads this one grammar. Measured on bash 5.2, dash 0.5.12 and zsh
+/// 5.9:
+///
+/// - A cluster ending in `o`, after `-` or `+` (`-o`, `-euo`, `+o`), takes the
+///   next word in all three. Only the last letter is read: bash and dash take
+///   a word for any `o` in the cluster, but zsh reads `-oe` as the option `e`.
+/// - A cluster ending in `O` (`-O extglob`, `+O`) takes one in bash only. zsh's
+///   `-O` is a plain flag and dash rejects it. `sh` counts as bash, which it is
+///   on macOS. On Linux it is dash, which refuses `-O` and runs nothing, so
+///   the extra read costs nothing.
+/// - bash's `--rcfile FILE` and `--init-file FILE` take one. dash and zsh
+///   reject both.
+pub fn shell_option_takes_value(shell: &str, word: &str) -> bool {
+    let bash = matches!(shell, "bash" | "sh");
+    if word.starts_with("--") {
+        return bash && matches!(word, "--rcfile" | "--init-file");
+    }
+    match word.strip_prefix(['-', '+']).and_then(|c| c.chars().last()) {
+        Some('o') => true,
+        Some('O') => bash,
+        _ => false,
+    }
 }
 
 /// Whether a shell's options before its first operand include `-s`, which
@@ -22882,6 +23004,67 @@ mod tests {
     }
 
     #[test]
+    fn shell_c_argument_skips_a_shell_option_value() {
+        // `-o` takes the next word as its value. Read as the shell's first
+        // operand, `pipefail` ended the walk, so `bash -euo pipefail -c
+        // 'rm note.md'` surfaced no script and deleted a vault note with no
+        // block (cadence-hooks#1493 security review). Each row ran its
+        // script under bash 5.2, dash 0.5.12 or zsh 5.9.
+        let inner = "rm note.md".to_string();
+        for cmd in [
+            "bash -o pipefail -c 'rm note.md'",
+            "bash -euo pipefail -c 'rm note.md'",
+            "bash -euxo pipefail -c 'rm note.md'",
+            "bash +o posix -c 'rm note.md'",
+            "bash -O extglob -c 'rm note.md'",
+            "bash +O extglob -c 'rm note.md'",
+            "bash --rcfile rc.sh -c 'rm note.md'",
+            "bash --init-file rc.sh -c 'rm note.md'",
+            // A `+…` cluster is an option, not an operand.
+            "bash +e -c 'rm note.md'",
+            // A cluster holding `c` and ending in `o` takes the value first.
+            "bash -co pipefail 'rm note.md'",
+            "bash -ceuo pipefail 'rm note.md'",
+            "bash -co pipefail -- 'rm note.md'",
+            "zsh -co pipefail 'rm note.md'",
+            "dash -co errexit 'rm note.md'",
+            // A here-string after the value is the script, as for a bare
+            // `bash <<< 'rm note.md'`.
+            "bash -euo pipefail <<< 'rm note.md'",
+            "sh -o errexit -c 'rm note.md'",
+            // `sh` is bash on macOS (measured as `exec -a sh bash`). On Linux
+            // it is dash, which refuses `-O` and runs nothing.
+            "sh -O extglob -c 'rm note.md'",
+            "dash -euo errexit -c 'rm note.md'",
+            "zsh -euo pipefail -c 'rm note.md'",
+            "sudo bash -euo pipefail -c 'rm note.md'",
+            // zsh's `-O` is a plain flag, so `-c` is still its own option.
+            "zsh -O -c 'rm note.md'",
+        ] {
+            assert_eq!(shell_c_argument(cmd), Some(inner.clone()), "{cmd:?}");
+            assert!(command_segments(cmd).contains(&inner), "{cmd:?}");
+        }
+        // A script file after the same options is still not an inline
+        // script, and the option value is not one either.
+        for cmd in [
+            "bash script.sh",
+            "bash -o pipefail script.sh",
+            "bash -euo pipefail script.sh",
+            "bash +o posix script.sh",
+            "bash -O extglob script.sh",
+            "bash --rcfile rc.sh script.sh",
+            "zsh -O script.sh",
+        ] {
+            assert_eq!(shell_c_argument(cmd), None, "{cmd:?}");
+            assert_eq!(command_segments(cmd), vec![cmd.to_string()], "{cmd:?}");
+        }
+        // Only a cluster's last letter is read. zsh takes the rest of `-oe`
+        // as the option name `e` and runs nothing. bash and dash would run
+        // the script: a gap left open, see [`shell_option_takes_value`].
+        assert_eq!(shell_c_argument("zsh -oe pipefail -c 'rm note.md'"), None);
+    }
+
+    #[test]
     fn command_segments_unescapes_an_escaped_shell_c_script() {
         // `bash -c cat\ .env` hands bash the script `cat .env`. With an
         // escaped blank kept in its word, the raw script was one token and
@@ -24480,7 +24663,8 @@ mod tests {
             // Relative targets accumulate.
             ("cd a\ncd b\ngh pr create", "/cwd/a/b"),
         ] {
-            let located = segment_work_dirs_with_cdpath(command, "/cwd", false);
+            let located =
+                segment_work_dirs_with_cdpath(command, "/cwd", false, UnreadEval::MayMove);
             assert_eq!(
                 located.last().map(|segment| &*segment.dir),
                 Some(want),
@@ -24497,11 +24681,12 @@ mod tests {
         // ended. Each reading now starts in the cwd, and every `cd` in such
         // a command is a maybe-move.
         let dirs_of = |command: &str, segment: &str| -> Vec<String> {
-            let mut dirs: Vec<String> = segment_work_dirs_with_cdpath(command, "/cwd", false)
-                .into_iter()
-                .filter(|located| located.raw == segment)
-                .map(|located| located.dir.to_string())
-                .collect();
+            let mut dirs: Vec<String> =
+                segment_work_dirs_with_cdpath(command, "/cwd", false, UnreadEval::MayMove)
+                    .into_iter()
+                    .filter(|located| located.raw == segment)
+                    .map(|located| located.dir.to_string())
+                    .collect();
             dirs.sort();
             dirs.dedup();
             dirs
@@ -24510,7 +24695,7 @@ mod tests {
         let command = "a=(x)#; cd x; git push 'u' main";
         assert_eq!(dirs_of(command, "git push 'u' main"), ["/cwd", "/cwd/x"]);
         assert!(
-            segment_work_dirs_with_cdpath(command, "/cwd", false)
+            segment_work_dirs_with_cdpath(command, "/cwd", false, UnreadEval::MayMove)
                 .iter()
                 .all(|located| !located.dir.contains("x/x")),
             "{command:?}"
@@ -24560,7 +24745,7 @@ mod tests {
 
     /// Every directory the LAST segment may run in, per [`segment_work_dirs`].
     fn last_dirs(command: &str) -> Vec<String> {
-        let located = segment_work_dirs_with_cdpath(command, "/cwd", false);
+        let located = segment_work_dirs_with_cdpath(command, "/cwd", false, UnreadEval::MayMove);
         let last = located.last().map(|segment| segment.raw.clone());
         located
             .iter()
@@ -24886,6 +25071,101 @@ mod tests {
         }
     }
 
+    /// Under [`UnreadEval::StaysPut`] an `eval` of text the walk cannot see
+    /// leaves the shell where the walk read it, unless the walk read
+    /// something in it or before it that moves. [`UnreadEval::MayMove`],
+    /// the reading every other guard keeps, is unchanged.
+    #[test]
+    fn an_unread_eval_stays_put_only_when_nothing_read_moves() {
+        const X: &str = UNRESOLVABLE_DIR;
+        let dirs = |command: &str, unread_eval| -> Vec<String> {
+            let located = segment_work_dirs_with_cdpath(command, "/cwd", false, unread_eval);
+            let last = located.last().map(|segment| segment.raw.clone());
+            located
+                .iter()
+                .filter(|segment| Some(&segment.raw) == last.as_ref())
+                .map(|segment| segment.dir.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        for (command, base, stays) in [
+            // Nothing the walk read moves.
+            ("eval \"$S\"; gh pr create", "/cwd", true),
+            ("eval \"${S}\"; gh pr create", "/cwd", true),
+            ("eval -- \"$S\"; gh pr create", "/cwd", true),
+            ("eval \"$(direnv export bash)\"; gh pr create", "/cwd", true),
+            (
+                "eval \"$(direnv export zsh)\" && gh pr create",
+                "/cwd",
+                true,
+            ),
+            ("eval `direnv export bash`; gh pr create", "/cwd", true),
+            ("eval $(cat x); gh pr create", "/cwd", true),
+            // Quoted, it is not the `ssh-agent` idiom, so `MayMove` does not
+            // exempt it.
+            ("eval '$(ssh-agent -s)'; gh pr create", "/cwd", true),
+            ("if true; then eval \"$S\"; fi; gh pr create", "/cwd", true),
+            ("cd /u; eval \"$S\"; gh pr create", "/u", true),
+            // Something it read moves, or something in it is not read.
+            ("eval \"cd $D\"; gh pr create", "/cwd", false),
+            (
+                "eval \"$(ssh-agent -s; cd /u)\"; gh pr create",
+                "/cwd",
+                false,
+            ),
+            (
+                "eval \"$(zoxide init bash --cmd cd)\"; gh pr create",
+                "/cwd",
+                false,
+            ),
+            ("eval \"$S\" pushd /u; gh pr create", "/cwd", false),
+            ("eval \"$(eval \"$S\")\"; gh pr create", "/cwd", false),
+            ("S='cd /u'; eval \"$S\"; gh pr create", "/cwd", false),
+            ("f() { cd /u; }; eval \"$S\"; gh pr create", "/cwd", false),
+            ("PATH=/x:$PATH; eval \"$S\"; gh pr create", "/cwd", false),
+            ("eval \"$1\"; gh pr create", "/cwd", false),
+            ("eval \"${S:-cd /u}\"; gh pr create", "/cwd", false),
+            // A backslash can spell `cd` past the word check.
+            ("eval \"$S\" 'c\\d /u'; gh pr create", "/cwd", false),
+        ] {
+            let mut moves = vec![base.to_string(), X.to_string()];
+            moves.sort();
+            let want = if stays {
+                vec![base.to_string()]
+            } else {
+                moves.clone()
+            };
+            assert_eq!(dirs(command, UnreadEval::StaysPut), want, "{command}");
+            assert_eq!(dirs(command, UnreadEval::MayMove), moves, "{command}");
+        }
+        // The two public wrappers, which every guard but gh-write calls,
+        // keep `MayMove`.
+        let last_dirs = |located: Vec<(String, std::rc::Rc<str>)>| -> Vec<String> {
+            let last = located.last().map(|(raw, _)| raw.clone());
+            located
+                .iter()
+                .filter(|(raw, _)| Some(raw) == last.as_ref())
+                .map(|(_, dir)| dir.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let command = "eval \"$S\"; gh pr create";
+        let mut moves = vec!["/cwd".to_string(), X.to_string()];
+        moves.sort();
+        let located = segment_work_dirs(command, "/cwd")
+            .into_iter()
+            .map(|LocatedSegment { raw, dir }| (raw, dir))
+            .collect();
+        assert_eq!(last_dirs(located), moves, "segment_work_dirs: {command}");
+        assert_eq!(
+            last_dirs(command_segments_with_dirs(command, "/cwd")),
+            moves,
+            "command_segments_with_dirs: {command}"
+        );
+    }
+
     /// A flood of `pushd`, `popd` and checkout-root `cd`s is bounded: each
     /// lookup past the budget is unresolvable rather than a disk read.
     #[test]
@@ -24900,7 +25180,12 @@ mod tests {
             "eval \"$(direnv hook bash)\"; ",
         ] {
             let command = format!("{}gh pr create", unit.repeat(200_000 / unit.len()));
-            let located = segment_work_dirs_with_cdpath(&command, "/nonexistent-cwd", false);
+            let located = segment_work_dirs_with_cdpath(
+                &command,
+                "/nonexistent-cwd",
+                false,
+                UnreadEval::MayMove,
+            );
             assert!(located.last().is_some(), "{unit}");
         }
         crate::test_builders::assert_elapsed_under(
@@ -24983,7 +25268,7 @@ mod tests {
                 vec![root.as_str()],
             ),
         ] {
-            let located = segment_work_dirs_with_cdpath(command, &sub, false);
+            let located = segment_work_dirs_with_cdpath(command, &sub, false, UnreadEval::MayMove);
             let last = located.last().map(|segment| segment.raw.clone());
             let mut got: Vec<String> = located
                 .iter()
@@ -25066,7 +25351,8 @@ mod tests {
             // A later absolute cd leaves the unresolvable directory behind.
             (true, "cd sub; cd /u; gh pr create", vec!["/u"]),
         ] {
-            let located = segment_work_dirs_with_cdpath(command, "/cwd", env_cdpath);
+            let located =
+                segment_work_dirs_with_cdpath(command, "/cwd", env_cdpath, UnreadEval::MayMove);
             let last = located.last().map(|segment| segment.raw.clone());
             let got: std::collections::BTreeSet<String> = located
                 .iter()
@@ -25088,7 +25374,8 @@ mod tests {
             std::time::Duration::from_secs_f64(if cfg!(debug_assertions) { 10.0 } else { 0.5 });
         for (env_cdpath, command) in [(true, relative), (true, writes), (false, assigned)] {
             let start = std::time::Instant::now();
-            let _ = segment_work_dirs_with_cdpath(&command, "/cwd", env_cdpath);
+            let _ =
+                segment_work_dirs_with_cdpath(&command, "/cwd", env_cdpath, UnreadEval::MayMove);
             crate::test_builders::assert_elapsed_under(
                 &format!("{:?}", start.elapsed()),
                 start.elapsed(),
@@ -25182,7 +25469,8 @@ mod tests {
             (format!("{deep}cd b\ngh pr create"), UNRESOLVABLE_DIR),
             (format!("{deep}cd /u\ngh pr create"), "/u"),
         ] {
-            let located = segment_work_dirs_with_cdpath(&command, "/cwd", false);
+            let located =
+                segment_work_dirs_with_cdpath(&command, "/cwd", false, UnreadEval::MayMove);
             assert_eq!(located.last().map(|segment| &*segment.dir), Some(want));
         }
     }
