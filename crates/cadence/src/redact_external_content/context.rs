@@ -706,6 +706,10 @@ mod tests {
 
     #[test]
     fn owned_verdict_table() {
+        // Host matching reads `default_host()`, so an ambient `GH_HOST` must
+        // not decide it.
+        let guard = crate::redact_external_content::lock_terms_env();
+        let _ambient = crate::redact_external_content::AmbientPostEnv::clear(&guard);
         let mine = owners(&["me"]);
         let table: Vec<(Vec<Option<Target>>, bool)> = vec![
             (vec![t("github.com", "me/tool")], true),
