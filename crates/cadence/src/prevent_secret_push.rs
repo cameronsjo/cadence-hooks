@@ -1648,9 +1648,10 @@ fn missing_directory(dir: &str) -> String {
 
 /// Subcommands that make commits or move refs. One of them earlier in the
 /// same call has not run when the guard reads the repository.
-/// `branch` and `tag` count only when they name a new ref (their list and
-/// query forms open with an option), and `reset`/`stash` not at all: their
-/// everyday forms do not make the ref a push names.
+/// `branch` counts only when it names a new ref (its list and query forms
+/// open with an option), `tag` only when [`tag_creates_a_ref`] says so, and
+/// `reset`/`stash` not at all: their everyday forms do not make the ref a
+/// push names.
 const REF_WRITERS: &[&str] = &[
     "am",
     "checkout",
@@ -1674,7 +1675,8 @@ const UNRESOLVED_RANGE: &str = "git could not resolve";
 fn ref_writer_before_push(calls: &[GitCall]) -> Option<String> {
     let writes = |rest: &[String]| match rest {
         [sub, ..] if REF_WRITERS.contains(&sub.as_str()) => true,
-        [sub, name, ..] if sub == "branch" || sub == "tag" => !name.starts_with('-'),
+        [sub, args @ ..] if sub == "tag" => tag_creates_a_ref(args),
+        [sub, name, ..] if sub == "branch" => !name.starts_with('-'),
         _ => false,
     };
     calls
@@ -1683,6 +1685,69 @@ fn ref_writer_before_push(calls: &[GitCall]) -> Option<String> {
         .find(|call| writes(&call.rest))
         .and_then(|call| call.rest.first().cloned())
 }
+
+/// Whether `git tag ARGS` creates a tag: a tag name follows its creation
+/// options (`-s`, `-a`, `-f`, `-m MSG`, `-u KEY`). An option of the list,
+/// delete or verify form makes it none, and so does no name at all.
+fn tag_creates_a_ref(args: &[String]) -> bool {
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            return words.next().is_some();
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, glued) = long
+                .split_once('=')
+                .map_or((long, false), |(n, _)| (n, true));
+            if TAG_OTHER_FORM_LONG.contains(&name) {
+                return false;
+            }
+            if !glued && TAG_VALUE_LONG.contains(&name) {
+                words.next();
+            }
+            continue;
+        }
+        let Some(cluster) = word.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            return true;
+        };
+        for (at, c) in cluster.char_indices() {
+            if TAG_OTHER_FORM_SHORT.contains(c) {
+                return false;
+            }
+            if TAG_VALUE_SHORT.contains(c) {
+                if at + c.len_utf8() == cluster.len() {
+                    words.next();
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// `git tag`'s options that take a value, glued or as the next word.
+const TAG_VALUE_SHORT: &str = "mFu";
+const TAG_VALUE_LONG: &[&str] = &["message", "file", "local-user", "cleanup", "trailer"];
+/// `git tag`'s options that select its list, delete or verify form.
+const TAG_OTHER_FORM_SHORT: &str = "ldvni";
+const TAG_OTHER_FORM_LONG: &[&str] = &[
+    "list",
+    "delete",
+    "verify",
+    "contains",
+    "no-contains",
+    "merged",
+    "no-merged",
+    "points-at",
+    "sort",
+    "format",
+    "column",
+    "no-column",
+    "ignore-case",
+    "omit-empty",
+    "color",
+    "no-color",
+];
 
 /// Name the likely cause of a range that did not resolve, when there is one
 /// the reader can act on (cameronsjo/cadence-hooks#1381): a ref-writing git
@@ -3458,6 +3523,60 @@ mod tests {
             &fx.run("git push origin HEAD:refs/heads/main3"),
             &["cfg.txt", "AWS access key id"],
         );
+    }
+
+    #[test]
+    fn a_tag_made_in_the_same_call_as_the_push_names_the_split() {
+        // cameronsjo/cadence-hooks#1511: a signed or annotated tag is the
+        // common release form, and its options come before the name.
+        let fx = Fx::new("samecalltag");
+        fx.commit("f", "fine\n", "first");
+        for tag in [
+            "git tag v9 HEAD",
+            "git tag -s v9 HEAD",
+            "git tag -m x v9 HEAD",
+            "git tag -a v9 -m x HEAD",
+            "git tag -sm x v9",
+            "git tag -mx v9",
+            "git tag --message x v9",
+            "git tag --message=x v9",
+            "git tag -u KEY v9",
+            "git tag -f -F notes.txt v9",
+            "git tag --cleanup verbatim -a v9",
+            "git tag -a -- v9",
+        ] {
+            let r = fx.run(&format!(
+                "{tag} && git push --no-follow-tags origin refs/tags/v9"
+            ));
+            assert_warns(&r, &["`git tag`", "has not run", "next call"]);
+            assert_not_narrow(&r);
+        }
+        // The list, delete and verify forms make no tag, so a typo is not
+        // blamed on them.
+        for tag in [
+            "git tag",
+            "git tag -l 'v*'",
+            "git tag --list",
+            "git tag -n5",
+            "git tag -d v1",
+            "git tag -v v1",
+            "git tag --contains HEAD",
+            "git tag --points-at HEAD",
+            "git tag --sort=-v:refname",
+            "git tag -m x",
+            "git tag --message x",
+            "git tag -a --",
+        ] {
+            let r = fx.run(&format!(
+                "{tag} && git push --no-follow-tags origin refs/tags/v9"
+            ));
+            assert_warns(&r, &["refs/tags/v9"]);
+            assert!(
+                !r.message.as_deref().unwrap_or("").contains("next call"),
+                "{tag}: {:?}",
+                r.message
+            );
+        }
     }
 
     #[test]

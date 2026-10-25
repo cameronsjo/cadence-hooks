@@ -590,18 +590,81 @@ fn operand_outside_vault(operand: &str, vault: &str, meta: &dyn FileMeta) -> boo
 /// Verbs that neither touch the filesystem nor run another command, so a
 /// segment made of one (with no output redirect) cannot change what a
 /// sibling deletion's operand resolves to.
+/// `exit` only ends the shell, so it can stop a later deletion from running
+/// and never moves one (cameronsjo/cadence-hooks#1536). `set` is not here: a
+/// few of its options do reach a deletion, so [`set_toggles_only_strict_mode`]
+/// reads its arguments.
 const INERT_VERBS: &[&str] = &[
-    "echo", "printf", "true", ":", "ls", "cat", "pwd", "test", "[",
+    "echo", "printf", "true", ":", "ls", "cat", "pwd", "test", "[", "exit",
 ];
 
+/// The `set` option letters that mean the same harmless thing in bash, zsh
+/// and ksh: `e` (exit on error), `u` (fail on an unset variable), `x` and `v`
+/// (trace to stderr), and `E` (bash: traps follow functions; zsh: `pushd`
+/// prints less).
+const STRICT_MODE_SET_LETTERS: &str = "euxvE";
+
+/// The `set -o` names of those options, plus `pipefail`, as bash spells them.
+/// zsh ignores case and `_` in a name (`ERR_EXIT`), so a name is compared in
+/// that form.
+const STRICT_MODE_SET_NAMES: &[&str] = &[
+    "errexit", "nounset", "xtrace", "verbose", "errtrace", "pipefail",
+];
+
+/// Is this `set` one a script runs for strict mode, and nothing else
+/// (cameronsjo/cadence-hooks#1536)? `set -euo pipefail`, `set -e`, `set +x`,
+/// `set -o errexit`, and a bare `set` or `set -o` (which print) qualify: each
+/// argument is a `-`/`+` cluster of [`STRICT_MODE_SET_LETTERS`], where a final
+/// `o` takes the next argument as one of [`STRICT_MODE_SET_NAMES`].
+///
+/// Any other `set` keeps the verdict, because some options reach a deletion:
+/// zsh's and ksh's `set -A t note.md` puts `note.md` in `$t`, so a variable
+/// assigned from `mktemp` no longer holds the temp path at `rm -f "$t"`; and
+/// bash's `set -P`, zsh's `set -w` and `set -o physical` make `cd link/..`
+/// land beside the link's target instead of beside the link, so a deletion
+/// placed by that `cd` moves. A positional argument or `--` keeps it too, as
+/// does any letter not listed.
+fn set_toggles_only_strict_mode(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(cluster) = arg.strip_prefix(['-', '+']) else {
+            return false;
+        };
+        let (letters, names_next) = match cluster.strip_suffix('o') {
+            Some(letters) => (letters, true),
+            None => (cluster, false),
+        };
+        if (letters.is_empty() && !names_next)
+            || !letters.chars().all(|c| STRICT_MODE_SET_LETTERS.contains(c))
+        {
+            return false;
+        }
+        if names_next
+            && let Some(name) = args.next()
+            && !STRICT_MODE_SET_NAMES.contains(&name.to_ascii_lowercase().replace('_', "").as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does this command run only an [`INERT_VERBS`] verb, or a `set` that
+/// toggles only strict mode ([`set_toggles_only_strict_mode`])?
+fn runs_inert_verb(argv: &[String]) -> bool {
+    argv.first().is_some_and(|first| {
+        let verb = command_word(first);
+        INERT_VERBS.contains(&verb.as_ref())
+            || (verb == "set" && set_toggles_only_strict_mode(&argv[1..]))
+    })
+}
+
 /// Is this non-deleting segment one that cannot reshape the filesystem before
-/// a sibling deletion runs? An [`INERT_VERBS`] head with no output redirect.
-/// Everything else — `ln`, `mv`, `cp`, `mkdir`, `cd`, `pushd`, a shell wrapper,
-/// `find`, `eval`, a function call, an unknown command — is not.
+/// a sibling deletion runs? An inert head ([`runs_inert_verb`]) with no output
+/// redirect. Everything else — `ln`, `mv`, `cp`, `mkdir`, `cd`, `pushd`, a
+/// shell wrapper, `find`, `eval`, a function call, an unknown command — is not.
 fn is_inert_segment(argv: &[String], segment: &str) -> bool {
-    argv.first()
-        .is_some_and(|first| INERT_VERBS.contains(&command_word(first).as_ref()))
-        && redirect_targets(segment).is_empty()
+    runs_inert_verb(argv) && redirect_targets(segment).is_empty()
 }
 
 /// Can the command give a variable a value that no assignment segment shows,
@@ -3662,6 +3725,64 @@ mod tests {
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
             );
+        }
+    }
+
+    /// cameronsjo/cadence-hooks#1536 step 1: `exit` and a strict-mode `set`
+    /// are inert, so the script shapes that start with one, or bail out with
+    /// one, keep the fresh-`mktemp` relief and the outside-the-vault one. A
+    /// `set` that can move a deletion (zsh's `-A`, bash's `-P`, zsh's `-w`,
+    /// `-o physical`), one with a positional argument, and either verb with a
+    /// redirect keep the block.
+    #[test]
+    fn exit_and_a_strict_mode_set_are_inert() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // The issue's first three rows.
+            (
+                r#"set -euo pipefail; t=$(mktemp); trap 'rm -f "$t"' EXIT; echo x > "$t""#,
+                Allow,
+            ),
+            (r#"set -e; tmp=$(mktemp -d); rm -rf "$tmp""#, Allow),
+            (r#"t=$(mktemp) || exit 1; rm -f "$t""#, Allow),
+            // Other strict-mode spellings, and `exit` in other places.
+            (
+                r#"set -eu; set -o pipefail; t=$(mktemp); rm -f "$t""#,
+                Allow,
+            ),
+            (r#"set -Eeuo pipefail; t=$(mktemp); rm -f "$t""#, Allow),
+            (
+                r#"set -o errexit -o nounset; t=$(mktemp); rm -f "$t""#,
+                Allow,
+            ),
+            (r#"set -o ERR_EXIT; t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"set -x; t=$(mktemp); rm -f "$t"; set +x"#, Allow),
+            (r#"set; t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"set -o; t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); rm -f "$t"; exit $?"#, Allow),
+            ("set -e; rm /tmp/x", Allow),
+            ("rm /tmp/x || exit 1", Allow),
+            // zsh and ksh put the words after `set -A t` in `$t`.
+            (r#"t=$(mktemp); set -A t note.md; rm -f "$t""#, Block),
+            (r#"t=$(mktemp); set +A t note.md; rm -f "$t""#, Block),
+            (r#"t=$(mktemp); set -eA t note.md; rm -f "$t""#, Block),
+            // `-P`, zsh's `-w` and `-o physical` change where `cd ..` lands.
+            ("set -P; rm /tmp/x", Block),
+            ("set -w; rm /tmp/x", Block),
+            ("set -o physical; rm /tmp/x", Block),
+            ("set -o chaselinks; rm /tmp/x", Block),
+            // A positional argument, `--` or a bare `-`.
+            (r#"set -- note.md; t=$(mktemp); rm -f "$t""#, Block),
+            (r#"set -e note.md; t=$(mktemp); rm -f "$t""#, Block),
+            (r#"set -; t=$(mktemp); rm -f "$t""#, Block),
+            // A redirect writes a file, as it does after `echo`.
+            ("exit > note.md; rm /tmp/x", Block),
+            ("set -x 2> note.md; rm /tmp/x", Block),
+        ];
+        for &(command, expected) in cases {
+            let result =
+                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::with(&["/tmp"]));
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
         }
     }
 
