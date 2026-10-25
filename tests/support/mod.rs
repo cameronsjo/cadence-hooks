@@ -34,13 +34,16 @@ fn config_dir() -> &'static PathBuf {
 }
 
 /// A `cadence-hooks` command that cannot reach the real `~/.claude`:
-/// `CLAUDE_CONFIG_DIR` points at an isolated dir and an ambient
-/// `CLAUDE_PROJECT_DIR` is dropped. The three enforcement switches are dropped
+/// `CLAUDE_CONFIG_DIR` points at an isolated dir, and an ambient
+/// `CLAUDE_PROJECT_DIR` and `CADENCE_METRICS_DIR` are dropped. The metrics dir
+/// outranks the config dir, so an exported one would send every logged deny
+/// to the real `denials.jsonl`. The three enforcement switches are dropped
 /// too, so a runner session's value cannot decide a verdict.
 pub fn cadence_hooks() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     cmd.env("CLAUDE_CONFIG_DIR", config_dir())
         .env_remove("CLAUDE_PROJECT_DIR")
+        .env_remove("CADENCE_METRICS_DIR")
         // A cloud session exports this; ambient, it would self-disable the hooks
         // these tests exercise (cadence-hooks#1197). Tests that want it set it.
         .env_remove("CLAUDE_CODE_REMOTE")

@@ -305,21 +305,31 @@ fn assert_elapsed_under_if(
 pub const GROUP_FAIL_OPEN_MARKERS: [&str; 2] = ["did not finish within", "did not block"];
 
 /// Whether a `group` run was a fail-open at its deadline and so says nothing
-/// about the guard: it took at least `deadline`, exited 0 or 1 (1 is what
-/// `merge_group_output` returns when every member timed out), and printed the
-/// degraded text for a member that did not finish. A bare exit 1 without that
+/// about the guard: it took at least `deadline`, exited 0 or 1, and printed the
+/// degraded text for a member that did not finish.
+///
+/// Where that text lands depends on the exit code, as `merge_group_output`
+/// merges it. Exit 0 is the envelope a member that did finish earns by nudging
+/// (git-safety does on a heredoc flood), and the notice rides its
+/// `additionalContext` on **stdout** with stderr empty. Exit 1 is the group
+/// with nothing else to say, and the notice is on **stderr**. Reading stderr
+/// alone called the exit-0 case "no degraded text" and failed a loaded run that
+/// had said exactly what it did (cadence-hooks#1505). A bare exit 1 without the
 /// text is a crash and never qualifies. Timing opt-in turns this off.
 pub fn is_group_fail_open(
     enabled: bool,
     code: Option<i32>,
+    stdout: &str,
     stderr: &str,
     took: std::time::Duration,
     deadline: std::time::Duration,
 ) -> bool {
-    !enabled
-        && took >= deadline
-        && matches!(code, Some(0 | 1))
-        && GROUP_FAIL_OPEN_MARKERS.iter().all(|m| stderr.contains(m))
+    let printed = match code {
+        Some(0) => stdout,
+        Some(1) => stderr,
+        _ => return false,
+    };
+    !enabled && took >= deadline && GROUP_FAIL_OPEN_MARKERS.iter().all(|m| printed.contains(m))
 }
 
 /// Assert a `group` that fails open at `deadline` blocked (exit 2) in time.
@@ -335,11 +345,20 @@ pub fn is_group_fail_open(
 pub fn assert_blocked_before_deadline(
     what: &str,
     code: Option<i32>,
+    stdout: &str,
     stderr: &str,
     took: std::time::Duration,
     deadline: std::time::Duration,
 ) {
-    assert_blocked_before_deadline_if(timing_tests_enabled(), what, code, stderr, took, deadline);
+    assert_blocked_before_deadline_if(
+        timing_tests_enabled(),
+        what,
+        code,
+        stdout,
+        stderr,
+        took,
+        deadline,
+    );
 }
 
 #[track_caller]
@@ -347,16 +366,17 @@ fn assert_blocked_before_deadline_if(
     enabled: bool,
     what: &str,
     code: Option<i32>,
+    stdout: &str,
     stderr: &str,
     took: std::time::Duration,
     deadline: std::time::Duration,
 ) {
-    if code == Some(2) || is_group_fail_open(enabled, code, stderr, took, deadline) {
+    if code == Some(2) || is_group_fail_open(enabled, code, stdout, stderr, took, deadline) {
         return;
     }
     panic!(
         "{what}: exit {code:?} after {took:?}, expected a block (exit 2) before {deadline:?}; \
-         stderr: {stderr}"
+         stdout: {stdout}; stderr: {stderr}"
     );
 }
 
@@ -486,11 +506,25 @@ mod timing_tests {
     const DEGRADED: &str = "cadence-hooks: 'git-safety' did not finish within 5000 ms and \
                             did not block; see failopen.jsonl\n";
 
-    fn blocked(enabled: bool, code: Option<i32>, stderr: &str, took_ms: u64) {
+    /// The exit-0 envelope `merge_group_output` writes when a member that did
+    /// finish nudged and another missed the deadline: the notice rides
+    /// `additionalContext` on stdout, and stderr stays empty.
+    fn envelope_with_notice() -> String {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "additionalContext": format!("a nudge\n\n{}", DEGRADED.trim_end()),
+                "hookEventName": "PreToolUse",
+            }
+        })
+        .to_string()
+    }
+
+    fn blocked(enabled: bool, code: Option<i32>, stdout: &str, stderr: &str, took_ms: u64) {
         assert_blocked_before_deadline_if(
             enabled,
             "case",
             code,
+            stdout,
             stderr,
             Duration::from_millis(took_ms),
             Duration::from_secs(4),
@@ -500,15 +534,20 @@ mod timing_tests {
     #[test]
     fn a_block_passes_at_any_speed() {
         for enabled in [false, true] {
-            blocked(enabled, Some(2), "", 1);
+            blocked(enabled, Some(2), "", "", 1);
         }
     }
 
     #[test]
     fn a_degraded_fail_open_past_the_deadline_is_load_unless_timing_is_opted_in() {
-        for code in [Some(0), Some(1)] {
-            blocked(false, code, DEGRADED, 5000);
-            let strict = std::panic::catch_unwind(|| blocked(true, code, DEGRADED, 5000));
+        // Exit 1 says it on stderr; exit 0 says it in the stdout envelope.
+        let cases = [
+            (Some(1), String::new(), DEGRADED.to_string()),
+            (Some(0), envelope_with_notice(), String::new()),
+        ];
+        for (code, stdout, stderr) in cases {
+            blocked(false, code, &stdout, &stderr, 5000);
+            let strict = std::panic::catch_unwind(|| blocked(true, code, &stdout, &stderr, 5000));
             assert!(strict.is_err(), "{code:?}");
         }
     }
@@ -516,22 +555,39 @@ mod timing_tests {
     #[test]
     fn a_crash_or_bare_exit_past_the_deadline_is_not_load() {
         let panicked = "cadence-hooks: 'x' hit an internal error (panic) and did not block; see failopen.jsonl\n";
-        for (code, stderr) in [
-            (Some(1), ""),
-            (Some(1), panicked),
-            (Some(0), ""),
-            (None, DEGRADED),
-            (Some(3), DEGRADED),
+        let envelope = envelope_with_notice();
+        for (code, stdout, stderr) in [
+            (Some(1), "", ""),
+            (Some(1), "", panicked),
+            (Some(0), "", ""),
+            (None, "", DEGRADED),
+            (Some(3), "", DEGRADED),
+            // The notice on the channel the exit code does not use is not the
+            // group's output: exit 0 prints it on stdout, exit 1 on stderr.
+            (Some(0), "", DEGRADED),
+            (Some(1), envelope.as_str(), ""),
+            // A nudge-only exit 0 with no notice is a plain allow.
+            (
+                Some(0),
+                r#"{"hookSpecificOutput":{"additionalContext":"a nudge"}}"#,
+                "",
+            ),
         ] {
-            let r = std::panic::catch_unwind(|| blocked(false, code, stderr, 5000));
-            assert!(r.is_err(), "{code:?} {stderr:?}");
+            let r = std::panic::catch_unwind(|| blocked(false, code, stdout, stderr, 5000));
+            assert!(r.is_err(), "{code:?} {stdout:?} {stderr:?}");
         }
     }
 
     #[test]
     #[should_panic(expected = "expected a block")]
     fn a_fast_non_block_is_a_real_failure() {
-        blocked(false, Some(1), DEGRADED, 50);
+        blocked(false, Some(1), "", DEGRADED, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a block")]
+    fn a_fast_exit_zero_with_the_notice_is_a_real_failure() {
+        blocked(false, Some(0), &envelope_with_notice(), "", 50);
     }
 
     #[test]
