@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -uo pipefail
+# Log to a scratch dir: a deny piped at the real binary otherwise lands in the
+# real denials.jsonl, where the usage census reads it as a session outcome.
+export CADENCE_METRICS_DIR="$(mktemp -d)"
+trap 'rm -rf "$CADENCE_METRICS_DIR"' EXIT
 BIN=/tmp/wt-shellcluster/target/release/cadence-hooks
 PY=$(command -v python3)
 run() {

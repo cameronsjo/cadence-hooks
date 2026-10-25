@@ -7,10 +7,12 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    UNRESOLVABLE_DIR, carries_substitution, child_scripts, clobber_redirect_targets,
-    command_segments, command_word, executable_tokens, executable_tokens_marked, looks_absolute,
-    peel_command_runners, redirect_operator_span, redirect_targets, segment_work_dirs,
-    skip_git_global_options, strip_verbatim_prefix, substitution_bodies, tokenize,
+    COMMAND_RUNNERS, UNRESOLVABLE_DIR, carries_substitution, child_scripts,
+    clobber_redirect_targets, command_segments, command_word, executable_tokens,
+    executable_tokens_marked, installs_trap_action, is_assignment_word, looks_absolute,
+    peel_command_runners, redirect_operator_span, redirect_targets, segment_scripts,
+    segment_work_dirs, skip_git_global_options, strip_verbatim_prefix, substitution_bodies,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -567,21 +569,440 @@ fn is_inert_segment(argv: &[String], segment: &str) -> bool {
         && redirect_targets(segment).is_empty()
 }
 
+/// Can the command give a variable a value that no assignment segment shows,
+/// or skip an assignment [`command_segments`] reads as made? Then a variable
+/// assigned from `mktemp` need not hold that path at its deletion:
+///
+/// - a parameter default (`t=${t:-$(mktemp)}`, `${t:=…}`, `${t+…}`), which the
+///   shell leaves at the value the name already holds;
+/// - an assignment straight after `&&` or `||` (`[ -z "$t" ] && t=$(mktemp)`),
+///   which a failed test skips;
+/// - `printf -v t …`, which assigns from inside a command that is otherwise
+///   inert. (An arithmetic assignment, `$((t=3))`, lists as a segment of its
+///   own and is not inert.)
+/// - a bare `*` (`t=*`, `t="*"`, [`assigns_a_bare_star`]), which the walk
+///   cannot tell from the `*` it lists beside an assignment from `mktemp`.
+///
+/// Substring tests that can only keep a block.
+fn assigns_unseen(command: &str, segments: &[String]) -> bool {
+    uses_parameter_default(command)
+        || assigns_after_logical_operator(command)
+        || assigns_a_bare_star(command)
+        || (command.contains("printf")
+            && segments.iter().any(|segment| {
+                let tokens = executable_tokens(segment);
+                let argv = peel_command_runners(&tokens);
+                argv.first()
+                    .is_some_and(|first| command_word(first) == "printf")
+                    && argv[1..].iter().any(|arg| arg.starts_with("-v"))
+            }))
+}
+
+/// Does the command use a parameter default or substitution (`${t:-word}`,
+/// `${t:=word}`, `${t+word}`)? A `${t:0:3}` reads as one too.
+fn uses_parameter_default(command: &str) -> bool {
+    command.match_indices("${").any(|(at, _)| {
+        let rest = &command[at + 2..];
+        let name = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        name > 0 && rest[name..].starts_with([':', '-', '=', '+', '?'])
+    })
+}
+
+/// Does the command assign a bare `*`, as `t=*` or `t="*"`? The `*` must end
+/// the value: a blank, a `;`, `&`, `|`, `)` or a closing quote comes next, or
+/// nothing does. A closing quote counts anywhere, not only at the end of a
+/// quoted `trap` action (`trap 'tmp=*' INT`), which is why
+/// `echo 'a=*' > "$t"` also keeps the block. [`command_segments`] lists a `*`
+/// beside an assignment from `mktemp`, so the operand walk passes that
+/// segment ([`is_fresh_temp_bookkeeping`]). A `*` the command typed never
+/// shows in the raw text that way: it is a glob, and after
+/// `trap 'rm -rf $t' EXIT; t=*` the trap deletes every file in the cwd.
+fn assigns_a_bare_star(command: &str) -> bool {
+    command.match_indices('=').any(|(at, _)| {
+        command[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && ["*", "\"*\""].iter().any(|star| {
+                command[at + 1..].strip_prefix(star).is_some_and(|rest| {
+                    rest.chars().next().is_none_or(|c| {
+                        c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')' | '\'' | '"')
+                    })
+                })
+            })
+    })
+}
+
+/// Does a `$(mktemp …)` call run a second command before its first `)`, as
+/// `$(mktemp -d; ls)` or `$(mktemp -d && pwd)` do? Core cuts the deletion's
+/// segment at that `;`, `&`, `|` or newline, so the segment ends in
+/// `$(mktemp -d` and [`unquoted_fresh_temp_span`] would close the call with
+/// the trimmed `)`, while the shell also deletes what the second command
+/// prints: `rm -rf $(mktemp -d; pwd)` deletes the cwd. A substring test that
+/// can only keep a block.
+fn mktemp_call_runs_more(command: &str) -> bool {
+    command.match_indices("$(").any(|(at, _)| {
+        let body = command[at + 2..].trim_start();
+        body.starts_with("mktemp")
+            && body
+                .find([')', ';', '&', '|', '\n'])
+                .is_some_and(|end| body.as_bytes()[end] != b')')
+    })
+}
+
+/// Does an `&&` or `||` come straight before an assignment word?
+fn assigns_after_logical_operator(command: &str) -> bool {
+    ["&&", "||"].iter().any(|operator| {
+        command.match_indices(operator).any(|(at, _)| {
+            let rest = command[at + operator.len()..].trim_start();
+            let name = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            name > 0 && rest[name..].starts_with(['=', '+'])
+        })
+    })
+}
+
+/// Is this word exactly one `$(mktemp …)` or backtick `mktemp` substitution?
+/// Its path is one `mktemp` has just made, so it holds no vault file:
+/// `mktemp` never returns a path that existed before (with `-u`, it names one
+/// that does not exist), whatever its options, template or `TMPDIR`.
+/// [`command_segments`] writes a variable assigned from such a call into the
+/// later segments as the call itself, so `t=$(mktemp); rm "$t"` reads
+/// `rm "$(mktemp)"`. The call is read only over plain words: a `/`, a quote,
+/// a `$` or a nested substitution in it is not read.
+fn is_fresh_temp_word(word: &str) -> bool {
+    let Some(inner) = word
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            word.strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        })
+    else {
+        return false;
+    };
+    inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '='))
+        && inner.split_whitespace().next() == Some("mktemp")
+}
+
+/// How many words an unquoted `$(mktemp …)` operand at the head of `words`
+/// spans, when it is one ([`is_fresh_temp_word`]). A segment's last `)` is
+/// trimmed as a group closer, so a call that ends the segment loses its own,
+/// and [`tokenize`] then cuts what is left at its blanks: `rm -f $(mktemp)`
+/// ends in the word `$(mktemp`, and `rm -rf $(mktemp -d)` in `$(mktemp` and
+/// `-d`. The call is put back together from its words: each must be
+/// unquoted (a quoted `'$(mktemp'` is a file name), and the first `)` must
+/// end one of them. When the words run out first, the trimmed `)` closed it,
+/// or core cut the segment at a second command inside the call
+/// (`$(mktemp -d; ls)`), which [`mktemp_call_runs_more`] refuses before this
+/// runs. A call that does not end the segment is one word already.
+///
+/// Unquoted, the shell splits and globs what the call prints, which is one
+/// path except under GNU's `--help` and `--version` (or an abbreviation) and
+/// its undocumented `-V`, alone or in a group (`-dV`): `rm -f $(mktemp --help)`
+/// deletes any file named `a` or `file`. This does not put such a call back
+/// together, so that spelling keeps the block.
+fn unquoted_fresh_temp_span(words: &[String], unquoted_prefix_lens: &[usize]) -> Option<usize> {
+    if !words.first()?.starts_with("$(") {
+        return None;
+    }
+    let mut call = String::new();
+    for (count, (word, &len)) in words.iter().zip(unquoted_prefix_lens).enumerate() {
+        let prints_text = word.starts_with("--h")
+            || word.starts_with("--v")
+            || (word.starts_with('-') && !word.starts_with("--") && word.contains('V'));
+        if len < word.len() || prints_text {
+            return None;
+        }
+        if count > 0 {
+            call.push(' ');
+        }
+        call.push_str(word);
+        if let Some(at) = word.find(')') {
+            return (at + 1 == word.len() && is_fresh_temp_word(&call)).then_some(count + 1);
+        }
+    }
+    call.push(')');
+    is_fresh_temp_word(&call).then_some(words.len())
+}
+
+/// The value of a segment that only assigns one variable (`t=$(mktemp)`,
+/// `t="$(mktemp -d)"`, `t=*`), with one pair of double quotes taken off.
+fn plain_assignment_value(segment: &str) -> Option<&str> {
+    let segment = segment.trim();
+    let (name, value) = segment.split_once('=')?;
+    if name.ends_with('+') || !is_assignment_word(segment) {
+        return None;
+    }
+    Some(
+        value
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.strip_suffix('"'))
+            .unwrap_or(value),
+    )
+}
+
+/// Is this segment one the operand walk may pass over because all it does is
+/// make or fill a fresh `mktemp` path? The path is judged as a deletion operand
+/// ([`is_fresh_temp_word`]), and none of these can move a vault file under it:
+///
+/// - an assignment of such a call, or of the `*` the walk lists beside it;
+/// - the call itself, with no redirect;
+/// - an [`INERT_VERBS`] command whose every redirect writes such a path;
+/// - a `trap` whose action hands its commands only variables
+///   (`trap 'rm -rf "$tmp"' EXIT`, [`trap_action_takes_only_variables`]). The
+///   action runs later, but each variable in it reads as the call it was
+///   assigned, so its deletion is judged in this walk like any other, and an
+///   operand that is not a variable (`trap 'rm -rf build' EXIT`) keeps the
+///   verdict.
+///
+/// Any other assignment, `t=note.md` or `t=$(date)`, is not inert, so a
+/// variable that is reassigned anywhere in the command keeps the block.
+fn is_fresh_temp_bookkeeping(tokens: &[String], argv: &[String], segment: &str) -> bool {
+    if plain_assignment_value(segment)
+        .is_some_and(|value| value == "*" || is_fresh_temp_word(value))
+    {
+        return true;
+    }
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let verb = command_word(first);
+    let targets = redirect_targets(segment);
+    if verb == "mktemp" {
+        return targets.is_empty();
+    }
+    if INERT_VERBS.contains(&verb.as_ref()) {
+        return !targets.is_empty() && targets.iter().all(|target| is_fresh_temp_word(target));
+    }
+    verb == "trap" && installs_trap_action(tokens) && trap_action_takes_only_variables(segment)
+}
+
+/// Is every word after the head of each command in this `trap`'s action,
+/// options aside, one that starts with `$` (`rm -rf "$tmp"`, `rm -f $a ${b}`)?
+/// Read standalone, so a variable stays the reference it is. This tells a
+/// variable from a path. It does not own redirects: the clobber check blocks
+/// one over an existing vault file wherever it sits, and one to a new file
+/// only creates it. It still refuses a redirect (`2>/dev/null`) and the `]`
+/// of a `[` test, which are not variables, so those cleanup lines keep the
+/// block though they delete no vault file; cameronsjo/cadence-hooks#1536
+/// lists them. The action's commands are segments of the operand walk too
+/// and are judged there like any other: a deletion of a variable that is not
+/// a fresh `mktemp` path, or a command that is not inert, keeps the block.
+fn trap_action_takes_only_variables(segment: &str) -> bool {
+    segment_scripts(segment).iter().all(|script| {
+        command_segments(script).iter().all(|inner| {
+            let tokens = executable_tokens(inner);
+            let argv = peel_command_runners(&tokens);
+            argv.iter()
+                .skip(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .all(|arg| arg.starts_with('$'))
+        })
+    })
+}
+
+/// Verbs that run a command string they were handed in a child of their own: a
+/// shell's `-c`, `env -S`, `script -c`, `flock`, `watch`, and `su`/`runuser`.
+/// These are the wrappers core reads a script out of ([`segment_scripts`]) that
+/// are not also a deletion or a re-pointing shape: `find -exec`, `git`, `tmux`,
+/// `eval` and `trap` are left out. What the wrapper does with its own file
+/// operands is not judged, as on `main` for the bare forms: `script` truncates
+/// its typescript file and `flock` creates its lock file, and
+/// `script -q -c 'echo hi' note.md` already allowed there.
+const SCRIPT_WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "env", "script", "flock", "watch", "su", "runuser",
+];
+
+/// `find` runs a command of its own (`-exec`), and core can read that command
+/// in place of the wrapper's whole command: it reads `runuser -u root find .
+/// -exec rm {} +` as running only `rm`, so the `find` would be passed over. A
+/// wrapper with `find` among its own words keeps the verdict, also where the
+/// word is only an argument (`flock /tmp/l rm /tmp/find`), which keeps main's
+/// block. A word with a blank in it is a script string, judged as its own
+/// segments, and is not read here. The other commands that run something of
+/// their own (`git`, `eval`, `trap`, `xargs`, `tmux`) already keep the verdict
+/// behind such a wrapper, so a user or file of that name keeps the relief.
+const RUNS_ITS_OWN: &str = "find";
+
+/// The segments of the command being judged, with the lookup
+/// [`is_script_wrapper`] asks of them, built on first use.
+struct ListedSegments<'a> {
+    segments: &'a [String],
+    set: std::cell::OnceCell<std::collections::HashSet<&'a str>>,
+}
+
+impl<'a> ListedSegments<'a> {
+    fn new(segments: &'a [String]) -> Self {
+        ListedSegments {
+            segments,
+            set: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn contains(&self, segment: &str) -> bool {
+        self.set
+            .get_or_init(|| self.segments.iter().map(String::as_str).collect())
+            .contains(segment)
+    }
+}
+
+/// Is this non-deleting segment a wrapper that does no more than run the script
+/// core read out of it (cadence-hooks#1443)? [`command_segments`] lists that
+/// script's own segments beside the wrapper's, so each is judged on its own in
+/// the same walk and the wrapper adds nothing to judge: `flock /tmp/l rm
+/// /tmp/x` is `rm /tmp/x`, and `sh -c 'rm note.md'` is `rm note.md`.
+///
+/// That holds only while the list really holds them, so each script is read
+/// afresh and every segment of it must already be listed. Past the nesting
+/// [`command_segments`] expands, the deepest commands are not listed (`flock a
+/// flock b flock c flock d flock e rm note.md`), and the wrapper keeps the
+/// verdict. So does a wrapper core read no script out of (`sh script.sh`,
+/// `watch` with no command, an option it could not classify), and a wrapper
+/// behind `xargs`, whose stdin words land on the end of the command the
+/// wrapper runs.
+fn is_script_wrapper(
+    tokens: &[String],
+    argv: &[String],
+    segment: &str,
+    listed: &ListedSegments,
+) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    if !SCRIPT_WRAPPERS.contains(&command_word(first).as_ref()) {
+        return false;
+    }
+    let runners = &tokens[..tokens.len() - argv.len()];
+    if runners.iter().any(|t| command_word(t) == "xargs") {
+        return false;
+    }
+    if tokens
+        .iter()
+        .any(|t| !t.contains(char::is_whitespace) && command_word(t) == RUNS_ITS_OWN)
+    {
+        return false;
+    }
+    let scripts = segment_scripts(segment);
+    !scripts.is_empty()
+        && scripts.iter().all(|script| {
+            rescan(script)
+                && command_segments(script)
+                    .iter()
+                    .all(|inner| listed.contains(inner))
+        })
+}
+
+/// Could this text move the shell's directory? A substring test, so a path
+/// that merely contains `cd` also reads as a move, which keeps a verdict and
+/// never lifts one. The directory walk places a wrapper's whole script where
+/// the wrapper starts, so a `cd` inside the script would put its deletions
+/// somewhere the walk does not look: `cd /tmp && sh -c 'cd /vault; rm x.md'`.
+/// A wrapper that moves by an option of its own (`env -C`, `su -l`, `sudo -i`)
+/// is [`moves_by_option`]'s question. A bare deletion behind the same option
+/// (`cd /tmp && env -C /vault rm x.md`) is placed by core, unchanged here.
+fn may_move_directory(text: &str) -> bool {
+    ["cd", "pushd", "popd"]
+        .iter()
+        .any(|word| text.contains(word))
+}
+
+/// Does a wrapper segment start its script somewhere other than where the
+/// segment runs, by an option of the wrapper or of a runner in front of it?
+/// `env -C <dir>` and `sudo -D <dir>` (each also `--chdir`) move to the
+/// directory they name, and a login (`su -`, `su -l`, `runuser -l`,
+/// `sudo -i`) moves to the target user's home. The directory walk places a
+/// wrapper's script where the wrapper starts, so one that moves keeps the cwd
+/// verdict there: `cd /tmp && env -C /vault sh -c 'rm x.md'` deletes the
+/// vault's `x.md`, not `/tmp/x.md`.
+///
+/// Each runner's options are read as that runner's (`sudo -u me env -i`
+/// does not log in), and a short cluster ends at a flag that takes a value,
+/// so `sudo -uadmin` and `su -s/usr/local/bin/zsh` are not read as `-i` or
+/// `-l`. A login shell (`bash -lc`, `sh -l -c`) and a cleared environment
+/// (`env -i`) stay where they started and are not moves, and the wrapper's
+/// own options end at `--`, so `runuser -u me -- bash -lc '…'` is not either.
+/// Reading a move that is not there only keeps the cwd verdict.
+fn moves_by_option(tokens: &[String], argv: &[String]) -> bool {
+    let mut runner = None;
+    for token in &tokens[..tokens.len() - argv.len()] {
+        let word = command_word(token);
+        if !token.starts_with('-') && COMMAND_RUNNERS.contains(&word.as_ref()) {
+            runner = Some(word);
+        } else if runner
+            .as_deref()
+            .is_some_and(|tool| option_moves(tool, token))
+        {
+            return true;
+        }
+    }
+    let Some(verb) = argv.first() else {
+        return false;
+    };
+    let verb = command_word(verb);
+    argv[1..]
+        .iter()
+        .take_while(|word| *word != "--")
+        .any(|word| option_moves(&verb, word))
+}
+
+/// Does `word`, one option word handed to `tool`, change the directory the
+/// command runs in ([`moves_by_option`])?
+fn option_moves(tool: &str, word: &str) -> bool {
+    // Per tool: the short flags that move, the short flags that take a value
+    // (the rest of the cluster is that value), and the long options that move.
+    let (moving, valued, long): (&str, &str, &[&str]) = match tool {
+        "env" => ("C", "uSPa", &["--chdir"]),
+        "sudo" => ("iD", "aCcgpRrTtUu", &["--login", "--chdir"]),
+        "su" | "runuser" => ("l", "cgGsuw", &["--login"]),
+        _ => return false,
+    };
+    if word == "-" {
+        // `su -` logs in; `env -` is `env -i`.
+        return tool != "env";
+    }
+    if word.starts_with("--") {
+        let name = word.split_once('=').map_or(word, |(name, _)| name);
+        return long.contains(&name);
+    }
+    let Some(cluster) = word.strip_prefix('-') else {
+        return false;
+    };
+    for flag in cluster.chars() {
+        if moving.contains(flag) {
+            return true;
+        }
+        if valued.contains(flag) {
+            return false;
+        }
+    }
+    false
+}
+
 /// With the shell standing inside the vault, is every deletion the command
 /// makes provably aimed outside it (cadence-hooks#839)? The cwd names where
 /// the shell stands, not what `rm` is handed, so `rm /tmp/scratch.py` issued
 /// from the vault is not the trash guard's business.
 ///
 /// Only a plain deletion verb (`rm`, `unlink`, `shred`, `truncate`) at a
-/// segment head is judged operand by operand. Every other destructive shape
-/// keeps the cwd verdict: `git rm` (pathspecs, `--pathspec-from-file`),
-/// `xargs` (operands arrive on stdin), and every command that sits beside the
-/// deletion unless it is inert ([`is_inert_segment`]) — so `find`, `eval`, a
-/// shell wrapper, and anything that could re-point an operand (`ln`, `mv`,
-/// `cd`) keep the block. Options are skipped only before the
-/// first operand or `--`, so a `-f` a strict-POSIX `rm` would treat as a file
-/// is judged as one. A redirection is skipped only when its operator is
-/// unquoted — a quoted `'>note.md'` is a file `rm` deletes.
+/// segment head is judged operand by operand, and so is the deletion a script
+/// wrapper runs (`sh -c 'rm /tmp/x'`, `flock /tmp/l rm /tmp/x`,
+/// [`is_script_wrapper`]): its script is a segment of its own. Every other
+/// destructive shape keeps the cwd verdict: `git rm` (pathspecs,
+/// `--pathspec-from-file`), `xargs` (operands arrive on stdin), and every
+/// command that sits beside the deletion unless it is inert
+/// ([`is_inert_segment`]) — so `find`, `eval`, a wrapper core read no script
+/// out of, and anything that could re-point an operand (`ln`, `mv`, `cd`) keep
+/// the block. An operand that is a fresh `mktemp` path ([`is_fresh_temp_word`],
+/// which is what [`command_segments`] makes of `rm "$t"` after `t=$(mktemp)`,
+/// and unquoted, [`unquoted_fresh_temp_span`]) holds no vault file, and the
+/// segments that make or fill one pass ([`is_fresh_temp_bookkeeping`]).
+/// Options are skipped only before the first operand or `--`, so a `-f` a
+/// strict-POSIX `rm` would treat as a file is judged as one. A redirection is
+/// skipped only when its operator is unquoted — a quoted `'>note.md'` is a
+/// file `rm` deletes.
 fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) -> bool {
     if command.len() > MAX_JUDGED_COMMAND_LEN {
         return false;
@@ -590,16 +1011,26 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
     if segments.len() > MAX_JUDGED_SEGMENTS {
         return false;
     }
+    let listed = ListedSegments::new(&segments);
+    // A variable assigned from `mktemp` holds the path it just made unless
+    // something in the command can change or skip the assignment, and a call
+    // is read only when it runs nothing else.
+    let fresh_temps = !assigns_unseen(command, &segments) && !mktemp_call_runs_more(command);
     let mut judged = 0;
-    for segment in segments {
-        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(&segment);
+    for segment in &segments {
+        let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
         let argv = peel_command_runners(&tokens);
         if !head_deletes(argv) {
             // Every other segment must be provably inert. The physical check
             // reads the disk at hook time, so a sibling that reshapes it first
             // — `ln -s <vault> /tmp/l; rm -rf /tmp/l/`, a `mv`, a `cd` — would
-            // walk an operand into the vault after the check passed it.
-            if !is_inert_segment(argv, &segment) {
+            // walk an operand into the vault after the check passed it. A
+            // script wrapper is its script's segments, judged in this same
+            // walk, so it is passed over.
+            if !is_inert_segment(argv, segment)
+                && !is_script_wrapper(&tokens, argv, segment, &listed)
+                && !(fresh_temps && is_fresh_temp_bookkeeping(&tokens, argv, segment))
+            {
                 return false;
             }
             continue;
@@ -632,7 +1063,16 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
             }
             options_done = true;
             judged += 1;
-            if judged > MAX_JUDGED_OPERANDS || !operand_outside_vault(arg, vault, meta) {
+            if judged > MAX_JUDGED_OPERANDS {
+                return false;
+            }
+            if fresh_temps && let Some(span) = unquoted_fresh_temp_span(&argv[i..], &lens[i..]) {
+                i += span;
+                continue;
+            }
+            if !(operand_outside_vault(arg, vault, meta)
+                || (fresh_temps && is_fresh_temp_word(arg)))
+            {
                 return false;
             }
             i += 1;
@@ -649,8 +1089,13 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
 /// The [`deletions_all_outside_vault`] rules hold otherwise: only a plain
 /// deletion verb at a segment head is judged (not `git rm`, `xargs`,
 /// `find`), every operand must pass [`operand_outside_vault`] as the path it
-/// lands on, and every other segment must be a directory move or inert. A
-/// deletion the walk leaves in `cwd`, or cannot place, keeps the block.
+/// lands on, and every other segment must be a directory move, inert, or a
+/// script wrapper ([`is_script_wrapper`]) that does not move on its own
+/// ([`may_move_directory`], [`moves_by_option`]). Every segment of such a
+/// wrapper's script is a segment of this walk too, so a wrapper inside it is
+/// judged the same way. Beside or inside such a wrapper, no deletion may move
+/// by an option either. A deletion the walk leaves in `cwd`, or cannot place,
+/// keeps the block.
 fn placed_deletions_all_outside_vault(
     command: &str,
     cwd: &str,
@@ -665,6 +1110,9 @@ fn placed_deletions_all_outside_vault(
     if segments.len() > MAX_JUDGED_SEGMENTS {
         return false;
     }
+    let listed = ListedSegments::new(&segments);
+    let mut passed_a_wrapper = false;
+    let mut a_deletion_moves = false;
     for segment in segments.iter() {
         let tokens = executable_tokens(segment);
         let argv = peel_command_runners(&tokens);
@@ -677,11 +1125,30 @@ fn placed_deletions_all_outside_vault(
             if verb == "git" || runners.iter().any(|t| command_word(t) == "xargs") {
                 return false;
             }
+            a_deletion_moves |= moves_by_option(&tokens, argv);
         } else if !matches!(verb.as_ref(), "cd" | "pushd" | "popd")
             && !is_inert_segment(argv, segment)
         {
-            return false;
+            if !(is_script_wrapper(&tokens, argv, segment, &listed)
+                && !may_move_directory(segment)
+                && !moves_by_option(&tokens, argv))
+            {
+                return false;
+            }
+            passed_a_wrapper = true;
         }
+    }
+    // Core places a deletion behind `env -C <dir>` or `sudo -i` where the `cd`
+    // put the shell, not where the option moves it. Beside a wrapper, `main`
+    // blocked that deletion only because the wrapper ended this walk, so a
+    // walk that passed one over keeps the block: `cd /tmp && flock /tmp/l echo
+    // hi; env -C /vault rm x.md` deletes the vault's `x.md`. A deletion inside
+    // the wrapper's script is one of this walk's segments, so `cd /tmp && sh
+    // -c 'env -C /vault rm x.md'` keeps it too. An option on a command that
+    // deletes nothing moves only that command: `cd /tmp && sh -c 'sudo -i
+    // true; rm -rf build'` deletes `/tmp/build`.
+    if passed_a_wrapper && a_deletion_moves {
+        return false;
     }
     let placed = moved_deletion_operands(command, cwd, vault, home, meta);
     if placed.lifted.is_empty() || placed.judged.len() > MAX_JUDGED_OPERANDS {
@@ -1635,8 +2102,9 @@ mod tests {
             ("eval rm /tmp/a", Block),
             ("sh -c 'eval rm /tmp/a'", Block),
             (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
-            // A wrapper is not inert, whatever its script says.
-            ("sh -c 'rm /tmp/a'", Block),
+            // A script wrapper is its script's segments, judged like a bare
+            // deletion (cameronsjo/cadence-hooks#1443).
+            ("sh -c 'rm /tmp/a'", Allow),
             ("sh -c 'rm note.md'", Block),
             ("bash -c 'rm \"$1\"' _ note.md", Block),
             ("bash -c 'cd /tmp && rm a'", Block),
@@ -1671,6 +2139,198 @@ mod tests {
         let result =
             check_destructive_in_vault("rm /tmp/a", "/vault/notes", "/vault", &FakeFs::default());
         assert_eq!(result.outcome, Allow);
+    }
+
+    /// cameronsjo/cadence-hooks#1443: from a vault cwd, a deletion a script
+    /// wrapper runs is judged operand by operand, as the bare one is. Each
+    /// wrapper spelling takes the same deletions: one aimed outside the vault
+    /// allows, one the guard reads as aimed into it (a vault path, a relative
+    /// name, a mix, an operand it cannot place) still blocks.
+    #[test]
+    fn a_deletion_behind_a_wrapper_is_judged_like_a_bare_one() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let wrappers = [
+            "flock /tmp/l {}",
+            "script -q -c '{}' /dev/null",
+            "script -q -t -c '{}' /dev/null",
+            "sh -c '{}'",
+            "bash -c '{}'",
+            "zsh -c '{}'",
+            "dash -c '{}'",
+            "watch -x {}",
+            "runuser -u app -- {}",
+            "env -S 'A=1' {}",
+            "env -S 'A=1 {}'",
+            "su -c '{}'",
+            "sudo sh -c '{}'",
+            "flock /tmp/l sh -c '{}'",
+        ];
+        let deletions: &[(&str, cadence_hooks_core::Outcome)] = &[
+            ("rm -f /tmp/x", Allow),
+            ("rm -rf /tmp/build /home/me/out", Allow),
+            ("unlink /tmp/x", Allow),
+            ("truncate -s0 /tmp/log", Allow),
+            ("rm -f /vault/note.md", Block),
+            ("rm -rf /vault", Block),
+            ("rm -f note.md", Block),
+            ("rm -f ./note.md", Block),
+            ("rm -f /tmp/x note.md", Block),
+            ("rm -f /tmp/x /vault/note.md", Block),
+            ("rm -f /tmp/../vault/note.md", Block),
+            ("rm -f /tmp/$X", Block),
+            ("rm -f /tmp/*", Block),
+            ("rm -rf /", Block),
+        ];
+        let fs = FakeFs::with(&["/tmp"]);
+        for wrapper in wrappers {
+            for &(deletion, expected) in deletions {
+                let command = wrapper.replace("{}", deletion);
+                for cwd in ["/vault", "/vault/notes"] {
+                    let result = check_destructive_in_vault(&command, cwd, "/vault", &fs);
+                    assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
+                }
+            }
+        }
+        // The same wrappers from outside the vault were already judged by the
+        // operands; they stay so.
+        for wrapper in wrappers {
+            for (deletion, expected) in [("rm -f /tmp/x", Allow), ("rm -f /vault/note.md", Block)] {
+                let command = wrapper.replace("{}", deletion);
+                let result = check_destructive_in_vault(&command, "/home/me", "/vault", &fs);
+                assert_eq!(result.outcome, expected, "cwd=/home/me: {command}");
+            }
+        }
+
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // A wrapper in a chain, a subshell, or beside other deletions.
+            ("sh -c 'rm /tmp/a' && flock /tmp/l rm /tmp/b", Allow),
+            ("sh -c 'rm /tmp/a'; rm /tmp/b", Allow),
+            ("(sh -c 'rm /tmp/x')", Allow),
+            ("sh -c 'rm /tmp/a; rm /tmp/b'", Allow),
+            ("sh -c 'rm /tmp/a; rm note.md'", Block),
+            ("sh -c 'rm /tmp/a' && rm note.md", Block),
+            ("flock /tmp/l rm /tmp/a; sh -c 'rm note.md'", Block),
+            // Wrappers nest, and past the depth core expands they still block.
+            ("sh -c \"sh -c 'rm /tmp/x'\"", Allow),
+            ("sh -c \"sh -c 'rm note.md'\"", Block),
+            ("flock /tmp/l sh -c 'flock /tmp/m rm /tmp/x'", Allow),
+            ("flock /tmp/l sh -c 'flock /tmp/m rm note.md'", Block),
+            // Past the nesting the walk expands, the deepest command is not
+            // listed, so a wrapper above it keeps the verdict.
+            (
+                "rm /tmp/a; flock /tmp/a flock /tmp/b flock /tmp/c flock /tmp/d flock /tmp/e rm note.md",
+                Block,
+            ),
+            (
+                "rm /tmp/a; sh -c \"sh -c \\\"sh -c 'sh -c \\\\\\\"rm note.md\\\\\\\"'\\\"\"",
+                Block,
+            ),
+            // Every segment of the script must be listed, not just one: the
+            // first `rm` is listed (it is also a top-level segment), the
+            // second is past the nesting the walk expands.
+            (
+                "rm /tmp/x; flock /tmp/a flock /tmp/b flock /tmp/c flock /tmp/d sh -c 'rm /tmp/x; rm note.md'",
+                Block,
+            ),
+            // A segment that assigns a variable is not inert.
+            ("X=note.md; sh -c 'rm $X'", Block),
+            ("X=/tmp/a Y=note.md; sh -c 'rm $Y'", Block),
+            (
+                "sh -c \"sh -c \\\"sh -c 'sh -c \\\\\\\"rm note.md\\\\\\\"'\\\"\"",
+                Block,
+            ),
+            // A positional parameter the wrapper was handed is not a path.
+            ("bash -c 'rm \"$1\"' _ /tmp/x", Block),
+            ("bash -c 'rm -f \"$@\"' _ /tmp/x", Block),
+            ("flock /tmp/l sh -c 'rm $0' /tmp/x", Block),
+            // A sibling that could re-point an operand keeps the block, ahead
+            // of the wrapper or inside it.
+            ("ln -s /vault /tmp/l; sh -c 'rm -rf /tmp/l/note.md'", Block),
+            ("ln -s /vault /tmp/l; flock /tmp/k rm /tmp/l/note.md", Block),
+            ("ln -s /vault /tmp/l && watch -x rm /tmp/l/note.md", Block),
+            ("mv /vault/note.md /tmp/y; sh -c 'rm /tmp/y'", Block),
+            ("cp -r /vault /tmp/v; runuser -u app -- rm -r /tmp/v", Block),
+            ("cd /tmp && sh -c 'rm /tmp/y'", Block),
+            ("sh -c 'ln -s /vault /tmp/l; rm -rf /tmp/l/note.md'", Block),
+            ("sh -c 'mv /vault/note.md /tmp/y; rm /tmp/y'", Block),
+            ("sh -c 'cd /tmp && rm /tmp/y'", Block),
+            ("sh -c 'cd /vault; rm /tmp/y'", Block),
+            // A wrapper's substitution runs in the parent, and is judged.
+            ("sh -c 'true' \"$(rm note.md)\"", Block),
+            ("sh -c 'rm /tmp/a' \"$(rm note.md)\"", Block),
+            ("flock /tmp/l rm /tmp/a $(echo note.md)", Block),
+            // Shapes that are never judged operand by operand keep the cwd
+            // verdict inside a wrapper, or behind one.
+            ("sh -c 'git rm /tmp/a'", Block),
+            ("flock /tmp/l git rm /tmp/a", Block),
+            ("sh -c 'find /tmp -delete'", Block),
+            ("flock /tmp/l find /tmp -delete", Block),
+            (r"sh -c 'find /tmp -exec rm {} \;'", Block),
+            ("sh -c 'eval rm /tmp/a'", Block),
+            ("watch -x eval rm /tmp/a", Block),
+            ("echo /vault/note.md | xargs flock /tmp/l rm", Block),
+            ("xargs sh -c 'rm /tmp/a'", Block),
+            (r"find /tmp -exec sh -c 'rm /tmp/a' \;", Block),
+            (r"find /tmp -delete -exec flock /tmp/l rm /tmp/a \;", Block),
+            // A wrapper core read no script out of keeps the verdict.
+            ("rm /tmp/a; sh clean.sh", Block),
+            ("rm /tmp/a; bash ./clean.sh /tmp/b", Block),
+            ("rm /tmp/a; watch", Block),
+            ("rm /tmp/a; nice --bogus sh -c 'rm /tmp/b'", Block),
+            // Only the wrappers core reads a script out of are passed over.
+            ("rm /tmp/a; ssh host rm /tmp/b", Block),
+            ("rm /tmp/a; my_wrapper rm /tmp/b", Block),
+            ("tmux new-session 'rm /tmp/a'", Block),
+            // `trap` and `git` hand a command string to a shell, and are not
+            // script wrappers.
+            ("trap 'rm -f /tmp/a' EXIT; rm /tmp/b", Block),
+            ("git rebase -x 'rm /tmp/a' main", Block),
+            // Core reads `runuser -u USER find …` as running only the
+            // `-exec` action, so a wrapper with `find` among its own words
+            // keeps the verdict.
+            ("runuser -u root find . -exec rm {} +", Block),
+            (
+                r#"runuser -u me find . -name "*.md" -exec rm -f {} \;"#,
+                Block,
+            ),
+            ("runuser -u root find . -exec shred {} +", Block),
+            ("runuser -u root env find . -exec rm {} +", Block),
+            ("runuser -u root timeout 5 find . -exec rm {} +", Block),
+            ("runuser -u root find /tmp -exec rm {} +", Block),
+            ("runuser -u root -- find . -exec rm {} +", Block),
+            ("runuser -u root /usr/bin/find . -exec rm {} +", Block),
+            // A wrapper without `find` keeps the relief, and so does one
+            // whose `find` is inside a script string, its own segments.
+            ("runuser -u root rm -f /tmp/x", Allow),
+            ("runuser -u root env rm -f /tmp/x", Allow),
+            ("sh -c 'rm -f /tmp/find'", Allow),
+            // Only `find` is read among the wrapper's words, so a user, file
+            // or argument named after another command that runs its own
+            // keeps the relief.
+            ("sh -c 'rm -f /tmp/x' git", Allow),
+            ("sudo -u git sh -c 'rm -f /tmp/x'", Allow),
+            ("runuser -u git -- rm -f /tmp/x", Allow),
+            ("flock /tmp/l rm -rf /tmp/git", Allow),
+            // Those commands keep the block behind such a wrapper anyway.
+            ("runuser -u root eval 'rm note.md'", Block),
+            ("runuser -u root trap 'rm note.md' EXIT", Block),
+            ("runuser -u root xargs rm < list.txt", Block),
+            ("runuser -u root tmux new 'rm note.md'", Block),
+            ("runuser -u root git rm note.md", Block),
+        ];
+        for &(command, expected) in cases {
+            let result = check_destructive_in_vault(command, "/vault", "/vault", &fs);
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
+        }
+        // A redirect on the wrapper still truncates an existing vault file.
+        let fs = FakeFs::with(&["/tmp", "/vault/note.md"]);
+        for command in [
+            "sh -c 'rm /tmp/a' > note.md",
+            "flock /tmp/l rm /tmp/a >| note.md",
+        ] {
+            let result = check_destructive_in_vault(command, "/vault", "/vault", &fs);
+            assert_eq!(result.outcome, Block, "{command}");
+        }
     }
 
     #[test]
@@ -2051,6 +2711,283 @@ mod tests {
             (vault, "cd /tmp && ln -s $HOME/vault l && rm -rf l/", Block),
             (vault, "echo $(cd /tmp; rm -f a)", Allow),
             (vault, "echo $(cd /tmp; ls); rm -f a", Block),
+            // A script wrapper runs where the `cd` put it, and is judged
+            // there like a bare deletion (cameronsjo/cadence-hooks#1443).
+            (vault, "cd /tmp && sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && flock /tmp/l rm -rf build", Allow),
+            (vault, "cd /tmp && watch -x rm -f a b", Allow),
+            (
+                vault,
+                "cd $HOME/proj && runuser -u app -- rm -rf build",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build'; sh -c 'rm -f x.md'",
+                Allow,
+            ),
+            (vault, "cd /tmp && sh -c 'rm -rf *'", Block),
+            (vault, "cd /tmp && sh -c 'rm -rf ../vault/x'", Block),
+            (vault, "cd Runbooks && sh -c 'rm x.md'", Block),
+            // A `cd` inside the wrapper moves it off the directory the walk
+            // placed it in.
+            (vault, "cd /tmp && sh -c 'cd -; rm x.md'", Block),
+            (
+                vault,
+                "cd /tmp && sh -c 'cd /home/me/vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'cd $OBSIDIAN_VAULT && rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && bash -c 'pushd /home/me/vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && flock /tmp/l sh -c 'cd /home/me/vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -S 'A=1' sh -c 'cd /home/me/vault; rm x.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build; cd /home/me/vault; rm x.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && sh -c 'find . -delete'", Block),
+            (vault, "cd /tmp && flock /tmp/l git rm -r x", Block),
+            (
+                vault,
+                "cd /tmp && runuser -u root find . -exec rm {} +",
+                Block,
+            ),
+            // So does a directory option or a login on the wrapper, or on a
+            // runner in front of it.
+            (
+                vault,
+                "cd /tmp && env -C /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -C/home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -iC /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir=/home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir=/home/me/vault/env sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env -C /home/me/vault -S 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && flock /tmp/l env -C /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sudo -u me env -C /home/me/vault sh -c 'rm note.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && su -l me -c 'rm note.md'", Block),
+            (vault, "cd /tmp && su - me -c 'rm note.md'", Block),
+            (vault, "cd /tmp && su --login me -c 'rm note.md'", Block),
+            (vault, "cd /tmp && su -lc 'rm note.md' me", Block),
+            (vault, "cd /tmp && su me -l -c 'rm note.md'", Block),
+            (vault, "cd /tmp && runuser -l me -c 'rm note.md'", Block),
+            (
+                vault,
+                "cd /tmp && runuser --login me -c 'rm note.md'",
+                Block,
+            ),
+            (vault, "cd /tmp && sudo -i sh -c 'rm note.md'", Block),
+            (vault, "cd /tmp && sudo -iu me sh -c 'rm note.md'", Block),
+            (vault, "cd /tmp && sudo --login sh -c 'rm note.md'", Block),
+            (vault, "cd /tmp && nice sudo -i sh -c 'rm note.md'", Block),
+            // And a wrapper whose script runs a command that moves, the
+            // deletion itself included.
+            (
+                vault,
+                "cd /tmp && sh -c 'env -C /home/me/vault rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && flock /tmp/l env -C /home/me/vault rm x.md",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && watch -x env -C /home/me/vault rm note.md",
+                Block,
+            ),
+            (vault, "cd /tmp && sh -c 'sudo -i rm note.md'", Block),
+            (vault, "cd /tmp && flock /tmp/l sudo -i rm note.md", Block),
+            (
+                vault,
+                "cd /tmp && sh -c 'nice -n 5 env -C /home/me/vault rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'echo hi; env -C /home/me/vault rm note.md'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c \"flock /tmp/l env -C /home/me/vault rm note.md\"",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && bash -c 'sh -c \"env --chdir=/home/me/vault rm note.md\"'",
+                Block,
+            ),
+            // Core places a bare deletion behind a directory or login option
+            // where the `cd` put the shell. Beside a wrapper the walk passed
+            // over, that deletion keeps the block.
+            (
+                vault,
+                "cd /tmp && flock /tmp/l echo hi; env -C /home/me/vault rm x.md",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && env --chdir=/home/me/vault rm note.md && sh -c 'echo hi'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && (watch -x echo hi; nice env -C /home/me/vault rm note.md)",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build'; sudo -i rm note.md",
+                Block,
+            ),
+            // A login shell, a cleared environment, and an option's value
+            // are not moves.
+            (vault, "cd /tmp && env A=1 sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && env -i sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && env - sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && env -uC sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && bash -lc 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sh -l -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && su me -c 'rm -rf build'", Allow),
+            (
+                vault,
+                "cd /tmp && su -s/usr/local/bin/zsh me -c 'rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && runuser -u me -- bash -lc 'rm -rf build'",
+                Allow,
+            ),
+            (vault, "cd /tmp && sudo sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sudo -uadmin sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sudo -ubill sh -c 'rm -rf build'", Allow),
+            (
+                vault,
+                "cd /tmp && sudo -gwireshark sh -c 'rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && su -s/opt/local/bin/zsh me -c 'rm -rf build'",
+                Allow,
+            ),
+            (vault, "cd /tmp && su -gplugdev me -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && su me -c'ls; rm -rf build'", Allow),
+            (
+                vault,
+                "cd /tmp && runuser -ulocal -- sh -c 'rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && env -S'CC=gcc sh -c \"rm -rf build\"'",
+                Allow,
+            ),
+            // With no wrapper beside it, a bare deletion behind the same
+            // option is core's to place, unchanged.
+            (vault, "cd /tmp && rm -rf build; env -C /tmp rm -f x", Allow),
+            (vault, "cd /tmp && sudo env -i sh -c 'rm -rf build'", Allow),
+            (vault, "cd /tmp && sh -c 'env A=1 rm -rf build'", Allow),
+            (vault, "cd /tmp && flock /tmp/l env -i rm -rf build", Allow),
+            (vault, "cd /tmp && sh -c 'sudo -u me rm -rf build'", Allow),
+            // An option on a command in the script that deletes nothing moves
+            // only that command.
+            (
+                vault,
+                "cd /tmp && sh -c 'env -C /home/me/vault ls; rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'sudo -i true; rm -rf build'",
+                Allow,
+            ),
+            (
+                vault,
+                "cd /tmp && sh -c 'rm -rf build; sudo -i true'",
+                Allow,
+            ),
+            // `trap` and `git` run a command string too, but they are not
+            // script wrappers: the handler runs at exit, wherever the shell
+            // ends up, and a `!` alias or `rebase -x` runs at the repository's
+            // top level, not where the walk placed it.
+            (vault, "cd /tmp && trap 'rm -rf build' EXIT", Block),
+            (
+                vault,
+                "cd /tmp && trap 'rm -rf build' EXIT; cd $OBSIDIAN_VAULT",
+                Block,
+            ),
+            (vault, "cd /tmp && git -c alias.x='!rm -rf build' x", Block),
+            (vault, "cd /tmp && xargs sh -c 'rm a'", Block),
+            (
+                vault,
+                "cd /tmp && sh -c 'ln -s $HOME/vault l && rm -rf l/'",
+                Block,
+            ),
+            (
+                vault,
+                "cd /tmp && ln -s $HOME/vault l && sh -c 'rm -rf l/'",
+                Block,
+            ),
+            (
+                vault,
+                "sh -c 'rm -f x.md'; cd /tmp && sh -c 'rm -rf build'",
+                Block,
+            ),
             // A `cd` that fails leaves the deletion where the shell started:
             // into a directory that is not there, or with a `||` that runs
             // the deletion when it fails.
@@ -2069,6 +3006,23 @@ mod tests {
             let result =
                 check_destructive_in_vault_at(command, cwd, vault, Some("/home/me"), &dirs);
             assert_eq!(result.outcome, expected, "cwd={cwd}: {command}");
+        }
+    }
+
+    /// Core does not peel `sudo -D` yet, so no command reaches the directory
+    /// walk's wrapper arm with it; the move is still read for when it does.
+    #[test]
+    fn sudo_chdir_reads_as_a_move() {
+        for (segment, moves) in [
+            ("sudo -D /home/me/vault sh -c 'rm note.md'", true),
+            ("sudo -D/home/me/vault sh -c 'rm note.md'", true),
+            ("sudo --chdir=/home/me/vault sh -c 'rm note.md'", true),
+            ("sudo --chdir /home/me/vault sh -c 'rm note.md'", true),
+            ("sudo -u me sh -c 'rm -rf build'", false),
+        ] {
+            let tokens = executable_tokens(segment);
+            let argv = peel_command_runners(&tokens);
+            assert_eq!(moves_by_option(&tokens, argv), moves, "{segment}");
         }
     }
 
@@ -2565,6 +3519,242 @@ mod tests {
         }
     }
 
+    /// With the shell standing in the vault, a variable assigned from a bare
+    /// `$(mktemp …)` in the same command, or such a call as the operand, holds
+    /// only the path `mktemp` just made, so deleting it deletes no vault file,
+    /// whatever the call's options, template or `TMPDIR`. A call the guard does
+    /// not read, a reassignment, an assignment that may not have run, a suffix,
+    /// another operand, or a sibling that is not inert keeps the block.
+    #[test]
+    fn a_fresh_mktemp_path_holds_no_vault_file() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+        let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
+            // The reports.
+            (r#"t=$(mktemp); echo x > "$t"; rm -f "$t""#, Allow),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT"#, Allow),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; ls"#, Allow),
+            // The assignment, the call and the quoted operand, in each spelling.
+            (r#"t=$(mktemp); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp -d); rm -rf "$t""#, Allow),
+            ("t=`mktemp`; rm -f \"$t\"", Allow),
+            (r#"t="$(mktemp -d)"; rm -rf "$t""#, Allow),
+            (r#"t=$(mktemp) && rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); printf '%s\n' "$t"; rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); rm -f "${t}""#, Allow),
+            (r#"rm -f "$(mktemp)""#, Allow),
+            (r#"t=$(mktemp -u); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp --suffix=.md); rm -f "$t""#, Allow),
+            // A `V` in a long option's value is not GNU's `-V`.
+            (r#"rm -f $(mktemp --suffix=-V)"#, Allow),
+            (r#"t=$(mktemp --); rm -f "$t""#, Allow),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "${tmp}"' EXIT"#, Allow),
+            // An unquoted operand. A call that ends the segment loses its `)`
+            // to the group-closer trim and splits at its blanks, so it is put
+            // back together; one that does not is one word already.
+            (r#"t=$(mktemp); rm -f $t"#, Allow),
+            (r#"rm -f $(mktemp)"#, Allow),
+            (r#"rm -rf $(mktemp -d)"#, Allow),
+            (r#"rm -rf $(mktemp -d) 2>/dev/null"#, Allow),
+            (
+                r#"tmp=$(mktemp); echo x > "$tmp"; cat "$tmp"; rm -f $tmp"#,
+                Allow,
+            ),
+            (r#"tmp=$(mktemp); trap 'rm -f $tmp' EXIT"#, Allow),
+            // `mktemp` only makes a new path, wherever its options, template
+            // or `TMPDIR` put it.
+            (r#"t=$(mktemp -t note.XXXX); rm -f "$t""#, Allow),
+            (r#"t=$(mktemp -d -t note); rm -rf "$t""#, Allow),
+            (r#"t=$(mktemp -p .); rm "$t""#, Allow),
+            (r#"t=$(mktemp -dp .); rm -rf "$t""#, Allow),
+            (r#"t=$(mktemp -p.); rm "$t""#, Allow),
+            (r#"t=$(mktemp --tmpdir); rm "$t""#, Allow),
+            (r#"t=$(mktemp --tmp); rm "$t""#, Allow),
+            (r#"t=$(mktemp --tmpdir=.); rm "$t""#, Allow),
+            (r#"t=$(mktemp note.XXXX); rm "$t""#, Allow),
+            (r#"t=$(mktemp -d note.XXXX); rm -rf "$t""#, Allow),
+            (r#"rm -f $(mktemp -p .)"#, Allow),
+            (r#"TMPDIR=. mktemp; rm -f "$(mktemp)""#, Allow),
+            // What fills the path: a fresh redirect on an inert verb, and a
+            // bare call with no redirect.
+            (
+                r#"t=$(mktemp); echo x >> "$t"; cat "$t"; rm -f "$t""#,
+                Allow,
+            ),
+            (r#"t=$(mktemp); cat note.md > "$t"; rm -f "$t""#, Allow),
+            // A second command inside a substitution that is not a `mktemp`
+            // call leaves the reading on.
+            (
+                r#"t=$(mktemp); echo "$(ls; pwd)" > "$t"; rm -f "$t""#,
+                Allow,
+            ),
+            ("mktemp; rm /tmp/x", Allow),
+            ("mktemp -t /vault/x.XXXX; rm /tmp/x", Allow),
+            // A trap whose action hands its commands only variables, deleting
+            // or not; the walk judges those commands where they stand.
+            (
+                r#"tmp=$(mktemp -d); trap 'echo "$tmp"' EXIT; rm -rf "$tmp""#,
+                Allow,
+            ),
+            // No assignment, so the variable is not read.
+            (r#"rm -f "$t""#, Block),
+            (r#"trap 'rm -rf "$tmp"' EXIT"#, Block),
+            // A call with a `/` in it is not read.
+            (r#"t=$(mktemp -p /vault/x); rm "$t""#, Block),
+            (r#"t=$(mktemp --tmpdir=/vault); rm "$t""#, Block),
+            (r#"t=$(mktemp /tmp/x.XXXX); rm "$t""#, Block),
+            (r#"t=$(mktemp -t /tmp/x.XXXX); rm "$t""#, Block),
+            // A `TMPDIR` assignment is a sibling that is not inert, and a call
+            // behind a `TMPDIR=` prefix is not read.
+            (r#"TMPDIR=.; t=$(mktemp); rm "$t""#, Block),
+            (r#"export TMPDIR=.; t=$(mktemp); rm "$t""#, Block),
+            (r#"t=$(TMPDIR=. mktemp); rm "$t""#, Block),
+            // A reassignment a segment shows is a sibling that is not inert.
+            (r#"t=$(mktemp); t=note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); t+=note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); read t; rm "$t""#, Block),
+            (r#"t=$(mktemp); echo $((t=5)); rm "$t""#, Block),
+            (r#"t=$(mktemp); : $((t = 5)); rm "$t""#, Block),
+            (r#"t=$(mktemp); (( t = 5 )); rm "$t""#, Block),
+            (r#"t=$(mktemp); u=$(date); rm "$u""#, Block),
+            (
+                r#"tmp=$(mktemp -d); tmp=note.md; trap 'rm -rf "$tmp"' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; tmp=note.md"#,
+                Block,
+            ),
+            // A reassignment the walk cannot see as one (`assigns_unseen`):
+            // `printf -v`, and a bare `*`, which is a glob.
+            (r#"t=$(mktemp); printf -v t note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp); printf -vt note.md; rm "$t""#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*"#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t="*""#, Block),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; ls; tmp=*"#,
+                Block,
+            ),
+            // The `*` can sit before a terminator, or be a trap's whole action.
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*; ls"#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*&& ls"#, Block),
+            (r#"t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*|cat"#, Block),
+            ("t=$(mktemp -d); trap 'rm -rf $t' EXIT\nt=*\nls", Block),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; trap 'tmp=*' INT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT; trap "tmp=*" INT"#,
+                Block,
+            ),
+            // A `*` that is not a whole value assigned to a name is not one.
+            (r#"t=$(mktemp); echo a=*.md > "$t"; rm -f "$t""#, Allow),
+            (r#"t=$(mktemp); echo "x =* y" > "$t"; rm -f "$t""#, Allow),
+            // An assignment that may not have run (`assigns_unseen`: a
+            // parameter default, an `&&` or `||` before it), one that does not
+            // reach the deletion (a subshell, a prefix), or one that is not the
+            // bare call (an append, a suffix).
+            (r#"t=${t:-$(mktemp)}; rm -f "$t""#, Block),
+            (r#": ${t:=$(mktemp)}; rm -f "$t""#, Block),
+            (r#"[ -n "$t" ] || t=$(mktemp); rm -f "$t""#, Block),
+            (r#"false && t=$(mktemp); rm -f "$t""#, Block),
+            (r#"[ -z "$t" ] && t=$(mktemp); rm -f "$t""#, Block),
+            (r#"[ -n "$t" ] || t=$(mktemp) && rm -f "$t""#, Block),
+            (r#"t=$(mktemp); rm -f "${t:-note.md}""#, Block),
+            (r#"(t=$(mktemp)); rm -f "$t""#, Block),
+            (r#"t=$(mktemp) rm -f "$t""#, Block),
+            (r#"t+=$(mktemp); rm -f "$t""#, Block),
+            (r#"t=$(mktemp -d)/x; rm -rf "$t""#, Block),
+            // Only the path itself is read, quoted or not, and every operand
+            // must be one.
+            (r#"t=$(mktemp -d); rm -rf "$t"/x"#, Block),
+            (r#"t=$(mktemp); rm -rf $t/x"#, Block),
+            (r#"rm -rf $(mktemp -d)/x"#, Block),
+            (r#"rm -rf $(mktemp -d)x"#, Block),
+            (r#"t=$(mktemp -d -t "$(cat note.md)"); rm -rf "$t""#, Block),
+            (r#"t=$(mktemp); rm -f "$t" note.md"#, Block),
+            (r#"rm -rf $(mktemp -d) note.md"#, Block),
+            // A call that prints text, not a path, is not put back together,
+            // and a quoted word is a file name, not a call.
+            (r#"rm -f $(mktemp --help)"#, Block),
+            (r#"rm -f $(mktemp --ver)"#, Block),
+            (r#"rm -f $(mktemp -V)"#, Block),
+            (r#"rm -f $(mktemp -dV)"#, Block),
+            (r#"rm -f '$(mktemp' '-d)'"#, Block),
+            // A call that runs a second command deletes what that prints too.
+            (r#"rm -rf $(mktemp -d; ls)"#, Block),
+            (r#"rm -rf $(mktemp -d && pwd)"#, Block),
+            (r#"rm -f $(mktemp & echo note.md)"#, Block),
+            (r#"rm -f $(mktemp | cat)"#, Block),
+            ("rm -rf $(mktemp -d\nls)", Block),
+            (r#"rm -rf $( mktemp -d; ls )"#, Block),
+            // Every call is read, not only the first.
+            (r#"rm -rf $(mktemp -d) $(mktemp -d; ls)"#, Block),
+            (r#"sh -c 'rm -rf $(mktemp -d; ls)'"#, Block),
+            (r#"t=$(mktemp); rm -f "$t" "$u""#, Block),
+            (r#"t=$(mktemp); rm -f "$t"; rm note.md"#, Block),
+            // A sibling that moves, copies or links files, or a redirect to
+            // anything but the fresh path.
+            (
+                r#"tmp=$(mktemp -d); mv note.md "$tmp"; rm -rf "$tmp""#,
+                Block,
+            ),
+            (r#"tmp=$(mktemp -d); cp -r . "$tmp"; rm -rf "$tmp""#, Block),
+            (r#"tmp=$(mktemp -d); cd "$tmp"; rm -rf "$tmp""#, Block),
+            (
+                r#"tmp=$(mktemp -d); ln -s $PWD "$tmp/l"; rm -rf "$tmp""#,
+                Block,
+            ),
+            (
+                r#"t=$(mktemp); echo x > "$t"; echo y > note.md; rm -f "$t""#,
+                Block,
+            ),
+            (r#"t=$(mktemp); tee "$t" < note.md; rm -f "$t""#, Block),
+            ("mktemp > note.md; rm /tmp/x", Block),
+            ("mktemp -t > note.md; rm /tmp/x", Block),
+            // A trap whose action hands a command a path or a redirect, or
+            // runs a command the walk does not pass.
+            (r#"tmp=$(mktemp -d); trap 'rm -rf build' EXIT"#, Block),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp"; rm note.md' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp" note.md' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'rm -rf "$tmp" > note.md' EXIT"#,
+                Block,
+            ),
+            (
+                r#"tmp=$(mktemp -d); trap 'mv "$x" "$tmp"' EXIT; rm -rf "$tmp""#,
+                Block,
+            ),
+            (r#"tmp=$(mktemp -d); trap 'git rm -rf "$tmp"' EXIT"#, Block),
+            (
+                r#"tmp=$(mktemp -d); trap "$cleanup" EXIT; rm -rf "$tmp""#,
+                Block,
+            ),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf "$1"' EXIT"#, Block),
+            (r#"tmp=$(mktemp -d); trap 'rm -rf $' EXIT"#, Block),
+        ];
+        for &(command, expected) in cases {
+            let result =
+                check_destructive_in_vault(command, "/vault", "/vault", &FakeFs::with(&["/tmp"]));
+            assert_eq!(result.outcome, expected, "cwd=/vault: {command}");
+        }
+        // From a vault subdirectory the same.
+        for command in [
+            r#"t=$(mktemp); echo x > "$t"; rm -f "$t""#,
+            r#"t=$(mktemp); rm -f $t"#,
+        ] {
+            let result =
+                check_destructive_in_vault(command, "/vault/notes", "/vault", &FakeFs::default());
+            assert_eq!(result.outcome, Allow, "cwd=/vault/notes: {command}");
+        }
+    }
+
     #[test]
     fn platform_runner_option_spellings_rm_inside_vault_blocked() {
         // Two spellings the runner grammars missed, both verified against the
@@ -2641,6 +3831,22 @@ mod tests {
                 "{command} must block"
             );
         }
+    }
+
+    #[test]
+    fn a_shell_option_value_does_not_hide_a_shell_wrapper() {
+        // Core read `pipefail`, the value of `-o`, as the shell's first
+        // operand and surfaced no script, so this deleted a real note from a
+        // vault with no block (cadence-hooks#1493 security review).
+        assert_eq!(
+            outcome_in_vault("bash -euo pipefail -c 'rm note.md'"),
+            cadence_hooks_core::Outcome::Block
+        );
+        // A script file after the same options is still not read.
+        assert_eq!(
+            outcome_in_vault("bash -euo pipefail sync.sh"),
+            cadence_hooks_core::Outcome::Allow
+        );
     }
 
     #[test]
