@@ -217,7 +217,7 @@ export CADENCE_ALLOWED_OWNERS="cameron git.sjo.lol/cameron"
 
 ### How guard-gh-write resolves targets
 
-For a single `gh` write, the target resolves in order: explicit `-R`/`--repo` flag (all four forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`) → positional `owner/repo` argument → `gh api repos/...` path → the working directory's git remotes. A resolved target is checked against the allowlists; an owned target proceeds without any flag.
+For a single `gh` write, the target resolves in order: a PR or issue URL argument (`gh pr merge https://github.com/owner/repo/pull/1`, on the `gh pr` and `gh issue` verbs that take one; gh reads it before `-R`, so it wins over every source after it, except under `gh issue transfer`, where the sources after it are judged too) → explicit `-R`/`--repo` flag (all four forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`) → positional `owner/repo` argument → `gh api repos/...` path → the working directory's git remotes. A resolved target is checked against the allowlists; an owned target proceeds without any flag.
 
 The target host follows the command itself, on any subcommand, in two spellings:
 an explicit `--hostname` (separate or `=` form) overrides an inline

@@ -3977,6 +3977,22 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_option_value_does_not_hide_a_shell_wrapper() {
+        // Core read `pipefail`, the value of `-o`, as the shell's first
+        // operand and surfaced no script, so this deleted a real note from a
+        // vault with no block (cadence-hooks#1493 security review).
+        assert_eq!(
+            outcome_in_vault("bash -euo pipefail -c 'rm note.md'"),
+            cadence_hooks_core::Outcome::Block
+        );
+        // A script file after the same options is still not read.
+        assert_eq!(
+            outcome_in_vault("bash -euo pipefail sync.sh"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
     fn find_exec_action_with_a_flagged_runner_does_not_hide_a_shell_wrapper() {
         // The same finding at the second executable position. The exec window
         // handed `child_scripts` the UNPEELED slice, so a flagged runner in
