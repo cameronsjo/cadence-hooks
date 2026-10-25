@@ -19,8 +19,8 @@ use cadence_hooks_core::paths::read_untrusted_config;
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, TRANSPARENT, command_segments, command_word, dollar_opens_quote_after,
     executable_tokens, executable_tokens_marked, is_assignment_word, peel_command_runners,
-    shell_fed_heredoc_bodies, split_segments, split_segments_with_ops, strip_heredoc_bodies,
-    tokenize, unescape_word,
+    shell_fed_heredoc_bodies, shell_option_takes_value, split_segments, split_segments_with_ops,
+    strip_heredoc_bodies, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -190,9 +190,6 @@ fn sends_stdin(cmd: &str, argv: &[String]) -> bool {
         _ => false,
     }
 }
-
-/// Shell options whose VALUE is the next token, so it is not the script.
-const SHELL_VALUED_OPTIONS: &[&str] = &["-o", "-O", "+o", "+O", "--rcfile", "--init-file"];
 
 /// The FILE an HTTPie request item reads, or `None` for any other item.
 ///
@@ -1736,7 +1733,14 @@ fn literal_output(word: &str, argv: &[String]) -> Option<String> {
 
 /// Does this shell invocation read its script from stdin — no `-c`, no script
 /// file operand (or an explicit `-s`)?
+///
+/// An option's value is skipped by core's grammar
+/// ([`shell_option_takes_value`]), so `bash -euo pipefail` reads stdin: a
+/// whole-word table read `pipefail` as a script file there.
 fn shell_reads_stdin(argv: &[String]) -> bool {
+    let Some(shell) = argv.first().map(|w| command_word(w)) else {
+        return false;
+    };
     let mut i = 1;
     while let Some(t) = argv.get(i) {
         if t == "--" {
@@ -1745,10 +1749,8 @@ fn shell_reads_stdin(argv: &[String]) -> bool {
         if !(t.starts_with('-') || t.starts_with('+')) || t.len() < 2 {
             return false;
         }
-        if SHELL_VALUED_OPTIONS.contains(&t.as_str()) {
-            i += 2;
-            continue;
-        }
+        // Before the value test: `-co pipefail` is still `-c`, and `-so
+        // pipefail x` still reads stdin.
         if t.starts_with('-') && !t.starts_with("--") {
             if t.contains('c') {
                 return false;
@@ -1757,7 +1759,7 @@ fn shell_reads_stdin(argv: &[String]) -> bool {
                 return true;
             }
         }
-        i += 1;
+        i += 1 + usize::from(shell_option_takes_value(&shell, t));
     }
     true
 }
@@ -2669,7 +2671,7 @@ fn closing_paren(chars: &[char], from: usize) -> Option<usize> {
 }
 
 /// The `-c` script of a shell invocation whose options [`command_segments`]
-/// does not walk (`bash -o pipefail -c '…'`, `bash +x -c '…'`).
+/// does not walk (`bash -oe pipefail -c '…'`, `ksh -o pipefail -c '…'`).
 fn shell_c_script(argv: &[String]) -> Option<&str> {
     let options = shell_options(argv);
     options
@@ -3008,13 +3010,12 @@ fn shell_options(argv: &[String]) -> ShellOptions {
     };
     let mut i = 1;
     while let Some(t) = argv.get(i) {
-        if SHELL_VALUED_OPTIONS.contains(&t.as_str()) {
-            i += 2;
-        } else if t == "--" || t == "-" {
+        if t == "--" || t == "-" {
             i += 1;
             break;
         } else if t.starts_with("--") {
-            i += 1;
+            // Read as bash reads it, like the clusters below.
+            i += 1 + usize::from(shell_option_takes_value("bash", t));
         } else if let Some(cluster) = t.strip_prefix(['-', '+']).filter(|c| !c.is_empty()) {
             options.command |= cluster.contains('c');
             i += 1 + cluster.chars().filter(|c| matches!(c, 'o' | 'O')).count();
@@ -6983,6 +6984,27 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_c_script_after_an_option_value_is_read() {
+        // Core reads past a shell option's value (`-o pipefail`), so each
+        // script reaches this guard as a segment of its own. Each allowed
+        // before: core read the value as the script or stopped at it, which
+        // also kept this guard's own option walk from running. Each runs
+        // `cat .env` on the real shell.
+        assert_bash(
+            &[
+                "bash -co pipefail 'cat .env'",
+                "bash -ceuo pipefail 'cat .env'",
+                "bash -co pipefail -- 'cat .env'",
+                "bash -cO extglob 'cat .env'",
+                "zsh +O -c 'cat .env'",
+                "bash -euo pipefail <<< 'cat .env'",
+            ],
+            cadence_hooks_core::Outcome::Block,
+            "a shell script behind an option value",
+        );
+    }
+
+    #[test]
     fn a_function_definition_does_not_change_the_verdict() {
         // cadence-ecosystem ADR-0046 rule 1: a read through a shell function
         // is out of scope, so a definition no longer blocks a command that
@@ -9297,6 +9319,9 @@ mod tests {
                 "bash -o posix -c 'cat .env'",
                 "bash -O extglob -c 'cat .env'",
                 "bash --rcfile /dev/null -c 'cat .env'",
+                // Core stops at `pipefail` after `-oe`, so only the fallback
+                // walk reads past `--rcfile` here.
+                "bash --rcfile /dev/null -oe pipefail -c 'cat .env'",
                 "bash +x -c 'cat .env'",
                 "sudo -D /x bash -o posix -c 'cat .env'",
                 "su -lc 'cat .env' root",
