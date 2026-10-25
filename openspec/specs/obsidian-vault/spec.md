@@ -94,6 +94,21 @@ A verb SHALL count only where the shell runs it: at the head of a segment or as 
 - **WHEN** an `apply_patch` moves `/vault/note.md` to `/vault/.trash/note.md`
 - **THEN** the hook exits 0
 
+### Requirement: A fresh mktemp path holds no vault file
+From a cwd inside the vault, `trash-guard` SHALL read a bare `$(mktemp …)` operand, or a variable the command assigned from one or a backtick `mktemp`, quoted or not, as a fresh path holding no vault file, whatever its options, template or `TMPDIR`, and allow deleting it and what makes or fills it. A call it does not read, a reassignment to anything else, an assignment that may be skipped, a suffix, an operand that may be a vault file and a sibling that is not inert MUST keep the block.
+
+#### Scenario: Fresh path made, filled and deleted
+- **WHEN** the cwd is the vault and a Bash call runs `t=$(mktemp); echo x > "$t"; rm -f "$t"`, `tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT`, `t=$(mktemp); rm -f $t` or `t=$(mktemp -p .); rm "$t"`
+- **THEN** the hook exits 0
+
+#### Scenario: A call the guard does not read
+- **WHEN** the cwd is the vault and a Bash call runs `rm -f $(mktemp $opts)` (a `$` in the call), `t=$(TMPDIR=. mktemp); rm "$t"` (a word before `mktemp`) or `rm -f $(mktemp --help)` (the call prints text, not a path)
+- **THEN** the hook exits 2
+
+#### Scenario: A variable that may not hold the fresh path
+- **WHEN** the cwd is the vault and a Bash call runs `t=$(mktemp); t=note.md; rm "$t"`, `t=$(mktemp -d); trap 'rm -rf $t' EXIT; t=*` or `tmp=$(mktemp -d); mv note.md "$tmp"; rm -rf "$tmp"`
+- **THEN** the hook exits 2
+
 ### Requirement: Protected guard
 `trash-guard` is a protected, security-critical guard: `CADENCE_DISABLE` MUST NOT turn it off. `CADENCE_BYPASS=1` keeps its general meaning.
 
@@ -166,7 +181,7 @@ A deletion the guard reads behind a wrapper SHALL keep the cwd verdict, a block,
 - **THEN** the hook exits 2
 
 ### Requirement: A git rm that leaves the file on disk is allowed
-A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The rule holds for the bare command, behind a runner or wrapper, as a `find -exec` action, and from outside the vault.
+A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The rule holds for the bare command, behind a runner or wrapper, as a `find -exec` action, and from outside the vault. A word known only when the shell runs is not read.
 
 #### Scenario: Index-only git rm in the vault
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md`, `git rm -r --cached sub/` or `git -C . rm --cached note.md`
@@ -179,3 +194,11 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 #### Scenario: A deleting command beside it
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md; rm note.md`
 - **THEN** the hook exits 2
+
+#### Scenario: A --cached inside a command substitution
+- **WHEN** the cwd is the vault and a Bash call runs `git rm -f note.md $(git diff --name-only --cached)`
+- **THEN** the hook exits 2
+
+#### Scenario: A command substitution beside a --cached
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md $(git ls-files -d)`
+- **THEN** the hook exits 0, and a `--no-cached` or `--` the substitution may print is not read

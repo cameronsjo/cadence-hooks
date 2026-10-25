@@ -34,11 +34,11 @@
 use std::borrow::Cow;
 
 use crate::shell::{
-    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, Readings, TRANSPARENT, apply_cd_target,
-    child_scripts_but_git_exec, command_word, executable_tokens_marked, git_command_line_aliases,
-    git_exec, git_output_detailed, installs_trap_action, is_assignment_word, peel_command_runners,
-    resolve_cd_target, runs_an_unreadable_command, runs_in_found_directories, strip_group_wrappers,
-    unescape_word,
+    COMMAND_RUNNERS, GitExec, GitOutput, MAX_WRAPPER_DEPTH, Readings, TRANSPARENT, UnreadEval,
+    UnreadEvalReading, apply_cd_target, child_scripts_but_git_exec, command_word,
+    executable_tokens_marked, git_command_line_aliases, git_exec, git_output_detailed,
+    installs_trap_action, is_assignment_word, peel_command_runners, resolve_cd_target,
+    runs_an_unreadable_command, runs_in_found_directories, strip_group_wrappers, unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -134,8 +134,9 @@ pub struct PushInvocation {
     /// the push may not run in [`PushInvocation::work_dir`], so neither its
     /// history nor its remotes can be read from there. Set by every
     /// which-repository cause listed on `unresolved` (a redirect flag or env
-    /// assignment, an unfollowable directory change — an `eval`, a `trap`
-    /// action, a `$` target — and a push hidden behind a prefix this walk
+    /// assignment, an unfollowable directory change — an `eval` (one whose
+    /// script needs expansion only as [`push_locations_reading`] says), a
+    /// `trap` action, a `$` target — and a push hidden behind a prefix this walk
     /// cannot peel), and by none of the which-refs causes. An ownership guard
     /// reads this one: a `push.default=matching` repository changes what a
     /// push publishes, never where it goes (cadence-hooks#1095).
@@ -219,10 +220,29 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 /// [`push_invocations`]. For a guard that asks where a push goes, not what it
 /// publishes (cadence-hooks#1095).
 pub fn push_locations(command: &str, cwd: &str) -> Vec<PushInvocation> {
+    push_locations_reading(command, cwd, UnreadEval::MayMove)
+}
+
+/// [`push_locations`], reading an `eval` of text the walk cannot see as
+/// `unread_eval` says. Under [`UnreadEval::MayMove`] every `eval` but a known
+/// tool's start-up script leaves where the push runs unknowable
+/// ([`PushInvocation::repository_unresolved`]). Under
+/// [`UnreadEval::StaysPut`] one whose script needs expansion leaves the shell
+/// where it was, when [`UnreadEvalReading::stays_put`] says so for `command`;
+/// an `eval` of text the walk can read (`eval "cd /u"`) is still
+/// unknowable. The push-remote guard reads an `eval` this way
+/// (cameronsjo/cadence-hooks#1530).
+pub fn push_locations_reading(
+    command: &str,
+    cwd: &str,
+    unread_eval: UnreadEval,
+) -> Vec<PushInvocation> {
     let mut out = Vec::new();
     let gh_hosts = GhHosts::for_command(command);
     let toplevels = Toplevels::default();
-    let walk = Walk::for_command(command, false, &gh_hosts, &toplevels);
+    let reading = UnreadEvalReading::new(command);
+    let mut walk = Walk::for_command(command, false, &gh_hosts, &toplevels);
+    walk.unread_eval = (unread_eval == UnreadEval::StaysPut).then_some(&reading);
     let mut writes = Vec::new();
     collect_push_invocations(
         command,
@@ -308,6 +328,9 @@ struct Walk<'a> {
     gh_hosts: &'a GhHosts,
     /// Working-tree tops already found this walk ([`toplevel_of`]).
     toplevels: &'a Toplevels,
+    /// Set under [`UnreadEval::StaysPut`]: the whole command's reading of an
+    /// `eval` whose script needs expansion ([`directory_verb`]).
+    unread_eval: Option<&'a UnreadEvalReading<'a>>,
 }
 
 impl<'a> Walk<'a> {
@@ -322,6 +345,7 @@ impl<'a> Walk<'a> {
             trusts_known_commands: !may_redefine_known_commands(command),
             gh_hosts,
             toplevels,
+            unread_eval: None,
         }
     }
 }
@@ -936,7 +960,12 @@ fn collect_push_reading(
         // scope pushed above restores the flag at its `)` (#1233).
         if segment.contains('(')
             && crate::shell::cut_inner_tails(segment).iter().any(|tail| {
-                directory_verb(&crate::shell::executable_tokens(tail), known_ok).is_some()
+                directory_verb(
+                    &crate::shell::executable_tokens(tail),
+                    known_ok,
+                    walk.unread_eval,
+                )
+                .is_some()
             })
         {
             scope_directory = true;
@@ -1053,7 +1082,7 @@ fn collect_push_reading(
             );
         }
 
-        match directory_verb(&tokens, known_ok) {
+        match directory_verb(&tokens, known_ok, walk.unread_eval) {
             Some(DirectoryVerb::Knowable(verb_tokens)) => {
                 match resolve_directory_verb(verb_tokens, known_ok) {
                     Some((target, absolute)) => {
@@ -1857,7 +1886,11 @@ enum DirectoryVerb<'a> {
 /// merely *could* unescape to a directory verb refuses. That over-refuses the
 /// unquoted `\cd`, which really does move — an explainable refusal, traded
 /// against a silently wrong answer.
-fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>> {
+fn directory_verb<'t>(
+    tokens: &'t [String],
+    known_ok: bool,
+    unread_eval: Option<&UnreadEvalReading>,
+) -> Option<DirectoryVerb<'t>> {
     fn names_directory_verb(word: &str) -> bool {
         matches!(word, "cd" | "pushd" | "popd")
     }
@@ -1946,6 +1979,13 @@ fn directory_verb(tokens: &[String], known_ok: bool) -> Option<DirectoryVerb<'_>
     if unescape_word(candidate).as_ref() == "eval" {
         // Redirections are not operands: `eval "$(ssh-agent -s)" >/dev/null`.
         if known_ok && crate::shell::eval_is_tool_init(&strip_redirections(&rest[1..])) {
+            return None;
+        }
+        // A guard that asked for [`UnreadEval::StaysPut`] reads an `eval` of
+        // text it cannot see as leaving the shell where it was, unless
+        // something it read moves (cadence-ecosystem ADR-0046 rule 3).
+        let operands: Vec<&str> = rest[1..].iter().map(String::as_str).collect();
+        if unread_eval.is_some_and(|reading| reading.stays_put(&operands)) {
             return None;
         }
         return Some(DirectoryVerb::Unknowable);
@@ -3890,6 +3930,84 @@ mod tests {
         }
         // The ref-only cause still reaches `unresolved`.
         assert!(push_locations("git -c push.default=matching push origin", "/repo")[0].unresolved);
+    }
+
+    /// Under [`UnreadEval::StaysPut`] an `eval` whose script needs expansion
+    /// leaves the push where the walk read it, unless something read in it
+    /// or around it moves; [`UnreadEval::MayMove`], which [`push_locations`]
+    /// keeps, refuses every `eval` but a known tool's start-up script
+    /// (cameronsjo/cadence-hooks#1530). Every row is `(command, unresolved
+    /// under StaysPut)`; each is unresolved under MayMove.
+    #[test]
+    fn an_unread_eval_leaves_the_push_where_it_was_only_when_asked() {
+        for (command, stays_put_unresolved) in [
+            ("eval \"$S\"; git push origin main", false),
+            ("eval \"${S}\" && git push origin main", false),
+            ("eval -- \"$S\"; git push origin main", false),
+            (
+                "eval \"$(direnv export bash)\"; git push origin main",
+                false,
+            ),
+            ("eval `direnv export bash`; git push origin main", false),
+            ("eval $(cat x) >/dev/null; git push origin main", false),
+            ("if true; then eval \"$S\"; fi; git push origin main", false),
+            ("sh -c 'eval \"$S\"; git push origin main'", false),
+            // Its script can be read: the walk does not follow it.
+            ("eval 'echo hi'; git push origin main", true),
+            ("eval \"cd /other\"; git push origin main", true),
+            // Something in it, or in the command, may move.
+            ("eval \"cd $D\"; git push origin main", true),
+            (
+                "eval \"$(zoxide init bash --cmd cd)\"; git push origin main",
+                true,
+            ),
+            ("eval \"$S\" pushd /u; git push origin main", true),
+            ("eval \"$(eval \"$S\")\"; git push origin main", true),
+            ("S='cd /u'; eval \"$S\"; git push origin main", true),
+            ("f() { true; }; eval \"$S\"; git push origin main", true),
+            (
+                "function f { true; }; eval \"$S\"; git push origin main",
+                true,
+            ),
+            ("PATH=/x:$PATH; eval \"$S\"; git push origin main", true),
+            ("export GIT_DIR=/x; eval \"$S\"; git push origin main", true),
+            ("eval \"$1\"; git push origin main", true),
+            ("eval \"$@\"; git push origin main", true),
+            ("eval \"${S:-cd /u}\"; git push origin main", true),
+            ("eval \"$S\" 'c\\d /u'; git push origin main", true),
+            // The `eval` is not what leaves the push unknowable here.
+            ("eval \"$S\"; GIT_DIR=/x/.git git push origin main", true),
+        ] {
+            let stays = push_locations_reading(command, "/repo", UnreadEval::StaysPut);
+            let moves = push_locations_reading(command, "/repo", UnreadEval::MayMove);
+            assert_eq!(stays.len(), 1, "{command}: {stays:?}");
+            assert_eq!(moves.len(), 1, "{command}: {moves:?}");
+            assert_eq!(
+                stays[0].repository_unresolved, stays_put_unresolved,
+                "StaysPut: {command}"
+            );
+            assert!(moves[0].repository_unresolved, "MayMove: {command}");
+            assert_eq!(stays[0].work_dir, "/repo", "{command}");
+            assert_eq!(
+                push_locations(command, "/repo"),
+                moves,
+                "push_locations keeps MayMove: {command}"
+            );
+        }
+        // The same reading where the splitter cut a substitution open: the
+        // `eval` there marks the pushes after it in that subshell
+        // directory-unverified only under MayMove.
+        let command = "echo $(eval \"$S\" && git push origin main )";
+        let stays = push_locations_reading(command, "/repo", UnreadEval::StaysPut);
+        let moves = push_locations_reading(command, "/repo", UnreadEval::MayMove);
+        assert!(
+            !stays.is_empty() && stays.iter().all(|push| !push.directory_unverified),
+            "StaysPut: {stays:?}"
+        );
+        assert!(
+            moves.iter().any(|push| push.directory_unverified),
+            "MayMove: {moves:?}"
+        );
     }
 
     /// cameronsjo/cadence-hooks#1226: a push a git subcommand runs through its
