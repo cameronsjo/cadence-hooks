@@ -430,13 +430,12 @@ mod tests {
 
     // `would_block_here` reads real process env (`CADENCE_ALLOW_MAIN`,
     // `CADENCE_NO_ENFORCE_WORKTREE`), unlike `enforce_worktree`'s own tests
-    // (which inject an `EnvConfig`) — so these tests pin real env, serialized
-    // via the shared `crate::CADENCE_ALLOW_MAIN_TEST_LOCK` and restored on drop,
-    // panic included. The lock is crate-wide, not module-local, because
-    // `warn_main_branch`'s tests mutate `CADENCE_ALLOW_MAIN` too — two separate
-    // module locks would not exclude each other under cargo's parallel runner
-    // (cadence-hooks#298). Mirrors `session::start`'s
-    // `with_worktree_env`/`WorktreeEnvGuard` pattern.
+    // (which inject an `EnvConfig`) — so these tests pin real env through the
+    // crate's one `with_env`, which serializes on the crate-wide env lock and
+    // restores on unwind. The lock is crate-wide, not module-local: two
+    // separate module locks would not exclude each other under cargo's
+    // parallel runner (cadence-hooks#298), and `enforce_worktree` and
+    // `warn_main_branch` read the same vars.
 
     /// This crate's own `target/`-relative scratch root — `env!` resolves at
     /// THIS call site, landing under `crates/guardrails`'s own `target/`.
@@ -447,55 +446,34 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/warn-branch-base-scratch")
     }
 
-    struct WorktreeEnvGuard {
-        allow: Option<std::ffi::OsString>,
-        kill: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for WorktreeEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: only constructed inside `with_worktree_env`, which
-            // holds `CADENCE_ALLOW_MAIN_TEST_LOCK` for this guard's whole
-            // lifetime (declared after the lock, so it drops before the lock
-            // releases — panic included).
-            unsafe {
-                match self.allow.take() {
-                    Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
-                    None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
-                }
-                match self.kill.take() {
-                    Some(v) => std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", v),
-                    None => std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE"),
-                }
-            }
-        }
-    }
-
     fn with_worktree_env<T>(allow: Option<&str>, kill: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _lock = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let _restore = WorktreeEnvGuard {
-            allow: std::env::var_os("CADENCE_ALLOW_MAIN"),
-            kill: std::env::var_os("CADENCE_NO_ENFORCE_WORKTREE"),
-        };
-        // SAFETY: serialized via ENV_LOCK; `_restore` puts the caller's
-        // values back on scope exit.
-        unsafe {
-            match allow {
-                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
-                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
-            }
-            match kill {
-                Some(v) => std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", v),
-                None => std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE"),
-            }
-        }
-        f()
+        crate::with_env(
+            &[
+                ("CADENCE_ALLOW_MAIN", allow),
+                ("CADENCE_NO_ENFORCE_WORKTREE", kill),
+            ],
+            f,
+        )
     }
 
     fn with_clean_worktree_env<T>(f: impl FnOnce() -> T) -> T {
         with_worktree_env(None, None, f)
+    }
+
+    #[test]
+    fn the_worktree_env_helper_holds_the_one_crate_env_lock() {
+        with_worktree_env(None, None, || {
+            // `WouldBlock` only: a poisoned but free lock also returns `Err`, and
+            // another test poisons it on purpose, so `is_err()` could not fail in
+            // a full run.
+            assert!(
+                matches!(
+                    crate::CADENCE_ENV_TEST_LOCK.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "the helper must hold the lock every other env-mutating test takes"
+            );
+        });
     }
 
     /// Meta-repo `meta/` (a primary on main) gitignoring `wt/`, a linked
