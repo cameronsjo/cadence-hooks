@@ -13716,10 +13716,16 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 /// count balances, and over every word of a backtick span, however the words
 /// were split. A `--` inside a substitution is skipped with it.
 ///
-/// Skipping a word can only hide an option. A caller that asks whether one is
-/// present (`--cached`) therefore answers no, the side that blocks, when a
-/// quoted `(` or backtick throws the count off. Each `git rm` option reader
-/// iterates these words in place of its raw arguments (cadence-hooks#1521).
+/// A skipped word hides whatever option it would have given git, so the
+/// answer fails toward blocking only for an option whose presence allows. A
+/// reader that asks whether `--cached` is present answers no, the side that
+/// blocks, when a quoted `(` or backtick throws the count off. A reader that
+/// also honors a later `--no-cached`, or the `--` stop, does not: a
+/// substitution that prints one, or a variable no walk resolved (`"$o"` with
+/// `o=--no-cached`), can turn an allowed `git rm --cached` into a deletion.
+/// Only a crafted command spells that, and cadence-ecosystem ADR-0046 rule 1
+/// leaves such commands out of scope. Each `git rm` option reader iterates
+/// these words in place of its raw arguments (cadence-hooks#1521).
 pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
     // Open `$(` (and nested `(`) count, and whether a backtick span is open,
     // carried from one word to the next.

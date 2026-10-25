@@ -213,7 +213,10 @@ fn head_deletes(argv: &[String]) -> bool {
 /// `git diff`'s, and git deletes the note (cadence-hooks#1556 review N1).
 ///
 /// A word that is the value of an option such as `--pathspec-from-file` is
-/// read as an option here, which no one types.
+/// read as an option here, which no one types. A word whose value is known only
+/// when the command runs (a substitution, an unresolved `$o`) is not read, so a
+/// `--no-cached` or `--` it would expand to goes unseen; only a crafted command
+/// spells that (cadence-ecosystem ADR-0046 rule 1).
 fn git_rm_keeps_the_tree(args: &[String]) -> bool {
     let mut cached = false;
     for arg in cadence_hooks_core::shell::git_rm_option_words(args) {
