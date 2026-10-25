@@ -177,7 +177,7 @@ review, install the official `security-guidance` plugin
 
 | Hook | Event | What it does | Remote |
 |------|-------|--------------|--------|
-| `trash-guard` | PreToolUse (Bash, Edit, Write, destructive `mcp__*` tools) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, `coproc` of any of those, clobber redirects, and an empty or whitespace-only `Write` over an existing vault file); use `.trash/` instead | run |
+| `trash-guard` | PreToolUse (Bash, Edit, Write, destructive `mcp__*` tools) | Block destructive vault operations (`rm`, `git rm` (not `--cached`), `unlink`, `shred`, `truncate`, `find -delete`, `coproc` of any of those, clobber redirects, and an empty or whitespace-only `Write` over an existing vault file); use `.trash/` instead | run |
 | `trash-guard-liveness` | SessionStart | Nudge when `OBSIDIAN_VAULT` is set but is not a directory, or a trash-guard route no longer judges as contracted | self-disable |
 
 A verb counts only where the shell runs an executable, and there are two such
