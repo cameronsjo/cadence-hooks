@@ -16,7 +16,8 @@ use cadence_hooks_core::shell::{
     ExpansionWork, carries_substitution, command_segments, command_segments_with_dirs,
     command_word, eval_is_tool_init, evaluated_static_substitutions, executable_tokens,
     is_assignment_word, may_spell_word, names_command_by_unknown_substitution, parse_work_dir,
-    peel_command_runners, skip_transparent_prefixes, strip_group_wrappers, tokenize, unescape_word,
+    peel_command_runners, shell_option_takes_value, skip_transparent_prefixes,
+    strip_group_wrappers, tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -685,17 +686,15 @@ const SHELL_NAMES: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
 /// Script file suffixes a `source`/`.` operand or a direct `./x.sh` names.
 const SCRIPT_SUFFIXES: &[&str] = &[".sh", ".bash", ".zsh", ".ksh"];
 
-/// Options of a shell that take the NEXT word as their value.
-const SHELL_VALUE_OPTIONS: &[&str] = &["-o", "-O", "+o", "+O", "--rcfile", "--init-file"];
-
 fn has_script_suffix(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
     SCRIPT_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
 }
 
 /// The script file operand of a shell invocation (`bash x.sh`, `sh -e x.sh`),
-/// or `None` for `-c`, stdin, or no operand.
-fn shell_script_file(argv: &[String]) -> Option<&str> {
+/// or `None` for `-c`, stdin, or no operand. An option's value is skipped by
+/// core's grammar: `pipefail` in `bash -euo pipefail -c '…'` is not a file.
+fn shell_script_file<'a>(shell: &str, argv: &'a [String]) -> Option<&'a str> {
     let mut i = 1;
     while let Some(word) = argv.get(i) {
         if word == "--" {
@@ -704,12 +703,13 @@ fn shell_script_file(argv: &[String]) -> Option<&str> {
         if !(word.starts_with('-') || word.starts_with('+')) || word.len() < 2 {
             return Some(word);
         }
-        if SHELL_VALUE_OPTIONS.contains(&word.as_str()) {
-            i += 2;
-            continue;
-        }
+        // Before the value test: `-co pipefail 'x'` is still the `-c` form.
         if word.starts_with('-') && !word.starts_with("--") && word.contains('c') {
             return None;
+        }
+        if shell_option_takes_value(shell, word) {
+            i += 2;
+            continue;
         }
         i += 1;
     }
@@ -861,7 +861,8 @@ fn unseen_execution(
             // A script file read whole that never names git runs no git
             // command: no note (cameronsjo/cadence-hooks#1339).
             w if SHELL_NAMES.contains(&w)
-                && shell_script_file(argv).is_some_and(|file| script_runs_git(segment, file)) =>
+                && shell_script_file(w, argv)
+                    .is_some_and(|file| script_runs_git(segment, file)) =>
             {
                 return Some("a script file");
             }
@@ -2855,6 +2856,11 @@ mod tests {
             "\"$(git rev-parse --show-toplevel)/x.sh\"",
             "gh $(which x) delete",
             "bash x.sh && bash y.sh",
+            // An option's value is skipped; the file after it is still read.
+            "bash -euo pipefail check.sh",
+            "bash -O extglob check.sh",
+            // zsh's `-O` is a plain flag, so zsh runs `check.sh`.
+            "zsh -O check.sh",
         ] {
             let result = GitSafetyGuard.run(&make_bash_input(command));
             assert_eq!(result.outcome, nudge, "{command}");
@@ -2865,6 +2871,11 @@ mod tests {
         for command in [
             "bash -c 'ls'",
             "bash -c \"echo hi\"",
+            // `pipefail` is the value of `-o`, not a script file: core reads
+            // the `-c` script, so the guard does see inside it.
+            "bash -euo pipefail -c 'cargo build'",
+            "bash -o pipefail -c 'ls'",
+            "bash -co pipefail 'cargo build'",
             "echo hi | bash",
             "bash",
             "bash --version",
