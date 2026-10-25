@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.132.0] - 2026-10-25
+
 ### Added
 
 - **The plan-shape lint nudges on a plan with no `## Concessions` section.** `lint-plan-shape` and the persist-time format gate now name `a ## Concessions section` among the stanzas a plan lacks, between the `## Loop` stanza and the Alternatives-declined stanza, the order the plan template lists them. It is a nudge only: the `Panel:` line is still the one stanza that blocks. The check looks for the heading and nothing under it, so a table or `Concessions: none — <reason>` under the heading both pass, and that line with no heading above it does not. The heading match is the one `## Loop` gets: the exact line `## Concessions` with optional trailing whitespace, so `## Concessions made`, `### Concessions`, `## concessions`, an indented heading, and a heading inside a fenced code block, an HTML comment or leading frontmatter do not count. A plan written before the template gained the section now draws the nudge at approval. (cameronsjo/cadence-hooks#1450)
