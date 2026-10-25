@@ -2138,7 +2138,7 @@ const LOOP_FIX_RETARGETING_VARS: [&str; 3] = ["GH_REPO", "GH_HOST", "GIT_DIR"];
 /// - A directory change [`parse_work_dir`] does not read: a `cd` in a
 ///   subshell, a `{ …; }` group or an `if`, a `pushd`, a `cd` on a later
 ///   line, or a runner's `-C`/`-D`. The per-segment reading
-///   ([`command_segments_with_dirs`], then [`dir_after_runners`]) follows
+///   ([`command_segments_with_dirs_reading`], then [`dir_after_runners`]) follows
 ///   those, so it must put every gh write in `work_dir` too. A read
 ///   elsewhere does not matter.
 ///
@@ -2150,7 +2150,9 @@ fn loop_fix_may_name_dir_repo(command: &str, cwd: &str, work_dir: &str) -> bool 
     {
         return false;
     }
-    let segments = command_segments_with_dirs(command, cwd);
+    // The verdict reads an unread `eval` as staying put; the fix does not.
+    // It names the repo only when it is sure, so an `eval` may move here.
+    let segments = command_segments_with_dirs_reading(command, cwd, UnreadEval::MayMove);
     // A reading cut short may have missed a gh write in another directory.
     !ExpansionWork::spent()
         && segments
@@ -12243,6 +12245,9 @@ mod tests {
                 "for n in 1 2; do gh pr merge $n; env -C ../other gh issue close $n; done",
                 true,
             ),
+            // An `eval` the walk cannot read may move the shell. The verdict
+            // judges the loop where it was read; the fix still names no repo.
+            (r#"eval "$S"; for n in 1 2; do gh pr merge $n; done"#, false),
             // A `GH_HOST`, or a `GIT_DIR` that gh's git reads the remotes
             // from. Relaxed mode allows these, as it did before.
             (
