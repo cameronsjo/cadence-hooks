@@ -979,48 +979,84 @@ const STRONG_WORDS: &[&str] = &[
 // Value policy
 // ---------------------------------------------------------------------------
 
+/// What makes a value a placeholder wherever it sits in it (`[REDACTED]`,
+/// `gho_****…`), spelled in lowercase and matched in any case. [`maskable`]
+/// and [`ArgRun::mark()`] both look for these, so a new one goes here, once.
+const PLACEHOLDER_MARKS: [&str; 2] = ["redacted", "****"];
+
 /// Can this value be a secret at all? False only for empty, boolean/null,
 /// obvious placeholders and variable references.
 fn maskable(value: &str) -> bool {
-    let mut v = value.trim();
-    if v.len() >= 2
-        && let (Some(a), Some(b)) = (v.chars().next(), v.chars().next_back())
-        && a == b
-        && matches!(a, '"' | '\'')
-    {
-        v = v[1..v.len() - 1].trim();
+    value_bounds(value, 0, value.len(), &mut |to| {
+        value[..to].trim_end().len()
+    })
+    .is_some_and(|(a, b)| {
+        maskable_trimmed(&value[a..b], &mut |s: &str| {
+            let lower = s.to_ascii_lowercase();
+            PLACEHOLDER_MARKS.iter().any(|mark| lower.contains(mark))
+        })
+    })
+}
+
+/// The bounds [`maskable`] judges inside `text[from..to]`: trimmed, and when
+/// that is wrapped in one pair of matching quotes, the inside trimmed again.
+/// `None` when nothing is left. `end_of(to)` is the end of `text[..to]` with
+/// its trailing blanks dropped; it is asked only when a non-blank lies in
+/// `text[from..to]`, so a caller may answer it from an earlier `from`.
+fn value_bounds(
+    text: &str,
+    from: usize,
+    to: usize,
+    end_of: &mut impl FnMut(usize) -> usize,
+) -> Option<(usize, usize)> {
+    let trimmed = |from: usize, to: usize, end_of: &mut dyn FnMut(usize) -> usize| {
+        let a = to - text[from..to].trim_start().len();
+        (a < to).then(|| (a, end_of(to)))
+    };
+    let (a, b) = trimmed(from, to, end_of)?;
+    let bytes = text.as_bytes();
+    if b - a >= 2 && bytes[a] == bytes[b - 1] && matches!(bytes[a], b'"' | b'\'') {
+        return trimmed(a + 1, b - 1, end_of);
     }
-    if v.is_empty() {
-        return false;
-    }
-    let lower = v.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "true" | "false" | "null" | "none" | "nil" | "~" | "undefined"
-    ) || is_placeholder(&lower)
+    Some((a, b))
+}
+
+/// [`maskable`] of a value already trimmed and taken out of its quotes.
+/// `marked(s)` says whether `s` holds `redacted` in any case or `****`; every
+/// `s` it is asked about is a piece of `v` that ends where `v` ends.
+fn maskable_trimmed(v: &str, marked: &mut impl FnMut(&str) -> bool) -> bool {
+    const NO_VALUE: &[&str] = &["true", "false", "null", "none", "nil", "~", "undefined"];
+    if v.is_empty()
+        || NO_VALUE.iter().any(|w| v.eq_ignore_ascii_case(w))
+        || is_placeholder(v, marked)
     {
         return false;
     }
     // An auth scheme followed by a placeholder or a variable reference:
     // `Bearer <token>`, `token ***`, `Bearer $TOKEN`, `Bearer ${TOKEN}`.
-    if let Some((scheme, rest)) = lower.split_once(' ')
-        && matches!(scheme, "bearer" | "basic" | "token" | "digest")
-        && (is_placeholder(rest.trim()) || is_var_ref(v[scheme.len()..].trim()))
+    // No scheme is longer than six bytes, so only the first seven are read
+    // for the space after it.
+    if let Some(k) = v.bytes().take(7).position(|b| b == b' ')
+        && ["bearer", "basic", "token", "digest"]
+            .iter()
+            .any(|scheme| v[..k].eq_ignore_ascii_case(scheme))
+        && (is_placeholder(v[k + 1..].trim(), marked) || is_var_ref(v[k..].trim()))
     {
         return false;
     }
     !is_var_ref(v)
 }
 
-/// `***`, `gho_****…`, `<redacted>`, `[REDACTED]`, `(sensitive value)`.
-fn is_placeholder(lower: &str) -> bool {
-    lower.contains("redacted")
-        || lower.contains("****")
-        || lower.chars().all(|c| c == '*')
-        || (lower.starts_with('<') && lower.ends_with('>'))
-        || (lower.starts_with('(')
-            && lower.ends_with(')')
-            && (lower.contains("sensitive") || lower.contains("known after apply")))
+/// `***`, `gho_****…`, `<redacted>`, `[REDACTED]`, `(sensitive value)`, in any
+/// case. `marked` is [`maskable_trimmed`]'s.
+fn is_placeholder(s: &str, marked: &mut impl FnMut(&str) -> bool) -> bool {
+    marked(s)
+        || s.bytes().all(|b| b == b'*')
+        || (s.starts_with('<') && s.ends_with('>'))
+        || (s.starts_with('(') && s.ends_with(')') && {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("sensitive") || lower.contains("known after apply")
+        })
 }
 
 /// `$VAR`, `${VAR}`, `${{ secrets.X }}` — a reference, not a value. A bare
@@ -1539,17 +1575,97 @@ fn line_end(text: &str, from: usize, cache: &mut (usize, usize)) -> usize {
     }
 }
 
-/// Offset from `from` of the first `,` or `)` before `eol`, the end of
-/// `from`'s line. `cache` holds the last search's start and the delimiter it
-/// found (or `eol` when none), so a run of matches on one line, each starting
-/// before that delimiter, reads the text up to it once: a fresh search per
-/// match walks a long tail once per match (#1508).
-fn arg_end(text: &str, from: usize, eol: usize, cache: &mut (usize, usize)) -> Option<usize> {
-    if from < cache.0 || from > cache.1 {
-        let at = text[from..eol].find([',', ')']).map_or(eol, |i| from + i);
-        *cache = (from, at);
+/// One run of `name=` values inside a parenthesis that all end at the same
+/// `,` or `)`. Each value runs from its own start to that delimiter, so the
+/// values are suffixes of one stretch of text, and what the value tests read
+/// near that delimiter is found once per run, not once per match. A fresh
+/// search per match walks a long tail once per match (#1508, #1532).
+struct ArgRun {
+    /// Start of the search that found `at`.
+    from: usize,
+    /// The first `,` or `)` at or after `from` on its line, or the line's end.
+    at: usize,
+    /// `(to, end)`: the end of `text[from..to]` with its trailing blanks
+    /// dropped, for `to` = `at` and for one other `to` (inside a quote).
+    ends: [(usize, usize); 2],
+    /// Start of the last [`PLACEHOLDER_MARKS`] entry in `text[from..at]`, in
+    /// any case, once looked for.
+    mark: Option<Option<usize>>,
+}
+
+impl ArgRun {
+    fn new() -> Self {
+        ArgRun {
+            from: usize::MAX,
+            at: 0,
+            ends: [(usize::MAX, 0); 2],
+            mark: None,
+        }
     }
-    (cache.1 < eol).then(|| cache.1 - from)
+
+    /// Offset from `from` of the first `,` or `)` before `eol`, the end of
+    /// `from`'s line. A match that starts inside the current run reuses its
+    /// delimiter, or that there is none.
+    fn delimiter(&mut self, text: &str, from: usize, eol: usize) -> Option<usize> {
+        if from < self.from || from > self.at {
+            let at = text[from..eol].find([',', ')']).map_or(eol, |i| from + i);
+            *self = ArgRun {
+                from,
+                at,
+                ..ArgRun::new()
+            };
+        }
+        (self.at < eol).then(|| self.at - from)
+    }
+
+    /// The end of the run's text up to `to`, with its trailing blanks dropped.
+    fn trimmed_end(&mut self, text: &str, to: usize) -> usize {
+        let slot = usize::from(to != self.at);
+        if self.ends[slot].0 != to {
+            self.ends[slot] = (to, self.from + text[self.from..to].trim_end().len());
+        }
+        self.ends[slot].1
+    }
+
+    /// Start of the last placeholder mark in the run (see `mark`).
+    fn mark(&mut self, text: &str) -> Option<usize> {
+        let (from, at) = (self.from, self.at);
+        *self.mark.get_or_insert_with(|| {
+            let hay = &text.as_bytes()[from..at];
+            let last = |needle: &[u8]| {
+                hay.windows(needle.len())
+                    .rposition(|w| w.eq_ignore_ascii_case(needle))
+            };
+            PLACEHOLDER_MARKS
+                .iter()
+                .filter_map(|needle| last(needle.as_bytes()))
+                .max()
+                .map(|p| from + p)
+        })
+    }
+
+    /// Is the value from `start` to the run's delimiter a variable passed
+    /// along ([`is_arg_reference`]) or no secret at all ([`maskable`])? The
+    /// answer is theirs for `text[start..at]`, read without walking the run's
+    /// tail again. Past the trimmed end there are only blanks and at most one
+    /// quote, so a mark that starts at or after a piece's start lies inside
+    /// that piece. Keeping the mark's position is more than this caller
+    /// needs: a run that holds a mark is skipped whole at its first value.
+    fn skips(&mut self, text: &str, start: usize, name: &str) -> bool {
+        let end = self.trimmed_end(text, self.at).max(start);
+        if is_arg_reference(&text[start..end], name) {
+            return true;
+        }
+        let at = self.at;
+        let Some((a, b)) = value_bounds(text, start, at, &mut |to| self.trimmed_end(text, to))
+        else {
+            return true;
+        };
+        let mark = self.mark(text);
+        !maskable_trimmed(&text[a..b], &mut |s: &str| {
+            mark.is_some_and(|m| m >= b - s.len())
+        })
+    }
 }
 
 fn at_line_start(text: &str, at: usize) -> bool {
@@ -1563,7 +1679,7 @@ fn at_line_start(text: &str, at: usize) -> bool {
 fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
     let mut done = 0;
     let mut eol_cache = (usize::MAX, 0);
-    let mut arg_cache = (usize::MAX, 0);
+    let mut arg_run = ArgRun::new();
     let mut parens = Parens::default();
     for m in INLINE_EQ.find_iter(text) {
         let head = m.as_str();
@@ -1587,14 +1703,11 @@ fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
         // no closing `,`/`)` (`INFO (pid 12 token=…`) — takes the normal path.
         if parens.depth_at(text, name_at) > 0
             && !matches!(text[start..].chars().next(), Some('"' | '\''))
-            && let Some(len) = arg_end(text, start, eol, &mut arg_cache)
+            && let Some(len) = arg_run.delimiter(text, start, eol)
+            && arg_run.skips(text, start, tail_name(&head[..head.len() - 1]))
         {
-            let value = &text[start..start + len];
-            let name = tail_name(&head[..head.len() - 1]);
-            if is_arg_reference(value, name) || !maskable(value) {
-                done = start + len;
-                continue;
-            }
+            done = start + len;
+            continue;
         }
         let (vs, ve) = match text[start..eol].chars().next() {
             Some(q @ ('"' | '\'')) => {
@@ -1904,16 +2017,18 @@ fn is_arg_reference(value: &str, name: &str) -> bool {
     if v.is_empty() || v == name {
         return !v.is_empty();
     }
-    let (head, call) = match v.split_once('(') {
-        Some((head, _)) => (head, true),
-        None => (v, false),
-    };
-    let ident = head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && head
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'));
-    let snake = v.chars().all(|c| c.is_ascii_lowercase() || c == '_');
-    ident && (call || head.contains('.') || snake)
+    // `head` is `v` up to its first `(`, and must be an identifier path. So
+    // the first character that cannot sit in one decides: a `(` ends `head`,
+    // and anything else is inside it. Reading on to the end would walk a long
+    // value once per match (#1532).
+    let (head, call) =
+        match v.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':'))) {
+            Some(i) if v[i..].starts_with('(') => (&v[..i], true),
+            Some(_) => return false,
+            None => (v, false),
+        };
+    let ident = head.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+    ident && (call || head.contains('.') || v.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
 }
 
 fn leading_indent(line: &str) -> usize {
@@ -2737,6 +2852,10 @@ mod tests {
             ("+ lftp -u u,Zq9vKh7wR3xPq h\n", "Zq9vKh7wR3xPq"),
             ("ngrok authtoken Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
             ("+ htpasswd -b f user Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            // A value that only opens like a placeholder is a secret: the
+            // `(sensitive value)` form needs its `)`, the `<x>` form its `>`.
+            ("DB_PASSWORD=(sensitive)Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
+            ("DB_PASSWORD=<Zq9vKh7wR3xPq\n", "Zq9vKh7wR3xPq"),
         ];
         let mut cases = cases;
         for (input, canary) in round2 {
@@ -3359,6 +3478,11 @@ mod tests {
             "GITHUB_TOKEN=\n",
             "password: '***'\n",
             "password: [REDACTED]\n",
+            // A plan's value it cannot know yet, and a placeholder after an
+            // auth scheme.
+            "  + password = (known after apply)\n",
+            "token=Bearer <token>\n",
+            "password: token ***\n",
             "require_auth: true\n",
             "max_tokens: 4096\n",
             "token_type: bearer\n",
@@ -3544,6 +3668,114 @@ mod tests {
         assert!(RedactSecretOutput.run(&none).updated_tool_output.is_none());
     }
 
+    /// #1532: values in one parenthesis that share a far `,` or `)` each run
+    /// to it. The run keeps their trimmed end (also inside a closing quote)
+    /// and its last `redacted` or `****`, and each value is judged as a read
+    /// of it up to that delimiter would judge it. Every expected output here
+    /// is what the code before #1532 gave, a known gap included (#1552).
+    #[test]
+    fn values_sharing_a_far_paren_delimiter_are_judged_as_before() {
+        let tail = " ".repeat(64);
+        let m = "[redacted: secret-named value]";
+        let cases = [
+            // A variable passed along skips the rest of the run. Its path
+            // may hold `::`.
+            (format!("Client(token=self.token{tail})\n"), None),
+            (format!("f(x token=settings::defaults.token{tail})\n"), None),
+            (
+                format!("f(x auth=a token=self.token{tail})\n"),
+                Some(format!("f(x auth={m} token=self.token{tail})\n")),
+            ),
+            (
+                format!("f(x auth=x token=get_password(){tail})\n"),
+                Some(format!("f(x auth={m} token=get_password(){tail})\n")),
+            ),
+            // A word after an attribute path makes it no variable.
+            (
+                format!("f(x token=a.b c{tail})\n"),
+                Some(format!("f(x token={m}\n")),
+            ),
+            // A placeholder or a variable after an auth scheme is no secret.
+            (format!("f(x token=Bearer [REDACTED]{tail},\n"), None),
+            (format!("f(x token=Bearer ${{TOKEN}}{tail})\n"), None),
+            // A placeholder anywhere in the value skips the rest of the run.
+            // These rows keep a value that masks on its own, so they pin a
+            // known gap, not intended behavior: one placeholder hides every
+            // value in the stretch up to the delimiter (#1552). The fix for
+            // that rewrites them.
+            (
+                format!("f(x auth=redacted token=Zq9vKh7wR3xPq{tail})\n"),
+                None,
+            ),
+            (
+                format!("f(x token=**** password=Zq9vKh7wR3xPq{tail})\n"),
+                None,
+            ),
+            (
+                format!("f(x auth=a token=Zq9vKh7wR3xPq <REDACTED>{tail})\n"),
+                None,
+            ),
+            // `****` marks the run as `redacted` does, and a mark flush
+            // against the delimiter is inside the run. These rows keep a
+            // value that masks on its own without the parenthesis, so they
+            // keep a secret too, for #1552's reason; the fix for #1552
+            // changes their expected output.
+            (
+                "f(x auth=**** token=Zq9vKh7wR3xPq     )\n".to_string(),
+                None,
+            ),
+            ("f(x auth=Zq9vKh7wR3xPq ****)\n".to_string(), None),
+            ("f(x auth=a auth=****)\n".to_string(), None),
+            // A new run, at another parenthesis or on the next line, looks
+            // for its own mark: the first run holds none, so its value masks.
+            // The second run's value would mask without the parenthesis, so
+            // it is kept for #1552's reason too; the fix for #1552 changes
+            // these expected outputs.
+            (
+                "f(x auth=Zq9vKh7wR3xPq) g(y auth=Zq9vKh7wR3xPq ****)\n".to_string(),
+                Some(format!("f(x auth={m} g(y auth=Zq9vKh7wR3xPq ****)\n")),
+            ),
+            (
+                "f(x auth=Zq9vKh7wR3xPq)\nf(x auth=Zq9vKh7wR3xPq ****)\n".to_string(),
+                Some(format!("f(x auth={m}\nf(x auth=Zq9vKh7wR3xPq ****)\n")),
+            ),
+            // Otherwise each value is judged in turn.
+            (
+                format!("f(x auth=a token=Zq9vKh7wR3xPq{tail})\n"),
+                Some(format!("f(x auth={m} token={m}\n")),
+            ),
+            (
+                format!("f(x auth=a{tail} token=Zq9vKh7wR3xPq{tail})\n"),
+                Some(format!("f(x auth={m}{tail} token={m}\n")),
+            ),
+            // In quotes, the value ends before the blanks ahead of the
+            // closing quote.
+            (
+                format!("f(x auth= \"a\" token= \"Zq9vKh7wR3xPq{tail}\" )\n"),
+                Some(format!("f(x auth= \"a\" token={m}\n")),
+            ),
+            (format!("f(x auth= \"a\" token= \"{tail}\" )\n"), None),
+            // The value ends before its trailing blanks, in quotes or not:
+            // `<x>`, `true` and an empty pair of quotes are no secret.
+            (format!("f(x token=true{tail})\n"), None),
+            (
+                format!("f(x auth=a token=<x>{tail})\n"),
+                Some(format!("f(x auth={m} token=<x>{tail})\n")),
+            ),
+            (
+                format!("f(x auth=a token= \"<x>{tail}\" )\n"),
+                Some(format!("f(x auth={m} token= \"<x>{tail}\" )\n")),
+            ),
+            (
+                format!("f(x auth=a token= \"\"{tail})\n"),
+                Some(format!("f(x auth={m} token= \"\"{tail})\n")),
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(&input), want, "{input:?}");
+        }
+    }
+
     /// Gate 2's perf corpus at 5 MB. The release bound (0.5 s) is what the hook
     /// deadline needs; debug builds get a loose bound so the test still catches
     /// a quadratic blow-up (which took 27 s in release before the fix).
@@ -3619,6 +3851,18 @@ mod tests {
             // `)` that ends its value. With none on the line, that search may
             // not walk the blank run once per match.
             format!("f(x{}{}", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
+            // #1532: with the `,` or `)` far away, every value runs to it, and
+            // the value tests may not read that long value once per match.
+            format!("f(x{}{})", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
+            format!("f(x{}{},", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
+            format!("f(x{})", " auth=a".repeat(140_000)),
+            // A quoted value ends before the blanks ahead of its closing
+            // quote, and that end is also found once per run.
+            format!(
+                "f(x{}{}\" )",
+                " auth= \"a".repeat(1_000),
+                " ".repeat(4 * MB)
+            ),
         ];
         for input in inputs {
             let started = std::time::Instant::now();
