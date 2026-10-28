@@ -23,6 +23,8 @@ command -v yq >/dev/null || { echo "lint-release-env: yq is required" >&2; exit 
 
 # The environments that hold release secrets.
 protected="release signing"
+# Exact match per name: a distinct environment such as "release signing" is not protected.
+is_protected() { local p; for p in $protected; do [[ $1 == "$p" ]] && return 0; done; return 1; }
 
 bad=0
 fail() {
@@ -70,7 +72,7 @@ for wf in "$dir"/*.yml "$dir"/*.yaml; do
         # shellcheck disable=SC2016 # a literal ${{ is what marks an expression.
         if [[ "$name" == *'${{'* ]]; then
           unreadable+="$job"$'\t'"an expression"$'\n'
-        elif [[ " $protected " == *" $name "* ]]; then
+        elif is_protected "$name"; then
           named+="$name"$'\n'
         fi ;;
       :*) echo "lint-release-env: unexpected row for job '$job' in $wf" >&2; exit 2 ;;
