@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# lint-release-env.sh: refuse any workflow that names the `release`
-# environment and can be triggered by `pull_request_target`, `workflow_run`,
-# or `issue_comment` (ADR-0044 (i)).
+# lint-release-env.sh: refuse any workflow that names the `release` or
+# `signing` environment and can be triggered by `pull_request_target`,
+# `workflow_run`, or `issue_comment` (ADR-0044 (i)).
 #
 # Those three triggers run on the default branch, so the environment's
 # deployment policy lets them through. A job there that names `release`
-# would hand the App key to code an outside PR or comment can steer.
+# would hand the App key to code an outside PR or comment can steer, and one
+# that names `signing` would hand it the code-signing identity.
 #
 # Canonical copy: cadence-ecosystem scripts/release/lint-release-env.sh.
 # Repos vendor it at .github/scripts/lint-release-env.sh and run it in CI.
@@ -19,6 +20,9 @@ set -euo pipefail
 dir="${1:-.github/workflows}"
 [[ -d "$dir" ]] || { echo "lint-release-env: no directory $dir" >&2; exit 2; }
 command -v yq >/dev/null || { echo "lint-release-env: yq is required" >&2; exit 2; }
+
+# The environments that hold release secrets.
+protected="release signing"
 
 bad=0
 fail() {
@@ -56,7 +60,7 @@ for wf in "$dir"/*.yml "$dir"/*.yaml; do
           // "")' "$wf")" \
     || { echo "lint-release-env: cannot parse $wf" >&2; exit 2; }
 
-  named=0
+  named=""
   unreadable=""
   while IFS='|' read -r job etag ntag name; do
     [[ -n "$job" ]] || continue
@@ -66,8 +70,8 @@ for wf in "$dir"/*.yml "$dir"/*.yaml; do
         # shellcheck disable=SC2016 # a literal ${{ is what marks an expression.
         if [[ "$name" == *'${{'* ]]; then
           unreadable+="$job"$'\t'"an expression"$'\n'
-        elif [[ "$name" == release ]]; then
-          named=1
+        elif [[ " $protected " == *" $name "* ]]; then
+          named+="$name"$'\n'
         fi ;;
       :*) echo "lint-release-env: unexpected row for job '$job' in $wf" >&2; exit 2 ;;
       *)
@@ -78,19 +82,20 @@ for wf in "$dir"/*.yml "$dir"/*.yaml; do
   done <<< "$envs"
 
   # An expression or an unreadable node is refused only under the three
-  # triggers, where it could resolve to `release` with nothing else in the
-  # way. Under any other trigger GitHub applies the environment's deployment
-  # policy to the ref that runs, so a PR branch that resolves to `release` is
+  # triggers, where it could resolve to a protected environment with nothing
+  # else in the way. Under any other trigger GitHub applies the environment's deployment
+  # policy to the ref that runs, so a PR branch that resolves to one is
   # refused by GitHub itself, and expressions are ordinary there (a matrix of
   # environments). Refusing them everywhere would block clean workflows.
   for t in pull_request_target workflow_run issue_comment; do
     grep -qx "$t" <<< "$triggers" || continue
-    if [[ "$named" == 1 ]]; then
-      fail "$wf" "names the release environment and is triggered by $t"
-    fi
+    while IFS= read -r env; do
+      [[ -n "$env" ]] || continue
+      fail "$wf" "names the $env environment and is triggered by $t"
+    done < <(sort -u <<< "$named")
     while IFS=$'\t' read -r job what; do
       [[ -n "$job" ]] || continue
-      fail "$wf" "job '$job' sets its environment with $what, which could resolve to release, and is triggered by $t; name the environment literally"
+      fail "$wf" "job '$job' sets its environment with $what, which could resolve to release or signing, and is triggered by $t; name the environment literally"
     done <<< "$unreadable"
   done
 done
