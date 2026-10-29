@@ -92,10 +92,7 @@ impl Logger for LogSession {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let commits = std::fs::read_to_string(dir.join("commits.jsonl"))
-            .ok()
-            .map(|contents| count_commits(&contents, session_id))
-            .unwrap_or(0);
+        let commits = commits_in_ledger(&dir.join("commits.jsonl"), session_id);
 
         // Graded from the same transcript string already in memory, at the same
         // price table cost is computed from — so `costUsd` and
@@ -137,6 +134,14 @@ impl Logger for LogSession {
             let _ = file.write_all(line.as_bytes());
         }
     }
+}
+
+/// Commit rows for the session in the commits ledger, rotated `.1` included, so
+/// a session that straddles a rotation does not report fewer commits.
+fn commits_in_ledger(commits_path: &std::path::Path, session_id: &str) -> u64 {
+    common::read_ledger(commits_path)
+        .map(|contents| count_commits(&contents, session_id))
+        .unwrap_or(0)
 }
 
 /// Count `commits.jsonl` rows belonging to `session_id`. Pure — operates on
@@ -432,6 +437,21 @@ mod tests {
         assert_eq!(count_commits(&jsonl, "s2"), 1);
         assert_eq!(count_commits(&jsonl, "other"), 0);
         assert_eq!(count_commits("", "s1"), 0);
+    }
+
+    #[test]
+    fn commits_in_ledger_counts_across_the_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("commits.jsonl");
+        assert_eq!(commits_in_ledger(&path, "s1"), 0, "no ledger");
+        std::fs::write(
+            common::rotated_ledger_path(&path),
+            "{\"sessionId\":\"s1\"}\n{\"sessionId\":\"s2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(&path, "{\"sessionId\":\"s1\"}\n").unwrap();
+        assert_eq!(commits_in_ledger(&path, "s1"), 2);
+        assert_eq!(commits_in_ledger(&path, "s2"), 1);
     }
 
     /// Whole ≥ parts: a session scan of the full transcript costs at least as

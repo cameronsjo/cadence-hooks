@@ -272,11 +272,11 @@ pub fn summarize(contents: &str, repo: &str, now: i64) -> Option<String> {
     ))
 }
 
-/// [`summarize`] over the live ledger for the repo at `cwd`. Fail-open: a missing
-/// or unreadable ledger is `None`.
+/// [`summarize`] over the ledger (rotated `.1` plus live) for the repo at `cwd`.
+/// Fail-open: a missing or unreadable ledger is `None`.
 pub fn summary_line(cwd: Option<&str>) -> Option<String> {
     let path = common::metrics_dir().join("bypasses.jsonl");
-    let contents = std::fs::read_to_string(path).ok()?;
+    let contents = common::read_ledger(&path)?;
     summarize(
         &contents,
         &common::repo_basename(cwd),
@@ -555,6 +555,34 @@ mod tests {
                 .collect(),
             Err(_) => vec![],
         }
+    }
+
+    #[test]
+    fn summary_line_reads_the_rotated_dot_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("rotrepo");
+        std::fs::create_dir(&repo).unwrap();
+        let armed = row(
+            "armed",
+            "dismissal",
+            "enforce-worktree",
+            "rotrepo",
+            "2027-01-01T00:00:00Z",
+            Some(i64::MAX / 2),
+        );
+        let ledger = tmp.path().join("bypasses.jsonl");
+        std::fs::write(common::rotated_ledger_path(&ledger), armed).unwrap();
+
+        let line = {
+            let cwd = repo.to_string_lossy().into_owned();
+            let mut line = None;
+            with_metrics_dir(tmp.path(), || line = summary_line(Some(&cwd)));
+            line
+        };
+        assert!(
+            line.is_some_and(|l| l.contains("enforce-worktree")),
+            "an armed dismissal only in `.1` is still reported"
+        );
     }
 
     #[test]
