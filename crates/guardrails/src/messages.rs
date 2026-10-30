@@ -5,12 +5,42 @@
 //! duplicate, not a thematic echo. Consolidating them means a future wording
 //! change lands once instead of drifting between copies.
 
+use crate::warn_unreviewed_ready_flip::is_safe_host;
+use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
+
 /// The worktree-creation recipe: `enforce_worktree`'s block message, its
 /// subprocess-mutation nudge, and `warn_branch_base`'s worktree-first nudge
 /// all point here. Includes its own code-span backticks so callers just
 /// interpolate it inline.
 pub const WORKTREE_CREATE_RECIPE: &str =
     "`git worktree add .claude/worktrees/<slug> -b feat/<slug>` (or EnterWorktree)";
+
+/// The longest host name DNS allows.
+const MAX_HOST_NAME: usize = 253;
+
+/// The text after `Host scope:` that `guard_push_remote` and `guard_gh_write`
+/// print when a target's host is neither `default` nor in
+/// `CADENCE_EXTRA_HOSTS`.
+///
+/// The host is often read from a remote URL in `.git/config`. The settings
+/// this offers are text to copy, so they reuse the host only when it is a
+/// plain host name ([`is_safe_host`]) of at most 253 characters, the longest
+/// DNS allows. Any other host is named flattened, with no setting
+/// (cameronsjo/cadence-hooks#1526; the bound is code review N2 on #1539).
+pub fn host_scope_advice(default: &str, host: &str) -> String {
+    if host.len() <= MAX_HOST_NAME && is_safe_host(host) {
+        format!(
+            "bare entries match `{default}` only — for `{host}`, qualify them (`{host}/<owner>`) \
+             or set `CADENCE_EXTRA_HOSTS={host}`"
+        )
+    } else {
+        let shown = sanitize_field(host, MAX_PATH_DISPLAY);
+        format!(
+            "bare entries match `{default}` only — `{shown}` is not a plain host name, so no \
+             setting is offered for it"
+        )
+    }
+}
 
 /// Emitted when a `CADENCE_ALLOWED_OWNERS`-gated guard fires with no
 /// allowlist configured at all — `guard_push_remote` and `guard_gh_write`
