@@ -65,7 +65,10 @@ pub mod warn_stale;
 /// writer resolves against. Re-exported so a JSONL append living outside
 /// this crate (e.g. `session persist-plan-approval`'s `plan-links.jsonl`) reuses the
 /// resolution instead of re-deriving it.
-pub use common::{metrics_dir, open_ledger};
+pub use common::{
+    DEFAULT_LEDGER_MAX_BYTES, LEDGER_MAX_BYTES_ENV, ledger_max_bytes, metrics_dir, open_ledger,
+    read_ledger, rotated_ledger_path,
+};
 
 pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_bypass::{

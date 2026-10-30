@@ -70,9 +70,7 @@ impl Logger for LogCommit {
         }
         let commits_path = dir.join("commits.jsonl");
 
-        let last_message_id = std::fs::read_to_string(&commits_path)
-            .ok()
-            .and_then(|contents| parse_last_message_id(&contents, session_id));
+        let last_message_id = previous_message_id(&commits_path, session_id);
 
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
@@ -125,6 +123,14 @@ impl Logger for LogCommit {
             let _ = file.write_all(line.as_bytes());
         }
     }
+}
+
+/// The session's previous `lastMessageId` in the commits ledger, rotated `.1`
+/// included: a session that straddles a rotation must still find its previous
+/// row, or its next commit re-prices the whole transcript.
+fn previous_message_id(commits_path: &std::path::Path, session_id: &str) -> Option<String> {
+    common::read_ledger(commits_path)
+        .and_then(|contents| parse_last_message_id(&contents, session_id))
 }
 
 /// Find the `lastMessageId` of the most recent `commits.jsonl` entry for this
@@ -210,6 +216,25 @@ mod tests {
         .join("\n");
         assert_eq!(parse_last_message_id(&jsonl, "s1").as_deref(), Some("m5"));
         assert_eq!(parse_last_message_id(&jsonl, "s2").as_deref(), Some("x9"));
+    }
+
+    #[test]
+    fn previous_message_id_finds_a_row_the_rotation_moved_to_dot_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("commits.jsonl");
+        std::fs::write(
+            common::rotated_ledger_path(&path),
+            "{\"sessionId\":\"s1\",\"lastMessageId\":\"m1\"}\n",
+        )
+        .unwrap();
+        std::fs::write(&path, "{\"sessionId\":\"s2\",\"lastMessageId\":\"x9\"}\n").unwrap();
+
+        assert_eq!(previous_message_id(&path, "s1").as_deref(), Some("m1"));
+        assert_eq!(previous_message_id(&path, "s2").as_deref(), Some("x9"));
+
+        // The live file wins when both hold the session.
+        std::fs::write(&path, "{\"sessionId\":\"s1\",\"lastMessageId\":\"m7\"}\n").unwrap();
+        assert_eq!(previous_message_id(&path, "s1").as_deref(), Some("m7"));
     }
 
     #[test]

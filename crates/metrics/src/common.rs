@@ -105,7 +105,155 @@ fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBu
 /// open failure and skips the row (ADR-0001). Permissions are a Unix concept;
 /// elsewhere this is a plain create-and-append open. A failed tighten is
 /// ignored, so the append still happens.
+///
+/// Past the size cap ([`ledger_max_bytes`]) the ledger first rotates to
+/// `<name>.jsonl.1` (cameronsjo/cadence#2074): see [`rotate_if_over_cap`]. A
+/// rotation problem is logged and ignored, never returned.
 pub fn open_ledger(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    open_ledger_capped(path.as_ref(), ledger_max_bytes())
+}
+
+/// Env var that sets the rotation cap, in bytes, for every `<metrics_dir>/*.jsonl`
+/// ledger. `0` turns rotation off; unset, empty, or unparsable keeps
+/// [`DEFAULT_LEDGER_MAX_BYTES`].
+pub const LEDGER_MAX_BYTES_ENV: &str = "CADENCE_METRICS_MAX_BYTES";
+
+/// Default rotation cap: 16 MiB per ledger, so at most about 32 MiB of one
+/// ledger (live plus `.1`) stays on disk. A few hundred bytes a row, that is
+/// tens of thousands of rows, past what any reader here needs, and small
+/// enough that a reader's `read_to_string` stays cheap.
+pub const DEFAULT_LEDGER_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Smallest cap honored. Anything lower is almost certainly a unit slip (`16`
+/// meaning 16 MiB), and at a few hundred bytes a row it would rotate on every
+/// write and leave each ledger holding about two rows, erasing the audit
+/// ledgers with no trace. A lower value keeps [`DEFAULT_LEDGER_MAX_BYTES`].
+pub const MIN_LEDGER_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The rotation cap in bytes, or `None` when `CADENCE_METRICS_MAX_BYTES=0`
+/// turned rotation off.
+pub fn ledger_max_bytes() -> Option<u64> {
+    parse_ledger_max_bytes(std::env::var(LEDGER_MAX_BYTES_ENV).ok().as_deref())
+}
+
+fn parse_ledger_max_bytes(raw: Option<&str>) -> Option<u64> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Some(DEFAULT_LEDGER_MAX_BYTES),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) if n >= MIN_LEDGER_MAX_BYTES => Some(n),
+            // An unreadable or implausibly small cap must not silently disable
+            // the safeguard or erase history.
+            Ok(_) | Err(_) => Some(DEFAULT_LEDGER_MAX_BYTES),
+        },
+    }
+}
+
+/// Where `path` rotates to: the same name with `.1` appended.
+pub fn rotated_ledger_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Read a ledger as one string, oldest rows first: the rotated `.1` file, then
+/// the live file. `None` when neither can be read.
+///
+/// Every reader that wants history uses this instead of reading the live path,
+/// or it loses everything written before the last rotation. A rotation landing
+/// between the two reads can leave the just-rotated rows out of this one read;
+/// the next read sees them in `.1`.
+pub fn read_ledger(path: &Path) -> Option<String> {
+    // Regular files only: a FIFO at either path would block the read.
+    let read = |p: &Path| {
+        std::fs::metadata(p)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|_| std::fs::read_to_string(p).ok())
+    };
+    let older = read(&rotated_ledger_path(path));
+    let live = read(path);
+    match (older, live) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (Some(mut older), Some(live)) => {
+            if !older.is_empty() && !older.ends_with('\n') {
+                older.push('\n');
+            }
+            older.push_str(&live);
+            Some(older)
+        }
+    }
+}
+
+pub(crate) fn open_ledger_capped(path: &Path, cap: Option<u64>) -> std::io::Result<std::fs::File> {
+    let file = open_append(path)?;
+    #[cfg(unix)]
+    if let Some(cap) = cap {
+        return Ok(rotate_if_over_cap(path, file, cap));
+    }
+    #[cfg(not(unix))]
+    let _ = cap; // debt: no rotation off Unix (rename-over-open-file semantics differ), flock-free Windows scheme if a Windows ledger ever reaches the doctor warning
+    Ok(file)
+}
+
+/// Rotate `path` to `<path>.1` when the already-open `file` is at or past `cap`,
+/// and return the handle to append to.
+///
+/// Safe with several hook processes at once:
+/// - The rotator takes a non-blocking `flock` on the live inode. A process that
+///   loses the race skips rotation and appends as before.
+/// - Under the lock the rotator renames only if the path still names the inode
+///   it holds, so a process that opened the old file before another rotated it
+///   cannot rename the fresh file over `.1` and drop a whole generation.
+/// - `rename` replaces any older `.1` atomically. A process still holding the
+///   old inode finishes its single `O_APPEND` write into `.1`, the same
+///   in-flight write a plain archive would catch.
+///
+/// Every failure returns a usable handle (ADR-0001) and is recorded in
+/// `failopen.jsonl`.
+#[cfg(unix)]
+fn rotate_if_over_cap(path: &Path, file: std::fs::File, cap: u64) -> std::fs::File {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(held) = file.metadata() else {
+        return file;
+    };
+    if held.len() < cap {
+        return file;
+    }
+    // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
+    // touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            crate::log_failopen::log_rotation_failure(path, &err);
+        }
+        return file; // WouldBlock: another process is rotating this ledger
+    }
+    let renamed = match std::fs::symlink_metadata(path) {
+        Ok(on_disk) if on_disk.ino() == held.ino() && on_disk.dev() == held.dev() => {
+            std::fs::rename(path, rotated_ledger_path(path))
+        }
+        // The path names a different inode: another process already rotated.
+        Ok(_) => Ok(()),
+        // Moved aside by hand (`doctor`'s archive remediation): nothing to
+        // rotate, and the reopen below starts a fresh file.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    };
+    match renamed {
+        // The lock dies with the old handle when it drops here.
+        Ok(()) => open_append(path).unwrap_or(file),
+        Err(err) => {
+            crate::log_failopen::log_rotation_failure(path, &err);
+            file
+        }
+    }
+}
+
+fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -574,6 +722,274 @@ mod tests {
         std::os::unix::fs::symlink(&target, tmp.path().join("diagnostics.jsonl")).unwrap();
         append_transcript_diagnostic_to(tmp.path(), "claude", "jsonl", "code", "main");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+    }
+
+    #[test]
+    fn ledger_cap_parses_env_values() {
+        let d = Some(DEFAULT_LEDGER_MAX_BYTES);
+        assert_eq!(parse_ledger_max_bytes(None), d);
+        assert_eq!(parse_ledger_max_bytes(Some("")), d);
+        assert_eq!(parse_ledger_max_bytes(Some("  ")), d);
+        assert_eq!(
+            parse_ledger_max_bytes(Some("lots")),
+            d,
+            "garbage keeps the default"
+        );
+        assert_eq!(parse_ledger_max_bytes(Some("-5")), d);
+        assert_eq!(parse_ledger_max_bytes(Some("2097152")), Some(2_097_152));
+        assert_eq!(parse_ledger_max_bytes(Some(" 2097152 ")), Some(2_097_152));
+        assert_eq!(
+            parse_ledger_max_bytes(Some("1048576")),
+            Some(MIN_LEDGER_MAX_BYTES),
+            "the floor itself is honored"
+        );
+        assert_eq!(
+            parse_ledger_max_bytes(Some("16")),
+            d,
+            "a MiB-for-bytes slip keeps the default instead of erasing history"
+        );
+        assert_eq!(parse_ledger_max_bytes(Some("1048575")), d);
+        assert_eq!(
+            parse_ledger_max_bytes(Some("0")),
+            None,
+            "0 turns rotation off"
+        );
+    }
+
+    #[test]
+    fn rotated_path_appends_dot_one() {
+        assert_eq!(
+            rotated_ledger_path(Path::new("/m/denials.jsonl")),
+            PathBuf::from("/m/denials.jsonl.1")
+        );
+    }
+
+    #[cfg(unix)]
+    fn append_rotating(path: &Path, cap: Option<u64>, line: &str) {
+        let mut file = open_ledger_capped(path, cap).unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_at_the_cap_rotates_to_dot_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(&path, "old-1\nold-2\n").unwrap();
+
+        append_rotating(&path, Some(12), "new\n");
+
+        assert_eq!(
+            std::fs::read_to_string(rotated_ledger_path(&path)).unwrap(),
+            "old-1\nold-2\n"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(mode_of(&rotated_ledger_path(&path)), 0o600);
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_replaces_an_older_dot_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(rotated_ledger_path(&path), "ancient\n").unwrap();
+        std::fs::write(&path, "recent\n").unwrap();
+
+        append_rotating(&path, Some(7), "new\n");
+
+        assert_eq!(
+            std::fs::read_to_string(rotated_ledger_path(&path)).unwrap(),
+            "recent\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_under_the_cap_or_with_rotation_off_stays_whole() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(&path, "12345\n").unwrap();
+
+        append_rotating(&path, Some(7), "a\n"); // 6 bytes held < 7
+        append_rotating(&path, None, "b\n");
+
+        assert!(!rotated_ledger_path(&path).exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "12345\na\nb\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_error_is_logged_and_the_append_still_lands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(&path, "old\n").unwrap();
+        // A non-empty directory at `.1` makes the rename fail.
+        let blocker = rotated_ledger_path(&path);
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), "x").unwrap();
+
+        append_rotating(&path, Some(1), "new\n");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
+        let logged = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(logged.trim()).unwrap();
+        assert_eq!(row["reason"], "ledger_rotate_failed");
+        assert_eq!(row["subcommand"], "denials.jsonl");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failopen_rotation_error_is_not_logged_into_itself() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("failopen.jsonl");
+        std::fs::write(&path, "old\n").unwrap();
+        let blocker = rotated_ledger_path(&path);
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), "x").unwrap();
+
+        append_rotating(&path, Some(1), "new\n");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
+    }
+
+    /// A process that opened the ledger before another rotated it still holds
+    /// the old inode (now `.1`). Rotating from that stale handle must not
+    /// rename the fresh live file over `.1`.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_handle_does_not_clobber_the_rotated_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(&path, "generation-one\n").unwrap();
+        let stale = open_append(&path).unwrap();
+
+        append_rotating(&path, Some(5), "generation-two\n"); // rotates
+
+        let mut handle = rotate_if_over_cap(&path, stale, 5);
+        handle.write_all(b"from-stale\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(rotated_ledger_path(&path)).unwrap(),
+            "generation-one\n",
+            ".1 must survive the stale rotator"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "generation-two\nfrom-stale\n",
+            "the stale handle is swapped for the live file"
+        );
+    }
+
+    /// Another process is mid-rotation (it holds the lock): this writer skips
+    /// rotating, appends as before, and reports nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_that_loses_the_lock_race_appends_without_rotating() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(&path, "over-the-cap\n").unwrap();
+        let rival = open_append(&path).unwrap();
+        // SAFETY: `rival` owns a valid descriptor for the whole call.
+        assert_eq!(
+            unsafe { libc::flock(rival.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "positive control: the rival takes the lock"
+        );
+
+        append_rotating(&path, Some(5), "mine\n");
+
+        assert!(
+            !rotated_ledger_path(&path).exists(),
+            "no rotation under a held lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "over-the-cap\nmine\n"
+        );
+        assert!(
+            !tmp.path().join("failopen.jsonl").exists(),
+            "losing the race is not an error"
+        );
+        drop(rival);
+
+        // Control: once the lock is free the same call rotates.
+        append_rotating(&path, Some(5), "later\n");
+        assert!(rotated_ledger_path(&path).exists());
+    }
+
+    /// `doctor`'s remediation moves the ledger aside by hand; a writer that had
+    /// it open then finds nothing at the path. That is not a failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_moved_aside_mid_write_is_replaced_not_reported() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        std::fs::write(&path, "over-the-cap\n").unwrap();
+        let held = open_append(&path).unwrap();
+        std::fs::rename(&path, tmp.path().join("denials.jsonl.archived")).unwrap();
+
+        let mut handle = rotate_if_over_cap(&path, held, 5);
+        handle.write_all(b"fresh\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+        assert!(!rotated_ledger_path(&path).exists());
+        assert!(!tmp.path().join("failopen.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_appenders_lose_no_row_across_a_rotation() {
+        const THREADS: usize = 8;
+        const ROWS: usize = 250;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("subagents.jsonl");
+        let pad = "x".repeat(60);
+
+        // ~85 bytes a row, 2000 rows: one rotation at 120 KB, never two, so
+        // every row must survive between `.1` and the live file.
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let (path, pad) = (&path, &pad);
+                scope.spawn(move || {
+                    for i in 0..ROWS {
+                        let row = format!("{{\"t\":{t},\"i\":{i},\"pad\":\"{pad}\"}}\n");
+                        append_rotating(path, Some(120_000), &row);
+                    }
+                });
+            }
+        });
+
+        assert!(rotated_ledger_path(&path).exists(), "the cap was crossed");
+        let all = read_ledger(&path).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for line in all.lines() {
+            let row: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("torn or interleaved line {line:?}: {e}"));
+            assert!(
+                seen.insert((row["t"].as_u64().unwrap(), row["i"].as_u64().unwrap())),
+                "duplicate row {line}"
+            );
+        }
+        assert_eq!(seen.len(), THREADS * ROWS, "no row lost");
+    }
+
+    #[test]
+    fn read_ledger_returns_dot_one_then_live() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("commits.jsonl");
+        assert_eq!(read_ledger(&path), None, "neither file exists");
+
+        std::fs::write(&path, "live\n").unwrap();
+        assert_eq!(read_ledger(&path).as_deref(), Some("live\n"));
+
+        // `.1` with no trailing newline must not fuse with the first live row.
+        std::fs::write(rotated_ledger_path(&path), "older").unwrap();
+        assert_eq!(read_ledger(&path).as_deref(), Some("older\nlive\n"));
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_ledger(&path).as_deref(), Some("older"), "only `.1`");
     }
 
     #[test]
