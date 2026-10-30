@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pulldown-cmark` bumped to 0.13.5 for RUSTSEC-2026-0414** (exponential event growth with `ENABLE_WIKILINKS`). The binary never enables wikilinks, so it was not reachable, but the advisory audit failed every PR.
+
 ## [0.132.1] - 2026-10-25
 
 ### Fixed
