@@ -1474,6 +1474,20 @@ fn gh_command_host(command: &str, env_host: &str) -> String {
 /// to compare it, and a message shows it as typed ([`host_as_typed`]). The
 /// [`UNRESOLVED_GH_HOST`] stand-in is never folded.
 fn selected_gh_host(command: &str, fold: fn(&str) -> String) -> Option<String> {
+    selected_gh_host_by(command, fold).map(|(host, _)| host)
+}
+
+/// Which part of a `gh` invocation selected its host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostSelector {
+    /// `--hostname`, which only `gh api` takes.
+    HostnameFlag,
+    /// `GH_HOST`, inline on the command.
+    InlineGhHost,
+}
+
+/// [`selected_gh_host`], with the part of the command that selected it.
+fn selected_gh_host_by(command: &str, fold: fn(&str) -> String) -> Option<(String, HostSelector)> {
     let (tokens, gh_index) = gh_command_tokens(command)?;
     let table = host_scan_flags(&tokens[gh_index..]);
 
@@ -1539,7 +1553,9 @@ fn selected_gh_host(command: &str, fold: fn(&str) -> String) -> Option<String> {
         index += 1;
     }
 
-    flag_host.or(inline_host)
+    flag_host
+        .map(|host| (host, HostSelector::HostnameFlag))
+        .or(inline_host.map(|host| (host, HostSelector::InlineGhHost)))
 }
 
 #[cfg(test)]
@@ -1774,6 +1790,17 @@ fn host_is_read(host: &str) -> bool {
 /// `$H`). A host the segment does not spell, such as the hook's own
 /// `GH_HOST`, is shown as given. Message only: no verdict reads it.
 fn host_as_typed(segment: &str, host: &str) -> String {
+    target_host_as_typed(segment, host)
+        .or_else(|| {
+            selected_gh_host(segment, str::to_owned)
+                .filter(|typed| typed.eq_ignore_ascii_case(host))
+        })
+        .unwrap_or_else(|| host.to_string())
+}
+
+/// `host` as the target's own `HOST/` part types it: the first half of
+/// [`host_as_typed`], and `None` when the target does not spell it.
+fn target_host_as_typed(segment: &str, host: &str) -> Option<String> {
     let typed_in = |text: &str| {
         let at = text.to_ascii_lowercase().find(host)?;
         text.get(at..at + host.len()).map(str::to_string)
@@ -1799,11 +1826,37 @@ fn host_as_typed(segment: &str, host: &str) -> String {
                 .is_some_and(|value_host| value_host == host)
         })
         .find_map(|value| typed_in(&value))
-        .or_else(|| {
-            selected_gh_host(segment, str::to_owned)
-                .filter(|typed| typed.eq_ignore_ascii_case(host))
-        })
-        .unwrap_or_else(|| host.to_string())
+}
+
+/// The fix for a target whose host [`host_is_read`] cannot judge, when the
+/// target does not spell that host itself. `--hostname` or `GH_HOST` chose
+/// it, so a literal `-R` or endpoint path would leave the command blocked:
+/// the fix names the host instead. `--hostname` when the command passes one
+/// (gh takes it over `GH_HOST`), else `GH_HOST`, inline or exported earlier.
+/// `None` when the target spells the host (`-R "$h/o/r"`, or a `gh repo`
+/// argument such as `"$h/o/r"`), whose fix is a literal target (#1507).
+///
+/// Returns the `Fix:` line's text and the block metadata's plain form.
+fn unread_host_fix(segment: &str, host: &str) -> Option<(&'static str, &'static str)> {
+    let argument_spells_host = gh_repo_positional_target(segment)
+        .and_then(|(_, argument_host, _)| argument_host)
+        .is_some_and(|argument_host| argument_host.eq_ignore_ascii_case(host));
+    if host_is_read(host) || argument_spells_host || target_host_as_typed(segment, host).is_some() {
+        return None;
+    }
+    let by_flag = selected_gh_host_by(segment, str::to_owned)
+        .is_some_and(|(_, by)| by == HostSelector::HostnameFlag);
+    Some(if by_flag {
+        (
+            "give `--hostname` a literal host (`--hostname <host>`), or drop it",
+            "give --hostname a literal host, or drop it",
+        )
+    } else {
+        (
+            "set `GH_HOST` to a literal host (`GH_HOST=<host>`), or drop it",
+            "set GH_HOST to a literal host, or drop it",
+        )
+    })
 }
 
 /// For a blocked target that carries a shell expansion: true when it still
@@ -4519,9 +4572,24 @@ fn judge_resolution(
                 // message's `-R cameronsjo/x` fix would drop the host. The
                 // loop's `-R` arm says the same of that value (#1507).
                 let literal = target_spelling(segment, "owner/repo");
+                let repo_expanded = repo_has_unexpanded_expansion(&repo);
+                // When `--hostname` or `GH_HOST` chose the unread host, a
+                // literal target alone leaves the command blocked, so the fix
+                // names the host as well, or alone when the target is literal.
+                let (fix_line, fix) = match unread_host_fix(segment, &host) {
+                    None => (
+                        format!("pass the target as a literal `{literal}`"),
+                        format!("pass the target as a literal {literal}"),
+                    ),
+                    Some((line, plain)) if repo_expanded => (
+                        format!("pass the target as a literal `{literal}`; also {line}"),
+                        format!("pass the target as a literal {literal}; also {plain}"),
+                    ),
+                    Some((line, plain)) => (line.to_string(), plain.to_string()),
+                };
                 // Name the part that expands: with only the host expanded,
                 // `Target:` shows the whole spec, host first, as typed.
-                let target = if repo_has_unexpanded_expansion(&repo) {
+                let target = if repo_expanded {
                     repo
                 } else {
                     format!("{}/{repo}", host_as_typed(segment, &host))
@@ -4531,11 +4599,11 @@ fn judge_resolution(
                         "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
                          Target:  {target} (an unexpanded shell expansion — its value is only known \
                          when the shell runs)\n   \
-                         Fix: pass the target as a literal `{literal}`"
+                         Fix: {fix_line}"
                     ),
                     BlockMetadata {
                         rule_id: "gh-write-target-unresolvable".to_string(),
-                        fix: format!("pass the target as a literal {literal}"),
+                        fix,
                         allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                         severity: "error",
                     },
@@ -7661,7 +7729,11 @@ mod tests {
         // A literal path is owned on a host only: the per-segment pass must
         // still refuse a host the guard cannot read.
         let command = r#"for h in a b; do gh api --hostname "$h" -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a; done"#;
-        assert!(blocks(&run_1344(command, "cameronsjo", false)));
+        let result = run_1344(command, "cameronsjo", false);
+        assert!(blocks(&result));
+        // The path is literal, so the fix names the host (#1507).
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.fix, "give --hostname a literal host, or drop it");
         let command = r#"for b in a b; do GH_HOST=evil.example gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/${b}"; done"#;
         assert!(blocks(&run_1344(command, "cameronsjo", false)));
     }
@@ -11579,6 +11651,123 @@ mod tests {
         assert_eq!(
             meta.fix,
             "name the host on the gh command itself (--hostname <host>)"
+        );
+    }
+
+    #[test]
+    fn issue_1507_unread_host_fix_names_what_chose_the_host() {
+        // When `--hostname` or `GH_HOST` chose the unread host, a literal
+        // target alone leaves the command blocked, so the fix names the host.
+        // When the target spells the host itself, a literal target is the fix.
+        const LITERAL_R: &str = "pass the target as a literal -R owner/repo";
+        const LITERAL_API: &str = "pass the target as a literal gh api repos/owner/repo/…";
+        const HOSTNAME: &str = "give --hostname a literal host, or drop it";
+        const GH_HOST: &str = "set GH_HOST to a literal host, or drop it";
+        let single = |flag: &str| format!("gh issue create {flag} --title t --body b");
+        let cases = [
+            // The target spells the host.
+            (single(r#"-R "$h/evil/x""#), LITERAL_R.to_string()),
+            (single(r#"-R "https://$h/evil/x""#), LITERAL_R.to_string()),
+            (single(r#"-R "$(cat h)/evil/x""#), LITERAL_R.to_string()),
+            (single(r#"-R "$h/evil/$r""#), LITERAL_R.to_string()),
+            (
+                r#"GH_REPO="$H/evil/x" gh issue create --title t --body b"#.to_string(),
+                LITERAL_R.to_string(),
+            ),
+            (
+                r#"GH_REPO="$H/z/y" gh pr merge 5 -s -R cameronsjo/x"#.to_string(),
+                LITERAL_R.to_string(),
+            ),
+            (
+                r#"gh repo archive "$h/evil/x" --yes"#.to_string(),
+                "pass the target as a literal gh repo archive owner/repo".to_string(),
+            ),
+            (
+                r#"GH_HOST=$z gh repo archive "$H/evil/x" --yes"#.to_string(),
+                "pass the target as a literal gh repo archive owner/repo".to_string(),
+            ),
+            // `--hostname` chose it, over an inline `GH_HOST` too.
+            (single(r#"--hostname "$h" -R evil/x"#), HOSTNAME.to_string()),
+            (single(r#"--hostname="$H" -R evil/x"#), HOSTNAME.to_string()),
+            (
+                r#"gh api --hostname "$h" -X POST repos/evil/x/issues -f title=t"#.to_string(),
+                HOSTNAME.to_string(),
+            ),
+            (
+                r#"GH_HOST=$z gh api --hostname "$h" -X POST repos/evil/x/issues -f title=t"#
+                    .to_string(),
+                HOSTNAME.to_string(),
+            ),
+            // `GH_HOST` chose it, inline or exported.
+            (
+                single("-R evil/x").replace("gh issue", "GH_HOST=$h gh issue"),
+                GH_HOST.to_string(),
+            ),
+            (
+                "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
+                GH_HOST.to_string(),
+            ),
+            (
+                r#"GH_HOST=$h gh api -X POST repos/evil/x/issues -f title=t"#.to_string(),
+                GH_HOST.to_string(),
+            ),
+            // An exported `GH_HOST` adds the host it may hold beside the
+            // default one, so an owned repo is judged on the unread host.
+            (
+                format!("export GH_HOST=$(cat h); {}", single("-R cameronsjo/x")),
+                GH_HOST.to_string(),
+            ),
+            // A `-R` that decides leaves `GH_REPO` unread, so `GH_HOST` chose.
+            (
+                r#"GH_REPO="$H/z/y" GH_HOST=$h gh issue create -R evil/x --title t --body b"#
+                    .to_string(),
+                GH_HOST.to_string(),
+            ),
+            // The name expands too: both fixes.
+            (
+                single(r#"-R "evil/$r""#).replace("gh issue", "GH_HOST=$h gh issue"),
+                format!("{LITERAL_R}; also {GH_HOST}"),
+            ),
+            (
+                r#"gh api --hostname "$h" -X POST "repos/evil/$r/issues" -f title=t"#.to_string(),
+                format!("{LITERAL_API}; also {HOSTNAME}"),
+            ),
+        ];
+        for (command, fix) in &cases {
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(command, cwd, false);
+                assert!(blocks(&result), "{command} in {cwd}");
+                let message = msg(&result);
+                assert!(
+                    message.contains("Cannot determine target repo"),
+                    "{command} in {cwd}: {message}"
+                );
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
+                assert_eq!(&meta.fix, fix, "{command} in {cwd}");
+            }
+        }
+        // The `Fix:` line says the same, with the spelling in backticks.
+        let result = run_1491(&single(r#"--hostname "$h" -R evil/x"#), "/tmp", false);
+        assert!(
+            msg(&result).contains(
+                "Fix: give `--hostname` a literal host (`--hostname <host>`), or drop it"
+            ),
+            "{}",
+            msg(&result)
+        );
+        let result = run_1491(
+            &single(r#"-R "evil/$r""#).replace("gh issue", "GH_HOST=$h gh issue"),
+            "/tmp",
+            false,
+        );
+        assert!(
+            msg(&result).contains(
+                "Fix: pass the target as a literal `-R owner/repo`; also set `GH_HOST` to a \
+                 literal host (`GH_HOST=<host>`), or drop it"
+            ),
+            "{}",
+            msg(&result)
         );
     }
 
