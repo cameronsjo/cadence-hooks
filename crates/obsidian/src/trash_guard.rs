@@ -3641,6 +3641,7 @@ mod tests {
             ("git rm note.md >> --cached", Block),
             ("git rm note.md 2> --cached", Block),
             ("git rm note.md <<- --cached", Block),
+            ("git rm -f --cached 2>- --no-cached note.md", Block),
             ("git rm --cached note.md > log.txt", Allow),
         ];
         for &(command, expected) in cases {

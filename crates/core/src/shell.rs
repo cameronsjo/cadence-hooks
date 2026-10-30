@@ -13875,7 +13875,11 @@ pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>
                 return false;
             }
             if let Some((len, _)) = redirect_operator_span(word) {
-                redirect_target = matches!(&word[len..], "" | "|" | "&" | "-");
+                // `<<-` takes the next word as its delimiter; `>-` and `2>-` name a
+                // file called `-` and leave the next word to git.
+                let rest = &word[len..];
+                redirect_target =
+                    matches!(rest, "" | "|" | "&") || (rest == "-" && word[..len].ends_with("<<"));
                 return false;
             }
             true
@@ -17466,6 +17470,14 @@ mod tests {
             // `<<-` takes its delimiter as the next word.
             ("note.md <<- --cached", &["note.md"]),
             ("note.md <<- -n", &["note.md"]),
+            (
+                "--cached note.md 2>- --no-cached",
+                &["--cached", "note.md", "--no-cached"],
+            ),
+            (
+                "-n note.md >- --no-dry-run",
+                &["-n", "note.md", "--no-dry-run"],
+            ),
             // A process substitution's words are the inner command's.
             ("note.md > >(sed -n p)", &["note.md"]),
             ("note.md >(sed -n p)", &["note.md"]),
