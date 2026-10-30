@@ -40,7 +40,10 @@ pub fn sanitize_field(s: &str, max: usize) -> String {
 /// name alone (`https://<token>@github.com/…`).
 ///
 /// The authority ends at the first `/`, `?`, `#` or whitespace after `://`,
-/// and its userinfo ends at the last `@` before that. An scp-style address
+/// and its userinfo ends at the last `@` before that. So a password holding a
+/// raw `/` (`https://u:pa/ss@host/r`) is not masked. git's own URL parse ends
+/// the authority at the same `/`, so git would not send that text as a
+/// credential either. An scp-style address
 /// (`git@github.com:owner/repo`) is left as is: git reads the part before its
 /// first `:` as the host, so the form has no place for a password, and its
 /// user name goes to ssh, which never takes a token there.
