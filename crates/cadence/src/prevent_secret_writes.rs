@@ -1551,6 +1551,7 @@ mod tests {
             // so git deletes `.env` (cadence-hooks#1580 review).
             "git rm .env > --cached",
             "git rm .env >> --cached",
+            "git rm .env <<- --cached",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }
@@ -1605,6 +1606,7 @@ mod tests {
             "git rm .env >| --dry-run",
             "git rm .env > -n",
             "git rm .env 2> -n",
+            "git rm .env <<- -n",
             // A process substitution's `-n` is the inner command's.
             "git rm .env > >(sed -n p)",
             "git rm .env >(sed -n p)",

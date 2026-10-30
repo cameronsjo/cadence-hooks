@@ -13875,7 +13875,7 @@ pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>
                 return false;
             }
             if let Some((len, _)) = redirect_operator_span(word) {
-                redirect_target = matches!(&word[len..], "" | "|" | "&");
+                redirect_target = matches!(&word[len..], "" | "|" | "&" | "-");
                 return false;
             }
             true
@@ -17463,6 +17463,9 @@ mod tests {
             ("note.md >--dry-run", &["note.md"]),
             ("--cached note.md > log.txt", &["--cached", "note.md"]),
             ("note.md 2>&1 -n", &["note.md", "-n"]),
+            // `<<-` takes its delimiter as the next word.
+            ("note.md <<- --cached", &["note.md"]),
+            ("note.md <<- -n", &["note.md"]),
             // A process substitution's words are the inner command's.
             ("note.md > >(sed -n p)", &["note.md"]),
             ("note.md >(sed -n p)", &["note.md"]),
