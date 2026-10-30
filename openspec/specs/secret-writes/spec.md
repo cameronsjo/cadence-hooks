@@ -205,3 +205,21 @@ A `git rm` dry run prints what it would remove and changes neither the index nor
 #### Scenario: A deleting command beside it
 - **WHEN** a Bash command runs `git rm -n .env; rm .env`
 - **THEN** the hook blocks
+
+### Requirement: The git rm exemptions apply only to a plain command
+The `--cached` and dry-run exemptions SHALL apply only when every word of the `git rm` command holds only letters, digits and `._/@:+=,%-`, each optionally backslash-escaped or quoted, with an optional subshell or brace group around the whole command. Any other shell syntax in the command MUST fall back to reading the `git rm` as `rm`.
+
+#### Scenario: Quoted options stay plain
+- **WHEN** a Bash command runs `git rm '--cached' .env`, `git rm $'--cached' .env`, `FOO=1 git rm -n .env` or `(git rm --cached .env)`
+- **THEN** the hook allows
+
+#### Scenario: Shell syntax in the command
+- **WHEN** a Bash command runs `git rm .env <<- -n`, `git rm --cached --ignore-unmatch .env '>' --no-cached`, `git rm .env>--cached` or `git rm -n .env > out.txt`
+- **THEN** the hook blocks
+
+### Requirement: A glued redirect does not hide a deleted operand
+A redirect glued to an operand of `rm`, `tee`, `shred` or `unlink` SHALL end the operand where the redirect begins, so the operand is still judged.
+
+#### Scenario: Redirect glued to a secret operand
+- **WHEN** a Bash command runs `rm .env>x` or `git rm .env>-n`
+- **THEN** the hook blocks
