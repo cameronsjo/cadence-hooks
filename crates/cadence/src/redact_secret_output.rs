@@ -68,9 +68,11 @@
 //!    minified), `"NAME=value"` in a JSON string (`docker inspect` env arrays),
 //!    k8s/ECS `name: X` + `value: V` pairs, `--password=V`/`--token V` flags,
 //!    `name    value` table rows (vault `kv get`) and `.netrc` `password V`.
-//!    Cookie values are masked whatever the cookie is called (`theme=dark`
-//!    included): a session cookie is a credential, and readability loses to
-//!    that.
+//!    A key glued to a grep prefix (`path:3:password: x`), a diff marker
+//!    (`+password: x`) or markdown emphasis (`**Password:** x`) is read as a
+//!    key after a label ([`glued_spans`]). Cookie values are masked whatever
+//!    the cookie is called (`theme=dark` included): a session cookie is a
+//!    credential, and readability loses to that.
 //!
 //! **Deliberately left alone:** names whose last segment is metadata
 //! (`KEY_ID`, `secretName`, `PASSWORD_FILE`), a bare `key` (key/value
@@ -352,12 +354,17 @@ pub fn redact(text: &str) -> Option<String> {
     let plain = strip_ansi(text);
     collect_mapped(text, &plain, &mut names, &mut spans);
     let plain_masks = merge(std::mem::take(&mut spans));
-    // An escape inside a plain-pass mask adds nothing when decoded: the text
-    // it could expose is masked already, and any pair beyond the mask that
-    // only decoding reveals has escapes of its own outside it, which still
-    // open a window (a window spans the whole line). Skipping these keeps
-    // dense escaped output (`"PASSWORD=x\n"…`, `\"PASSWORD=x\"…`) to one pass.
+    // An escape adds nothing when decoded if one plain-pass mask runs from it
+    // to the end of its line: every character from the escape on, where the
+    // decoded text differs and a pair it starts would sit, is masked already.
+    // A mask that ends mid-line settles nothing. A weak `=` value stops at the
+    // first blank, so in `x auth=abc\npassword: <secret>` the mask covers the
+    // `\n` but not ` <secret>`, and only the decoded window reads
+    // `password: <secret>` at a line start (#1538). Skipping the settled ones
+    // keeps dense lines a line-start mask covers (`PASSWORD=x\nPASSWORD=x…`)
+    // to one pass. The line end is cached, so a long line is read once.
     let mut cursor = 0usize;
+    let mut line = (usize::MAX, 0usize);
     let settled = |p: usize| {
         let Some(o) = plain.orig(p) else {
             return false;
@@ -365,13 +372,25 @@ pub fn redact(text: &str) -> Option<String> {
         while cursor < plain_masks.len() && plain_masks[cursor].end <= o {
             cursor += 1;
         }
-        plain_masks.get(cursor).is_some_and(|m| m.start <= o)
+        let Some(mask) = plain_masks.get(cursor).filter(|m| m.start <= o) else {
+            return false;
+        };
+        let eol = line_end(&plain.text, p, &mut line);
+        // `p` is a backslash, so the line holds at least that byte.
+        plain
+            .orig(eol.max(p + 1) - 1)
+            .is_some_and(|last| mask.end > last)
     };
     let windows = escape_windows(&plain.text, settled);
     spans = plain_masks;
+    // A glued key's mask settles no escape. Its weak `=` value runs to the
+    // first blank, so `+auth=abc\npassword: x` would cover the `\n` whose
+    // decoded window reads `password: x` (#1537).
+    glued_spans(text, &plain, &mut names, &mut spans);
     for (start, end) in windows {
         let window = unescape_window(&plain, start, end, text.len());
         collect_mapped(text, &window, &mut names, &mut spans);
+        glued_spans(text, &window, &mut names, &mut spans);
     }
     if spans.is_empty() {
         return None;
@@ -415,7 +434,8 @@ fn merge(mut spans: Vec<Span>) -> Vec<Span> {
     merged
 }
 
-/// Run every detector over `view` and map its spans back to `original`.
+/// Run every detector but [`glued_spans`] over `view` and map its spans back
+/// to `original`.
 ///
 /// A span's end maps to just past the original char its last byte came from
 /// (a two-byte escape counts whole), so a colour reset right after a masked
@@ -433,11 +453,17 @@ fn collect_mapped(original: &str, view: &View<'_>, names: &mut Names, spans: &mu
     argv_flag_spans(t, &mut local);
     npmrc_spans(t, &mut local);
     line_spans(t, names, &mut local);
-    for s in local {
+    map_spans(original, view.map.as_deref(), &local, spans);
+}
+
+/// Map spans found in a view to `original` through the view's `map` (`None`
+/// is the identity) and add them to `spans`.
+fn map_spans(original: &str, map: Option<&[usize]>, local: &[Span], spans: &mut Vec<Span>) {
+    for &s in local {
         if s.start >= s.end {
             continue;
         }
-        let (start, end) = match &view.map {
+        let (start, end) = match map {
             None => (s.start, s.end),
             Some(map) => {
                 let (Some(&start), Some(&last)) = (map.get(s.start), map.get(s.end - 1)) else {
@@ -2031,6 +2057,290 @@ fn is_arg_reference(value: &str, name: &str) -> bool {
     ident && (call || head.contains('.') || v.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
 }
 
+// ---------------------------------------------------------------------------
+// Keys glued to a prefix
+// ---------------------------------------------------------------------------
+
+/// One change to a line: its bytes `start..end` (empty for an insert) become
+/// the text given.
+type Edit = (usize, usize, &'static str);
+
+/// A secret-named key glued to a prefix: for an emphasized one, its opening
+/// marker's length and its closing marker's span ([`emphasized_key`]), and
+/// the name's strength.
+type GluedKey = (Option<(usize, usize, usize)>, Strength);
+
+/// What [`grep_prefix`] read after a prefix: where the text after it starts,
+/// a context line's two dashes, and what its `key` found there.
+type GrepKey<T> = (usize, Option<(usize, usize)>, T);
+
+/// Mask the value of a secret-named key glued to what comes before it, which
+/// no other detector reads: a mid-line name needs a blank, a quote or a
+/// bracket before it, and a line-start name may follow only blanks and spaced
+/// markers. The glues read here are a grep prefix (`config/db.yml:3:password:
+/// x`, `path:3:5:`, a context line's `path-3-`), a diff marker (`+password: x`,
+/// `-DB_PASSWORD=x`) and markdown emphasis around the key and its colon
+/// (`**Password:** x`, `*Password*: x`). Each such line is rewritten so the
+/// key follows a label, as in `config/db.yml:3: password: x`, and the mid-line
+/// forms are read on that twin ([`glue_edits`]). After a label, a value of
+/// one word masks by the name's usual test and a value of several words is a
+/// message, kept. A bare `pass` set off by emphasis alone follows a plain word
+/// instead, so its value masks only when its first word looks like a
+/// credential (#1449). The twin's spans map back into its own line, so a line
+/// with no glued secret-named key is never changed here. Every such line goes
+/// into one twin, which [`inline_spans`] reads a line at a time, so a 5 MB
+/// diff costs one more pass, not one per line. [`redact`] calls this after
+/// the plain pass has chosen which escapes to decode, so a glued mask never
+/// stops an escape from opening its window.
+fn glued_spans(original: &str, view: &View<'_>, names: &mut Names, spans: &mut Vec<Span>) {
+    let t: &str = &view.text;
+    let mut edits = Vec::new();
+    let mut twin = String::new();
+    let mut map = Vec::new();
+    let mut line_start = 0;
+    for raw in t.split_inclusive('\n') {
+        let start = line_start;
+        line_start += raw.len();
+        edits.clear();
+        glue_edits(raw, names, &mut edits);
+        if edits.is_empty() {
+            continue;
+        }
+        let orig = |k: usize| view.orig(start + k).unwrap_or(original.len());
+        // Each byte maps to the origin of the char it is part of, as in a
+        // view's own map. In ASCII every byte is a char, so a run is copied
+        // whole rather than a char at a time.
+        let copy = |twin: &mut String, map: &mut Vec<usize>, from: usize, to: usize| {
+            let part = &raw[from..to];
+            twin.push_str(part);
+            if part.is_ascii() {
+                map.extend((from..to).map(orig));
+            } else {
+                for (k, c) in part.char_indices() {
+                    map.extend(std::iter::repeat_n(orig(from + k), c.len_utf8()));
+                }
+            }
+        };
+        let mut at = 0;
+        for &(s, e, with) in &edits {
+            copy(&mut twin, &mut map, at, s);
+            twin.push_str(with);
+            map.extend(std::iter::repeat_n(orig(s), with.len()));
+            at = e;
+        }
+        copy(&mut twin, &mut map, at, raw.len());
+    }
+    if !twin.is_empty() {
+        let mut local = Vec::new();
+        inline_spans(&twin, names, &mut local);
+        map_spans(original, Some(&map), &local, spans);
+    }
+}
+
+/// The edits that make each glued secret-named key on `line` follow a label
+/// (see [`glued_spans`]), ascending and apart:
+///
+/// - a grep prefix glued to the key, `path:3:` or `path:3:5:`, gets a blank
+///   after it; a context line's `path-3-` also has its dashes read as colons;
+/// - a diff marker, a `+` or `-` that starts the line, gets `: ` after it.
+///   When the line's first word reads as a grep prefix with no key after it
+///   (`+DB_PASSWORD=Zq9v-2026-Kh7w`, `+DB_PASSWORD=Zq9v:12:Kh7w`), only a
+///   plain `=` key is read there. A `:` key or an emphasized key is not: its
+///   value would run to the end of the line, so a value of several words
+///   would spend an emphasized key after it (`+password-1-x: **Token:** x`);
+/// - emphasis that opens right after such a prefix is dropped; elsewhere, at
+///   the line start or after a blank, it becomes `: `. Its close, right
+///   before or after the colon, is dropped.
+///
+/// Emphasis alone does not make a bare `pass` a key (`**Pass:** 12/12`): it
+/// reads as after an ordinary word (#1449), behind a prefix too
+/// (`+**Pass:** 12/12`). So its opening marker becomes two plain words
+/// instead of a label: after a field (`Status:`, a grep prefix's `3:`), one
+/// word would be that field's value, and a bare `pass` after a value is a
+/// key.
+///
+/// A key is a name ([`is_name_char`]) the redactor reads as secret
+/// ([`Names::get`]), followed by `:` or `=` when it is plain and by `:` when
+/// it is emphasized.
+fn glue_edits(line: &str, names: &mut Names, edits: &mut Vec<Edit>) {
+    let bytes = line.as_bytes();
+    let mut done = 0;
+    // What a key's opening emphasis, or the gap after its prefix, becomes:
+    // the label given, or two plain words for an emphasized bare `pass`.
+    let label = |(close, strength): GluedKey, label: &'static str, words| {
+        let tally = close.is_some() && strength == Strength::Tally;
+        (close, if tally { words } else { label })
+    };
+    let prefix = grep_prefix(line, |at| glued_key(line, at, names));
+    if let Some(Some((at, dashes, key))) = prefix {
+        if let Some((a, b)) = dashes {
+            edits.push((a, a + 1, ":"));
+            edits.push((b, b + 1, ":"));
+        }
+        let (close, with) = label(key, " ", " x x ");
+        done = push_key(edits, at, close, with);
+    } else if matches!(bytes.first(), Some(b'+' | b'-'))
+        && let Some(key) = glued_key(line, 1, names)
+        // Behind a grep prefix with no key, only a plain `=` key.
+        && (prefix.is_none()
+            || (key.0.is_none() && line[1..].trim_start_matches(is_name_char).starts_with('=')))
+    {
+        let (close, with) = label(key, ": ", " x x ");
+        done = push_key(edits, 1, close, with);
+    }
+    for (p, _) in line.match_indices(['*', '_']) {
+        if p < done || (p > 0 && !matches!(bytes[p - 1], b' ' | b'\t')) {
+            continue;
+        }
+        if let Some((open, s, e, strength)) = emphasized_key(line, p, names) {
+            let (close, with) = label((Some((open, s, e)), strength), ": ", "x x ");
+            done = push_key(edits, p, close, with);
+        }
+    }
+}
+
+/// Push the edits for a key at `at`: its opening emphasis (when `close` is
+/// given, the marker before the name) becomes `with`, and its close goes.
+/// Returns where the edits end.
+fn push_key(
+    edits: &mut Vec<Edit>,
+    at: usize,
+    close: Option<(usize, usize, usize)>,
+    with: &'static str,
+) -> usize {
+    match close {
+        Some((open, s, e)) => {
+            edits.push((at, at + open, with));
+            edits.push((s, e, ""));
+            e
+        }
+        None => {
+            edits.push((at, at, with));
+            at
+        }
+    }
+}
+
+/// A grep prefix that starts `line`, read by `key` at the text after it:
+/// `None` when `line` has no such prefix, and otherwise where that text
+/// starts, for a context line (`path-3-`) the two dashes, and what `key`
+/// found there, when it found something. A match line is `path:3:` or
+/// `path:3:5:`; the path holds no blank or colon. A context line's path ends
+/// at a `-`, digits, `-` before any colon or blank. A path can hold such a
+/// run itself (`logs/2026-10-24.log-12-`), so each is tried in turn until
+/// `key` finds something after one, but only where the name after it holds
+/// no later run: that name would run through the real separator
+/// (`2026-07-09-pre-push-secret-scan-237.md-7-next` is not a key). A match
+/// line with nothing found after it, or a line with such a run and nothing
+/// found after any run, is `Some(None)`: a grep prefix with no key, after
+/// which [`glue_edits`] reads a diff marker only for a plain `=` key.
+fn grep_prefix<T>(
+    line: &str,
+    mut key: impl FnMut(usize) -> Option<T>,
+) -> Option<Option<GrepKey<T>>> {
+    let bytes = line.as_bytes();
+    let path_end = bytes
+        .iter()
+        .position(|&b| matches!(b, b':' | b' ' | b'\t' | b'\r' | b'\n'))
+        .unwrap_or(bytes.len());
+    let digits = |from: usize| {
+        bytes[from.min(bytes.len())..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    let n = digits(path_end + 1);
+    let end = path_end + 1 + n;
+    if path_end > 0 && bytes.get(path_end) == Some(&b':') && n > 0 && bytes.get(end) == Some(&b':')
+    {
+        let col = digits(end + 1);
+        let at = if col > 0 && bytes.get(end + 1 + col) == Some(&b':') {
+            end + 2 + col
+        } else {
+            end + 1
+        };
+        return Some(key(at).map(|k| (at, None, k)));
+    }
+    let mut found = false;
+    let mut pending: Option<(usize, usize)> = None;
+    let mut from = 1;
+    while let Some(i) = bytes[from.min(path_end)..path_end]
+        .iter()
+        .position(|&b| b == b'-')
+    {
+        let a = from + i;
+        let n = digits(a + 1);
+        if n > 0 && a + 1 + n < path_end && bytes[a + 1 + n] == b'-' {
+            found = true;
+            if let Some((pa, pb)) = pending
+                && line
+                    .get(pb + 1..a)
+                    .is_some_and(|gap| gap.contains(|c: char| !is_name_char(c)))
+                && let Some(k) = key(pb + 1)
+            {
+                return Some(Some((pb + 1, Some((pa, pb)), k)));
+            }
+            pending = Some((a, a + 1 + n));
+        }
+        from = a + 1 + n;
+    }
+    if let Some((pa, pb)) = pending
+        && let Some(k) = key(pb + 1)
+    {
+        return Some(Some((pb + 1, Some((pa, pb)), k)));
+    }
+    found.then_some(None)
+}
+
+/// A secret-named key glued to a prefix at `at`, plain (followed by `:` or
+/// `=`) or emphasized.
+fn glued_key(line: &str, at: usize, names: &mut Names) -> Option<GluedKey> {
+    if let Some((open, s, e, strength)) = emphasized_key(line, at, names) {
+        return Some((Some((open, s, e)), strength));
+    }
+    let rest = &line[at..];
+    if !rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return None;
+    }
+    let end = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
+    if !rest[end..].starts_with([':', '=']) {
+        return None;
+    }
+    names.get(&rest[..end]).map(|strength| (None, strength))
+}
+
+/// A secret-named key wrapped, with its colon, in markdown emphasis (`**`,
+/// `__`, `*`, `_`) that opens at `at`: `**Password:**` or `**Password**:`.
+/// Returns the opening marker's length, the closing marker's span and the
+/// name's strength. `_` is a name character, so `__Password__:` is the key
+/// `__Password__` instead, and [`glued_key`] reads it as a plain key.
+fn emphasized_key(
+    line: &str,
+    at: usize,
+    names: &mut Names,
+) -> Option<(usize, usize, usize, Strength)> {
+    let rest = &line[at..];
+    let mark = ["**", "__", "*", "_"]
+        .into_iter()
+        .find(|m| rest.starts_with(m))?;
+    let m = mark.len();
+    let body = &rest[m..];
+    if !body.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let end = body.find(|c: char| !is_name_char(c)).unwrap_or(body.len());
+    let after = &body[end..];
+    let close = if after.starts_with(':') && after[1..].starts_with(mark) {
+        (end + 1, end + 1 + m)
+    } else if after.starts_with(mark) && after[m..].starts_with(':') {
+        (end, end + m)
+    } else {
+        return None;
+    };
+    let strength = names.get(&body[..end])?;
+    Some((m, at + m + close.0, at + m + close.1, strength))
+}
+
 fn leading_indent(line: &str) -> usize {
     line.len() - line.trim_start_matches([' ', '\t']).len()
 }
@@ -2526,6 +2836,39 @@ mod tests {
 
     fn masked(text: &str) -> String {
         redact(text).unwrap_or_else(|| text.to_string())
+    }
+
+    /// cameronsjo/cadence-hooks#1538: an escape inside a mask that ends
+    /// mid-line opens its decoded window, so a pair only decoding reveals past
+    /// the mask is masked. The issue's two rows, exactly, then other masks that
+    /// stop at a blank (weak names, a query string) and other escapes.
+    #[test]
+    fn an_escape_inside_a_mid_line_mask_still_decodes() {
+        let p = pw();
+        let m = NAMED_MARK;
+        for (input, want) in [
+            (
+                format!("x auth=abc\\npassword: {p}\n"),
+                format!("x auth={m} {m}\n"),
+            ),
+            (
+                format!("INFO auth=abc\\npassword: {p}\n"),
+                format!("INFO auth={m} {m}\n"),
+            ),
+        ] {
+            assert_eq!(masked(&input), want, "{input}");
+        }
+        for input in [
+            format!("x basic_auth=abc\\npassword: {p}\n"),
+            format!("x db_pass=abc\\npassword: {p}\n"),
+            format!("x ssh_key=abc\\r\\npassword: {p}\r\n"),
+            format!("x license_key=abc\\ntoken: {p}\n"),
+            format!("GET /a?token=abc\\npassword: {p} HTTP/1.1\n"),
+            format!("{{\"log\":\"x auth=abc\\npassword: {p}\"}}\n"),
+            format!("\x1b[2mx auth=abc\\npassword: {p}\x1b[m\n"),
+        ] {
+            assert!(!masked(&input).contains(&p), "{input}");
+        }
     }
 
     /// Each input carries one of the canaries; none may survive. Includes
@@ -3600,6 +3943,264 @@ mod tests {
         }
     }
 
+    /// A key glued to a grep prefix, a diff marker or markdown emphasis is read
+    /// as a key after a label ([`glued_spans`]): a value of one word masks by
+    /// the name's usual test, and every other byte is kept.
+    #[test]
+    fn a_key_glued_to_a_prefix_is_read_after_a_label() {
+        let p = pw();
+        let m = NAMED_MARK;
+        let masks = [
+            // `grep -rn`: a match line, one with a column, a context line.
+            (
+                format!("config/db.yml:3:password: {p}\n"),
+                format!("config/db.yml:3:password: {m}\n"),
+            ),
+            (
+                format!(".env:1:DB_PASSWORD={p}\n"),
+                format!(".env:1:DB_PASSWORD={m}\n"),
+            ),
+            (
+                format!("config/db.yml:3:5:password: {p}\n"),
+                format!("config/db.yml:3:5:password: {m}\n"),
+            ),
+            (
+                format!("config/db.yml-4-password: {p}\n"),
+                format!("config/db.yml-4-password: {m}\n"),
+            ),
+            (
+                format!("src/app.py:7:pass: {p}\n"),
+                format!("src/app.py:7:pass: {m}\n"),
+            ),
+            // A diff line.
+            (format!("+password: {p}\n"), format!("+password: {m}\n")),
+            (format!("-DB_PASSWORD={p}\n"), format!("-DB_PASSWORD={m}\n")),
+            (format!("+pass: {p}\n"), format!("+pass: {m}\n")),
+            // A plain glued bare `pass` is in key position, so a value that
+            // is not credential-shaped masks too, as after `+ pass:`.
+            ("+pass: hunter2\n".to_string(), format!("+pass: {m}\n")),
+            // Emphasis around the key and its colon.
+            (
+                format!("**Password:** {p}\n"),
+                format!("**Password:** {m}\n"),
+            ),
+            (
+                format!("**Password**: {p}\n"),
+                format!("**Password**: {m}\n"),
+            ),
+            (format!("*Password:* {p}\n"), format!("*Password:* {m}\n")),
+            (format!("**Pass:** {p}\n"), format!("**Pass:** {m}\n")),
+            (
+                format!("- **Password:** {p}\n"),
+                format!("- **Password:** {m}\n"),
+            ),
+            (
+                format!("Login with **Password:** {p}\n"),
+                format!("Login with **Password:** {m}\n"),
+            ),
+            (
+                format!("Error: __Password:__ {p}\n"),
+                format!("Error: __Password:__ {m}\n"),
+            ),
+            (
+                format!("**Authorization:** Bearer {p}\n"),
+                format!("**Authorization:** {m}\n"),
+            ),
+            // Emphasis after a diff marker or a grep prefix.
+            (
+                format!("+**Password:** {p}\n"),
+                format!("+**Password:** {m}\n"),
+            ),
+            (
+                format!("+__Password:__ {p}\n"),
+                format!("+__Password:__ {m}\n"),
+            ),
+            (
+                format!("docs/setup.md:12:**Password:** {p}\n"),
+                format!("docs/setup.md:12:**Password:** {m}\n"),
+            ),
+            // Only the glued line changes.
+            (
+                format!("user: admin\n+password: {p}\n+host: db\n"),
+                format!("user: admin\n+password: {m}\n+host: db\n"),
+            ),
+            // A colored line maps back through the colors, and a value that
+            // ends in a multi-byte char is masked to its end, no further.
+            (
+                format!("\x1b[32m+password: {p}\x1b[m\n"),
+                format!("\x1b[32m+password: {m}\x1b[m\n"),
+            ),
+            (
+                format!("\x1b[35mconfig/db.yml\x1b[m:\x1b[32m3\x1b[m:password: {p}\n"),
+                format!("\x1b[35mconfig/db.yml\x1b[m:\x1b[32m3\x1b[m:password: {m}\n"),
+            ),
+            (
+                format!("+password: {p}é\nnext line\n"),
+                format!("+password: {m}\nnext line\n"),
+            ),
+            (
+                format!("Café **Password:** {p}\n"),
+                format!("Café **Password:** {m}\n"),
+            ),
+            // An escape inside a glued weak key's mask still opens its
+            // decoded window, so a secret that only decoding reveals masks.
+            (
+                format!("+auth=abc\\npassword: {p}\n"),
+                format!("+auth={m} {m}\n"),
+            ),
+            (
+                format!("src/a.env:3:db_pass=abc\\tPASSWORD: {p}\n"),
+                format!("src/a.env:3:db_pass={m} {m}\n"),
+            ),
+            // A glued key on a later line of an escaped string is read in
+            // that string's decoded window too.
+            (
+                format!("{{\"diff\":\"x\\n+password: {p}\\n\"}}\n"),
+                format!("{{\"diff\":\"x\\n+password: {m}\\n\"}}\n"),
+            ),
+            // Behind a prefix, an emphasized bare `pass` is judged as in
+            // prose, so a credential-shaped first word still masks.
+            (format!("+**Pass:** {p}\n"), format!("+**Pass:** {m}\n")),
+            (
+                format!("docs/report.md:3:**Pass:** {p}\n"),
+                format!("docs/report.md:3:**Pass:** {m}\n"),
+            ),
+            (
+                format!("Status: **Pass:** {p}\n"),
+                format!("Status: **Pass:** {m}\n"),
+            ),
+            // A context line whose path holds a `-digits-` run of its own.
+            (
+                format!("logs/2026-10-24.log-12-password: {p}\n"),
+                format!("logs/2026-10-24.log-12-password: {m}\n"),
+            ),
+            (
+                format!("_posts/2026-10-24-x.md-3-password: {p}\n"),
+                format!("_posts/2026-10-24-x.md-3-password: {m}\n"),
+            ),
+            // ...and one with a later `-digits-` run in its value. The path
+            // holds a `/`, so no line-start name runs over it.
+            (
+                "config/app.env-3-TOKEN=abc-2026-10-24\n".to_string(),
+                format!("config/app.env-3-TOKEN={m}\n"),
+            ),
+            // A plain glued key may start with `_`.
+            (format!("+_password={p}\n"), format!("+_password={m}\n")),
+            // A diff line whose value holds a `-digits-` run is read as a
+            // diff line when no key follows the run.
+            (
+                "+DB_PASSWORD=Zq9v-2026-Kh7w\n".to_string(),
+                format!("+DB_PASSWORD={m}\n"),
+            ),
+            // There, a `:` key or an emphasized key whose name holds the run
+            // is not read, so its value of several words does not spend an
+            // emphasized key later on the line.
+            (
+                format!("+password-1-x: **Token:** {p}\n"),
+                format!("+password-1-x: **Token:** {m}\n"),
+            ),
+            (
+                format!("+token-2-v: see **Secret:** {p}\n"),
+                format!("+token-2-v: see **Secret:** {m}\n"),
+            ),
+            (
+                format!("+**password-1-x:** a **Token:** {p}\n"),
+                format!("+**password-1-x:** a **Token:** {m}\n"),
+            ),
+            (
+                format!("+db_pass-1-x: *Secret*: {p}\n"),
+                format!("+db_pass-1-x: *Secret*: {m}\n"),
+            ),
+            (
+                format!("-a.log-12-token-2026-10:\tsee-2-docs now *Secret*: {p}\n"),
+                format!("-a.log-12-token-2026-10:\tsee-2-docs now *Secret*: {m}\n"),
+            ),
+            // A `:digits:` run makes the first word read as a match line's
+            // path: a plain `=` key is read as on a diff line...
+            (
+                "+DB_PASSWORD=Zq9v:12:Kh7w\n".to_string(),
+                format!("+DB_PASSWORD={m}\n"),
+            ),
+            ("+TOKEN=ab:1:cd\n".to_string(), format!("+TOKEN={m}\n")),
+            ("-API_KEY=x:1:y\n".to_string(), format!("-API_KEY={m}\n")),
+            // ...and a `:` key is not, so a later emphasized key is read.
+            (
+                format!("+password:12:x **Token:** {p}\n"),
+                format!("+password:12:x **Token:** {m}\n"),
+            ),
+            // A real match line with a key after it is read as before.
+            (
+                "docs/a.md:12:password: x\n".to_string(),
+                format!("docs/a.md:12:password: {m}\n"),
+            ),
+        ];
+        for (input, want) in &masks {
+            assert_eq!(masked(input), *want, "{input:?}");
+        }
+        let kept = [
+            // After a label, a value of several words is a message.
+            "src/auth.rs:12:password: see the vault docs\n",
+            "src/auth.rs-12-password: see the vault docs\n",
+            "+password: required field\n",
+            "**Password:** see the vault docs\n",
+            // The name's usual tests still apply.
+            "+password: required\n",
+            "config/db.yml:3:password: ${DB_PASSWORD}\n",
+            "+pass: 5\n",
+            "+PASS: TestFoo (0.00s)\n",
+            "**Token:** none\n",
+            // A bare `pass` set off by emphasis alone is judged as in prose.
+            "**Pass:** 12/12\n",
+            "**pass:** ok\n",
+            "- **Pass:** ok\n",
+            // ...behind a diff marker or a grep prefix too.
+            "+**Pass:** 12/12\n",
+            "-**Pass:** 12/12\n",
+            "+**pass:** ok\n",
+            "+**Pass:** ok\n",
+            "+**Pass:** 42/42\n",
+            "+**Pass:** 98%\n",
+            "+**Pass:** \u{2705}\n",
+            "+*Pass:* 12/12\n",
+            "+__Pass:__ 12/12\n",
+            "docs/report.md:3:**Pass:** 12/12\n",
+            "docs/report.md-3-**Pass:** 12/12\n",
+            "Status: **Pass:** 12/12\n",
+            // No glued secret-named key.
+            "token.c:12:5: warning: unused variable\n",
+            "config/db.yml:3:user: admin\n",
+            "+++ b/config/db.yml\n",
+            "--- a/config/db.yml\n",
+            "**Note:** rotate the password monthly\n",
+            "+**Second pass:** done\n",
+            // A glued name that is not secret leaves its line alone, so a
+            // bare `pass:` after it is read as on that line.
+            "+user=admin pass: hunter2\n",
+            "+note: x pass: hunter2\n",
+            "docs/a.md:3:user=admin pass: hunter2\n",
+            "**Note:** pass: hunter2\n",
+            "**Status:** pass: hunter2\n",
+            "*Note:* pass: hunter2\n",
+            // Not a grep prefix: an empty path, a dash that starts the line,
+            // digits that no dash closes.
+            ":3:password: x\n",
+            "-1-password: x\n",
+            "a-1/token: b\n",
+            // An emphasized name starts with a letter.
+            "**_token:** b\n",
+            // A `-digits-` run is a context separator only when the name
+            // after it holds no later one.
+            "docs/plans/2026-07-09-pre-push-secret-scan-237.md-7-next: \"Task 0 built\"\n",
+            // Emphasis opens only at the line start or after a blank.
+            "KEYS user*token:* 0\n",
+            // A name that is not secret leaves a `:digits:` line alone.
+            "+TOKEN_EXPIRES=12:30:45\n",
+        ];
+        for input in kept {
+            assert_eq!(redact(input), None, "{input:?}");
+        }
+    }
+
     fn response(stdout: &str, stderr: &str) -> ToolResponse {
         ToolResponse {
             stdout: Some(stdout.to_string()),
@@ -3851,6 +4452,20 @@ mod tests {
             // `)` that ends its value. With none on the line, that search may
             // not walk the blank run once per match.
             format!("f(x{}{}", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
+            // Keys glued to a prefix: every such line goes into one twin, and
+            // a context line's path is read once. A glued key costs about what
+            // its spaced form (`a:1: password: x`) does, so these are as dense
+            // as a diff, a grep or a markdown note, like the rows above.
+            format!("+password: {p}\n{}\n", " context".repeat(8)).repeat(5 * MB / 91),
+            format!("config/db.yml:3:password: {p}\nconfig/db.yml-4-  host: db\n")
+                .repeat(5 * MB / 68),
+            format!(
+                "- **Password:** {p}\n{}\n",
+                "Some prose about the setup. ".repeat(3)
+            )
+            .repeat(5 * MB / 116),
+            "**Pass:** ok, see the notes ".repeat(5 * MB / 28),
+            format!("{}:", "a-1-".repeat(5 * MB / 4)),
             // #1532: with the `,` or `)` far away, every value runs to it, and
             // the value tests may not read that long value once per match.
             format!("f(x{}{})", " auth=a".repeat(1_000), " ".repeat(4 * MB)),
