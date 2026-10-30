@@ -181,7 +181,7 @@ A deletion the guard reads behind a wrapper SHALL keep the cwd verdict, a block,
 - **THEN** the hook exits 2
 
 ### Requirement: A git rm that leaves the file on disk is allowed
-A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The rule holds for the bare command, behind a runner or wrapper, as a `find -exec` action, and from outside the vault. A word known only when the shell runs is not read.
+A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it.
 
 #### Scenario: Index-only git rm in the vault
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md`, `git rm -r --cached sub/` or `git -C . rm --cached note.md`
@@ -201,4 +201,15 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 
 #### Scenario: A command substitution beside a --cached
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md $(git ls-files -d)`
-- **THEN** the hook exits 0, and a `--no-cached` or `--` the substitution may print is not read
+- **THEN** the hook exits 2, because the command is not plain
+
+### Requirement: The --cached exemption applies only to a plain command
+`trash-guard` SHALL honor `--cached` only when every word of the `git rm` command is plain text (letters, digits, `._/@:+=,%-~`, optionally quoted or backslash-escaped) and no `xargs` runs it. A `find -exec` action or any other shell syntax MUST be read as a deletion.
+
+#### Scenario: Plain command behind a runner or from outside the vault
+- **WHEN** a Bash call runs `sudo git rm --cached note.md` in the vault, or `git rm -r --cached ~/Documents` from `/home/me`
+- **THEN** the hook exits 0
+
+#### Scenario: Shell syntax or xargs around a --cached
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached --ignore-unmatch note.md '>' --no-cached`, `git ls-files -z | xargs -0 git rm --cached` or `find . -exec git rm --cached {} \;`
+- **THEN** the hook exits 2

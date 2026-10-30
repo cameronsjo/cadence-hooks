@@ -13973,6 +13973,66 @@ pub fn git_rm_is_dry_run(args: &[String]) -> bool {
     dry_run
 }
 
+/// A byte a plain word may hold: nothing the shell redirects, splits on or
+/// treats as an operator, and no expansion that can yield an option. `~`
+/// expands to a home directory path or stays literal (`~--no-cached` names no
+/// user), so `git rm -r --cached ~/Documents` stays plain.
+fn is_plain_byte(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "._/@:+=,%-~".contains(c)
+}
+
+/// Is this segment a plain command, one whose words the program receives
+/// exactly as they are written? Each word holds only [`is_plain_byte`]
+/// characters, a backslash before one, or a `'…'`, `"…"` or `$'…'` quote
+/// around a run of them; blanks separate words. A subshell or brace group
+/// around the whole command is peeled first ([`strip_group_wrappers`]).
+pub fn is_plain_command(segment: &str) -> bool {
+    let mut chars = strip_group_wrappers(segment).chars();
+    let quoted_run_is_plain = |chars: &mut std::str::Chars<'_>, close: char| {
+        for c in chars.by_ref() {
+            if c == close {
+                return true;
+            }
+            if !is_plain_byte(c) {
+                return false;
+            }
+        }
+        false
+    };
+    while let Some(c) = chars.next() {
+        let plain = match c {
+            ' ' | '\t' => true,
+            '\\' => chars.next().is_some_and(is_plain_byte),
+            '\'' | '"' => quoted_run_is_plain(&mut chars, c),
+            '$' => chars.next() == Some('\'') && quoted_run_is_plain(&mut chars, '\''),
+            c => is_plain_byte(c),
+        };
+        if !plain {
+            return false;
+        }
+    }
+    true
+}
+
+/// May a guard trust [`git_rm_keeps_the_tree`] or [`git_rm_is_dry_run`] for
+/// the `git rm` in this segment? `runners` are the tokens peeled off in front
+/// of `git` (`sudo`, `env -i`, `xargs -0`).
+///
+/// Only when the segment is a plain command ([`is_plain_command`]) and no
+/// runner adds words to git's argv. An allowlist on purpose: each review of
+/// the earlier denylist found another spelling where the reader saw
+/// `--cached` or `-n` while git deleted the file — a redirect target
+/// (`git rm .env > --dry-run`, `.env>--cached`), a heredoc delimiter
+/// (`<<- -n`), a process substitution, a quoted `'>'` the option reader
+/// skipped past (cadence-hooks#1580 review). `xargs` appends the words it
+/// reads to git's argv, so `echo --no-cached | xargs git rm --cached .env`
+/// deletes the file (cadence-hooks#1583 review). A guard that gets `false`
+/// reads the command as `rm`, so an unusual spelling blocks; that is always
+/// safe here. Shared by `prevent-secret-writes` and `obsidian-trash-guard`.
+pub fn git_rm_exemption_is_trusted(segment: &str, runners: &[String]) -> bool {
+    is_plain_command(segment) && !runners.iter().any(|t| command_word(t) == "xargs")
+}
+
 /// `git push` long options whose value is a SEPARATE following word.
 ///
 /// Measured against git 2.55.0 by pointing pushes at nonexistent local paths and

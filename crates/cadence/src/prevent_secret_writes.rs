@@ -14,9 +14,10 @@ use crate::secret_patterns::{
     unresolved_parameter_cause, wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_word, executable_tokens, git_rm_is_dry_run,
-    git_rm_keeps_the_tree, peel_command_runners, redirect_operator_span, redirect_targets,
-    skip_git_global_options, strip_group_wrappers, tokenize, unescape_word,
+    carries_substitution, command_segments, command_word, executable_tokens,
+    git_rm_exemption_is_trusted, git_rm_is_dry_run, git_rm_keeps_the_tree, peel_command_runners,
+    redirect_operator_span, redirect_targets, skip_git_global_options, strip_group_wrappers,
+    tokenize, unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -65,54 +66,6 @@ fn writer_argv(tokens: &[String]) -> &[String] {
     argv
 }
 
-/// A byte a plain word may hold: nothing the shell expands, redirects, splits
-/// on or treats as an operator.
-fn is_plain_byte(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "._/@:+=,%-".contains(c)
-}
-
-/// Is this segment a plain command, one whose words git receives exactly as
-/// they are written? Each word holds only [`is_plain_byte`] characters, a
-/// backslash before one, or a `'…'`, `"…"` or `$'…'` quote around a run of
-/// them; blanks separate words. A subshell or brace group around the whole
-/// command is peeled first ([`strip_group_wrappers`]).
-///
-/// An allowlist on purpose. The `git rm --cached` and dry-run exemption is the
-/// one place this guard allows a `git rm` of a secret, and each review of a
-/// denylist found another spelling where the guard read `--cached` or `-n`
-/// while git deleted the file: a redirect target (`git rm .env > --dry-run`,
-/// `.env>--cached`), a heredoc delimiter (`<<- -n`), a process substitution, a
-/// quoted `'>'` the option reader skipped past (cadence-hooks#1580 review).
-/// Anything outside this shape falls back to reading the command as `rm`,
-/// which blocks: blocking an unusual spelling is always safe here.
-fn is_plain_command(segment: &str) -> bool {
-    let mut chars = strip_group_wrappers(segment).chars();
-    let quoted_run_is_plain = |chars: &mut std::str::Chars<'_>, close: char| {
-        for c in chars.by_ref() {
-            if c == close {
-                return true;
-            }
-            if !is_plain_byte(c) {
-                return false;
-            }
-        }
-        false
-    };
-    while let Some(c) = chars.next() {
-        let plain = match c {
-            ' ' | '\t' => true,
-            '\\' => chars.next().is_some_and(is_plain_byte),
-            '\'' | '"' => quoted_run_is_plain(&mut chars, c),
-            '$' => chars.next() == Some('\'') && quoted_run_is_plain(&mut chars, '\''),
-            c => is_plain_byte(c),
-        };
-        if !plain {
-            return false;
-        }
-    }
-    true
-}
-
 // `redirect_targets` (the all-redirects, append-included parser) moved to
 // `cadence_hooks_core::shell` so `enforce-worktree`'s subprocess-mutation nudge
 // shares this exact parser rather than hand-rolling a second one (#234) — the
@@ -126,8 +79,8 @@ fn is_plain_command(segment: &str) -> bool {
 /// `dd` — `of=` values; `truncate` — operands after consuming `-s <size>` /
 /// `--size=<n>`. `git rm` is judged as `rm` unless it is told `--cached`
 /// ([`git_rm_keeps_the_tree`]) or is a dry run ([`git_rm_is_dry_run`]), both
-/// of which leave the file on disk, and the segment is a plain command
-/// ([`is_plain_command`]); command runners (`sudo rm .env`,
+/// of which leave the file on disk, and core can trust that reading
+/// ([`git_rm_exemption_is_trusted`]); command runners (`sudo rm .env`,
 /// `env -i cp x .env`) are peeled by [`writer_argv`].
 ///
 /// Quote-aware via [`tokenize`] (#86): a quoted filename is one clean token,
@@ -154,7 +107,9 @@ fn writer_targets(segment: &str) -> Vec<String> {
         if let Some((sub, rest)) = skip_git_global_options(args).split_first()
             && sub == "rm"
         {
-            if is_plain_command(segment) && (git_rm_keeps_the_tree(rest) || git_rm_is_dry_run(rest))
+            let runners = &tokens[..tokens.len() - argv.len()];
+            if git_rm_exemption_is_trusted(segment, runners)
+                && (git_rm_keeps_the_tree(rest) || git_rm_is_dry_run(rest))
             {
                 return Vec::new();
             }
@@ -1574,7 +1529,6 @@ mod tests {
             "git -C . rm --cached .env",
             "sudo git rm --cached .env",
             "git rm --cached .env && git commit -m untrack",
-            "xargs git rm --cached .env",
             r"git rm \--cached .env",
             // Quoting and escapes that wrap only plain characters keep the
             // command plain (cadence-hooks#1580 review).
@@ -1624,6 +1578,13 @@ mod tests {
             "git rm --cached --ignore-unmatch .env '$(' --no-cached",
             "git rm --cached --ignore-unmatch .env '`' --no-cached",
             "git rm .env < <(echo --cached)",
+            // `xargs` appends the words it reads to git's argv, so a
+            // `--no-cached` on stdin turns the deletion back on
+            // (cadence-hooks#1583 review).
+            "xargs git rm --cached .env",
+            "echo --no-cached | xargs git rm --cached .env",
+            "printf -- \"--no-cached\\0\" | xargs -0 git rm --cached .env",
+            "xargs -a list git rm --cached .env",
             // A redirect anywhere in the command now blocks, even when the
             // `--cached` itself is real.
             "git rm --cached .env > log.txt",
@@ -1646,7 +1607,6 @@ mod tests {
             "git rm --no-dry-run -n .env",
             "git -C . rm -n .env",
             "sudo git rm --dry-run .env",
-            "xargs git rm -n .env",
             r"git rm -\n .env",
             "git rm -r -n .env",
             "git rm \"-n\" .env",
@@ -1695,6 +1655,9 @@ mod tests {
             "git rm -n --ignore-unmatch .env '$(' --no-dry-run",
             "git rm -n --ignore-unmatch .env '`' --no-dry-run",
             "git rm .env < <(echo -n)",
+            // `xargs` appends the words it reads to git's argv.
+            "xargs git rm -n .env",
+            "echo --no-dry-run | xargs git rm -n .env",
             // A redirect anywhere in the command now blocks, even when the
             // dry run itself is real.
             "git rm -n .env > out.txt",
