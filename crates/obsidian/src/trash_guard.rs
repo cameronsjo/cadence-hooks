@@ -3635,9 +3635,12 @@ mod tests {
                 Block,
             ),
             ("git rm --ignore-unmatch '>' -- --cached note.md", Block),
-            // The option reader sees words after quote removal, so a quoted
-            // paren or backslash would mislead it too; neither is plain, so
-            // the gate keeps both away from it (CAM-495).
+            // The option reader sees words after quote removal, so it would
+            // read git's pathspec `\--cached` as `--cached`; git deletes the
+            // note (CAM-495).
+            (r"git rm --ignore-unmatch '\--cached' note.md", Block),
+            // git keeps the note in these two; they block as false positives
+            // because the command is not plain.
             (r#"git rm -f 2> >(grep "(") --cached note.md"#, Block),
             (r"git rm --cached note.md '\--no-cached'", Block),
             // A tilde other than a leading `~/` can expand to an option an

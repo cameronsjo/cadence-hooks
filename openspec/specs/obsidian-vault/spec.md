@@ -216,5 +216,5 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 - **THEN** the hook exits 0
 
 #### Scenario: Shell syntax or xargs around a --cached
-- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached --ignore-unmatch note.md '>' --no-cached`, `git rm --cached note.md '\--no-cached'`, `git rm -f 2> >(grep "(") --cached note.md`, `git ls-files -z | xargs -0 git rm --cached` or `find . -exec git rm --cached {} \;`
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached --ignore-unmatch note.md '>' --no-cached`, `git rm --ignore-unmatch '\--cached' note.md`, `git ls-files -z | xargs -0 git rm --cached` or `find . -exec git rm --cached {} \;`
 - **THEN** the hook exits 2
