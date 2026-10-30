@@ -13825,21 +13825,27 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 /// count balances, and over every word of a backtick span, however the words
 /// were split. A `--` inside a substitution is skipped with it.
 ///
-/// A skipped word hides whatever option it would have given git, so the
-/// answer fails toward blocking only for an option whose presence allows. A
-/// reader that asks whether `--cached` is present answers no, the side that
-/// blocks, when a quoted `(` or backtick throws the count off. A reader that
-/// also honors a later `--no-cached`, or the `--` stop, does not: a
-/// substitution that prints one, or a variable no walk resolved (`"$o"` with
-/// `o=--no-cached`), can turn an allowed `git rm --cached` into a deletion.
-/// Only a crafted command spells that, and cadence-ecosystem ADR-0046 rule 1
-/// leaves such commands out of scope. Each `git rm` option reader iterates
-/// these words in place of its raw arguments (cadence-hooks#1521).
+/// A skipped word hides whatever option it would have given git, and a
+/// reader that honors a later `--no-cached` or the `--` stop could miss one
+/// that a substitution prints. Each `git rm` option reader iterates these
+/// words in place of its raw arguments (cadence-hooks#1521).
 ///
 /// Each word comes back after the shell's quote removal ([`unescape_word`]),
 /// because that is the word git gets: `\--no-cached` and `--no-cach\ed` are
 /// `--no-cached` to git, and `\--` ends its options (cadence-hooks#1546
 /// review).
+///
+/// The words arrive with their quotes already removed, so this cannot tell a
+/// quoted `'>'`, `'$('`, `'('` or backtick from shell syntax, and runs
+/// [`unescape_word`] again on a backslash that sat inside quotes. None of
+/// that reaches a verdict: a guard reads these words only for a command that
+/// [`git_rm_exemption_is_trusted`] accepts, and a plain command's quotes hold
+/// only [`is_plain_byte`] characters, so no operator, paren, backtick or
+/// backslash can sit inside them. `git rm --cached --ignore-unmatch .env '>'
+/// --no-cached`, `git rm --cached .env '\--no-cached'` and `git rm -f 2>
+/// >(grep "(") --cached .env` are each refused there and read as `rm`
+/// (cadence-hooks#1580 review, CAM-495). Carry quote provenance in from
+/// [`tokenize_marked`] before calling this for a command that is not plain.
 ///
 /// A redirect is the shell's, not git's: the operator and its target are
 /// skipped, so in `git rm .env > --dry-run` the `--dry-run` names the file the
@@ -17549,6 +17555,33 @@ mod tests {
                 let got: Vec<Cow<str>> = git_rm_option_words(argv).collect();
                 assert_eq!(got, want, "git rm {args}, read as {argv:?}");
             }
+        }
+    }
+
+    /// The option reader cannot see quotes, so a quoted operator, paren or
+    /// backslash would mislead it. The trust gate keeps every such command
+    /// away from it, while quoting around plain characters stays trusted
+    /// (CAM-495).
+    #[test]
+    fn git_rm_exemption_refuses_quoted_shell_syntax() {
+        for segment in [
+            "git rm --cached --ignore-unmatch .env '>' --no-cached",
+            "git rm --cached --ignore-unmatch .env \"2>\" --no-cached",
+            "git rm --cached --ignore-unmatch .env '$(' --no-cached",
+            "git rm --cached --ignore-unmatch .env '`' --no-cached",
+            r"git rm --cached .env '\--no-cached'",
+            r#"git rm -f 2> >(grep "(") --cached .env"#,
+            "git rm --cached .env '(' --no-cached",
+        ] {
+            assert!(!git_rm_exemption_is_trusted(segment, &[]), "{segment}");
+        }
+        for segment in [
+            "git rm --cached .env",
+            "git rm '--cached' \"note.md\" $'x.md'",
+            r"git rm \--cached .env",
+            "git rm -r --cached ~/Documents",
+        ] {
+            assert!(git_rm_exemption_is_trusted(segment, &[]), "{segment}");
         }
     }
 

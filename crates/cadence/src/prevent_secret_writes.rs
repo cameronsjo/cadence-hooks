@@ -1596,6 +1596,11 @@ mod tests {
             // A redirect anywhere in the command now blocks, even when the
             // `--cached` itself is real.
             "git rm --cached .env > log.txt",
+            // So does a quoted paren or backslash. The option reader sees
+            // words after quote removal and would misread both, so the plain
+            // check keeps them from it (CAM-495).
+            r#"git rm -f 2> >(grep "(") --cached .env"#,
+            r"git rm --cached .env '\--no-cached'",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }
