@@ -9,10 +9,10 @@
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, UNRESOLVABLE_DIR, carries_substitution, child_scripts,
     clobber_redirect_targets, command_segments, command_word, executable_tokens,
-    executable_tokens_marked, installs_trap_action, is_assignment_word, looks_absolute,
-    peel_command_runners, redirect_operator_span, redirect_targets, segment_scripts,
-    segment_work_dirs, skip_git_global_options, strip_verbatim_prefix, substitution_bodies,
-    tokenize,
+    executable_tokens_marked, git_rm_exemption_is_trusted, git_rm_keeps_the_tree,
+    installs_trap_action, is_assignment_word, looks_absolute, peel_command_runners,
+    redirect_operator_span, redirect_targets, segment_scripts, segment_work_dirs,
+    skip_git_global_options, strip_verbatim_prefix, substitution_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -184,10 +184,12 @@ fn word_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// `prevent_secret_writes::writer_targets`. `git`'s global options sit between
 /// the verb and the subcommand, so `git -C . rm note.md` is read past them
 /// rather than resolving its subcommand to `-C` (#528 review I2). A `git rm`
-/// that is told `--cached` ([`git_rm_keeps_the_tree`]) deletes nothing from disk.
-/// `writer_targets` does not honor `--cached` yet (#1535), so the two readers
-/// disagree there: `git rm --cached .env` still blocks in prevent-secret-writes.
-fn head_deletes(argv: &[String]) -> bool {
+/// that is told `--cached` ([`git_rm_keeps_the_tree`]) deletes nothing from disk;
+/// `writer_targets` reads it through the same core test (#1535). That reading
+/// counts only when `cached_is_trusted`, which callers take from
+/// [`git_rm_exemption_is_trusted`]: a plain command with no `xargs` in front.
+/// Anything else is read as a deletion (cadence-hooks#1583 review).
+fn head_deletes(argv: &[String], cached_is_trusted: bool) -> bool {
     let Some(first) = argv.first() else {
         return false;
     };
@@ -196,40 +198,15 @@ fn head_deletes(argv: &[String]) -> bool {
         || (verb == "git"
             && skip_git_global_options(&argv[1..])
                 .split_first()
-                .is_some_and(|(sub, rest)| sub == "rm" && !git_rm_keeps_the_tree(rest)))
+                .is_some_and(|(sub, rest)| {
+                    sub == "rm" && !(cached_is_trusted && git_rm_keeps_the_tree(rest))
+                }))
 }
 
-/// Does this `git rm` (the words after `rm`) take the path out of the index
-/// and leave the working-tree file alone? That is `--cached`, which git reads
-/// among the options in any order and ahead of any `--` (or `--end-of-options`),
-/// beside `-r`, `-q`, `-f`. git takes an unambiguous prefix of a long option, so
-/// `--cach` and `--c` are `--cached`, and `--no-cached` (`--no-c`) turns it
-/// off again; the last of the two wins. There is no short form, and after `--`
-/// the word is a file named `--cached`, which `git rm` does delete.
-///
-/// Only the words git reads as typed count
-/// ([`git_rm_option_words`](cadence_hooks_core::shell::git_rm_option_words)):
-/// in `git rm -f note.md $(git diff --name-only --cached)` the `--cached` is
-/// `git diff`'s, and git deletes the note (cadence-hooks#1556 review N1).
-///
-/// A word that is the value of an option such as `--pathspec-from-file` is
-/// read as an option here, which no one types. A word whose value is known only
-/// when the command runs (a substitution, an unresolved `$o`) is not read, so a
-/// `--no-cached` or `--` it would expand to goes unseen; only a crafted command
-/// spells that (cadence-ecosystem ADR-0046 rule 1).
-fn git_rm_keeps_the_tree(args: &[String]) -> bool {
-    let mut cached = false;
-    for arg in cadence_hooks_core::shell::git_rm_option_words(args) {
-        let Some(name) = arg.strip_prefix("--") else {
-            continue;
-        };
-        if "cached".starts_with(name) {
-            cached = true;
-        } else if name.len() > "no-".len() && "no-cached".starts_with(name) {
-            cached = false;
-        }
-    }
-    cached
+/// [`git_rm_exemption_is_trusted`] for a segment whose peeled `argv` is a
+/// suffix of its `tokens`.
+fn segment_cached_is_trusted(segment: &str, tokens: &[String], argv: &[String]) -> bool {
+    git_rm_exemption_is_trusted(segment, &tokens[..tokens.len() - argv.len()])
 }
 
 /// The command a `coproc` runs, given the `argv` that starts with `coproc`
@@ -274,7 +251,7 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         // rather than hidden (#528 review E).
         let tokens = executable_tokens(segment);
         let argv = peel_command_runners(&tokens);
-        if head_deletes(argv) {
+        if head_deletes(argv, segment_cached_is_trusted(segment, &tokens, argv)) {
             return true;
         }
         let Some(first) = argv.first() else {
@@ -319,7 +296,9 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
                 // otherwise `-exec git rm {} \;` and `-exec nice -n 10 rm {} \;`
                 // read their verb as `git`/`nice` and go unjudged.
                 let action_argv = peel_command_runners(&argv[i + 1..]);
-                if head_deletes(action_argv) {
+                // A `find` action is never a plain command (`{}`, `\;`), so
+                // its `git rm --cached` is read as a deletion.
+                if head_deletes(action_argv, false) {
                     return true;
                 }
                 // An exec action can name a shell instead of the verb itself
@@ -1118,7 +1097,7 @@ fn deletions_all_outside_vault(command: &str, vault: &str, meta: &dyn FileMeta) 
     for segment in &segments {
         let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
         let argv = peel_command_runners(&tokens);
-        if !head_deletes(argv) {
+        if !head_deletes(argv, segment_cached_is_trusted(segment, &tokens, argv)) {
             // Every other segment must be provably inert. The physical check
             // reads the disk at hook time, so a sibling that reshapes it first
             // — `ln -s <vault> /tmp/l; rm -rf /tmp/l/`, a `mv`, a `cd` — would
@@ -1218,7 +1197,7 @@ fn placed_deletions_all_outside_vault(
             continue;
         };
         let verb = command_word(first);
-        if head_deletes(argv) {
+        if head_deletes(argv, segment_cached_is_trusted(segment, &tokens, argv)) {
             let runners = &tokens[..tokens.len() - argv.len()];
             if verb == "git" || runners.iter().any(|t| command_word(t) == "xargs") {
                 return false;
@@ -1279,7 +1258,7 @@ fn deletion_operands(command: &str, depth: usize, out: &mut Vec<String>) {
         };
         let lens = &unquoted_prefix_lens[unquoted_prefix_lens.len() - argv.len()..];
         let verb = command_word(first);
-        if head_deletes(argv) {
+        if head_deletes(argv, segment_cached_is_trusted(segment, &tokens, argv)) {
             let mut start = 1;
             if verb == "git" {
                 let rest = skip_git_global_options(&argv[1..]);
@@ -3594,8 +3573,6 @@ mod tests {
             ("git rm --cached --no- note.md", Allow),
             // Wherever the same `git rm` is read.
             ("sudo git rm --cached note.md", Allow),
-            ("git ls-files -z | xargs -0 git rm --cached", Allow),
-            (r"find . -name '*.md' -exec git rm --cached {} \;", Allow),
             ("sh -c 'git rm --cached note.md'", Allow),
             ("flock /tmp/l git rm --cached note.md", Allow),
             ("cd sub && git rm --cached note.md", Allow),
@@ -3616,12 +3593,59 @@ mod tests {
             ("git rm --cached --no-cached note.md", Block),
             ("git rm --cached --no-c note.md", Block),
             ("git rm --cached --no-ca note.md", Block),
+            // The shell drops a backslash before git reads the word, so an
+            // escaped `--no-cached` or `--` counts (cadence-hooks#1546 review).
+            (r"git rm --cached note.md \--no-cached", Block),
+            (r"git rm --cached note.md --no-cach\ed", Block),
+            (r"git rm note.md \-- --cached", Block),
+            (r"git rm \--cached note.md", Allow),
             // The rest of the command is judged as it was.
             ("git rm --cached note.md; rm note.md", Block),
             ("sh -c 'git rm --cached note.md; rm note.md'", Block),
             ("git ls-files | xargs git rm", Block),
             (r"find . -exec git rm {} \;", Block),
             ("sudo git rm note.md", Block),
+            // The `--cached` reading counts only for a plain command with no
+            // `xargs` in front (cadence-hooks#1583 review). `xargs` appends
+            // stdin's words, so a `--no-cached` there deletes the note, and a
+            // `find` action is never plain.
+            ("git ls-files -z | xargs -0 git rm --cached", Block),
+            ("echo --no-cached | xargs git rm --cached note.md", Block),
+            (r"find . -name '*.md' -exec git rm --cached {} \;", Block),
+            // A quoted shell-looking word is not plain, so the option reader
+            // cannot skip past it to miss a `--no-cached` or `--`.
+            (
+                "git rm --cached --ignore-unmatch note.md '>' --no-cached",
+                Block,
+            ),
+            (
+                "git rm --cached --ignore-unmatch note.md '2>' --no-cached",
+                Block,
+            ),
+            (
+                "git rm --cached --ignore-unmatch note.md \">\" --no-cached",
+                Block,
+            ),
+            (
+                "git rm --cached --ignore-unmatch note.md '>|' --no-c",
+                Block,
+            ),
+            (
+                "git rm --cached --ignore-unmatch note.md '<(' --no-cached",
+                Block,
+            ),
+            ("git rm --ignore-unmatch '>' -- --cached note.md", Block),
+            // A tilde other than a leading `~/` can expand to an option an
+            // earlier command set.
+            ("HOME=--no-cached; git rm --cached note.md ~", Block),
+            ("export HOME=--no-cached; git rm --cached note.md ~", Block),
+            ("hash -d nc=--no-cached; git rm --cached note.md ~nc", Block),
+            ("PWD=--no-cached; git rm --cached note.md ~+", Block),
+            ("OLDPWD=--no-cached; git rm --cached note.md ~-", Block),
+            // Quoting that wraps only plain characters stays plain.
+            ("git rm '--cached' note.md", Allow),
+            ("git rm $'--cached' note.md", Allow),
+            ("(git rm --cached note.md)", Allow),
         ];
         for &(command, expected) in cases {
             assert_eq!(
@@ -3636,11 +3660,13 @@ mod tests {
     /// the `git rm` around it still deletes (cadence-hooks#1556 review N1).
     /// A substitution that ends the segment reached the option scan split at
     /// blanks, so its `--cached` was read as `git rm`'s and the note's
-    /// deletion was allowed. Every row was run through `git` 2.43: the Block
-    /// rows delete `note.md`, the Allow rows leave it on disk.
+    /// deletion was allowed. Every row was run through `git` 2.43 and deletes
+    /// `note.md`, except the ones with a real `--cached` outside the
+    /// substitution or redirect: those keep it, and block anyway because the
+    /// command is not plain (cadence-hooks#1583 review).
     #[test]
     fn git_rm_reads_no_cached_from_a_command_substitution() {
-        use cadence_hooks_core::Outcome::{Allow, Block};
+        use cadence_hooks_core::Outcome::Block;
         let cases: &[(&str, cadence_hooks_core::Outcome)] = &[
             ("git rm -f note.md $(git diff --name-only --cached)", Block),
             ("git rm note.md $(git diff --cached --name-only)", Block),
@@ -3658,11 +3684,18 @@ mod tests {
                 "git rm -f note.md $(git diff --name-only --cached) x.md",
                 Block,
             ),
-            // A real `--cached` outside the substitution still counts.
-            ("git rm --cached note.md $(git ls-files -d)", Allow),
-            ("git rm --cached note.md $(printf -- x)", Allow),
-            ("git rm $(git ls-files -d) --cached note.md", Allow),
-            ("git rm --cached -r . `git ls-files -d`", Allow),
+            // A substitution makes the command not plain, so even a real
+            // `--cached` outside it is not trusted (cadence-hooks#1583 review).
+            ("git rm --cached note.md $(git ls-files -d)", Block),
+            ("git rm --cached note.md $(printf -- x)", Block),
+            ("git rm $(git ls-files -d) --cached note.md", Block),
+            ("git rm --cached -r . `git ls-files -d`", Block),
+            // A redirect target is a file the shell opens, not git's option
+            // (cadence-hooks#1580 review).
+            ("git rm note.md > --cached", Block),
+            ("git rm note.md >> --cached", Block),
+            ("git rm note.md 2> --cached", Block),
+            ("git rm --cached note.md > log.txt", Block),
         ];
         for &(command, expected) in cases {
             assert_eq!(

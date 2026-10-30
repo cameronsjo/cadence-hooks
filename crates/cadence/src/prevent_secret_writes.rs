@@ -14,7 +14,8 @@ use crate::secret_patterns::{
     unresolved_parameter_cause, wget_write_targets,
 };
 use cadence_hooks_core::shell::{
-    carries_substitution, command_segments, command_word, executable_tokens, peel_command_runners,
+    carries_substitution, command_segments, command_word, executable_tokens,
+    git_rm_exemption_is_trusted, git_rm_is_dry_run, git_rm_keeps_the_tree, peel_command_runners,
     redirect_operator_span, redirect_targets, skip_git_global_options, strip_group_wrappers,
     tokenize, unescape_word,
 };
@@ -76,8 +77,11 @@ fn writer_argv(tokens: &[String]) -> &[String] {
 /// non-flag operand, or with `-t <dir>` / `--target-directory=<dir>` the dir
 /// value AND every operand (each source materializes under the target dir);
 /// `dd` — `of=` values; `truncate` — operands after consuming `-s <size>` /
-/// `--size=<n>`. `git rm` is judged as `rm`, and command runners (`sudo rm
-/// .env`, `env -i cp x .env`) are peeled by [`writer_argv`].
+/// `--size=<n>`. `git rm` is judged as `rm` unless it is told `--cached`
+/// ([`git_rm_keeps_the_tree`]) or is a dry run ([`git_rm_is_dry_run`]), both
+/// of which leave the file on disk, and core can trust that reading
+/// ([`git_rm_exemption_is_trusted`]); command runners (`sudo rm .env`,
+/// `env -i cp x .env`) are peeled by [`writer_argv`].
 ///
 /// Quote-aware via [`tokenize`] (#86): a quoted filename is one clean token,
 /// so prose inside quotes (`rm "notes about .env stuff.txt"`, commit
@@ -96,20 +100,35 @@ fn writer_targets(segment: &str) -> Vec<String> {
         // `git`'s global options sit between the verb and the subcommand, so
         // reading `args[0]` alone misses `git -C . rm .env` and
         // `git --no-pager rm .env` — both delete the file (#528 review I2).
-        let subcommand = skip_git_global_options(args);
-        if subcommand.first().map(String::as_str) == Some("rm") {
+        // `git rm --cached` takes the path out of the index and leaves the
+        // file on disk, so it writes and deletes nothing (#1535). Core's test
+        // is the one trash-guard reads `git rm` with, so the two agree.
+        // A dry run (`-n`, `--dry-run`) only prints what it would remove (#1547).
+        if let Some((sub, rest)) = skip_git_global_options(args).split_first()
+            && sub == "rm"
+        {
+            let runners = &tokens[..tokens.len() - argv.len()];
+            if git_rm_exemption_is_trusted(segment, runners)
+                && (git_rm_keeps_the_tree(rest) || git_rm_is_dry_run(rest))
+            {
+                return Vec::new();
+            }
             cmd = "rm";
-            args = &subcommand[1..];
+            args = rest;
         }
     }
 
     match cmd {
         // `shred`/`unlink` destroy each operand as `rm` does; `ln` replaces
         // its destination as `cp` does (cadence-hooks#816).
+        // A redirect glued to an operand ends it: `rm .env>x` removes `.env`
+        // and sends the output to `x` (cadence-hooks#1580 review).
         "tee" | "rm" | "shred" | "unlink" => args
             .iter()
             .filter(|t| !t.starts_with('-'))
-            .cloned()
+            .filter_map(|t| t.split(['<', '>']).next())
+            .filter(|t| !t.is_empty())
+            .map(String::from)
             .collect(),
         "cp" | "mv" | "install" | "ln" => {
             let mut targets = Vec::new();
@@ -1491,6 +1510,167 @@ mod tests {
             "git --git-dir=.git rm .env",
             "git -P rm .env",
             "sudo git -C . rm .env",
+        ] {
+            assert!(bash_targets_env_file(command), "{command} must block");
+        }
+    }
+
+    /// `git rm --cached` takes the file out of the index and leaves it on
+    /// disk, so it neither writes nor deletes a secret (#1535). The rule is
+    /// core's `git_rm_keeps_the_tree`, the one trash-guard reads `git rm` by.
+    #[test]
+    fn bash_git_rm_cached_env_allowed() {
+        for command in [
+            "git rm --cached .env",
+            "git rm --cached -r .env",
+            "git rm -r --cached .env",
+            "git rm .env --cached",
+            "git rm --cach .env",
+            "git -C . rm --cached .env",
+            "sudo git rm --cached .env",
+            "git rm --cached .env && git commit -m untrack",
+            r"git rm \--cached .env",
+            // Quoting and escapes that wrap only plain characters keep the
+            // command plain (cadence-hooks#1580 review).
+            "git rm '--cached' .env",
+            "git rm \"--cached\" .env",
+            "git rm $'--cached' .env",
+            r"git rm --cach\ed .env",
+            "git -c core.pager=cat rm --cached .env",
+            "FOO=1 git rm --cached .env",
+            "(git rm --cached .env)",
+            "{ git rm --cached .env; }",
+            "git rm --cached ~/proj/.env",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command} must be allowed");
+        }
+    }
+
+    #[test]
+    fn bash_git_rm_env_without_cached_still_blocked() {
+        // After `--` the word is a file, and a later `--no-cached` undoes
+        // `--cached`; a deleting sibling is judged as it always was. A
+        // `--cached` inside a substitution is the inner command's, so git
+        // deletes `.env` (cadence-hooks#1556 review N1).
+        for command in [
+            "git rm -f .env $(git diff --name-only --cached)",
+            "git rm -- --cached .env",
+            "git rm --end-of-options --cached .env",
+            "git rm --cached --no-cached .env",
+            "git rm --cached --no-c .env",
+            // The shell drops each backslash, so git reads `--no-cached`
+            // (cadence-hooks#1546 review).
+            r"git rm --cached .env \--no-cached",
+            r"git rm --cached .env --no-cach\ed",
+            r"git rm .env \-- --cached",
+            "git rm --cached .env; rm .env",
+            "git rm --cached .env && echo x > .env",
+            "git rm --cached x.txt .env.local; git rm .env",
+            // A redirect target is a file the shell opens, not git's option,
+            // so git deletes `.env` (cadence-hooks#1580 review).
+            "git rm .env > --cached",
+            "git rm .env >> --cached",
+            // Any shell syntax in the command falls back to blocking: each row
+            // below deletes `.env` under bash (cadence-hooks#1580 review).
+            "git rm .env>--cached",
+            "rm .env>x",
+            "git rm .env <<- --cached\n--cached\n",
+            "git rm --cached --ignore-unmatch .env '>' --no-cached",
+            "git rm --cached --ignore-unmatch .env '$(' --no-cached",
+            "git rm --cached --ignore-unmatch .env '`' --no-cached",
+            "git rm .env < <(echo --cached)",
+            // `xargs` appends the words it reads to git's argv, so a
+            // `--no-cached` on stdin turns the deletion back on
+            // (cadence-hooks#1583 review).
+            "xargs git rm --cached .env",
+            "echo --no-cached | xargs git rm --cached .env",
+            "printf -- \"--no-cached\\0\" | xargs -0 git rm --cached .env",
+            "xargs -a list git rm --cached .env",
+            // A tilde other than a leading `~/` can expand to an option an
+            // earlier command set (cadence-hooks#1583 review).
+            "HOME=--no-cached; git rm --cached .env ~",
+            "export HOME=--no-cached; git rm --cached .env ~",
+            "hash -d nc=--no-cached; git rm --cached .env ~nc",
+            "PWD=--no-cached; git rm --cached .env ~+",
+            "OLDPWD=--no-cached; git rm --cached .env ~-",
+            // A redirect anywhere in the command now blocks, even when the
+            // `--cached` itself is real.
+            "git rm --cached .env > log.txt",
+        ] {
+            assert!(bash_targets_env_file(command), "{command} must block");
+        }
+    }
+
+    /// A `git rm` dry run prints what it would remove and leaves the index
+    /// and the file alone (#1547). The rule is core's `git_rm_is_dry_run`.
+    #[test]
+    fn bash_git_rm_dry_run_env_allowed() {
+        for command in [
+            "git rm -n .env",
+            "git rm --dry-run .env",
+            "git rm --dry .env",
+            "git rm -rn .env",
+            "git rm -n -f .env",
+            "git rm .env -n",
+            "git rm --no-dry-run -n .env",
+            "git -C . rm -n .env",
+            "sudo git rm --dry-run .env",
+            r"git rm -\n .env",
+            "git rm -r -n .env",
+            "git rm \"-n\" .env",
+            "git rm '--dry-run' .env",
+            "FOO=1 git rm -n .env",
+            "(git rm -n .env)",
+        ] {
+            assert!(!bash_targets_env_file(command), "{command} must be allowed");
+        }
+    }
+
+    #[test]
+    fn bash_git_rm_env_without_dry_run_still_blocked() {
+        // After `--` the word is a file, and a later `--no-dry-run` undoes
+        // `-n`; a deleting sibling is judged as it always was. A `-n` inside
+        // a substitution is the inner command's, so git deletes `.env`.
+        for command in [
+            "git rm -f .env",
+            "git rm -f .env $(head -n 1 list.txt)",
+            "git rm .env `grep -n x notes`",
+            "git rm -- -n .env",
+            "git rm --end-of-options -n .env",
+            "git rm -n --no-dry-run .env",
+            "git rm --dry-run --no-d .env",
+            // The shell drops each backslash, so git reads `--no-dry-run`
+            // (cadence-hooks#1556 review).
+            r"git rm -n .env -\-no-dry-run",
+            r"git rm -n .env \--no-dry-run",
+            "git rm -n .env; rm .env",
+            "git rm -n .env && git rm .env",
+            // A redirect target is a file the shell opens, not git's option,
+            // so git deletes `.env` (cadence-hooks#1580 review).
+            "git rm .env > --dry-run",
+            "git rm .env >> --dry-run",
+            "git rm .env >| --dry-run",
+            "git rm .env > -n",
+            "git rm .env 2> -n",
+            // A process substitution's `-n` is the inner command's.
+            "git rm .env > >(sed -n p)",
+            "git rm .env >(sed -n p)",
+            // Any shell syntax in the command falls back to blocking: each row
+            // below deletes `.env` under bash (cadence-hooks#1580 review).
+            "git rm .env>-n",
+            "git rm .env <<- -n\n-n\n",
+            "git rm -n --ignore-unmatch .env '2>' --no-dry-run",
+            "git rm -n --ignore-unmatch .env '$(' --no-dry-run",
+            "git rm -n --ignore-unmatch .env '`' --no-dry-run",
+            "git rm .env < <(echo -n)",
+            // `xargs` appends the words it reads to git's argv.
+            "xargs git rm -n .env",
+            "echo --no-dry-run | xargs git rm -n .env",
+            "HOME=--no-dry-run; git rm -n .env ~",
+            // A redirect anywhere in the command now blocks, even when the
+            // dry run itself is real.
+            "git rm -n .env > out.txt",
+            "git rm -n .env 2>&1",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }
