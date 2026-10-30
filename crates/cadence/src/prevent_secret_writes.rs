@@ -1567,6 +1567,7 @@ mod tests {
             "git -C . rm -n .env",
             "sudo git rm --dry-run .env",
             "xargs git rm -n .env",
+            r"git rm -\n .env",
         ] {
             assert!(!bash_targets_env_file(command), "{command} must be allowed");
         }
@@ -1585,6 +1586,10 @@ mod tests {
             "git rm --end-of-options -n .env",
             "git rm -n --no-dry-run .env",
             "git rm --dry-run --no-d .env",
+            // The shell drops each backslash, so git reads `--no-dry-run`
+            // (cadence-hooks#1556 review).
+            r"git rm -n .env -\-no-dry-run",
+            r"git rm -n .env \--no-dry-run",
             "git rm -n .env; rm .env",
             "git rm -n .env && git rm .env",
         ] {

@@ -13925,7 +13925,9 @@ pub fn git_rm_keeps_the_tree(args: &[String]) -> bool {
 ///
 /// Only the words git reads as typed count ([`git_rm_option_words`]): in
 /// `git rm -f .env $(head -n 1 list.txt)` the `-n` is `head`'s, and git
-/// deletes `.env`.
+/// deletes `.env`. Each word is read after the shell's backslash removal, so
+/// `-\-no-dry-run` is `--no-dry-run` and `-\n` is `-n` (cadence-hooks#1556
+/// review).
 ///
 /// A word that is the value of an option such as `--pathspec-from-file` is
 /// read as an option here, which no one types.
@@ -17535,6 +17537,11 @@ mod tests {
             // `--n` and `--no-` are ambiguous to git, which refuses the line.
             ("--dry-run --n .env", true),
             ("--dry-run --no- .env", true),
+            // The shell drops each backslash before git reads the word.
+            ("-\\n .env", true),
+            ("\\--dry-run .env", true),
+            ("-n \\-- .env", true),
+            ("\\-- -n .env", false),
             (".env", false),
             ("-f .env", false),
             ("-rf .env", false),
@@ -17547,6 +17554,8 @@ mod tests {
             ("-n --no-dry-run .env", false),
             ("--dry-run --no-dry-run .env", false),
             ("--dry-run --no-d .env", false),
+            ("-n .env -\\-no-dry-run", false),
+            ("-n .env \\--no-dry-run", false),
             // git refuses these lines; read as no dry run, the side that blocks.
             ("--dry-runx .env", false),
             ("--dry-run=1 .env", false),
