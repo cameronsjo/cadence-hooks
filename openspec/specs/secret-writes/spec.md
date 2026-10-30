@@ -207,7 +207,7 @@ A `git rm` dry run prints what it would remove and changes neither the index nor
 - **THEN** the hook blocks
 
 ### Requirement: The git rm exemptions apply only to a plain command
-The `--cached` and dry-run exemptions SHALL apply only when every word of the `git rm` command holds only letters, digits and `._/@:+=,%-~`, each optionally backslash-escaped or quoted, with an optional subshell or brace group around the whole command, and no `xargs` runs it. Anything else MUST fall back to reading the `git rm` as `rm`.
+The `--cached` and dry-run exemptions SHALL apply only when every word of the `git rm` command holds only letters, digits, `._/@:+=,%-` and a leading `~/`, each optionally backslash-escaped or quoted, with an optional subshell or brace group around the whole command, and no `xargs` runs it. Anything else MUST fall back to reading the `git rm` as `rm`.
 
 #### Scenario: Quoted options stay plain
 - **WHEN** a Bash command runs `git rm '--cached' .env`, `git rm $'--cached' .env`, `FOO=1 git rm -n .env` or `(git rm --cached .env)`

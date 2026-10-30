@@ -1540,6 +1540,7 @@ mod tests {
             "FOO=1 git rm --cached .env",
             "(git rm --cached .env)",
             "{ git rm --cached .env; }",
+            "git rm --cached ~/proj/.env",
         ] {
             assert!(!bash_targets_env_file(command), "{command} must be allowed");
         }
@@ -1585,6 +1586,13 @@ mod tests {
             "echo --no-cached | xargs git rm --cached .env",
             "printf -- \"--no-cached\\0\" | xargs -0 git rm --cached .env",
             "xargs -a list git rm --cached .env",
+            // A tilde other than a leading `~/` can expand to an option an
+            // earlier command set (cadence-hooks#1583 review).
+            "HOME=--no-cached; git rm --cached .env ~",
+            "export HOME=--no-cached; git rm --cached .env ~",
+            "hash -d nc=--no-cached; git rm --cached .env ~nc",
+            "PWD=--no-cached; git rm --cached .env ~+",
+            "OLDPWD=--no-cached; git rm --cached .env ~-",
             // A redirect anywhere in the command now blocks, even when the
             // `--cached` itself is real.
             "git rm --cached .env > log.txt",
@@ -1658,6 +1666,7 @@ mod tests {
             // `xargs` appends the words it reads to git's argv.
             "xargs git rm -n .env",
             "echo --no-dry-run | xargs git rm -n .env",
+            "HOME=--no-dry-run; git rm -n .env ~",
             // A redirect anywhere in the command now blocks, even when the
             // dry run itself is real.
             "git rm -n .env > out.txt",

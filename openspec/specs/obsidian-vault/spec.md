@@ -204,7 +204,7 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 - **THEN** the hook exits 2, because the command is not plain
 
 ### Requirement: The --cached exemption applies only to a plain command
-`trash-guard` SHALL honor `--cached` only when every word of the `git rm` command is plain text (letters, digits, `._/@:+=,%-~`, optionally quoted or backslash-escaped) and no `xargs` runs it. A `find -exec` action or any other shell syntax MUST be read as a deletion.
+`trash-guard` SHALL honor `--cached` only when every word of the `git rm` command is plain text (letters, digits, `._/@:+=,%-` and a leading `~/`, optionally quoted or backslash-escaped) and no `xargs` runs it. A `find -exec` action or any other shell syntax MUST be read as a deletion.
 
 #### Scenario: Plain command behind a runner or from outside the vault
 - **WHEN** a Bash call runs `sudo git rm --cached note.md` in the vault, or `git rm -r --cached ~/Documents` from `/home/me`

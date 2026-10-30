@@ -13973,12 +13973,10 @@ pub fn git_rm_is_dry_run(args: &[String]) -> bool {
     dry_run
 }
 
-/// A byte a plain word may hold: nothing the shell redirects, splits on or
-/// treats as an operator, and no expansion that can yield an option. `~`
-/// expands to a home directory path or stays literal (`~--no-cached` names no
-/// user), so `git rm -r --cached ~/Documents` stays plain.
+/// A byte a plain word may hold: nothing the shell expands, redirects, splits
+/// on or treats as an operator.
 fn is_plain_byte(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "._/@:+=,%-~".contains(c)
+    c.is_ascii_alphanumeric() || "._/@:+=,%-".contains(c)
 }
 
 /// Is this segment a plain command, one whose words the program receives
@@ -13986,6 +13984,13 @@ fn is_plain_byte(c: char) -> bool {
 /// characters, a backslash before one, or a `'…'`, `"…"` or `$'…'` quote
 /// around a run of them; blanks separate words. A subshell or brace group
 /// around the whole command is peeled first ([`strip_group_wrappers`]).
+///
+/// A `~` is plain only as the literal `~/` that starts a word, so
+/// `git rm -r --cached ~/Documents` stays plain. Any other tilde can expand to
+/// an option an earlier command chose: `HOME=--no-cached; git rm --cached .env
+/// ~`, `~+` (`PWD`), `~-` (`OLDPWD`), a zsh `hash -d` name (cadence-hooks#1583
+/// review). `~/x` with such a `HOME` gives git `--no-cached/x`, a path it
+/// refuses, not an option.
 pub fn is_plain_command(segment: &str) -> bool {
     let mut chars = strip_group_wrappers(segment).chars();
     let quoted_run_is_plain = |chars: &mut std::str::Chars<'_>, close: char| {
@@ -13999,9 +14004,11 @@ pub fn is_plain_command(segment: &str) -> bool {
         }
         false
     };
+    let mut word_start = true;
     while let Some(c) = chars.next() {
         let plain = match c {
             ' ' | '\t' => true,
+            '~' => word_start && chars.clone().next() == Some('/'),
             '\\' => chars.next().is_some_and(is_plain_byte),
             '\'' | '"' => quoted_run_is_plain(&mut chars, c),
             '$' => chars.next() == Some('\'') && quoted_run_is_plain(&mut chars, '\''),
@@ -14010,6 +14017,7 @@ pub fn is_plain_command(segment: &str) -> bool {
         if !plain {
             return false;
         }
+        word_start = matches!(c, ' ' | '\t');
     }
     true
 }

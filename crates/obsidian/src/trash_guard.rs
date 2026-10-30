@@ -3635,6 +3635,13 @@ mod tests {
                 Block,
             ),
             ("git rm --ignore-unmatch '>' -- --cached note.md", Block),
+            // A tilde other than a leading `~/` can expand to an option an
+            // earlier command set.
+            ("HOME=--no-cached; git rm --cached note.md ~", Block),
+            ("export HOME=--no-cached; git rm --cached note.md ~", Block),
+            ("hash -d nc=--no-cached; git rm --cached note.md ~nc", Block),
+            ("PWD=--no-cached; git rm --cached note.md ~+", Block),
+            ("OLDPWD=--no-cached; git rm --cached note.md ~-", Block),
             // Quoting that wraps only plain characters stays plain.
             ("git rm '--cached' note.md", Allow),
             ("git rm $'--cached' note.md", Allow),
