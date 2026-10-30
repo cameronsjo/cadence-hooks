@@ -191,6 +191,11 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 - **WHEN** the cwd is the vault and a Bash call runs `git rm note.md`, `git rm -- --cached` or `git rm --cached --no-cached note.md`
 - **THEN** the hook exits 2
 
+#### Scenario: An option word with a backslash
+- **WHEN** the cwd is the vault and a Bash call runs `git rm note.md \-- --cached`, where the shell drops the backslash and git reads `--` as the end of its options
+- **THEN** the hook exits 2
+- **AND** `git rm \--cached note.md` exits 0
+
 #### Scenario: A deleting command beside it
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md; rm note.md`
 - **THEN** the hook exits 2
@@ -211,5 +216,5 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 - **THEN** the hook exits 0
 
 #### Scenario: Shell syntax or xargs around a --cached
-- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached --ignore-unmatch note.md '>' --no-cached`, `git ls-files -z | xargs -0 git rm --cached` or `find . -exec git rm --cached {} \;`
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached --ignore-unmatch note.md '>' --no-cached`, `git rm --ignore-unmatch '\--cached' note.md`, `git ls-files -z | xargs -0 git rm --cached` or `find . -exec git rm --cached {} \;`
 - **THEN** the hook exits 2
