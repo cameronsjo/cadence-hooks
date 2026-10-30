@@ -18,7 +18,7 @@
 ## ADDED Requirements
 
 ### Requirement: A git rm that leaves the file on disk is allowed
-A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The rule holds for the bare command, behind a runner or wrapper, as a `find -exec` action, and from outside the vault.
+A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `trash-guard` SHALL allow it. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The rule holds for the bare command, behind a runner or wrapper, as a `find -exec` action, and from outside the vault. A word known only when the shell runs is not read.
 
 #### Scenario: Index-only git rm in the vault
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md`, `git rm -r --cached sub/` or `git -C . rm --cached note.md`
@@ -31,3 +31,11 @@ A `git rm` with `--cached` among its options takes the path out of the index and
 #### Scenario: A deleting command beside it
 - **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md; rm note.md`
 - **THEN** the hook exits 2
+
+#### Scenario: A --cached inside a command substitution
+- **WHEN** the cwd is the vault and a Bash call runs `git rm -f note.md $(git diff --name-only --cached)`
+- **THEN** the hook exits 2
+
+#### Scenario: A command substitution beside a --cached
+- **WHEN** the cwd is the vault and a Bash call runs `git rm --cached note.md $(git ls-files -d)`
+- **THEN** the hook exits 0, and a `--no-cached` or `--` the substitution may print is not read
