@@ -1605,6 +1605,9 @@ mod tests {
             "git rm .env >| --dry-run",
             "git rm .env > -n",
             "git rm .env 2> -n",
+            // A process substitution's `-n` is the inner command's.
+            "git rm .env > >(sed -n p)",
+            "git rm .env >(sed -n p)",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }

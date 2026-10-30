@@ -13843,10 +13843,12 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 ///
 /// A redirect is the shell's, not git's: the operator and its target are
 /// skipped, so in `git rm .env > --dry-run` the `--dry-run` names the file the
-/// output goes to and git deletes `.env` (cadence-hooks#1580 review).
+/// output goes to and git deletes `.env` (cadence-hooks#1580 review). A
+/// process substitution (`>(sed -n p)`, `<(…)`) is skipped like `$(…)`: its
+/// words are the inner command's.
 pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>> {
-    // Open `$(` (and nested `(`) count, and whether a backtick span is open,
-    // carried from one word to the next.
+    // Open `$(`, `<(` and `>(` (and nested `(`) count, and whether a backtick
+    // span is open, carried from one word to the next.
     let mut open = 0usize;
     let mut in_backticks = false;
     // The target of a redirect whose operator is a word of its own
@@ -13855,25 +13857,28 @@ pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>
     args.iter()
         .map(String::as_str)
         .filter(move |word| {
-            if std::mem::take(&mut redirect_target) {
-                return false;
-            }
             let inside = open > 0 || in_backticks;
-            if !inside && let Some((len, _)) = redirect_operator_span(word) {
-                redirect_target = matches!(&word[len..], "" | "|" | "&");
-                return false;
-            }
             let mut prev = None;
             for c in word.chars() {
                 match c {
                     '`' => in_backticks = !in_backticks,
-                    '(' if open > 0 || prev == Some('$') => open += 1,
+                    '(' if open > 0 || matches!(prev, Some('$' | '<' | '>')) => open += 1,
                     ')' if open > 0 => open -= 1,
                     _ => {}
                 }
                 prev = Some(c);
             }
-            !inside && !word.contains("$(") && !word.contains('`')
+            if std::mem::take(&mut redirect_target)
+                || inside
+                || ["$(", "<(", ">(", "`"].iter().any(|s| word.contains(s))
+            {
+                return false;
+            }
+            if let Some((len, _)) = redirect_operator_span(word) {
+                redirect_target = matches!(&word[len..], "" | "|" | "&");
+                return false;
+            }
+            true
         })
         .map(unescape_word)
         .take_while(|word| word != "--" && word != "--end-of-options")
@@ -17458,6 +17463,10 @@ mod tests {
             ("note.md >--dry-run", &["note.md"]),
             ("--cached note.md > log.txt", &["--cached", "note.md"]),
             ("note.md 2>&1 -n", &["note.md", "-n"]),
+            // A process substitution's words are the inner command's.
+            ("note.md > >(sed -n p)", &["note.md"]),
+            ("note.md >(sed -n p)", &["note.md"]),
+            ("note.md <(grep -n x f) --cached", &["note.md", "--cached"]),
             (
                 "\\--no-cached --no-cach\\ed",
                 &["--no-cached", "--no-cached"],
