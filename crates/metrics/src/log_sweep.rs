@@ -113,13 +113,14 @@ fn count_recent(jsonl: &str, cutoff: &str) -> u64 {
         .count() as u64
 }
 
-/// Count `sweeps.jsonl` rows within `window` of `now`.
+/// Count `sweeps.jsonl` rows within `window` of `now`, reading the rotated
+/// `.1` file as well as the live one.
 ///
 /// Fail-open: a missing/unreadable `<dir>/sweeps.jsonl`, or any unparsable
 /// row, contributes 0 / is skipped rather than erroring. Doctor visibility
 /// only — never gates anything.
 pub fn recent_sweep_count(dir: &Path, window: Duration, now: SystemTime) -> u64 {
-    let Ok(contents) = std::fs::read_to_string(dir.join("sweeps.jsonl")) else {
+    let Some(contents) = common::read_ledger(&dir.join("sweeps.jsonl")) else {
         return 0;
     };
     let cutoff_ts =
@@ -268,6 +269,17 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn recent_sweep_count_includes_the_rotated_dot_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("sweeps.jsonl");
+        let row = format!("{{\"ts\":\"{}\"}}\n", common::utc_timestamp());
+        std::fs::write(common::rotated_ledger_path(&live), &row).unwrap();
+        std::fs::write(&live, &row).unwrap();
+        let count = recent_sweep_count(tmp.path(), Duration::from_secs(86_400), SystemTime::now());
+        assert_eq!(count, 2);
     }
 
     #[test]

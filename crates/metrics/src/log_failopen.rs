@@ -100,6 +100,37 @@ pub fn log_failopen(
     }
 }
 
+/// Record a failed ledger rotation (`reason` `ledger_rotate_failed`, the ledger
+/// name in `subcommand`) next to `ledger`, in the same directory.
+///
+/// A failure on `failopen.jsonl` itself is not recorded: the row would land in
+/// the ledger that just failed to rotate, and this early return is also what
+/// stops the call from recursing. Every other failing ledger adds one row per
+/// write, so `failopen.jsonl` goes through the same cap and cannot grow without
+/// bound while a rotation keeps failing.
+#[cfg(unix)]
+pub(crate) fn log_rotation_failure(ledger: &Path, error: &std::io::Error) {
+    let (Some(dir), Some(name)) = (ledger.parent(), ledger.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    if name == "failopen.jsonl" {
+        return;
+    }
+    let record = build_failopen_record(
+        "ledger_rotate_failed",
+        Some("metrics"),
+        Some(name),
+        env!("CARGO_PKG_VERSION"),
+        Some(&format!("rotate to {name}.1: {error}")),
+    );
+    if let Ok(mut file) = common::open_ledger(dir.join("failopen.jsonl")) {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// Fail-open row counts within a time window, grouped by `reason`.
 ///
 /// `version_mismatch` is pre-filtered (by [`counts_from`]) to rows whose
@@ -285,7 +316,7 @@ pub fn recent_failopen_report(
     current_version: &str,
     recency_reasons: &[&str],
 ) -> (FailopenCounts, HashMap<String, FailopenRecency>) {
-    let Ok(contents) = std::fs::read_to_string(dir.join("failopen.jsonl")) else {
+    let Some(contents) = common::read_ledger(&dir.join("failopen.jsonl")) else {
         return (FailopenCounts::default(), HashMap::new());
     };
     let cutoff = window_cutoff(now, window);
@@ -773,6 +804,29 @@ mod tests {
         );
         assert_eq!(counts, FailopenCounts::default());
         assert!(recency.is_empty());
+    }
+
+    #[test]
+    fn recent_failopen_report_counts_rows_the_rotation_moved_to_dot_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("failopen.jsonl");
+        let row = |reason: &str| {
+            format!(
+                "{{\"reason\":\"{reason}\",\"binaryVersion\":\"1.0.0\",\"ts\":\"{}\"}}\n",
+                common::utc_timestamp()
+            )
+        };
+        std::fs::write(common::rotated_ledger_path(&live), row("panic")).unwrap();
+        std::fs::write(&live, row("parse")).unwrap();
+
+        let (counts, _) = recent_failopen_report(
+            tmp.path(),
+            Duration::from_secs(86_400),
+            SystemTime::now(),
+            "1.0.0",
+            &[],
+        );
+        assert_eq!((counts.panic, counts.parse), (1, 1));
     }
 
     #[test]

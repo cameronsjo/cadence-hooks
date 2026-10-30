@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The metrics ledgers rotate once they reach 16 MiB.** Nothing rotated or pruned `<metrics_dir>/*.jsonl`, so `subagents.jsonl` and `denials.jsonl` had grown to tens of MiB each (cameronsjo/cadence#2074). Every ledger write now renames a ledger at or past the cap to `<name>.jsonl.1`, replacing any older `.1`, and starts a fresh file, so about twice the cap stays on disk per ledger. `CADENCE_METRICS_MAX_BYTES` sets the cap in bytes; `0` turns rotation off, and an unset, empty or unparsable value keeps 16 MiB, as does anything under 1 MiB (a `16` meant as MiB would otherwise rotate on every write and erase the audit ledgers). Rotation is Unix-only. The first write after upgrading rotates a ledger that is already over the cap, so a 50 MiB `denials.jsonl` becomes a 50 MiB `denials.jsonl.1` until the next rotation replaces it. Concurrent hooks are safe: the rotator takes a non-blocking `flock` on the live file and renames only if the path still names the file it holds, so a late writer cannot rename a fresh ledger over `.1`. A rotation error never fails or blocks a hook; it is recorded as a `ledger_rotate_failed` row in `failopen.jsonl` and the row is still appended.
+
+### Changed
+
+- **Readers of the ledgers read `.1` as well as the live file.** `doctor`'s fail-open and sweep counts, the SessionStart fail-open disclosure and bypass summary, `log-commit`'s per-session cost marker, `log-session`'s commit count and `persist-plan-approval`'s `plan-links.jsonl` lookup all read the rotated file first, so a rotation does not lose a session's cost marker or make a persisted plan look new.
+- **`doctor`'s large-ledger warning no longer says ledgers have no rotation.** At 64 MiB it now says whether rotation is off (`CADENCE_METRICS_MAX_BYTES=0`), the ledger is past the cap and rotates on its next write, or the cap is set above its size, and points at `ledger_rotate_failed` rows in `failopen.jsonl` when a ledger stays large. It also warns about a `.jsonl.1` over 64 MiB, which is where a ledger that grew past that before this release lands on its first write.
+
 ### Fixed
 
 - **`prevent-secret-writes` allows `git rm --cached` on a secret file.** It read every `git rm` as `rm`, so `git rm --cached .env`, `git rm --cached -r .env` and `git -C . rm --cached .env` blocked, though `--cached` takes the file out of the index and leaves it on disk. It now reads `git rm` through the same core test as `trash-guard`, so the two cannot disagree: `--cached` counts in any order before `--` or `--end-of-options`, as an unambiguous prefix (`--cach`), and a later `--no-cached` undoes it. Each option word is read as the shell hands it to git, so `git rm --cached .env \--no-cached` blocks; this also fixes `trash-guard`, which read the escaped word raw. `git rm .env`, `git rm -- --cached .env`, `git rm --cached --no-cached .env` and a writing or deleting command beside the `git rm --cached` still block. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
