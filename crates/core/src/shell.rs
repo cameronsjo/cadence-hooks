@@ -13831,7 +13831,12 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 /// Only a crafted command spells that, and cadence-ecosystem ADR-0046 rule 1
 /// leaves such commands out of scope. Each `git rm` option reader iterates
 /// these words in place of its raw arguments (cadence-hooks#1521).
-pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
+///
+/// Each word comes back after the shell's quote removal ([`unescape_word`]),
+/// because that is the word git gets: `\--no-cached` and `--no-cach\ed` are
+/// `--no-cached` to git, and `\--` ends its options (cadence-hooks#1546
+/// review).
+pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>> {
     // Open `$(` (and nested `(`) count, and whether a backtick span is open,
     // carried from one word to the next.
     let mut open = 0usize;
@@ -13852,7 +13857,8 @@ pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
             }
             !inside && !word.contains("$(") && !word.contains('`')
         })
-        .take_while(|word| *word != "--" && *word != "--end-of-options")
+        .map(unescape_word)
+        .take_while(|word| word != "--" && word != "--end-of-options")
 }
 
 /// Skip `git`'s global options so the slice begins at its SUBCOMMAND.
@@ -17419,6 +17425,13 @@ mod tests {
             ("--cached -- note.md", &["--cached"]),
             ("--end-of-options --cached", &[]),
             ("$(printf -- x) --cached note.md", &["--cached", "note.md"]),
+            // Each word is the one the shell hands git (cadence-hooks#1546
+            // review): an escaped `--` still ends git's options.
+            ("--cached \\-- note.md", &["--cached"]),
+            (
+                "\\--no-cached --no-cach\\ed",
+                &["--no-cached", "--no-cached"],
+            ),
             ("", &[]),
         ];
         for &(args, want) in rows {
@@ -17426,7 +17439,7 @@ mod tests {
             assert_eq!(read.get(..2), Some(&words("git rm")[..]), "git rm {args}");
             let split: Vec<String> = args.split_whitespace().map(String::from).collect();
             for argv in [&read[2..], &split[..]] {
-                let got: Vec<&str> = git_rm_option_words(argv).collect();
+                let got: Vec<Cow<str>> = git_rm_option_words(argv).collect();
                 assert_eq!(got, want, "git rm {args}, read as {argv:?}");
             }
         }
@@ -17488,6 +17501,12 @@ mod tests {
             ("cached", false),
             ("--cached --no-cached note.md", false),
             ("--cached --no-c note.md", false),
+            // The shell drops each backslash before git reads the word
+            // (cadence-hooks#1546 review).
+            ("--cached note.md \\--no-cached", false),
+            ("--cached note.md --no-cach\\ed", false),
+            ("note.md \\-- --cached", false),
+            ("\\--cached note.md", true),
             ("--cachedx note.md", false),
         ] {
             assert_eq!(git_rm_keeps_the_tree(&words(args)), keeps, "git rm {args}");

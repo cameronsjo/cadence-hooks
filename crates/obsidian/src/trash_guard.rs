@@ -3582,6 +3582,12 @@ mod tests {
             ("git rm --cached --no-cached note.md", Block),
             ("git rm --cached --no-c note.md", Block),
             ("git rm --cached --no-ca note.md", Block),
+            // The shell drops a backslash before git reads the word, so an
+            // escaped `--no-cached` or `--` counts (cadence-hooks#1546 review).
+            (r"git rm --cached note.md \--no-cached", Block),
+            (r"git rm --cached note.md --no-cach\ed", Block),
+            (r"git rm note.md \-- --cached", Block),
+            (r"git rm \--cached note.md", Allow),
             // The rest of the command is judged as it was.
             ("git rm --cached note.md; rm note.md", Block),
             ("sh -c 'git rm --cached note.md; rm note.md'", Block),
