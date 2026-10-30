@@ -2070,8 +2070,13 @@ enum LoopWriteDecision {
 /// those conditions every iteration's gh resolves to the same repo the hook
 /// sees — identical trust to a single command.
 ///
-/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block, but include the
-/// resolved repo as a copy-paste `-R` suggestion when available.
+/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block.
+///
+/// In either mode a block suggests the cwd's repo as the `-R` fix only when
+/// that repo is owned and the loop body provably stays in it; otherwise the
+/// fix gets a placeholder. The caller also drops the suggestion when gh may
+/// send a looped write elsewhere for a reason this judgment does not see
+/// ([`loop_fix_may_name_dir_repo`]).
 fn judge_loop_write(
     strict: bool,
     body_mutates_cwd: Option<bool>,
@@ -2081,11 +2086,22 @@ fn judge_loop_write(
     extra_hosts: &[String],
 ) -> LoopWriteDecision {
     // A concrete -R suggestion exists exactly when the cwd resolves to a
-    // single owned, non-fork repo. (Empty allowlists can never produce one —
-    // the unconfigured fail-safe holds for loops too.)
+    // single owned, non-fork repo and the loop body provably stays in it. A
+    // body that may change directory writes to whatever repo it moves to, so
+    // the cwd's repo is not its target and the fix gets a placeholder (#1524).
+    // (Empty allowlists can never produce one — the unconfigured fail-safe
+    // holds for loops too.) The allow below needs a body that stays put as
+    // well, so this moves no verdict.
     let suggestion = match cwd_resolution {
         RepoResolution::Resolved { host, repo }
-            if is_allowed_with_extras(host, repo, allowed_owners, allowed_repos, extra_hosts) =>
+            if body_mutates_cwd == Some(false)
+                && is_allowed_with_extras(
+                    host,
+                    repo,
+                    allowed_owners,
+                    allowed_repos,
+                    extra_hosts,
+                ) =>
         {
             Some(repo.clone())
         }
@@ -2141,6 +2157,70 @@ fn api_writes_are_literal(api_writes: &[String]) -> bool {
             .all(|w| api_literal_repo_target(w.trim_matches('`')).is_some())
 }
 
+/// The repo a looped `gh api` write's fix names: the cwd's `target` only when
+/// every such write is `repos/{owner}/{repo}/…`, the one path gh fills from
+/// the directory's remote. Any other path names its own owner or repo, or
+/// takes one from a variable, so the cwd's repo is not its target and the fix
+/// gets `placeholder` (#1524).
+fn looped_api_fix_target<'a>(
+    api_writes: &[String],
+    target: &'a str,
+    placeholder: &'a str,
+) -> &'a str {
+    let cwd_path = |w: &String| {
+        gh_api_endpoint(w.trim_matches('`'))
+            .and_then(|endpoint| api_repos_target(&endpoint))
+            .is_some_and(|repo| repo == "{owner}/{repo}")
+    };
+    if api_writes.iter().all(cwd_path) {
+        target
+    } else {
+        placeholder
+    }
+}
+
+/// Variables that send gh somewhere other than the directory's repo: gh reads
+/// `GH_REPO` in place of the directory (it also fills `{owner}/{repo}` in a
+/// `gh api` path), `GH_HOST` moves the host, and git, which gh asks for the
+/// remotes, reads them from `GIT_DIR`.
+const LOOP_FIX_RETARGETING_VARS: [&str; 3] = ["GH_REPO", "GH_HOST", "GIT_DIR"];
+
+/// Whether a loop block's fix may name `work_dir`'s repo, the suggestion
+/// [`judge_loop_write`] resolved there (#1524). That judgment sees only
+/// whether a loop body changes directory. Two things it cannot see send a
+/// looped write elsewhere, and either one gives the fix a placeholder:
+///
+/// - One of [`LOOP_FIX_RETARGETING_VARS`]: set non-empty where the hook runs,
+///   or named anywhere in the command (inline, exported, inside the body).
+/// - A directory change [`parse_work_dir`] does not read: a `cd` in a
+///   subshell, a `{ …; }` group or an `if`, a `pushd`, a `cd` on a later
+///   line, or a runner's `-C`/`-D`. The per-segment reading
+///   ([`command_segments_with_dirs_reading`], then [`dir_after_runners`]) follows
+///   those, so it must put every gh write in `work_dir` too. A read
+///   elsewhere does not matter.
+///
+/// It decides the fix's text only: the verdict is made before it runs.
+fn loop_fix_may_name_dir_repo(command: &str, cwd: &str, work_dir: &str) -> bool {
+    if LOOP_FIX_RETARGETING_VARS
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()) || command.contains(var))
+    {
+        return false;
+    }
+    // The verdict reads an unread `eval` as staying put; the fix does not.
+    // It names the repo only when it is sure, so an `eval` may move here.
+    let segments = command_segments_with_dirs_reading(command, cwd, UnreadEval::MayMove);
+    // A reading cut short may have missed a gh write in another directory.
+    !ExpansionWork::spent()
+        && segments
+            .iter()
+            .filter(|(segment, _)| {
+                segment_invokes_gh(segment)
+                    && (is_write_command(segment) || is_write_command(&requote_words(segment)))
+            })
+            .all(|(segment, dir)| dir_after_runners(segment, dir) == work_dir)
+}
+
 /// What a plain loop is, for the fix of a literal-path write refused for the
 /// loop's shape.
 const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only in a plain loop: \
@@ -2172,8 +2252,9 @@ fn looped_write_fix(
     if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
         return PLAIN_LOOP_FIX.to_string();
     }
+    let api_target = looped_api_fix_target(api_writes, target, "<owner>/<repo>");
     if only_api_writes(writes, api_writes) {
-        return format!("gh api repos/{target}/…");
+        return format!("gh api repos/{api_target}/…");
     }
     // `gh repo archive` and the other argument verbs have no -R (#1491).
     let repo_verb = writes
@@ -2195,7 +2276,7 @@ fn looped_write_fix(
         parts.push(format!("gh repo {verb} {owner}/<repo>"));
     }
     if !api_writes.is_empty() {
-        parts.push(format!("for gh api, gh api repos/{target}/…"));
+        parts.push(format!("for gh api, gh api repos/{api_target}/…"));
     }
     parts.join("; ")
 }
@@ -2264,9 +2345,10 @@ fn looped_write_block_message(
         .iter()
         .partition(|w| api_literal_repo_target(w.trim_matches('`')).is_some());
     if !unwritten.is_empty() {
+        let api_target = looped_api_fix_target(api_writes, fix_target, "owner/repo");
         fixes.push(format!(
             "`gh api` has no -R flag: write the repo literally in the path \
-             (`gh api repos/{fix_target}/…`), with no variable or `{{owner}}`/`{{repo}}` \
+             (`gh api repos/{api_target}/…`), with no variable or `{{owner}}`/`{{repo}}` \
              placeholder in the owner or repo name"
         ));
     }
@@ -4744,6 +4826,10 @@ impl Check for GhWriteGuard {
                         &extra_hosts,
                     );
                     if let LoopWriteDecision::Block { suggestion } = decision {
+                        // The verdict is made. The fix names the directory's
+                        // repo only when gh sends every looped write there.
+                        let suggestion = suggestion
+                            .filter(|_| loop_fix_may_name_dir_repo(command, cwd, &work_dir));
                         let (api_writes, writes): (Vec<String>, Vec<String>) = cmds
                             .iter()
                             .filter(|c| {
@@ -6277,26 +6363,31 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_cd_in_body_blocks_with_suggestion() {
+    fn cd_in_body_blocks_without_suggestion() {
         // GH_HOST moves the default host; read it under the env lock so a
         // concurrent GH_HOST mutator cannot change it mid-test (#938).
         with_env(&[("GH_HOST", None)], || {
-            // Loop body changes cwd — non-deterministic, block even though cwd is owned.
+            // Loop body may change cwd — non-deterministic, block even though
+            // cwd is owned. Its writes go to the repo it moves to, so the
+            // cwd's repo is no fix for them (#1524), in either mode.
             let o = owners(&["cameronsjo"]);
-            let decision = judge_loop_write(
-                false,
-                Some(true),
-                &resolved("cameronsjo/repo"),
-                &o,
-                &[],
-                &[],
-            );
-            assert_eq!(
-                decision,
-                LoopWriteDecision::Block {
-                    suggestion: Some("cameronsjo/repo".to_string())
+            for strict in [false, true] {
+                for body_mutates_cwd in [Some(true), None] {
+                    let decision = judge_loop_write(
+                        strict,
+                        body_mutates_cwd,
+                        &resolved("cameronsjo/repo"),
+                        &o,
+                        &[],
+                        &[],
+                    );
+                    assert_eq!(
+                        decision,
+                        LoopWriteDecision::Block { suggestion: None },
+                        "strict={strict} body_mutates_cwd={body_mutates_cwd:?}"
+                    );
                 }
-            );
+            }
         });
     }
 
@@ -6390,7 +6481,7 @@ mod tests {
     #[test]
     fn looped_api_write_message_never_advises_dash_r() {
         // #1344: gh api has no -R, so its advice is the literal path.
-        let api = vec!["`gh api -X DELETE repos/$o/x/git/refs/heads/a`".to_string()];
+        let api = vec!["`gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/a`".to_string()];
         let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"), false);
         assert!(!msg.contains("add `-R"), "{msg}");
         assert!(msg.contains("gh api repos/cameronsjo/forgectl/…"), "{msg}");
@@ -6398,6 +6489,12 @@ mod tests {
             msg.contains("without a literal repos/<owner>/<repo> path"),
             "{msg}"
         );
+        // A path that does not take both names from the cwd's remote is not
+        // the cwd's repo, so it gets a placeholder (#1524).
+        let api = vec!["`gh api -X DELETE repos/$o/x/git/refs/heads/a`".to_string()];
+        let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"), false);
+        assert!(!msg.contains("cameronsjo/forgectl"), "{msg}");
+        assert!(msg.contains("gh api repos/owner/repo/…"), "{msg}");
     }
 
     #[test]
@@ -6896,7 +6993,7 @@ mod tests {
     #[test]
     fn looped_write_fix_spells_each_kind() {
         let w = vec!["`gh pr comment 1`".to_string()];
-        let a = vec!["`gh api -X DELETE repos/$o/y`".to_string()];
+        let a = vec!["`gh api -X DELETE repos/{owner}/{repo}/y`".to_string()];
         assert_eq!(looped_write_fix(&w, &[], "o/r", false), "-R o/r");
         assert_eq!(
             looped_write_fix(&[], &a, "o/r", false),
@@ -6905,6 +7002,16 @@ mod tests {
         assert_eq!(
             looped_write_fix(&w, &a, "o/r", false),
             "-R o/r; for gh api, gh api repos/o/r/…"
+        );
+        // A path with its own owner or repo is not the cwd's repo (#1524).
+        let a = vec!["`gh api -X DELETE repos/$o/y`".to_string()];
+        assert_eq!(
+            looped_write_fix(&[], &a, "o/r", false),
+            "gh api repos/<owner>/<repo>/…"
+        );
+        assert_eq!(
+            looped_write_fix(&w, &a, "o/r", false),
+            "-R o/r; for gh api, gh api repos/<owner>/<repo>/…"
         );
     }
 
@@ -12152,6 +12259,355 @@ mod tests {
         cadence_hooks_core::git_fixtures::init_repo(repo.path());
         cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", url]);
         repo
+    }
+
+    // --- #1524: a loop's fix names the cwd's repo only for a write that targets it ---
+
+    /// The loop block's prose and structured fix for `command`, run from a
+    /// checkout of `cameronsjo/tool` with `cameronsjo` allowed.
+    fn loop_fix_in_tool(command: &str, strict: bool) -> (String, String) {
+        let repo = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let cwd = repo.path().to_str().expect("utf-8 temp path");
+        let result = run_1491(command, cwd, strict);
+        assert!(blocks(&result), "{command} (strict={strict})");
+        let message = msg(&result).to_string();
+        let meta = result.block_metadata.expect("structured block");
+        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{command}");
+        (message, meta.fix)
+    }
+
+    #[test]
+    fn a_loop_that_changes_directory_gets_no_fix_naming_the_cwd_repo() {
+        // The body writes to whatever repo it moves to, so `-R cameronsjo/tool`
+        // would send every write to the checkout's own repo.
+        for command in [
+            r#"for d in a b; do (cd "$d" && gh release delete v1 --yes); done"#,
+            r#"for d in a b; do cd "$d" && gh pr merge 5; cd ..; done"#,
+            r#"for d in a b; do (cd "$d" && gh secret set X --body y); done"#,
+            r#"for d in a b; do (cd "$d" && gh api -X DELETE repos/{owner}/{repo}/releases/1); done"#,
+            r#"for d in a b; do (cd "$d" && gh repo edit "$o/$d" --enable-issues); done"#,
+        ] {
+            for strict in [false, true] {
+                let (message, fix) = loop_fix_in_tool(command, strict);
+                assert!(!message.contains("cameronsjo"), "{command}: {message}");
+                assert!(!fix.contains("cameronsjo"), "{command}: {fix}");
+            }
+        }
+        let (message, fix) = loop_fix_in_tool(
+            r#"for d in a b; do (cd "$d" && gh release delete v1 --yes); done"#,
+            false,
+        );
+        assert!(
+            message.contains("Fix: add `-R owner/repo` to each command"),
+            "{message}"
+        );
+        assert_eq!(fix, "-R <owner>/<repo>");
+    }
+
+    #[test]
+    fn a_looped_api_path_that_is_not_the_cwd_repo_gets_a_placeholder() {
+        // Strict mode, no `cd`: a `gh api` path that names its own owner or
+        // repo, or takes one from a variable, is not the checkout's repo.
+        let api = "gh api repos/<owner>/<repo>/…";
+        for (command, fix) in [
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
+                api,
+            ),
+            (
+                r#"for o in a b; do gh api -X DELETE "repos/$o/x/releases/1"; done"#,
+                api,
+            ),
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/{owner}/$r/releases/1"; done"#,
+                api,
+            ),
+            // `{repo}` alone is not the path gh fills from the checkout.
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/work-org/{repo}/releases/$r"; done"#,
+                api,
+            ),
+            // Every api write must be `repos/{owner}/{repo}/…`, in either order.
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/{owner}/{repo}/releases/1"; gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
+                api,
+            ),
+            (
+                r#"for r in a b; do gh api -X DELETE "repos/work-org/$r/releases/1"; gh api -X DELETE "repos/{owner}/{repo}/releases/1"; done"#,
+                api,
+            ),
+            // Beside a command that takes `-R`, that command keeps the name.
+            (
+                r#"for r in a b; do gh pr merge 5; gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
+                "-R cameronsjo/tool; for gh api, gh api repos/<owner>/<repo>/…",
+            ),
+        ] {
+            let (message, got) = loop_fix_in_tool(command, true);
+            assert_eq!(got, fix, "{command}");
+            assert!(
+                message.contains("(`gh api repos/owner/repo/…`)"),
+                "{command}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loop_that_stays_put_keeps_the_cwd_repo_in_its_fix() {
+        // Strict mode blocks a loop that stays in the checkout; each write
+        // still resolves to the checkout's repo, so the fix names it.
+        for (command, fix, prose) in [
+            (
+                "for n in 1 2; do gh pr merge $n; done",
+                "-R cameronsjo/tool",
+                "add `-R cameronsjo/tool` to each command",
+            ),
+            (
+                r#"for b in a b; do gh api -X DELETE "repos/{owner}/{repo}/git/refs/heads/$b"; done"#,
+                "gh api repos/cameronsjo/tool/…",
+                "(`gh api repos/cameronsjo/tool/…`)",
+            ),
+        ] {
+            let (message, got) = loop_fix_in_tool(command, true);
+            assert_eq!(got, fix, "{command}");
+            assert!(message.contains(prose), "{command}: {message}");
+        }
+    }
+
+    /// Sibling checkouts in one temp dir: `tool` (`cameronsjo/tool`), `other`
+    /// (`work-org/other`) and `owned2` (`cameronsjo/owned2`).
+    fn sibling_checkouts() -> tempfile::TempDir {
+        let parent = tempfile::tempdir().expect("create git fixture");
+        for (name, url) in [
+            ("tool", "https://github.com/cameronsjo/tool.git"),
+            ("other", "https://github.com/work-org/other.git"),
+            ("owned2", "https://github.com/cameronsjo/owned2.git"),
+        ] {
+            let repo = parent.path().join(name);
+            std::fs::create_dir(&repo).expect("create checkout dir");
+            cadence_hooks_core::git_fixtures::init_repo(&repo);
+            cadence_hooks_core::git_fixtures::git_in(&repo, &["remote", "add", "origin", url]);
+        }
+        parent
+    }
+
+    /// Security and code review of #1548: the loop body stays put, but gh
+    /// sends the looped writes somewhere other than the checkout. Every row
+    /// runs from `tool`, beside `other` and `owned2` ([`sibling_checkouts`]):
+    /// `(command, relaxed mode blocks?)`. Strict mode blocks every row with the
+    /// loop block, and its fix must not name `cameronsjo/tool`. Relaxed mode
+    /// keeps its verdict and names no `cameronsjo/tool` either.
+    #[test]
+    fn a_loop_whose_writes_go_elsewhere_gets_no_fix_naming_the_cwd_repo() {
+        let parent = sibling_checkouts();
+        let tool = parent.path().join("tool");
+        let cwd = tool.to_str().expect("utf-8 temp path");
+        for (command, relaxed_blocks) in [
+            // A `GH_REPO`, which gh reads in place of the directory: inline,
+            // exported before the loop, or exported in its body.
+            (
+                "for n in 3 4; do GH_REPO=work-org/x gh release delete v$n --yes; done",
+                true,
+            ),
+            (
+                r#"for r in a b; do GH_REPO="work-org/$r" gh pr merge 5 --squash; done"#,
+                true,
+            ),
+            (
+                "export GH_REPO=work-org/x; for n in 3 4; do gh pr merge $n --squash; done",
+                true,
+            ),
+            (
+                "export GH_REPO=work-org/x && for n in 3 4; do gh pr merge $n --squash; done",
+                true,
+            ),
+            (
+                "export GH_REPO=work-org/x\nfor n in 3 4; do gh pr merge $n --squash; done",
+                true,
+            ),
+            (
+                "for n in 3 4; do export GH_REPO=work-org/x; gh pr merge $n --squash; done",
+                true,
+            ),
+            (
+                "for d in a b; do (export GH_REPO=work-org/$d; gh pr merge 5); done",
+                true,
+            ),
+            // An owned `GH_REPO` is still not the checkout's repo.
+            (
+                "export GH_REPO=cameronsjo/other; for n in 3 4; do gh pr merge $n --squash; done",
+                false,
+            ),
+            // gh fills `{owner}/{repo}` from `GH_REPO` too.
+            (
+                r#"for n in 1 2; do GH_REPO=work-org/x gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done"#,
+                true,
+            ),
+            (
+                r#"export GH_REPO=work-org/x; for n in 1 2; do gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done"#,
+                true,
+            ),
+            // A `cd` before the loop that the whole-command scan does not
+            // read: in a subshell, a group or an `if`, a `pushd`, or on a
+            // later line.
+            (
+                "(cd ../other && for n in 1 2; do gh pr merge $n; done)",
+                true,
+            ),
+            (
+                "( cd ../other; for n in 1 2; do gh issue close $n; done )",
+                true,
+            ),
+            (
+                "{ cd ../other; for n in 1 2; do gh pr merge $n; done; }",
+                true,
+            ),
+            (
+                "if cd ../other; then for n in 1 2; do gh pr merge $n; done; fi",
+                true,
+            ),
+            (
+                "if true; then cd ../other; for n in 1 2; do gh issue close $n; done; fi",
+                true,
+            ),
+            (
+                "pushd ../other >/dev/null && for n in 1 2; do gh pr merge $n; done",
+                true,
+            ),
+            (
+                "pushd ../other; for n in 1 2; do gh issue close $n; done; popd",
+                true,
+            ),
+            (
+                "echo hi\ncd ../other\nfor n in 1 2; do gh pr merge $n; done",
+                true,
+            ),
+            (
+                "set -e\ncd ../other\nfor n in 1 2; do gh issue close $n; done",
+                true,
+            ),
+            (
+                r#"(cd ../other && for n in 1 2; do gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done)"#,
+                true,
+            ),
+            // An owned sibling is still not the checkout's repo.
+            (
+                "(cd ../owned2 && for n in 1 2; do gh pr merge $n; done)",
+                false,
+            ),
+            // A runner's `-C` moves one write of the body.
+            (
+                "for n in 1 2; do gh pr merge $n; env -C ../other gh issue close $n; done",
+                true,
+            ),
+            // An `eval` the walk cannot read may move the shell. The verdict
+            // judges the loop where it was read; the fix still names no repo.
+            (r#"eval "$S"; for n in 1 2; do gh pr merge $n; done"#, false),
+            // A `GH_HOST`, or a `GIT_DIR` that gh's git reads the remotes
+            // from. Relaxed mode allows these, as it did before.
+            (
+                "for n in 1 2; do GIT_DIR=../other/.git gh pr merge $n; done",
+                false,
+            ),
+            (
+                "export GIT_DIR=../other/.git; for n in 1 2; do gh pr merge $n; done",
+                false,
+            ),
+            (
+                "for n in 1 2; do GH_HOST=ghe.example gh pr merge $n; done",
+                false,
+            ),
+        ] {
+            for strict in [false, true] {
+                let result = run_1491(command, cwd, strict);
+                assert_eq!(
+                    blocks(&result),
+                    strict || relaxed_blocks,
+                    "{command} (strict={strict}): {}",
+                    msg(&result)
+                );
+                let fix = result
+                    .block_metadata
+                    .as_ref()
+                    .map_or("", |m| m.fix.as_str());
+                for text in [msg(&result), fix] {
+                    assert!(
+                        !text.contains("cameronsjo/tool"),
+                        "{command} (strict={strict}): {text}"
+                    );
+                }
+                if strict {
+                    let meta = result.block_metadata.as_ref().expect("structured block");
+                    assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{command}");
+                    assert!(fix.contains("<owner>/<repo>"), "{command}: {fix}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_strict_loop_under_an_inherited_gh_repo_gets_no_fix_naming_the_cwd_repo() {
+        // gh reads a `GH_REPO` or `GH_HOST` the session exported as it reads
+        // one in the command. An empty one is unset, so the fix keeps the name.
+        let parent = sibling_checkouts();
+        let tool = parent.path().join("tool");
+        let cwd = tool.to_str().expect("utf-8 temp path");
+        for (gh_repo, gh_host, fix) in [
+            (Some("work-org/x"), None, "-R <owner>/<repo>"),
+            (None, Some("ghe.example"), "-R <owner>/<repo>"),
+            (Some(""), None, "-R cameronsjo/tool"),
+        ] {
+            with_env(
+                &[
+                    ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                    ("CADENCE_ALLOWED_REPOS", None),
+                    ("CADENCE_EXTRA_HOSTS", None),
+                    ("CADENCE_GH_STRICT_LOOPS", Some("1")),
+                    ("GH_HOST", gh_host),
+                    ("GH_REPO", gh_repo),
+                ],
+                || {
+                    let result =
+                        GhWriteGuard.run(&input_with("for n in 1 2; do gh pr merge $n; done", cwd));
+                    let meta = result.block_metadata.expect("structured block");
+                    let env = format!("GH_REPO={gh_repo:?} GH_HOST={gh_host:?}");
+                    assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{env}");
+                    assert_eq!(meta.fix, fix, "{env}");
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_strict_loop_after_a_cd_both_readings_follow_names_that_repo() {
+        // A leading `cd` is read by the whole-command scan and the per-segment
+        // walk alike, so the loop runs where the suggestion was resolved.
+        let parent = sibling_checkouts();
+        let tool = parent.path().join("tool");
+        let cwd = tool.to_str().expect("utf-8 temp path");
+        for (command, fix) in [
+            (
+                "for n in 1 2; do gh pr merge $n; done",
+                "-R cameronsjo/tool",
+            ),
+            (
+                "cd ../owned2 && for n in 1 2; do gh pr merge $n; done",
+                "-R cameronsjo/owned2",
+            ),
+            (
+                r#"cd ../owned2; for n in 1 2; do gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done"#,
+                "gh api repos/cameronsjo/owned2/…",
+            ),
+            // Only the writes need to run there: a read elsewhere moves nothing.
+            (
+                "for n in 1 2; do gh pr merge $n; done; env -C ../other gh issue view 1",
+                "-R cameronsjo/tool",
+            ),
+        ] {
+            let result = run_1491(command, cwd, true);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{command}");
+            assert_eq!(meta.fix, fix, "{command}");
+        }
     }
 
     /// How gh's target repo is read (cadence-hooks#1077, #1069, #937, #1115):
