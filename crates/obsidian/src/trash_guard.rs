@@ -3635,6 +3635,12 @@ mod tests {
             ("git rm --cached note.md $(printf -- x)", Allow),
             ("git rm $(git ls-files -d) --cached note.md", Allow),
             ("git rm --cached -r . `git ls-files -d`", Allow),
+            // A redirect target is a file the shell opens, not git's option
+            // (cadence-hooks#1580 review).
+            ("git rm note.md > --cached", Block),
+            ("git rm note.md >> --cached", Block),
+            ("git rm note.md 2> --cached", Block),
+            ("git rm --cached note.md > log.txt", Allow),
         ];
         for &(command, expected) in cases {
             assert_eq!(

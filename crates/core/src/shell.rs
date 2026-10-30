@@ -13840,15 +13840,29 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 /// because that is the word git gets: `\--no-cached` and `--no-cach\ed` are
 /// `--no-cached` to git, and `\--` ends its options (cadence-hooks#1546
 /// review).
+///
+/// A redirect is the shell's, not git's: the operator and its target are
+/// skipped, so in `git rm .env > --dry-run` the `--dry-run` names the file the
+/// output goes to and git deletes `.env` (cadence-hooks#1580 review).
 pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>> {
     // Open `$(` (and nested `(`) count, and whether a backtick span is open,
     // carried from one word to the next.
     let mut open = 0usize;
     let mut in_backticks = false;
+    // The target of a redirect whose operator is a word of its own
+    // (`> --dry-run`, `2> -n`) is a file name the shell opens; git never sees it.
+    let mut redirect_target = false;
     args.iter()
         .map(String::as_str)
         .filter(move |word| {
+            if std::mem::take(&mut redirect_target) {
+                return false;
+            }
             let inside = open > 0 || in_backticks;
+            if !inside && let Some((len, _)) = redirect_operator_span(word) {
+                redirect_target = matches!(&word[len..], "" | "|" | "&");
+                return false;
+            }
             let mut prev = None;
             for c in word.chars() {
                 match c {
@@ -17434,6 +17448,16 @@ mod tests {
             // Each word is the one the shell hands git (cadence-hooks#1546
             // review): an escaped `--` still ends git's options.
             ("--cached \\-- note.md", &["--cached"]),
+            // A redirect target is a file name, not an option (cadence-hooks#1580
+            // review); a target glued to `&` (`2>&1`) leaves the next word git's.
+            ("note.md > --dry-run", &["note.md"]),
+            ("note.md >> --cached", &["note.md"]),
+            ("note.md >| -n", &["note.md"]),
+            ("note.md 2> -n", &["note.md"]),
+            ("note.md >& --cached", &["note.md"]),
+            ("note.md >--dry-run", &["note.md"]),
+            ("--cached note.md > log.txt", &["--cached", "note.md"]),
+            ("note.md 2>&1 -n", &["note.md", "-n"]),
             (
                 "\\--no-cached --no-cach\\ed",
                 &["--no-cached", "--no-cached"],

@@ -1547,6 +1547,10 @@ mod tests {
             "git rm --cached .env; rm .env",
             "git rm --cached .env && echo x > .env",
             "git rm --cached x.txt .env.local; git rm .env",
+            // A redirect target is a file the shell opens, not git's option,
+            // so git deletes `.env` (cadence-hooks#1580 review).
+            "git rm .env > --cached",
+            "git rm .env >> --cached",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }
@@ -1568,6 +1572,8 @@ mod tests {
             "sudo git rm --dry-run .env",
             "xargs git rm -n .env",
             r"git rm -\n .env",
+            "git rm -n .env > out.txt",
+            "git rm -n .env 2>&1",
         ] {
             assert!(!bash_targets_env_file(command), "{command} must be allowed");
         }
@@ -1592,6 +1598,13 @@ mod tests {
             r"git rm -n .env \--no-dry-run",
             "git rm -n .env; rm .env",
             "git rm -n .env && git rm .env",
+            // A redirect target is a file the shell opens, not git's option,
+            // so git deletes `.env` (cadence-hooks#1580 review).
+            "git rm .env > --dry-run",
+            "git rm .env >> --dry-run",
+            "git rm .env >| --dry-run",
+            "git rm .env > -n",
+            "git rm .env 2> -n",
         ] {
             assert!(bash_targets_env_file(command), "{command} must block");
         }
