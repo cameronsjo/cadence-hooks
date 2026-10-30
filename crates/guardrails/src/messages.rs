@@ -6,7 +6,7 @@
 //! change lands once instead of drifting between copies.
 
 use crate::warn_unreviewed_ready_flip::is_safe_host;
-use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
+use cadence_hooks_core::display::{MAX_PATH_DISPLAY, mask_url_userinfo, sanitize_field};
 
 /// The worktree-creation recipe: `enforce_worktree`'s block message, its
 /// subprocess-mutation nudge, and `warn_branch_base`'s worktree-first nudge
@@ -40,6 +40,19 @@ pub fn host_scope_advice(default: &str, host: &str) -> String {
              setting is offered for it"
         )
     }
+}
+
+/// A push URL or repo value as `guard_push_remote` and `guard_gh_write` print
+/// it: any `scheme://userinfo@` masked to `***@` ([`mask_url_userinfo`]),
+/// then every control and invisible character a space and the text cut at
+/// 200 characters ([`sanitize_field`]).
+///
+/// The URL is often read from `.git/config`, and a `GH_REPO` value can be
+/// inherited from the environment, so neither is text the model has seen. A
+/// token in either reached the block or nudge text before
+/// (cameronsjo/cadence-hooks#1541).
+pub fn shown_url(url: &str) -> String {
+    sanitize_field(&mask_url_userinfo(url), MAX_PATH_DISPLAY)
 }
 
 /// Emitted when a `CADENCE_ALLOWED_OWNERS`-gated guard fires with no
