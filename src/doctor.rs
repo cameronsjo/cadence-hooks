@@ -1682,19 +1682,61 @@ fn telemetry_finding(
 }
 
 /// Size at which a single `<metrics_dir>/*.jsonl` ledger earns a doctor
-/// warning (cadence-hooks#425). The ledgers are append-only with no cap or
-/// rotation; at a few hundred bytes a row this is hundreds of thousands of
-/// rows, far past what any reader of them needs in one file.
+/// warning (cadence-hooks#425). Writers rotate a ledger to `<name>.jsonl.1`
+/// past `CADENCE_METRICS_MAX_BYTES` (16 MiB by default), so a live ledger this
+/// large means rotation is off, failing, or capped higher than this, or the
+/// ledger has not been written since an older binary grew it.
 const LEDGER_SIZE_WARN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What the diagnosis and the first half of the remediation say about
+/// rotation, given the effective cap and the ledger's size. Pure.
+fn rotation_advice(cap: Option<u64>, rotates: bool, len: u64) -> (String, String) {
+    const MIB: u64 = 1024 * 1024;
+    let env = cadence_hooks_metrics::LEDGER_MAX_BYTES_ENV;
+    let default = cadence_hooks_metrics::DEFAULT_LEDGER_MAX_BYTES;
+    match cap {
+        _ if !rotates => (
+            "ledgers rotate only on Unix; this platform keeps them whole".to_string(),
+            "archive it by hand".to_string(),
+        ),
+        None => (
+            format!("rotation is off ({env}=0)"),
+            format!("unset {env} (default {default} bytes) to rotate, or archive it by hand"),
+        ),
+        Some(cap) if len >= cap => (
+            format!(
+                "past the {} MiB rotation cap, so the next write rotates it to `.jsonl.1`",
+                cap / MIB
+            ),
+            "if it stays this large after a write, look for `ledger_rotate_failed` rows in \
+             failopen.jsonl, or archive it by hand"
+                .to_string(),
+        ),
+        Some(cap) => (
+            format!(
+                "under your {} MiB rotation cap ({env}), so it does not rotate yet",
+                cap / MIB
+            ),
+            format!("lower {env} (default {default} bytes), or archive it by hand"),
+        ),
+    }
+}
 
 /// One `Warning` per `<metrics_dir>/*.jsonl` ledger at or above `threshold`
 /// bytes — the size half of #425. Nothing is deleted or rewritten: the
-/// remediation is a documented archive-and-restart (`mv` the file aside; the
-/// next append recreates it, owner-only). A rename is safe under concurrent
+/// remediation says how rotation applies to the ledger (`cap` is the effective
+/// `CADENCE_METRICS_MAX_BYTES`, `rotates` whether this platform rotates) and
+/// keeps the documented archive-and-restart (`mv` the file aside; the next
+/// append recreates it, owner-only). A rename is safe under concurrent
 /// writers, since each append opens the path fresh and an in-flight write
 /// lands in the archived file. Missing or unreadable dir: no findings
 /// (fail-open, like the other telemetry reads).
-fn ledger_size_findings(dir: &Path, threshold: u64) -> Vec<Finding> {
+fn ledger_size_findings(
+    dir: &Path,
+    threshold: u64,
+    cap: Option<u64>,
+    rotates: bool,
+) -> Vec<Finding> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1703,7 +1745,12 @@ fn ledger_size_findings(dir: &Path, threshold: u64) -> Vec<Finding> {
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
             let meta = entry.metadata().ok()?;
-            (name.ends_with(".jsonl") && meta.is_file() && meta.len() >= threshold)
+            // `.jsonl.1` too: the first write after an upgrade moves a ledger
+            // that grew past the threshold into it, and every reader here still
+            // loads it whole.
+            ((name.ends_with(".jsonl") || name.ends_with(".jsonl.1"))
+                && meta.is_file()
+                && meta.len() >= threshold)
                 .then_some((name, meta.len()))
         })
         .collect();
@@ -1713,7 +1760,28 @@ fn ledger_size_findings(dir: &Path, threshold: u64) -> Vec<Finding> {
         .map(|(name, len)| {
             let path = dir.join(&name);
             let quoted = shell_single_quote(&path.display().to_string());
+            if name.ends_with(".1") {
+                return Finding {
+                    severity: Severity::Warning,
+                    blocker: Blocker::No,
+                    plugin: "cadence-metrics".to_string(),
+                    file: path,
+                    line: None,
+                    snippet: name,
+                    diagnosis: format!(
+                        "rotated ledger copy is {} MiB, larger than a rotation leaves; \
+                         the ledger grew past the cap before rotation existed. The next \
+                         rotation of the live ledger replaces it",
+                        len / (1024 * 1024)
+                    ),
+                    remediation: format!(
+                        "readers here load it whole, so remove it once you no longer \
+                         need the older rows: `rm {quoted}`"
+                    ),
+                };
+            }
             let archived = shell_single_quote(&format!("{}.archived", path.display()));
+            let (rotation, remedy) = rotation_advice(cap, rotates, len);
             Finding {
                 severity: Severity::Warning,
                 blocker: Blocker::No,
@@ -1721,14 +1789,10 @@ fn ledger_size_findings(dir: &Path, threshold: u64) -> Vec<Finding> {
                 file: path,
                 line: None,
                 snippet: name,
-                diagnosis: format!(
-                    "metrics ledger is {} MiB; ledgers are append-only with no rotation",
-                    len / (1024 * 1024)
-                ),
+                diagnosis: format!("metrics ledger is {} MiB; {rotation}", len / (1024 * 1024)),
                 remediation: format!(
-                    "archive it and let the next write start a fresh one: \
-                     `mv {quoted} {archived}` (delete or compress the archive \
-                     once nothing reads it)"
+                    "{remedy}: `mv {quoted} {archived}` lets the next write start a \
+                     fresh one (delete or compress the archive once nothing reads it)"
                 ),
             }
         })
@@ -4561,7 +4625,12 @@ pub fn run(
             window,
             now,
         ));
-        findings.extend(ledger_size_findings(&metrics_dir, LEDGER_SIZE_WARN_BYTES));
+        findings.extend(ledger_size_findings(
+            &metrics_dir,
+            LEDGER_SIZE_WARN_BYTES,
+            cadence_hooks_metrics::ledger_max_bytes(),
+            cfg!(unix),
+        ));
         // Names the CAUSE the deadline finding above can only tell the operator
         // to go looking for (#278). Gated with the other live-machine reads:
         // under `--root` these would report the dev machine's real dirs, not
@@ -4894,11 +4963,21 @@ mod tests {
             .set_len(4096)
             .unwrap();
 
-        let findings = ledger_size_findings(tmp.path(), 1024);
+        let findings = ledger_size_findings(tmp.path(), 1024, Some(1024), true);
         assert_eq!(findings.len(), 1, "only the large ledger");
         let f = &findings[0];
         assert_eq!(f.severity, Severity::Warning);
         assert_eq!(f.snippet, "denials.jsonl");
+        assert!(
+            !f.diagnosis.contains("no rotation"),
+            "the stale no-rotation claim is gone: {}",
+            f.diagnosis
+        );
+        assert!(
+            f.diagnosis.contains("rotation cap"),
+            "names the cap: {}",
+            f.diagnosis
+        );
         assert!(f.remediation.contains("mv '"), "{}", f.remediation);
         assert!(
             f.remediation.contains("denials.jsonl.archived"),
@@ -4908,9 +4987,53 @@ mod tests {
     }
 
     #[test]
+    fn ledger_size_findings_flags_an_oversized_rotated_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::File::create(tmp.path().join("denials.jsonl.1"))
+            .unwrap()
+            .set_len(2048)
+            .unwrap();
+        fs::write(tmp.path().join("hooks.jsonl.1"), "{}\n").unwrap();
+
+        let findings = ledger_size_findings(tmp.path(), 1024, Some(1024), true);
+
+        assert_eq!(findings.len(), 1, "only the large rotated copy");
+        let f = &findings[0];
+        assert_eq!(f.snippet, "denials.jsonl.1");
+        assert!(
+            f.diagnosis.contains("rotated ledger copy"),
+            "{}",
+            f.diagnosis
+        );
+        assert!(f.remediation.contains("rm '"), "{}", f.remediation);
+    }
+
+    #[test]
     fn ledger_size_findings_missing_dir_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(ledger_size_findings(&tmp.path().join("absent"), 1).is_empty());
+        assert!(ledger_size_findings(&tmp.path().join("absent"), 1, Some(1), true).is_empty());
+    }
+
+    #[test]
+    fn rotation_advice_says_why_the_ledger_is_still_large() {
+        const MIB: u64 = 1024 * 1024;
+        let (off, off_fix) = rotation_advice(None, true, 80 * MIB);
+        assert!(off.contains("rotation is off"), "{off}");
+        assert!(off_fix.contains("CADENCE_METRICS_MAX_BYTES"), "{off_fix}");
+
+        let (over, over_fix) = rotation_advice(Some(16 * MIB), true, 80 * MIB);
+        assert!(over.contains("past the 16 MiB rotation cap"), "{over}");
+        assert!(over_fix.contains("ledger_rotate_failed"), "{over_fix}");
+
+        let (under, under_fix) = rotation_advice(Some(128 * MIB), true, 80 * MIB);
+        assert!(under.contains("under your 128 MiB"), "{under}");
+        assert!(
+            under_fix.contains("lower CADENCE_METRICS_MAX_BYTES"),
+            "{under_fix}"
+        );
+
+        let (no_unix, _) = rotation_advice(Some(16 * MIB), false, 80 * MIB);
+        assert!(no_unix.contains("only on Unix"), "{no_unix}");
     }
 
     #[test]

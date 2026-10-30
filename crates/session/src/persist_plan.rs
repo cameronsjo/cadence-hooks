@@ -1838,7 +1838,8 @@ struct LedgerRow {
 }
 
 /// The `plan-links.jsonl` rows, read once per persist from a bounded tail
-/// ([`PLAN_LINKS_SCAN_MAX_BYTES`]), in file order. Both
+/// ([`PLAN_LINKS_SCAN_MAX_BYTES`]) of the rotated `.1` file and of the live
+/// one, in file order. Both
 /// [`session_already_persisted`] and [`Recognizer::holds_this_plan`] read
 /// these rows. An unreadable ledger is empty, which falls back to the file
 /// checks.
@@ -1850,11 +1851,21 @@ struct PlanLedger {
 impl PlanLedger {
     fn load() -> Self {
         let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
-        let Some(tail) =
-            cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
-        else {
+        // The rotated `.1` tail first (older rows), so a rotation does not make
+        // a persisted plan look new.
+        let tail = [
+            cadence_hooks_metrics::rotated_ledger_path(&path),
+            path.clone(),
+        ]
+        .iter()
+        .filter_map(|p| {
+            cadence_hooks_core::transcript::read_tail_bounded(p, PLAN_LINKS_SCAN_MAX_BYTES)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        if tail.is_empty() {
             return Self::default();
-        };
+        }
         let rows = tail
             .lines()
             .filter_map(|line| {
@@ -6006,6 +6017,31 @@ mod tests {
         // No heading: only the normalized-equality path.
         assert!(has_affinity("- [x] a", "- [ ] a"));
         assert!(!has_affinity("- [x] b", "- [ ] a"));
+    }
+
+    /// A rotation moves older `plan-links.jsonl` rows to `.1`; the ledger must
+    /// still see them, or a persisted plan looks new and is written twice.
+    #[test]
+    fn plan_ledger_reads_the_rotated_dot_one_file() {
+        let metrics_dir = TempDir::new().unwrap();
+        let live = metrics_dir.path().join("plan-links.jsonl");
+        // `.1` ends without a newline: the join must not fuse its last row
+        // with the first live row.
+        fs::write(
+            cadence_hooks_metrics::rotated_ledger_path(&live),
+            r#"{"body_sha256":"old","child_session_id":"s-old","plan_path":"docs/plans/a.md"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &live,
+            "{\"body_sha256\":\"new\",\"child_session_id\":\"s-new\",\"plan_path\":\"docs/plans/b.md\"}\n",
+        )
+        .unwrap();
+
+        let ledger = with_metrics_dir(metrics_dir.path(), PlanLedger::load);
+
+        let hashes: Vec<&str> = ledger.rows.iter().map(|r| r.body_hash.as_str()).collect();
+        assert_eq!(hashes, ["old", "new"], "older rows first, none fused");
     }
 
     /// A reboot clears the marker temp dir, and a resumed session keeps its
