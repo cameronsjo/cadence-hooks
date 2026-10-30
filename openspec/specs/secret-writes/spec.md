@@ -106,7 +106,7 @@ A Bash redirect or writer verb targeting `.envrc` SHALL block whatever it writes
 - **THEN** the hook blocks and stderr says the Write tool can write a pure-loader `.envrc`
 
 ### Requirement: Writer verbs targeting a secret file block
-`prevent-secret-writes` SHALL block a Bash command whose writer verb would create, overwrite, or delete a secret file, after peeling command runners (`sudo`, `env`, `nice`, `timeout`, `xargs`, `command`, `exec`, `time`). A copy from a secret file to a non-secret destination SHALL be allowed by this guard, since the read is `prevent-secret-leaks`' concern, and a quoted filename that only mentions a secret word MUST be allowed.
+`prevent-secret-writes` SHALL block a Bash command whose writer verb would create, overwrite, or delete a secret file (but see "A git rm that leaves the file on disk is allowed"), after peeling command runners (`sudo`, `env`, `nice`, `timeout`, `xargs`, `command`, `exec`, `time`). A copy from a secret file to a non-secret destination SHALL be allowed by this guard, since the read is `prevent-secret-leaks`' concern, and a quoted filename that only mentions a secret word MUST be allowed.
 
 #### Scenario: Deleting, truncating, and teeing
 - **WHEN** a Bash command runs `sudo rm ~/.ssh/id_rsa`, `truncate -s0 .env`, `tee .pgpass`, `shred .env`, or `git rm .env`
@@ -175,3 +175,33 @@ When a block names a dotenv-shaped file and `forgectl` is on PATH, the block mes
 #### Scenario: Unrelated tool
 - **WHEN** the payload's tool is `WebFetch`
 - **THEN** the hook allows
+
+### Requirement: A git rm that leaves the file on disk is allowed
+A `git rm` with `--cached` among its options takes the path out of the index and leaves the file on disk, so `prevent-secret-writes` SHALL NOT read its operands as write targets. Git reads `--cached` in any order with `-r`, `-q` and `-f`, ahead of any `--` or `--end-of-options`, and as an unambiguous prefix (`--cach`); a later `--no-cached` undoes it. The test MUST be the same one `trash-guard` reads `git rm` with.
+
+#### Scenario: Untracking a secret file
+- **WHEN** a Bash command runs `git rm --cached .env`, `git rm --cached -r .env` or `git -C . rm --cached .env`
+- **THEN** the hook allows
+
+#### Scenario: git rm that deletes the file
+- **WHEN** a Bash command runs `git rm .env`, `git rm -- --cached .env` or `git rm --cached --no-cached .env`
+- **THEN** the hook blocks
+
+#### Scenario: A deleting command beside it
+- **WHEN** a Bash command runs `git rm --cached .env; rm .env`
+- **THEN** the hook blocks
+
+### Requirement: A git rm dry run is allowed
+A `git rm` dry run prints what it would remove and changes neither the index nor the file, so `prevent-secret-writes` SHALL NOT read its operands as write targets. Git reads `-n` or `--dry-run` in any order with the other options, ahead of any `--` or `--end-of-options`. `-n` can share a word with `-r`, `-q` and `-f` (`-rn`), and `--dry-run` can be an unambiguous prefix (`--dry`); a later `--no-dry-run` undoes it.
+
+#### Scenario: Dry run of a secret file
+- **WHEN** a Bash command runs `git rm -n .env`, `git rm --dry-run .env` or `git rm -rn .env`
+- **THEN** the hook allows
+
+#### Scenario: git rm that deletes the file
+- **WHEN** a Bash command runs `git rm .env`, `git rm -- -n .env` or `git rm -n --no-dry-run .env`
+- **THEN** the hook blocks
+
+#### Scenario: A deleting command beside it
+- **WHEN** a Bash command runs `git rm -n .env; rm .env`
+- **THEN** the hook blocks

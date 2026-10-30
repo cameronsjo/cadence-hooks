@@ -9,10 +9,10 @@
 use cadence_hooks_core::shell::{
     COMMAND_RUNNERS, UNRESOLVABLE_DIR, carries_substitution, child_scripts,
     clobber_redirect_targets, command_segments, command_word, executable_tokens,
-    executable_tokens_marked, installs_trap_action, is_assignment_word, looks_absolute,
-    peel_command_runners, redirect_operator_span, redirect_targets, segment_scripts,
-    segment_work_dirs, skip_git_global_options, strip_verbatim_prefix, substitution_bodies,
-    tokenize,
+    executable_tokens_marked, git_rm_keeps_the_tree, installs_trap_action, is_assignment_word,
+    looks_absolute, peel_command_runners, redirect_operator_span, redirect_targets,
+    segment_scripts, segment_work_dirs, skip_git_global_options, strip_verbatim_prefix,
+    substitution_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -184,9 +184,8 @@ fn word_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// `prevent_secret_writes::writer_targets`. `git`'s global options sit between
 /// the verb and the subcommand, so `git -C . rm note.md` is read past them
 /// rather than resolving its subcommand to `-C` (#528 review I2). A `git rm`
-/// that is told `--cached` ([`git_rm_keeps_the_tree`]) deletes nothing from disk.
-/// `writer_targets` does not honor `--cached` yet (#1535), so the two readers
-/// disagree there: `git rm --cached .env` still blocks in prevent-secret-writes.
+/// that is told `--cached` ([`git_rm_keeps_the_tree`]) deletes nothing from disk;
+/// `writer_targets` reads it through the same core test (#1535).
 fn head_deletes(argv: &[String]) -> bool {
     let Some(first) = argv.first() else {
         return false;
@@ -197,39 +196,6 @@ fn head_deletes(argv: &[String]) -> bool {
             && skip_git_global_options(&argv[1..])
                 .split_first()
                 .is_some_and(|(sub, rest)| sub == "rm" && !git_rm_keeps_the_tree(rest)))
-}
-
-/// Does this `git rm` (the words after `rm`) take the path out of the index
-/// and leave the working-tree file alone? That is `--cached`, which git reads
-/// among the options in any order and ahead of any `--` (or `--end-of-options`),
-/// beside `-r`, `-q`, `-f`. git takes an unambiguous prefix of a long option, so
-/// `--cach` and `--c` are `--cached`, and `--no-cached` (`--no-c`) turns it
-/// off again; the last of the two wins. There is no short form, and after `--`
-/// the word is a file named `--cached`, which `git rm` does delete.
-///
-/// Only the words git reads as typed count
-/// ([`git_rm_option_words`](cadence_hooks_core::shell::git_rm_option_words)):
-/// in `git rm -f note.md $(git diff --name-only --cached)` the `--cached` is
-/// `git diff`'s, and git deletes the note (cadence-hooks#1556 review N1).
-///
-/// A word that is the value of an option such as `--pathspec-from-file` is
-/// read as an option here, which no one types. A word whose value is known only
-/// when the command runs (a substitution, an unresolved `$o`) is not read, so a
-/// `--no-cached` or `--` it would expand to goes unseen; only a crafted command
-/// spells that (cadence-ecosystem ADR-0046 rule 1).
-fn git_rm_keeps_the_tree(args: &[String]) -> bool {
-    let mut cached = false;
-    for arg in cadence_hooks_core::shell::git_rm_option_words(args) {
-        let Some(name) = arg.strip_prefix("--") else {
-            continue;
-        };
-        if "cached".starts_with(name) {
-            cached = true;
-        } else if name.len() > "no-".len() && "no-cached".starts_with(name) {
-            cached = false;
-        }
-    }
-    cached
 }
 
 /// The command a `coproc` runs, given the `argv` that starts with `coproc`
@@ -3616,6 +3582,12 @@ mod tests {
             ("git rm --cached --no-cached note.md", Block),
             ("git rm --cached --no-c note.md", Block),
             ("git rm --cached --no-ca note.md", Block),
+            // The shell drops a backslash before git reads the word, so an
+            // escaped `--no-cached` or `--` counts (cadence-hooks#1546 review).
+            (r"git rm --cached note.md \--no-cached", Block),
+            (r"git rm --cached note.md --no-cach\ed", Block),
+            (r"git rm note.md \-- --cached", Block),
+            (r"git rm \--cached note.md", Allow),
             // The rest of the command is judged as it was.
             ("git rm --cached note.md; rm note.md", Block),
             ("sh -c 'git rm --cached note.md; rm note.md'", Block),

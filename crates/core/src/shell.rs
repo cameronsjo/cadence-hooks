@@ -13831,7 +13831,12 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 /// Only a crafted command spells that, and cadence-ecosystem ADR-0046 rule 1
 /// leaves such commands out of scope. Each `git rm` option reader iterates
 /// these words in place of its raw arguments (cadence-hooks#1521).
-pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
+///
+/// Each word comes back after the shell's quote removal ([`unescape_word`]),
+/// because that is the word git gets: `\--no-cached` and `--no-cach\ed` are
+/// `--no-cached` to git, and `\--` ends its options (cadence-hooks#1546
+/// review).
+pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = Cow<'_, str>> {
     // Open `$(` (and nested `(`) count, and whether a backtick span is open,
     // carried from one word to the next.
     let mut open = 0usize;
@@ -13852,7 +13857,8 @@ pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
             }
             !inside && !word.contains("$(") && !word.contains('`')
         })
-        .take_while(|word| *word != "--" && *word != "--end-of-options")
+        .map(unescape_word)
+        .take_while(|word| word != "--" && word != "--end-of-options")
 }
 
 /// Skip `git`'s global options so the slice begins at its SUBCOMMAND.
@@ -13869,6 +13875,79 @@ pub fn git_rm_option_words(args: &[String]) -> impl Iterator<Item = &str> {
 /// was already going to run.
 pub fn skip_git_global_options(argv: &[String]) -> &[String] {
     skip_runner_flags("git", argv).unwrap_or(argv)
+}
+
+/// Does this `git rm` (the words after `rm`) take the path out of the index
+/// and leave the working-tree file alone? That is `--cached`, which git reads
+/// among the options in any order and ahead of any `--` (or `--end-of-options`),
+/// beside `-r`, `-q`, `-f`. git takes an unambiguous prefix of a long option, so
+/// `--cach` and `--c` are `--cached`, and `--no-cached` (`--no-c`) turns it
+/// off again; the last of the two wins. There is no short form, and after `--`
+/// the word is a file named `--cached`, which `git rm` does delete.
+///
+/// Shared by `obsidian-trash-guard` and `prevent_secret_writes::writer_targets`,
+/// so the two readers of `git rm` cannot disagree about it (#1535).
+///
+/// Only the words git reads as typed count ([`git_rm_option_words`]): in
+/// `git rm -f note.md $(git diff --name-only --cached)` the `--cached` is
+/// `git diff`'s, and git deletes the note (cadence-hooks#1556 review N1).
+///
+/// A word that is the value of an option such as `--pathspec-from-file` is
+/// read as an option here, which no one types. A word whose value is known only
+/// when the command runs (a substitution, an unresolved `$o`) is not read, so a
+/// `--no-cached` or `--` it would expand to goes unseen; only a crafted command
+/// spells that (cadence-ecosystem ADR-0046 rule 1).
+pub fn git_rm_keeps_the_tree(args: &[String]) -> bool {
+    let mut cached = false;
+    for arg in git_rm_option_words(args) {
+        let Some(name) = arg.strip_prefix("--") else {
+            continue;
+        };
+        if "cached".starts_with(name) {
+            cached = true;
+        } else if name.len() > "no-".len() && "no-cached".starts_with(name) {
+            cached = false;
+        }
+    }
+    cached
+}
+
+/// Is this `git rm` (the words after `rm`) a dry run, which prints what it
+/// would remove and touches neither the index nor the working tree? That is
+/// `-n` or `--dry-run`, which git reads among the options in any order and
+/// ahead of any `--` (or `--end-of-options`). `-n` can share one word with
+/// `git rm`'s other short flags (`-rn`, `-nf`), none of which takes a value.
+/// `--dry-run` takes an unambiguous prefix (`--dry`, `--d`), and
+/// `--no-dry-run` (`--no-d`) turns it off again; the last of the two wins.
+///
+/// Only `prevent_secret_writes::writer_targets` asks this (#1547).
+/// `obsidian-trash-guard` does not, so it still reads `git rm -n` as a deletion.
+///
+/// Only the words git reads as typed count ([`git_rm_option_words`]): in
+/// `git rm -f .env $(head -n 1 list.txt)` the `-n` is `head`'s, and git
+/// deletes `.env`. Each word is read after the shell's backslash removal, so
+/// `-\-no-dry-run` is `--no-dry-run` and `-\n` is `-n` (cadence-hooks#1556
+/// review).
+///
+/// A word that is the value of an option such as `--pathspec-from-file` is
+/// read as an option here, which no one types.
+pub fn git_rm_is_dry_run(args: &[String]) -> bool {
+    let mut dry_run = false;
+    for arg in git_rm_option_words(args) {
+        if let Some(name) = arg.strip_prefix("--") {
+            if "dry-run".starts_with(name) {
+                dry_run = true;
+            } else if name.len() > "no-".len() && "no-dry-run".starts_with(name) {
+                dry_run = false;
+            }
+        } else if let Some(flags) = arg.strip_prefix('-')
+            && flags.contains('n')
+            && flags.chars().all(|c| matches!(c, 'n' | 'q' | 'f' | 'r'))
+        {
+            dry_run = true;
+        }
+    }
+    dry_run
 }
 
 /// `git push` long options whose value is a SEPARATE following word.
@@ -17348,6 +17427,13 @@ mod tests {
             ("--cached -- note.md", &["--cached"]),
             ("--end-of-options --cached", &[]),
             ("$(printf -- x) --cached note.md", &["--cached", "note.md"]),
+            // Each word is the one the shell hands git (cadence-hooks#1546
+            // review): an escaped `--` still ends git's options.
+            ("--cached \\-- note.md", &["--cached"]),
+            (
+                "\\--no-cached --no-cach\\ed",
+                &["--no-cached", "--no-cached"],
+            ),
             ("", &[]),
         ];
         for &(args, want) in rows {
@@ -17355,7 +17441,7 @@ mod tests {
             assert_eq!(read.get(..2), Some(&words("git rm")[..]), "git rm {args}");
             let split: Vec<String> = args.split_whitespace().map(String::from).collect();
             for argv in [&read[2..], &split[..]] {
-                let got: Vec<&str> = git_rm_option_words(argv).collect();
+                let got: Vec<Cow<str>> = git_rm_option_words(argv).collect();
                 assert_eq!(got, want, "git rm {args}, read as {argv:?}");
             }
         }
@@ -17389,6 +17475,94 @@ mod tests {
                 Some(want_head),
                 "{command}"
             );
+        }
+    }
+
+    /// The words after `git rm`, and whether git leaves the file on disk.
+    /// Both readers of `git rm` (trash-guard, prevent-secret-writes) ask this.
+    #[test]
+    fn git_rm_keeps_the_tree_reads_cached_as_git_does() {
+        for (args, keeps) in [
+            ("--cached note.md", true),
+            ("-r --cached sub/", true),
+            ("--cached -r .", true),
+            ("note.md --cached", true),
+            ("--cached -- note.md", true),
+            ("--cach note.md", true),
+            ("--c note.md", true),
+            ("--no-cached --cached note.md", true),
+            // `--n` and `--no-` are ambiguous to git, which refuses the line.
+            ("--cached --n note.md", true),
+            ("--cached --no- note.md", true),
+            ("note.md", false),
+            ("-r sub/", false),
+            ("", false),
+            ("-- --cached", false),
+            ("--end-of-options --cached", false),
+            ("./--cached", false),
+            ("cached", false),
+            ("--cached --no-cached note.md", false),
+            ("--cached --no-c note.md", false),
+            // The shell drops each backslash before git reads the word
+            // (cadence-hooks#1546 review).
+            ("--cached note.md \\--no-cached", false),
+            ("--cached note.md --no-cach\\ed", false),
+            ("note.md \\-- --cached", false),
+            ("\\--cached note.md", true),
+            ("--cachedx note.md", false),
+        ] {
+            assert_eq!(git_rm_keeps_the_tree(&words(args)), keeps, "git rm {args}");
+        }
+    }
+
+    /// The words after `git rm`, and whether git only prints what it would
+    /// remove. Each row was run through git 2.43 against a tracked `.env`.
+    #[test]
+    fn git_rm_is_dry_run_reads_n_and_dry_run_as_git_does() {
+        for (args, dry_run) in [
+            ("-n .env", true),
+            ("--dry-run .env", true),
+            ("--dry .env", true),
+            ("--d .env", true),
+            ("-rn sub/", true),
+            ("-nr sub/", true),
+            ("-fn .env", true),
+            ("-r -q -f -n .env", true),
+            (".env -n", true),
+            (".env --dry-run", true),
+            ("-n -- .env", true),
+            ("-n --cached .env", true),
+            ("--no-dry-run -n .env", true),
+            ("--no-dry-run --dry-run .env", true),
+            // `--n` and `--no-` are ambiguous to git, which refuses the line.
+            ("--dry-run --n .env", true),
+            ("--dry-run --no- .env", true),
+            // The shell drops each backslash before git reads the word.
+            ("-\\n .env", true),
+            ("\\--dry-run .env", true),
+            ("-n \\-- .env", true),
+            ("\\-- -n .env", false),
+            (".env", false),
+            ("-f .env", false),
+            ("-rf .env", false),
+            ("", false),
+            ("--cached .env", false),
+            ("-- -n .env", false),
+            ("--end-of-options -n .env", false),
+            ("./-n .env", false),
+            ("n .env", false),
+            ("-n --no-dry-run .env", false),
+            ("--dry-run --no-dry-run .env", false),
+            ("--dry-run --no-d .env", false),
+            ("-n .env -\\-no-dry-run", false),
+            ("-n .env \\--no-dry-run", false),
+            // git refuses these lines; read as no dry run, the side that blocks.
+            ("--dry-runx .env", false),
+            ("--dry-run=1 .env", false),
+            ("-nx .env", false),
+            ("-N .env", false),
+        ] {
+            assert_eq!(git_rm_is_dry_run(&words(args)), dry_run, "git rm {args}");
         }
     }
 
