@@ -6098,7 +6098,8 @@ pub enum UnreadEval {
 /// leaves out of scope. One shape is plausible by accident: a shell helper
 /// whose output is a `cd` (a worktree switcher or directory picker run as
 /// `eval "$(tool …)"`), with a push or write chained after it, is judged in
-/// the directory it was read in.
+/// the directory it was read in. That is the gap cadence-hooks#1530 accepted
+/// when it chose this reading over blocking every such `eval`.
 fn unread_eval_operands_stay_put<'w>(
     operands: impl IntoIterator<Item = &'w str>,
     mentions: &std::collections::HashMap<String, Vec<usize>>,
