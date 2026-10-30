@@ -1519,6 +1519,7 @@ mod tests {
             "sudo git rm --cached .env",
             "git rm --cached .env && git commit -m untrack",
             "xargs git rm --cached .env",
+            r"git rm \--cached .env",
         ] {
             assert!(!bash_targets_env_file(command), "{command} must be allowed");
         }
@@ -1536,6 +1537,11 @@ mod tests {
             "git rm --end-of-options --cached .env",
             "git rm --cached --no-cached .env",
             "git rm --cached --no-c .env",
+            // The shell drops each backslash, so git reads `--no-cached`
+            // (cadence-hooks#1546 review).
+            r"git rm --cached .env \--no-cached",
+            r"git rm --cached .env --no-cach\ed",
+            r"git rm .env \-- --cached",
             "git rm --cached .env; rm .env",
             "git rm --cached .env && echo x > .env",
             "git rm --cached x.txt .env.local; git rm .env",

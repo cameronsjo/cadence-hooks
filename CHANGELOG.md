@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **`prevent-secret-writes` allows `git rm --cached` on a secret file.** It read every `git rm` as `rm`, so `git rm --cached .env`, `git rm --cached -r .env` and `git -C . rm --cached .env` blocked, though `--cached` takes the file out of the index and leaves it on disk. It now reads `git rm` through the same core test as `trash-guard`, so the two cannot disagree: `--cached` counts in any order before `--` or `--end-of-options`, as an unambiguous prefix (`--cach`), and a later `--no-cached` undoes it. `git rm .env`, `git rm -- --cached .env`, `git rm --cached --no-cached .env` and a writing or deleting command beside the `git rm --cached` still block. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
+- **`prevent-secret-writes` allows `git rm --cached` on a secret file.** It read every `git rm` as `rm`, so `git rm --cached .env`, `git rm --cached -r .env` and `git -C . rm --cached .env` blocked, though `--cached` takes the file out of the index and leaves it on disk. It now reads `git rm` through the same core test as `trash-guard`, so the two cannot disagree: `--cached` counts in any order before `--` or `--end-of-options`, as an unambiguous prefix (`--cach`), and a later `--no-cached` undoes it. Each option word is read as the shell hands it to git, so `git rm --cached .env \--no-cached` blocks; this also fixes `trash-guard`, which read the escaped word raw. `git rm .env`, `git rm -- --cached .env`, `git rm --cached --no-cached .env` and a writing or deleting command beside the `git rm --cached` still block. Part of the phase 2 guard narrowing (cameronsjo/cadence-hooks#1443).
 
 ## [0.132.1] - 2026-10-25
 
