@@ -6,5 +6,5 @@
 
 ## 2. Docs
 
-- [x] 2.1 Stage the CHANGELOG.md bullet under [Unreleased], and say in #1523's bullet that `guard-push-remote` now reads these `eval`s the same way
+- [x] 2.1 Stage the CHANGELOG.md bullet under [Unreleased], and say there that `guard-push-remote` reads these `eval`s as `guard-gh-write` does. #1523's bullet shipped in 0.132.0, so it stays as released
 - [x] 2.2 Leave docs/hooks.md as is: its guard-push-remote row names no `eval` rule
