@@ -32,12 +32,15 @@ impl Logger for Snapshot {
         };
 
         let dir = common::state_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
+        if common::create_private_dir(&dir).is_err() {
             return;
         }
 
-        if let Some(sha) = common::head_sha(input.cwd.as_deref()) {
-            let _ = std::fs::write(dir.join(format!("{session_id}.before")), sha);
+        if let Some(sha) = common::head_sha(input.cwd.as_deref())
+            && let Ok(mut file) =
+                common::open_state_marker(&dir.join(format!("{session_id}.before")), false)
+        {
+            let _ = std::io::Write::write_all(&mut file, sha.as_bytes());
         }
     }
 }

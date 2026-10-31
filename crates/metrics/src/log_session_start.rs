@@ -31,14 +31,14 @@ impl Logger for LogSessionStart {
         };
 
         let dir = common::state_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
+        if common::create_private_dir(&dir).is_err() {
             return;
         }
-
-        let _ = std::fs::write(
-            dir.join(format!("{session_id}.start")),
-            common::utc_timestamp(),
-        );
+        if let Ok(mut file) =
+            common::open_state_marker(&dir.join(format!("{session_id}.start")), false)
+        {
+            let _ = std::io::Write::write_all(&mut file, common::utc_timestamp().as_bytes());
+        }
     }
 }
 
@@ -91,6 +91,12 @@ mod tests {
 
         let marker = tmp.path().join("state").join("s1.start");
         assert!(marker.is_file(), "expected {marker:?} to exist");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the marker names a session: owner-only");
+        }
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert!(
             contents.ends_with('Z'),

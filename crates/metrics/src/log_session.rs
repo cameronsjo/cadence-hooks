@@ -29,9 +29,9 @@ impl Logger for LogSession {
     }
 
     fn run(&self, input: &MetricsInput) {
-        // Belt-and-suspenders gate: only write on SessionEnd. This fn never
-        // deletes state, but the gate keeps a misrouted event from writing a
-        // spurious row (mirrors `crates/session/src/end.rs`).
+        // Only SessionEnd: it writes the row and clears this session's
+        // per-session state, so a misrouted event must do neither (mirrors
+        // `crates/session/src/end.rs`).
         if input.hook_event_name.as_deref() != Some("SessionEnd") {
             return;
         }
@@ -43,6 +43,7 @@ impl Logger for LogSession {
         else {
             return;
         };
+        clear_session_state(&common::state_dir(), session_id);
         let Some(transcript_path) = input.transcript_path.as_deref() else {
             return;
         };
@@ -133,6 +134,18 @@ impl Logger for LogSession {
             line.push('\n');
             let _ = file.write_all(line.as_bytes());
         }
+    }
+}
+
+/// Remove the per-session markers other loggers leave under `state/`: the
+/// subagent Start times (`subagents/<session>/`) and the once-per-session
+/// bypass claims (`bypass/<session>/`). `session_id` has passed
+/// `is_safe_session_id`, so the join stays inside `state_dir`. Fail-open.
+// debt: a session that never reaches SessionEnd (crash, kill) leaves its two
+// small dirs behind; sweep them by age when `metrics rotate` lands (#1590).
+fn clear_session_state(state_dir: &std::path::Path, session_id: &str) {
+    for kind in ["subagents", "bypass"] {
+        let _ = std::fs::remove_dir_all(state_dir.join(kind).join(session_id));
     }
 }
 
@@ -232,6 +245,27 @@ mod tests {
     #[test]
     fn name_is_log_session() {
         assert_eq!(LogSession { prices_path: None }.name(), "log-session");
+    }
+
+    /// SessionEnd closes the per-session markers the subagent and bypass
+    /// loggers open, and leaves another session's alone.
+    #[test]
+    fn clear_session_state_removes_only_this_sessions_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        for (kind, session, file) in [
+            ("subagents", "s1", "a1.start"),
+            ("bypass", "s1", "enforce-worktree--CADENCE_ALLOW_MAIN"),
+            ("subagents", "s2", "a2.start"),
+        ] {
+            let dir = state.join(kind).join(session);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), "x").unwrap();
+        }
+        clear_session_state(state, "s1");
+        assert!(!state.join("subagents/s1").exists());
+        assert!(!state.join("bypass/s1").exists());
+        assert!(state.join("subagents/s2/a2.start").exists());
     }
 
     fn sample_scan() -> ScanResult {
