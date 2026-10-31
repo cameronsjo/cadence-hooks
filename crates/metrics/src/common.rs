@@ -152,6 +152,7 @@ fn parse_ledger_max_bytes(raw: Option<&str>) -> Option<u64> {
 /// Upper bound on same-second segment names tried before giving up, and the
 /// width of the zero-padded sequence (`000`-`999`). A ledger rotates once per
 /// cap's worth of rows, so even one collision is rare.
+#[cfg(unix)]
 const MAX_SEGMENT_ATTEMPTS: u32 = 1000;
 
 /// The segment `path` rotates to as the `seq`th rotation in the second
@@ -312,6 +313,7 @@ pub fn read_ledger_recent(path: &Path) -> Option<String> {
 
 /// Compact UTC stamp for a new segment, `YYYYMMDDTHHMMSSZ`, from the ledgers'
 /// shared clock.
+#[cfg(any(unix, test))]
 pub(crate) fn segment_stamp_now() -> String {
     compact_stamp(&utc_timestamp())
 }
