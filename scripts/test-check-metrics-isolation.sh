@@ -18,7 +18,7 @@ expect() {
     local envs=()
     while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift
-    out="$(env -u CLAUDE_CONFIG_DIR ${envs[@]+"${envs[@]}"} bash "$CHECK" "$@" 2>&1)"; rc=$?
+    out="$(env -u CLAUDE_CONFIG_DIR -u USERPROFILE -u HOMEDRIVE -u HOMEPATH ${envs[@]+"${envs[@]}"} bash "$CHECK" "$@" 2>&1)"; rc=$?
     if [[ "$rc" -eq "$want" ]]; then
         echo "ok   - $name"
     else
@@ -49,6 +49,18 @@ expect "default resolves to HOME/.claude" 1 "HOME=$TMP/home" --
 plant "$TMP/cfg/cadence/metrics/hooks.jsonl"
 expect "CLAUDE_CONFIG_DIR first comma entry wins" 1 "HOME=$TMP/empty" "CLAUDE_CONFIG_DIR= $TMP/cfg ,$TMP/empty" --
 expect "a later comma entry is ignored" 0 "HOME=$TMP/empty" "CLAUDE_CONFIG_DIR=$TMP/empty,$TMP/cfg" --
+expect "a blank first entry is skipped" 1 "HOME=$TMP/empty" "CLAUDE_CONFIG_DIR= ,$TMP/cfg" --
+
+plant "$TMP/tilde/x/cadence/metrics/hooks.jsonl"
+# shellcheck disable=SC2088 # the literal ~ is the input under test
+expect "~/x expands against HOME" 1 "HOME=$TMP/tilde" "CLAUDE_CONFIG_DIR=~/x" --
+mkdir -p "$TMP/bare/cadence/metrics"
+plant "$TMP/bare/cadence/metrics/hooks.jsonl"
+expect "a bare ~ is HOME" 1 "HOME=$TMP/bare" "CLAUDE_CONFIG_DIR=~" --
+expect "a glob in the value is not expanded" 0 "HOME=$TMP/empty" "CLAUDE_CONFIG_DIR=$TMP/*" --
+
+expect "USERPROFILE stands in for an unset HOME" 1 "HOME=" "USERPROFILE=$TMP/home" --
+expect "no home at all refuses" 2 "HOME=" --
 
 if [[ "$fails" -ne 0 ]]; then
     echo "$fails case(s) failed" >&2

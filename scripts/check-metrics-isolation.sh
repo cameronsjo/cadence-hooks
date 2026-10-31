@@ -10,23 +10,29 @@
 #   CONFIG_DIR defaults to the dir the binary resolves (claude_config_dir()).
 set -euo pipefail
 
-# The home dir as the binary sees it: HOME, else USERPROFILE (Windows),
-# converted to a POSIX path under Git Bash.
+# The home dir as the binary sees it (crates/core/src/paths.rs resolve_home):
+# HOME, else USERPROFILE, else HOMEDRIVE+HOMEPATH, converted to a POSIX path
+# under Git Bash.
 user_home() {
     local home="${HOME:-${USERPROFILE:-}}"
+    if [[ -z "$home" && -n "${HOMEDRIVE:-}" && -n "${HOMEPATH:-}" ]]; then
+        home="${HOMEDRIVE}${HOMEPATH}"
+    fi
     if [[ -n "$home" ]] && command -v cygpath >/dev/null 2>&1; then
         home="$(cygpath -u "$home")"
     fi
+    [[ "$home" == "/" ]] || home="${home%/}"
     printf '%s' "$home"
 }
 
 # Mirrors crates/core/src/paths.rs resolve_config_dir: the first non-empty
 # comma entry of CLAUDE_CONFIG_DIR, `~`-expanded, else <home>/.claude.
 config_dir() {
-    local home entry
+    local home entry entries
     home="$(user_home)"
-    local IFS=','
-    for entry in ${CLAUDE_CONFIG_DIR:-}; do
+    # read -a splits on the comma without pathname-expanding a * or ? in the value.
+    IFS=',' read -ra entries <<<"${CLAUDE_CONFIG_DIR:-}"
+    for entry in ${entries[@]+"${entries[@]}"}; do
         entry="${entry#"${entry%%[![:space:]]*}"}"
         entry="${entry%"${entry##*[![:space:]]}"}"
         [[ -n "$entry" ]] || continue
