@@ -70,13 +70,33 @@ pub const DEFAULT_RETENTION_DAYS: u64 = 180;
 pub const NEVER_DROP_LEDGERS: [&str; 3] = ["commits", "sessions", "plan-links"];
 /// A per-session state dir whose newest entry is older than this is swept.
 pub const STALE_SESSION_STATE_DAYS: u64 = 7;
-/// The `state/` parents whose per-session dirs the sweep may remove.
+/// The `state/` parents whose per-session dirs the sweep may remove:
+/// `subagents/<session>/` (`log-subagent` Start markers), `bypass/<session>/`
+/// (once-per-session bypass claims), and `commits/<session>/` (the per-session
+/// commit counter, cameronsjo/cadence-hooks#1599).
 pub const SESSION_STATE_PARENTS: [&str; 3] = ["subagents", "bypass", "commits"];
 /// Time the SessionStart run may spend before it stops between segments.
 pub const SESSION_START_BUDGET: Duration = Duration::from_secs(2);
+/// The SessionStart run leaves segments larger than this to `metrics rotate`
+/// run by hand, so one big segment cannot stall a session start.
+pub const SESSION_START_MAX_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// How long [`try_lock`] keeps retrying a lock that looks held. A test binary
+/// (or any multithreaded caller) that spawns a child shares the lock's open
+/// file description with that child between `fork` and `exec`, so the lock can
+/// look held for a moment with no other run alive; a real run holds it far
+/// longer than this.
+#[cfg(unix)]
+const LOCK_RETRY: Duration = Duration::from_millis(250);
+/// Slack over a segment's length that [`archive_holds`] decodes before it
+/// stops: the archived content is the segment plus at most one newline.
+const DECODE_SLACK_BYTES: u64 = 1024 * 1024;
 /// Wait after moving the live `denials` file aside before reading it, so an
 /// appender that opened the old file finishes its one write first.
 pub const QUARANTINE_GRACE: Duration = Duration::from_secs(1);
+
+/// Why `metrics rotate` refuses to run off Unix.
+pub const UNSUPPORTED: &str =
+    "needs Unix (an flock run lock); nothing was changed on this platform";
 
 const DAY_SECS: u64 = 86_400;
 /// Depth bound for the per-session mtime walk; the dirs hold flat markers.
@@ -116,6 +136,9 @@ pub struct RotateOptions<'a> {
     pub now: i64,
     /// Stop cleanly between segments once this passes.
     pub deadline: Option<Instant>,
+    /// Leave segments larger than this for a later run (the SessionStart run
+    /// sets [`SESSION_START_MAX_SEGMENT_BYTES`]; the CLI sets none).
+    pub max_segment_bytes: Option<u64>,
     /// Test fault injection.
     pub fault: Fault<'a>,
 }
@@ -131,6 +154,9 @@ pub struct RotateReport {
     pub archived: Vec<(String, String, u64)>,
     /// Per-session state dirs removed.
     pub swept: usize,
+    /// Segments past retention left for a later run because they exceed
+    /// [`RotateOptions::max_segment_bytes`].
+    pub deferred: usize,
     /// A leftover manifest was completed or rolled back first.
     pub recovered: bool,
 }
@@ -427,6 +453,7 @@ fn gzip_member(content: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 /// Decode every gzip member in `bytes`, concatenated.
+#[cfg(all(test, unix))]
 pub(crate) fn gunzip_all(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     if bytes.is_empty() {
@@ -434,6 +461,39 @@ pub(crate) fn gunzip_all(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     }
     MultiGzDecoder::new(bytes).read_to_end(&mut out)?;
     Ok(out)
+}
+
+/// Decode every gzip member in `bytes`, stopping past `cap` output bytes.
+/// `None` when the output would exceed `cap`.
+fn gunzip_capped(bytes: &[u8], cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    if bytes.is_empty() {
+        return Ok(Some(out));
+    }
+    MultiGzDecoder::new(bytes)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut out)?;
+    Ok((out.len() as u64 <= cap).then_some(out))
+}
+
+/// Refuse to grow an archive whose existing bytes do not decode to the end:
+/// gzip cannot resync past a damaged member, so every member appended after it
+/// would be unreadable while its source segment is deleted.
+fn check_archive_decodes(archive_dir: &Path, name: &str) -> std::io::Result<()> {
+    let Some(old) = read_regular(&archive_dir.join(name))? else {
+        return Ok(());
+    };
+    if old.is_empty() {
+        return Ok(());
+    }
+    std::io::copy(&mut MultiGzDecoder::new(&old[..]), &mut std::io::sink())
+        .map(|_| ())
+        .map_err(|err| {
+            io_err(format!(
+                "expected archive {name} to decode to the end before appending, found it damaged ({err}); \
+                 the segment stays in place and the archive is untouched"
+            ))
+        })
 }
 
 /// Grow `archive/<name>` by one gzip member holding `content`: old archive
@@ -445,6 +505,7 @@ fn append_member(
     content: &[u8],
     fault: Fault<'_>,
 ) -> std::io::Result<()> {
+    check_archive_decodes(archive_dir, name)?;
     let path = archive_dir.join(name);
     let old = read_regular(&path)?.unwrap_or_default();
     let tmp = archive_dir.join(format!(".{name}.tmp"));
@@ -472,10 +533,25 @@ pub(crate) fn archive_holds(archive_dir: &Path, manifest: &Manifest) -> std::io:
     if bytes.len() <= before {
         return Ok(false);
     }
-    let Ok(tail) = gunzip_all(&bytes[before..]) else {
+    // The member this move wrote decodes to the segment plus at most one
+    // newline; anything that decodes to far more is not it.
+    let cap = manifest.source_len.saturating_add(DECODE_SLACK_BYTES);
+    let Ok(Some(tail)) = gunzip_capped(&bytes[before..], cap) else {
         return Ok(false);
     };
     Ok(sha256_hex(&tail) == manifest.archived_sha256 && row_count(&tail) == manifest.rows)
+}
+
+/// Whether a manifest's names stay inside the metrics dir: `segment` is a
+/// segment name and `archive` is that ledger's monthly archive or the test-row
+/// archive. Pure.
+pub(crate) fn manifest_names_ok(manifest: &Manifest) -> bool {
+    let Some((stem, _, _)) = common::split_segment_name(&manifest.segment) else {
+        return false;
+    };
+    !manifest.segment.contains('/')
+        && (archive_month(&stem, &manifest.archive).is_some()
+            || manifest.archive == TESTROWS_ARCHIVE)
 }
 
 pub(crate) fn read_manifest(state: &Path) -> std::io::Result<Option<Manifest>> {
@@ -513,19 +589,68 @@ fn try_lock(state: &Path) -> std::io::Result<Option<std::fs::File>> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(state.join(LOCK_FILE))?;
-    // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
-    // touches no memory.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let give_up = Instant::now() + LOCK_RETRY;
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the whole call, and
+        // `flock` touches no memory.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
         let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(err);
+        }
+        // A child forked by another thread can hold the lock for a moment
+        // (see LOCK_RETRY); a real run is still running after the retries.
+        if Instant::now() >= give_up {
             return Ok(None);
         }
-        return Err(err);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Hold `state/rotate.lock` shared while `metrics cat` reads, blocking until a
+/// running archive move finishes; a rotate that starts meanwhile cannot take
+/// its exclusive lock and skips. `None` when `state/` does not exist (no run
+/// has ever started, so there is nothing to race).
+#[cfg(unix)]
+pub(crate) fn lock_shared(state: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    match std::fs::symlink_metadata(state) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(io_err(format!(
+                "expected {} to be a directory, found a symlink or file",
+                state.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(state.join(LOCK_FILE))?;
+    // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
+    // touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(Some(file))
 }
 
-// debt: no run lock off Unix (no flock), a LockFileEx scheme if a Windows machine ever runs rotate concurrently
+/// Off Unix nothing archives (see [`UNSUPPORTED`]), so there is no move to race.
+#[cfg(not(unix))]
+pub(crate) fn lock_shared(_state: &Path) -> std::io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
+// Never reached: `rotate` and `quarantine` return early off Unix (UNSUPPORTED).
 #[cfg(not(unix))]
 fn try_lock(state: &Path) -> std::io::Result<Option<std::fs::File>> {
     std::fs::OpenOptions::new()
@@ -581,10 +706,10 @@ pub(crate) fn recover(dir: &Path, fault: Fault<'_>) -> std::io::Result<bool> {
         return Ok(false);
     };
     let source = dir.join(&manifest.segment);
-    if !common::is_ledger_segment(&manifest.segment) || manifest.segment.contains('/') {
+    if !manifest_names_ok(&manifest) {
         return Err(io_err(format!(
-            "expected the rotate manifest to name a segment, found {:?}",
-            manifest.segment
+            "expected the rotate manifest to name a segment and its archive, found {:?} and {:?}",
+            manifest.segment, manifest.archive
         )));
     }
     let done = archive_holds(&archive_dir, &manifest)?;
@@ -688,6 +813,19 @@ fn rolled_up_segments(rollup: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether the file at `path`, `len` bytes long, ends without a newline.
+fn ends_mid_line(path: &Path, len: u64) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut file = open_read_nofollow(path)?;
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
 fn archive_segment(
     dir: &Path,
     name: &str,
@@ -710,8 +848,13 @@ fn archive_segment(
             out.push('\n');
         }
         if !out.is_empty() {
-            // One write, so a kill cannot leave half a segment's rollup.
-            let mut file = common::open_ledger(rollups.join(DENIALS_ROLLUP))?;
+            // One write, so a kill rarely leaves half a segment's rollup; a
+            // partial last line from one is closed off, never joined onto.
+            let rollup = rollups.join(DENIALS_ROLLUP);
+            let mut file = common::open_ledger(&rollup)?;
+            if ends_mid_line(&rollup, file.metadata()?.len())? {
+                out.insert(0, '\n');
+            }
             file.write_all(out.as_bytes())?;
             file.sync_all()?;
         }
@@ -730,6 +873,7 @@ fn archive_segment(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
         Err(err) => return Err(err),
     };
+    check_archive_decodes(&archive_dir, &archive)?;
     let manifest = Manifest {
         op: "archive".to_string(),
         segment: name.to_string(),
@@ -824,6 +968,9 @@ pub(crate) fn sweep_session_state(state: &Path, now: i64) -> (usize, Vec<String>
 /// in name order until the deadline, sweeps stale per-session state, and
 /// writes `state/rotate.last-success` only when all of it succeeded.
 pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, String> {
+    if cfg!(not(unix)) {
+        return Err(UNSUPPORTED.to_string());
+    }
     let (state, archive_dir, rollups) = dirs(dir);
     ensure_private_dir(&state).map_err(|e| format!("prepare state/: {e}"))?;
     let Some(_lock) = try_lock(&state).map_err(|e| format!("open {LOCK_FILE}: {e}"))? else {
@@ -847,6 +994,15 @@ pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, Stri
         if opts.deadline.is_some_and(|d| Instant::now() >= d) {
             report.partial = true;
             break;
+        }
+        let too_big = opts.max_segment_bytes.is_some_and(|max| {
+            std::fs::symlink_metadata(dir.join(&name)).is_ok_and(|m| m.len() > max)
+        });
+        if too_big {
+            // Left for a hand-run `metrics rotate`; the run is not complete.
+            report.deferred += 1;
+            report.partial = true;
+            continue;
         }
         match archive_segment(dir, &name, &stem, &stamp, &mut rolled_up, opts.fault) {
             Ok(Some(rows)) => {
@@ -882,9 +1038,14 @@ fn now_unix() -> i64 {
 /// `metrics rotate` (CLI): exit 0 on success or a lost lock, 1 on failure,
 /// which is also recorded in `failopen.jsonl`.
 pub fn run_rotate_cli(dir: &Path) -> u8 {
+    if cfg!(not(unix)) {
+        eprintln!("metrics rotate: {UNSUPPORTED}");
+        return 1;
+    }
     let opts = RotateOptions {
         now: now_unix(),
         deadline: None,
+        max_segment_bytes: None,
         fault: &no_fault,
     };
     match rotate(dir, &opts) {
@@ -920,7 +1081,7 @@ pub fn run_rotate_cli(dir: &Path) -> u8 {
 /// [`SESSION_START_BUDGET`], failing open. Whatever the budget leaves waits for
 /// the next day. A failure is a `failopen.jsonl` row, never an error.
 pub fn run_daily_at_session_start(dir: &Path) {
-    if !dir.is_dir() {
+    if cfg!(not(unix)) || !dir.is_dir() {
         return;
     }
     let state = dir.join("state");
@@ -945,6 +1106,7 @@ pub fn run_daily_at_session_start(dir: &Path) {
     let opts = RotateOptions {
         now: now_unix(),
         deadline: Some(Instant::now() + SESSION_START_BUDGET),
+        max_segment_bytes: Some(SESSION_START_MAX_SEGMENT_BYTES),
         fault: &no_fault,
     };
     if let Err(err) = rotate(dir, &opts) {
@@ -1030,6 +1192,7 @@ fn quarantine_segment(
         return Ok(Some(counts));
     }
     let (kept, test) = split_test_rows(&normalized(&bytes));
+    check_archive_decodes(&archive_dir, TESTROWS_ARCHIVE)?;
     let archive_len_before = std::fs::symlink_metadata(archive_dir.join(TESTROWS_ARCHIVE))
         .map(|m| m.len())
         .unwrap_or(0);
@@ -1080,6 +1243,9 @@ fn move_live_aside(_live: &Path) -> Result<Option<PathBuf>, String> {
 /// `sessionId` is not a UUID out of the live file and its segments into
 /// `archive/denials.testrows.jsonl.gz`.
 pub fn quarantine(dir: &Path, opts: &QuarantineOptions<'_>) -> Result<QuarantineReport, String> {
+    if cfg!(not(unix)) {
+        return Err(UNSUPPORTED.to_string());
+    }
     let live = dir.join("denials.jsonl");
     let mut report = QuarantineReport::default();
 
@@ -1162,6 +1328,10 @@ pub fn quarantine(dir: &Path, opts: &QuarantineOptions<'_>) -> Result<Quarantine
 /// `metrics rotate --quarantine-test-rows [--dry-run]` (CLI): exit 0 on
 /// success, 1 on failure (recorded in `failopen.jsonl` unless a dry run).
 pub fn run_quarantine_cli(dir: &Path, dry_run: bool) -> u8 {
+    if cfg!(not(unix)) {
+        eprintln!("metrics rotate: {UNSUPPORTED}");
+        return 1;
+    }
     let opts = QuarantineOptions {
         dry_run,
         grace: QUARANTINE_GRACE,
@@ -1233,6 +1403,7 @@ pub fn rotate_health(dir: &Path) -> RotateHealth {
     }
 }
 
-#[cfg(test)]
+// Unix only: off Unix `rotate` and `quarantine` refuse to run (UNSUPPORTED).
+#[cfg(all(test, unix))]
 #[path = "rotate_tests.rs"]
 mod tests;

@@ -39,8 +39,17 @@ fn opts(fault: Fault<'_>) -> RotateOptions<'_> {
     RotateOptions {
         now: NOW,
         deadline: None,
+        max_segment_bytes: None,
         fault,
     }
+}
+
+/// One clean run that must not skip: a skipped run would make every later
+/// assertion name the wrong property.
+fn run_ok(dir: &Path) -> RotateReport {
+    let report = rotate(dir, &opts(&no_fault)).unwrap();
+    assert!(!report.skipped, "expected a run, found the lock held");
+    report
 }
 
 fn lines_of(bytes: &[u8]) -> Vec<String> {
@@ -120,9 +129,14 @@ fn temp_files(dir: &Path) -> Vec<String> {
 }
 
 fn fail_at(step: Step) -> impl Fn(Step) -> std::io::Result<()> {
-    let fired = AtomicBool::new(false);
+    fail_at_nth(step, 1)
+}
+
+/// Fail at the `nth` time `step` is reached (1-based), once.
+fn fail_at_nth(step: Step, nth: usize) -> impl Fn(Step) -> std::io::Result<()> {
+    let seen = AtomicUsize::new(0);
     move |s| {
-        if s == step && !fired.swap(true, Ordering::SeqCst) {
+        if s == step && seen.fetch_add(1, Ordering::SeqCst) + 1 == nth {
             Err(std::io::Error::other(format!("injected kill after {s:?}")))
         } else {
             Ok(())
@@ -213,7 +227,7 @@ fn retention_boundaries_archive_only_segments_past_their_window() {
         expect_archived.push(write_segment(dir, stem, &days_ago(window + 1), 0, &rows));
     }
     let before = raw_rows(dir, &["denials", "commits", "skills"]);
-    let report = rotate(dir, &opts(&no_fault)).unwrap();
+    let report = run_ok(dir);
     let mut archived: Vec<String> = report.archived.iter().map(|(s, _, _)| s.clone()).collect();
     archived.sort();
     expect_archived.sort();
@@ -240,7 +254,7 @@ fn a_second_run_is_a_no_op() {
         write_segment(dir, "denials", &days_ago(120), seq, &rows);
     }
     let before = raw_rows(dir, &["denials"]);
-    let first = rotate(dir, &opts(&no_fault)).unwrap();
+    let first = run_ok(dir);
     assert_eq!(first.archived.len(), 3);
     let archive = std::fs::read(
         dir.join(ARCHIVE_DIR)
@@ -249,7 +263,7 @@ fn a_second_run_is_a_no_op() {
     .unwrap();
     let rollup = std::fs::read(dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP)).unwrap();
 
-    let second = rotate(dir, &opts(&no_fault)).unwrap();
+    let second = run_ok(dir);
     assert!(second.archived.is_empty());
     assert!(!second.recovered);
     assert_eq!(raw_rows(dir, &["denials"]), before);
@@ -272,13 +286,18 @@ fn a_second_run_is_a_no_op() {
 /// is left half done.
 #[test]
 fn a_kill_at_each_step_loses_and_duplicates_nothing() {
-    for step in [
+    // `nth` 2 kills the move of the second segment of the same month, so the
+    // archive already holds a member (`archive_len_before > 0`).
+    let cases = [
         Step::AfterRollup,
         Step::AfterManifest,
         Step::AfterArchiveTemp,
         Step::AfterArchiveRename,
         Step::AfterSourceDone,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|step| [(step, 1), (step, 2)]);
+    for (step, nth) in cases {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let mut names = Vec::new();
@@ -293,11 +312,20 @@ fn a_kill_at_each_step_loses_and_duplicates_nothing() {
             ));
         }
         let before = raw_rows(dir, &["denials"]);
-        let fault = fail_at(step);
+        let fault = fail_at_nth(step, nth);
         assert!(
             rotate(dir, &opts(&fault)).is_err(),
             "{step:?}: the kill surfaces"
         );
+        if nth == 2 {
+            let len = std::fs::metadata(
+                dir.join(ARCHIVE_DIR)
+                    .join(archive_name("denials", &days_ago(100))),
+            )
+            .unwrap()
+            .len();
+            assert!(len > 0, "{step:?}: the first segment is already archived");
+        }
         assert!(
             !dir.join("state").join(LAST_SUCCESS_FILE).exists(),
             "{step:?}: no success marker after a failed run"
@@ -307,16 +335,16 @@ fn a_kill_at_each_step_loses_and_duplicates_nothing() {
         cat.sort();
         assert_eq!(cat, before, "{step:?}: cat dedupes the half-done move");
 
-        let report = rotate(dir, &opts(&no_fault)).unwrap();
+        let report = run_ok(dir);
         assert_eq!(
             raw_rows(dir, &["denials"]),
             before,
-            "{step:?}: row multiset"
+            "{step:?} #{nth}: row multiset"
         );
         assert_eq!(
             rollup_segments(dir),
             names,
-            "{step:?}: each segment rolled up once"
+            "{step:?} #{nth}: each segment rolled up once"
         );
         let rollup_total: u64 = common::read_ledger(&dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP))
             .unwrap()
@@ -353,6 +381,7 @@ fn the_time_budget_stops_between_segments_and_withholds_the_success_marker() {
         &RotateOptions {
             now: NOW,
             deadline: Some(Instant::now()),
+            max_segment_bytes: None,
             fault: &no_fault,
         },
     )
@@ -411,7 +440,7 @@ fn a_concurrent_appender_during_rotate_loses_no_row() {
     // SAFETY: serialized against every other env-mutating test crate-wide via `common::ENV_LOCK`.
     unsafe { std::env::set_var("CADENCE_METRICS_DIR", &dir) };
     let appended = append_concurrently(&dir, || {
-        let report = rotate(&dir, &opts(&no_fault)).unwrap();
+        let report = run_ok(&dir);
         assert_eq!(report.archived.len(), 20);
     });
     // SAFETY: as above.
@@ -582,7 +611,7 @@ fn created_files_are_0600_and_dirs_0700() {
         0,
         &[denial(1, Some(UUID)), denial(2, Some("t"))],
     );
-    rotate(dir, &opts(&no_fault)).unwrap();
+    run_ok(dir);
     std::fs::write(dir.join("denials.jsonl"), format!("{}\n", denial(3, None))).unwrap();
     let q = quarantine(
         dir,
@@ -663,7 +692,7 @@ fn cat_prints_archives_then_segments_then_live() {
         0,
         &["{\"n\":1}".to_string()],
     );
-    rotate(dir, &opts(&no_fault)).unwrap();
+    run_ok(dir);
     write_segment(dir, "denials", &days_ago(10), 0, &["{\"n\":3}".to_string()]);
     write_segment(dir, "denials", &days_ago(5), 0, &["{\"n\":4}".to_string()]);
     std::fs::write(dir.join("denials.jsonl"), "{\"n\":5}").unwrap(); // no trailing newline
@@ -675,7 +704,7 @@ fn cat_prints_archives_then_segments_then_live() {
         0,
         &["{\"c\":1}".to_string()],
     );
-    rotate(dir, &opts(&no_fault)).unwrap();
+    run_ok(dir);
     assert_eq!(
         cat_rows(dir, "denials", None, false),
         [
@@ -941,4 +970,288 @@ fn a_late_append_into_the_quarantined_segment_is_kept() {
         lines_of(&std::fs::read(&path).unwrap()),
         [denial(1, Some(UUID)), late]
     );
+}
+
+// --- review hardening (cameronsjo/cadence-hooks#1600) -----------------------
+
+/// A child spawned by another thread shares the lock's open file description
+/// until it execs, so a bare non-blocking `flock` sometimes looked held with no
+/// other run alive (91 of 3000 tries in a probe). `try_lock` retries past that.
+#[test]
+fn a_concurrent_spawn_does_not_make_the_lock_look_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let spawner = {
+        let (stop, spawned) = (Arc::clone(&stop), Arc::clone(&spawned));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let _ = std::process::Command::new("/usr/bin/true").status();
+                spawned.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    while spawned.load(Ordering::SeqCst) < 5 {
+        std::thread::yield_now();
+    }
+    // Keep taking and dropping the lock across a few hundred spawns.
+    let until = spawned.load(Ordering::SeqCst) + 300;
+    let (mut tries, mut skipped) = (0, 0);
+    while spawned.load(Ordering::SeqCst) < until {
+        tries += 1;
+        if try_lock(&state).unwrap().is_none() {
+            skipped += 1;
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    spawner.join().unwrap();
+    assert_eq!(
+        skipped, 0,
+        "the lock looked held with no run alive ({skipped} of {tries})"
+    );
+}
+
+fn truncated_gzip() -> Vec<u8> {
+    let member = gzip_member(format!("{}\n", denial(9, Some(UUID))).as_bytes()).unwrap();
+    member[..member.len() - 6].to_vec()
+}
+
+#[test]
+fn a_damaged_archive_stops_the_move_and_keeps_the_segment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let stamp = days_ago(100);
+    let name = write_segment(dir, "denials", &stamp, 0, &[denial(1, Some(UUID))]);
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    let archive = dir.join(ARCHIVE_DIR).join(archive_name("denials", &stamp));
+    std::fs::write(&archive, truncated_gzip()).unwrap();
+    let damaged = std::fs::read(&archive).unwrap();
+
+    assert_eq!(run_rotate_cli(dir), 1);
+    assert!(dir.join(&name).is_file(), "the segment stays");
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        damaged,
+        "the archive is untouched"
+    );
+    assert!(dir.join("state").join(MANIFEST_FILE).metadata().is_err());
+    assert!(temp_files(dir).is_empty(), "{:?}", temp_files(dir));
+    let failopen = std::fs::read_to_string(dir.join("failopen.jsonl")).unwrap();
+    assert!(
+        failopen.contains(FAILOPEN_REASON) && failopen.contains("damaged"),
+        "{failopen}"
+    );
+}
+
+#[test]
+fn a_damaged_test_row_archive_stops_the_quarantine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let name = write_segment(dir, "denials", &days_ago(5), 0, &[denial(1, Some("t"))]);
+    let before = std::fs::read(dir.join(&name)).unwrap();
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(TESTROWS_ARCHIVE),
+        truncated_gzip(),
+    )
+    .unwrap();
+    assert!(quarantine(dir, &qopts(false, &no_fault)).is_err());
+    assert_eq!(std::fs::read(dir.join(&name)).unwrap(), before);
+    assert!(dir.join("state").join(MANIFEST_FILE).metadata().is_err());
+}
+
+/// A writer that runs `rotate` on `dir` at its first write, the moment `cat`
+/// is between reading archives and segments.
+struct RotateMidCat<'a> {
+    dir: &'a Path,
+    report: Option<RotateReport>,
+    out: Vec<u8>,
+}
+
+impl Write for RotateMidCat<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.report.is_none() {
+            self.report = Some(rotate(self.dir, &opts(&no_fault)).unwrap());
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_rotate_during_cat_skips_and_every_row_prints_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // One row archived already, so `cat` writes during the archive phase;
+    // a second segment of the same month is past retention and still waiting.
+    let stamp = days_ago(100);
+    write_segment(dir, "denials", &stamp, 0, &[denial(1, Some(UUID))]);
+    run_ok(dir);
+    write_segment(dir, "denials", &stamp, 1, &[denial(2, Some(UUID))]);
+    let mut sink = RotateMidCat {
+        dir,
+        report: None,
+        out: Vec::new(),
+    };
+    crate::ledger_cat::cat(dir, "denials", None, false, &mut sink).unwrap();
+    assert!(
+        sink.report.as_ref().is_some_and(|r| r.skipped),
+        "rotate must skip while cat holds the shared lock: {:?}",
+        sink.report
+    );
+    let mut printed = lines_of(&sink.out);
+    printed.sort();
+    let mut expect = vec![denial(1, Some(UUID)), denial(2, Some(UUID))];
+    expect.sort();
+    assert_eq!(printed, expect);
+}
+
+#[test]
+fn cat_waits_for_a_running_rotate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    write_segment(&dir, "denials", &days_ago(10), 0, &[denial(1, Some(UUID))]);
+    ensure_private_dir(&dir.join("state")).unwrap();
+    let held = try_lock(&dir.join("state")).unwrap().unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (dir, done) = (dir.clone(), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let rows = cat_rows(&dir, "denials", None, false);
+            done.store(true, Ordering::SeqCst);
+            rows
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "cat read while rotate held the lock"
+    );
+    drop(held);
+    assert_eq!(reader.join().unwrap(), [denial(1, Some(UUID))]);
+}
+
+#[test]
+fn the_session_start_bound_defers_big_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let small = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    let rows: Vec<String> = (0..40).map(|i| denial(i, Some(UUID))).collect();
+    let big = write_segment(dir, "denials", &days_ago(100), 1, &rows);
+    let report = rotate(
+        dir,
+        &RotateOptions {
+            now: NOW,
+            deadline: None,
+            max_segment_bytes: Some(1024),
+            fault: &no_fault,
+        },
+    )
+    .unwrap();
+    assert!(!report.skipped);
+    assert_eq!(report.deferred, 1);
+    assert!(report.partial);
+    assert!(!dir.join(&small).exists(), "the small segment moved");
+    assert!(dir.join(&big).is_file(), "the big one waits for a hand run");
+    assert!(!dir.join("state").join(LAST_SUCCESS_FILE).exists());
+    run_ok(dir);
+    assert!(!dir.join(&big).exists(), "the CLI run has no bound");
+}
+
+#[test]
+fn a_manifest_naming_an_outside_archive_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let name = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    let outside = dir.join("victim.tmp");
+    std::fs::write(&outside, "keep").unwrap();
+    ensure_private_dir(&dir.join("state")).unwrap();
+    let manifest = Manifest {
+        op: "archive".to_string(),
+        segment: name.clone(),
+        archive: "/../../victim".to_string(),
+        rows: 1,
+        sha256: String::new(),
+        source_len: 1,
+        archived_sha256: String::new(),
+        archive_len_before: 0,
+        kept_sha256: None,
+    };
+    assert!(!manifest_names_ok(&manifest));
+    write_manifest(&dir.join("state"), &manifest).unwrap();
+    assert!(rotate(dir, &opts(&no_fault)).is_err());
+    assert!(outside.is_file(), "nothing outside archive/ is touched");
+    assert!(dir.join(&name).is_file());
+}
+
+#[test]
+fn archive_holds_stops_decoding_past_the_segment_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive_dir = tmp.path();
+    let big = vec![b'x'; 3 * 1024 * 1024];
+    std::fs::write(
+        archive_dir.join("denials.2026-01.jsonl.gz"),
+        gzip_member(&big).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest {
+        op: "archive".to_string(),
+        segment: "denials.20260115T000000Z-000.jsonl".to_string(),
+        archive: "denials.2026-01.jsonl.gz".to_string(),
+        rows: 1,
+        sha256: String::new(),
+        source_len: 10,
+        archived_sha256: sha256_hex(&big),
+        archive_len_before: 0,
+        kept_sha256: None,
+    };
+    assert!(!archive_holds(archive_dir, &manifest).unwrap());
+    let fits = Manifest {
+        source_len: big.len() as u64,
+        ..manifest
+    };
+    assert!(
+        archive_holds(archive_dir, &fits).unwrap(),
+        "positive control"
+    );
+}
+
+#[test]
+fn a_rollup_append_never_joins_a_partial_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ensure_private_dir(&dir.join(ROLLUPS_DIR)).unwrap();
+    let rollup = dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP);
+    std::fs::write(&rollup, r#"{"day":"2026-01-01","count":1,"segm"#).unwrap();
+    write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    run_ok(dir);
+    let text = std::fs::read_to_string(&rollup).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(serde_json::from_str::<Value>(lines[1]).is_ok(), "{text}");
+}
+
+#[test]
+fn cat_since_compares_instants_not_spellings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("denials.jsonl"),
+        concat!(
+            r#"{"ts":"2026-01-12T00:00:00.500Z","n":1}"#,
+            "\n",
+            r#"{"ts":"2026-01-12T00:00:00+00:00","n":2}"#,
+            "\n",
+            r#"{"ts":"2026-01-11T23:59:59Z","n":3}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let since = crate::ledger_cat::parse_since("2026-01-12").unwrap();
+    assert_eq!(cat_rows(dir, "denials", Some(&since), false).len(), 2);
 }

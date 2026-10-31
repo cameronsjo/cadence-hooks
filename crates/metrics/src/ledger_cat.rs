@@ -49,7 +49,7 @@ enum Filter {
 
 struct Emitter<'a, W: Write> {
     out: &'a mut W,
-    since: Option<&'a str>,
+    since: Option<jiff::Timestamp>,
 }
 
 impl<W: Write> Emitter<'_, W> {
@@ -65,12 +65,14 @@ impl<W: Write> Emitter<'_, W> {
                 continue;
             }
             if let Some(since) = self.since {
+                // Parsed, so fractional seconds and `+00:00` offsets compare
+                // by instant, not by spelling.
                 let ts = serde_json::from_slice::<Value>(&line).ok().and_then(|row| {
                     row.get("ts")
                         .and_then(Value::as_str)
-                        .map(common::compact_stamp)
+                        .and_then(|ts| ts.parse::<jiff::Timestamp>().ok())
                 });
-                if !ts.is_some_and(|ts| ts.as_str() >= since) {
+                if !ts.is_some_and(|ts| ts >= since) {
                     continue;
                 }
             }
@@ -109,10 +111,15 @@ pub fn cat(
 ) -> std::io::Result<()> {
     let archive_dir = dir.join(ARCHIVE_DIR);
     let live = dir.join(format!("{ledger}.jsonl"));
+    // Shared lock for the whole read: a running archive move finishes first,
+    // and a rotate that starts meanwhile skips, so no row moves between the
+    // archive and segment phases below.
+    let _lock = rotate::lock_shared(&dir.join("state"))?;
     // A manifest left by a crash names one segment whose rows may be in two
     // places. Unreadable manifest: print everything (fail toward completeness).
     let manifest = rotate::read_manifest(&dir.join("state")).ok().flatten();
     let pending = manifest
+        .filter(rotate::manifest_names_ok)
         .filter(|m| rotate::archive_holds(&archive_dir, m).unwrap_or(false))
         .filter(|m| {
             rotate::read_regular(&dir.join(&m.segment))
@@ -121,7 +128,13 @@ pub fn cat(
                 .is_some_and(|b| rotate::sha256_hex(&b) == m.sha256)
         });
 
-    let mut emitter = Emitter { out, since };
+    let since_ts = since
+        .and_then(rotate::stamp_unix)
+        .and_then(|secs| jiff::Timestamp::from_second(secs).ok());
+    let mut emitter = Emitter {
+        out,
+        since: since_ts,
+    };
     if include_test_rows && ledger == "denials" {
         emitter.emit_gz(&archive_dir.join(TESTROWS_ARCHIVE))?;
     }
