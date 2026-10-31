@@ -299,7 +299,7 @@ fn plain_label(s: &str) -> bool {
 /// - **Active dismissals**: `armed` rows whose `expiresAt` is still ahead of
 ///   `now`, one per distinct hook.
 /// - **Used**: `used` rows in the last 24h, tallied by `kind` — this is where a
-///   `CADENCE_ALLOW_MAIN` counts first uses per session, hook, repo and agent.
+///   `CADENCE_ALLOW_MAIN` counts first uses per session, hook, working-directory repo and agent.
 ///
 /// Counts and hook names only: never a `reason`, path, or command (privacy
 /// contract of the ledger). Malformed lines are skipped (fail-open).
@@ -728,7 +728,7 @@ mod tests {
     }
 
     /// cadence-hooks#1588: `CADENCE_ALLOW_MAIN` is logged once per session,
-    /// hook, mechanism, repo and agent. Repeats collapse; each other dimension
+    /// hook, mechanism, working-directory repo and agent. Repeats collapse; each other dimension
     /// still gets its own first row.
     #[test]
     fn allow_main_used_is_logged_once_per_session_hook_mechanism_repo_and_agent() {

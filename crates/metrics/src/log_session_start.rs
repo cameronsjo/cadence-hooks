@@ -91,6 +91,12 @@ mod tests {
 
         let marker = tmp.path().join("state").join("s1.start");
         assert!(marker.is_file(), "expected {marker:?} to exist");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the marker names a session: owner-only");
+        }
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert!(
             contents.ends_with('Z'),
