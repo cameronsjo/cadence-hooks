@@ -1772,8 +1772,10 @@ fn ledger_size_findings(
                         len / (1024 * 1024)
                     ),
                     remediation: format!(
-                        "readers here load it whole; `gzip {quoted}` keeps its rows and \
-                         takes it out of what they read"
+                        "readers here load it whole until it ages past its retention \
+                         window, when `cadence-hooks metrics rotate` moves it into \
+                         `archive/`; do not gzip {quoted} by hand, which hides its rows \
+                         from `metrics cat`"
                     ),
                 };
             }
@@ -5074,7 +5076,12 @@ mod tests {
             "{}",
             f.diagnosis
         );
-        assert!(f.remediation.contains("gzip '"), "{}", f.remediation);
+        assert!(
+            f.remediation.contains("metrics rotate"),
+            "{}",
+            f.remediation
+        );
+        assert!(f.remediation.contains("do not gzip"), "{}", f.remediation);
     }
 
     #[test]
