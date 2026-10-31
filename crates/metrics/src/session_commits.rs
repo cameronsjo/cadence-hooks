@@ -7,11 +7,12 @@
 //!   increment is lost.
 //! - `last`: the newest commit row's `lastMessageId`, overwritten per commit.
 //!
-//! `log-session-start` creates an empty `count` on a fresh `startup`, so a
-//! session that never commits reads as zero without a ledger read. A session
-//! that started before this state existed, or resumed after its SessionEnd,
-//! has no `count`; `record` never creates one, and its readers fall back to
-//! the bounded ledger read. `log-session` removes the directory at `SessionEnd`, after
+//! `log-session-start` creates an empty `count` when a session starts fresh
+//! (`source` `startup` or `clear`), so a session that never commits reads as
+//! zero without a ledger read. Any other session (started before this state
+//! existed, a resume after its SessionEnd, a `compact`, no `source`) has no
+//! `count`; `record` never creates one, and its readers fall back to the
+//! bounded ledger read. `log-session` removes the directory at `SessionEnd`, after
 //! reading it. Every step is fail-open (ADR-0001): a write that fails leaves
 //! the fallback in charge.
 

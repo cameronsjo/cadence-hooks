@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Per-session cost
-`log-session-start` SHALL, on `SessionStart`, write the time to `state/<session_id>.start`, and on a `startup` create an empty `state/commits/<session_id>/count`. `log-session` SHALL, on `SessionEnd`, consume the marker, append a `sessions.jsonl` row with `repo`, `branch`, `reason`, `startTs`, `endTs`, `durationMs`, model costs, the commit count (`count`'s bytes, else the session's `commits.jsonl` rows), and `grading` (as `metrics grade`). Both MUST ignore other events and unsafe ids.
+`log-session-start` SHALL, on `SessionStart`, write the UTC time to `state/<session_id>.start`, and on `startup` or `clear` create an empty `state/commits/<session_id>/count`. `log-session` SHALL, on `SessionEnd`, consume the marker, scan the transcript, append a `sessions.jsonl` row with `repo`, `branch`, `reason`, `startTs`, `endTs`, `durationMs`, model costs, the commit count (`count`'s bytes, else `commits.jsonl`), and `grading`. Both MUST ignore other events and unsafe ids.
 
 #### Scenario: Session ends after two commits
 - **WHEN** a session with a start marker and two `commits.jsonl` rows ends

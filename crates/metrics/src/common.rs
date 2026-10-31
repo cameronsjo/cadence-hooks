@@ -1307,8 +1307,8 @@ mod tests {
         let path = tmp.path().join("subagents.jsonl");
         let pad = "x".repeat(60);
 
-        // ~85 bytes a row, 2000 rows, a 40 KB cap: several rotations, many of
-        // them inside one second, and every row must survive across the
+        // ~85 bytes a row, 2000 rows, a 40 KB cap: usually several rotations,
+        // often inside one second, and every row must survive across the
         // segments and the live file.
         std::thread::scope(|scope| {
             for t in 0..THREADS {
