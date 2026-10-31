@@ -4829,6 +4829,31 @@ mod tests {
     use cadence_hooks_core::capability::is_executable_at;
     use std::fs;
 
+    /// The only lock on `CADENCE_METRICS_DIR` in this crate's test process.
+    /// Reading an unparsable session record logs a `registry-parse-skips` row,
+    /// so a test that plants one must run inside this, or the row lands in the
+    /// operator's real ledger (cadence-hooks#1586).
+    static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_scratch_metrics_dir<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CADENCE_METRICS_DIR");
+        // SAFETY: every test here that changes this var holds METRICS_ENV_LOCK.
+        unsafe { std::env::set_var("CADENCE_METRICS_DIR", scratch.path()) };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: as above; the lock is still held.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CADENCE_METRICS_DIR", value),
+                None => std::env::remove_var("CADENCE_METRICS_DIR"),
+            }
+        }
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
     // ── Finding::render sanitization (#440) ─────────────────────────────────
 
     fn hostile_finding(text: &str) -> Finding {
@@ -8526,7 +8551,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("garbage.json"), "not json {{").unwrap();
 
-        match prune_liveness_gate(Some(&dir), None, 600, false) {
+        match with_scratch_metrics_dir(|| prune_liveness_gate(Some(&dir), None, 600, false)) {
             PruneGate::Blocked(names) => {
                 let rendered = names.join(", ");
                 assert!(
@@ -8542,7 +8567,7 @@ mod tests {
         }
         // The documented escape hatch still works.
         assert!(matches!(
-            prune_liveness_gate(Some(&dir), None, 600, true),
+            with_scratch_metrics_dir(|| prune_liveness_gate(Some(&dir), None, 600, true)),
             PruneGate::Proceed
         ));
     }
@@ -9044,7 +9069,7 @@ mod tests {
             seed(local.path(), global.path());
             assert!(
                 matches!(
-                    live_start_bound(Some(local.path()), Some(global.path()), 600),
+                    with_scratch_metrics_dir(|| live_start_bound(Some(local.path()), Some(global.path()), 600)),
                     LiveStart::Unknown(ref names) if !names.is_empty()
                 ),
                 "{label} must make the bound unknown"

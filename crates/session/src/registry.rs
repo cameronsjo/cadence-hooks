@@ -1150,7 +1150,10 @@ mod tests {
             live_peers(dir.path(), "", 600).is_empty(),
             "a future-dated record must not count as live"
         );
-        sweep_stale(dir.path(), 600, "someone-else", "test");
+        // The reap fires log_sweep; keep its row off the real metrics dir.
+        test_metrics_env::with_scratch_metrics_dir(|| {
+            sweep_stale(dir.path(), 600, "someone-else", "test");
+        });
         assert!(
             find_own(dir.path(), "future-session").is_none(),
             "and must be reapable, or it blocks forever"

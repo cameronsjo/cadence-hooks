@@ -73,6 +73,15 @@ jobs:
           CADENCE_TIMING_TESTS: '1'
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
 
+      # The runner starts with no ledgers, so any row in the default metrics
+      # dir now came from a test that logged without a scratch
+      # CADENCE_METRICS_DIR (#1586). On a workstation those rows pollute the
+      # operator's live ledgers.
+      - name: Tests leave the default metrics dir empty
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash scripts/check-metrics-isolation.sh
+
   openspec:
     # openspec/ holds the capability specs and the change proposals (#1446).
     # A spec or change that the CLI cannot parse is silently skipped by
