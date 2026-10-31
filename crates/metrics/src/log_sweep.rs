@@ -114,19 +114,19 @@ fn count_recent(jsonl: &str, cutoff: &str) -> u64 {
 }
 
 /// Count `sweeps.jsonl` rows within `window` of `now`, reading the rotated
-/// `.1` file as well as the live one.
+/// segments that can hold rows in the window as well as the live file.
 ///
 /// Fail-open: a missing/unreadable `<dir>/sweeps.jsonl`, or any unparsable
 /// row, contributes 0 / is skipped rather than erroring. Doctor visibility
 /// only — never gates anything.
 pub fn recent_sweep_count(dir: &Path, window: Duration, now: SystemTime) -> u64 {
-    let Some(contents) = common::read_ledger(&dir.join("sweeps.jsonl")) else {
-        return 0;
-    };
     let cutoff_ts =
         jiff::Timestamp::try_from(now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH))
             .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
     let cutoff = cutoff_ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let Some(contents) = common::read_ledger_since(&dir.join("sweeps.jsonl"), &cutoff) else {
+        return 0;
+    };
     count_recent(&contents, &cutoff)
 }
 
@@ -272,11 +272,15 @@ mod tests {
     }
 
     #[test]
-    fn recent_sweep_count_includes_the_rotated_dot_one_file() {
+    fn recent_sweep_count_includes_rotated_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let live = tmp.path().join("sweeps.jsonl");
         let row = format!("{{\"ts\":\"{}\"}}\n", common::utc_timestamp());
-        std::fs::write(common::rotated_ledger_path(&live), &row).unwrap();
+        std::fs::write(
+            common::ledger_segment_path(&live, &common::segment_stamp_now(), 0),
+            &row,
+        )
+        .unwrap();
         std::fs::write(&live, &row).unwrap();
         let count = recent_sweep_count(tmp.path(), Duration::from_secs(86_400), SystemTime::now());
         assert_eq!(count, 2);

@@ -272,10 +272,11 @@ pub fn summarize(contents: &str, repo: &str, now: i64) -> Option<String> {
     ))
 }
 
-/// [`summarize`] over the ledger (rotated `.1` plus live) for the repo at `cwd`.
+/// [`summarize`] over the ledger (rotated segments plus live) for the repo at `cwd`.
 /// Fail-open: a missing or unreadable ledger is `None`.
 pub fn summary_line(cwd: Option<&str>) -> Option<String> {
     let path = common::metrics_dir().join("bypasses.jsonl");
+    // debt: reads every segment because an armed dismissal can be old, bounded once cameronsjo/cadence-hooks#1590 archives segments past retention
     let contents = common::read_ledger(&path)?;
     summarize(
         &contents,
@@ -558,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_line_reads_the_rotated_dot_one_file() {
+    fn summary_line_reads_the_rotated_segments() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("rotrepo");
         std::fs::create_dir(&repo).unwrap();
@@ -571,7 +572,11 @@ mod tests {
             Some(i64::MAX / 2),
         );
         let ledger = tmp.path().join("bypasses.jsonl");
-        std::fs::write(common::rotated_ledger_path(&ledger), armed).unwrap();
+        std::fs::write(
+            common::ledger_segment_path(&ledger, "20260101T000000Z", 0),
+            armed,
+        )
+        .unwrap();
 
         let line = {
             let cwd = repo.to_string_lossy().into_owned();
@@ -581,7 +586,7 @@ mod tests {
         };
         assert!(
             line.is_some_and(|l| l.contains("enforce-worktree")),
-            "an armed dismissal only in `.1` is still reported"
+            "an armed dismissal only in a segment is still reported"
         );
     }
 

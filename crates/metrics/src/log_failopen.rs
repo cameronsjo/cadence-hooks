@@ -122,7 +122,7 @@ pub(crate) fn log_rotation_failure(ledger: &Path, error: &std::io::Error) {
         Some("metrics"),
         Some(name),
         env!("CARGO_PKG_VERSION"),
-        Some(&format!("rotate to {name}.1: {error}")),
+        Some(&format!("rotate {name} to a dated segment: {error}")),
     );
     if let Ok(mut file) = common::open_ledger(dir.join("failopen.jsonl")) {
         let mut line = record.to_string();
@@ -316,10 +316,10 @@ pub fn recent_failopen_report(
     current_version: &str,
     recency_reasons: &[&str],
 ) -> (FailopenCounts, HashMap<String, FailopenRecency>) {
-    let Some(contents) = common::read_ledger(&dir.join("failopen.jsonl")) else {
+    let cutoff = window_cutoff(now, window);
+    let Some(contents) = common::read_ledger_since(&dir.join("failopen.jsonl"), &cutoff) else {
         return (FailopenCounts::default(), HashMap::new());
     };
-    let cutoff = window_cutoff(now, window);
     let counts = counts_from(&contents, &cutoff, current_version);
     let recency = recency_reasons
         .iter()
@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_failopen_report_counts_rows_the_rotation_moved_to_dot_one() {
+    fn recent_failopen_report_counts_rows_the_rotation_moved_to_a_segment() {
         let tmp = tempfile::tempdir().unwrap();
         let live = tmp.path().join("failopen.jsonl");
         let row = |reason: &str| {
@@ -816,7 +816,11 @@ mod tests {
                 common::utc_timestamp()
             )
         };
-        std::fs::write(common::rotated_ledger_path(&live), row("panic")).unwrap();
+        std::fs::write(
+            common::ledger_segment_path(&live, &common::segment_stamp_now(), 0),
+            row("panic"),
+        )
+        .unwrap();
         std::fs::write(&live, row("parse")).unwrap();
 
         let (counts, _) = recent_failopen_report(
