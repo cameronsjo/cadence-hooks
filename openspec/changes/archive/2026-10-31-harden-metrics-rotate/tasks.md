@@ -2,7 +2,7 @@
 
 - [x] 1.1 Refuse to append to an archive that does not decode to the end
 - [x] 1.2 Shared lock for `metrics cat`
-- [x] 1.3 8 MiB per-segment bound for the SessionStart run
+- [x] 1.3 Twice-the-cap per-segment bound for the SessionStart run
 - [x] 1.4 Refuse to run off Unix
 - [x] 1.5 Retry the run lock past a forked child's brief hold
 - [x] 1.6 Validate the manifest's archive name; cap decoding in recovery

@@ -1045,6 +1045,58 @@ fn a_damaged_archive_stops_the_move_and_keeps_the_segment() {
     );
 }
 
+/// One damaged archive holds back only its own segments: another ledger's
+/// segment past retention still archives in the same run, which still
+/// reports the damage and writes no success marker.
+#[test]
+fn a_damaged_archive_holds_back_only_its_own_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let stamp = days_ago(100);
+    let held = write_segment(dir, "denials", &stamp, 0, &[denial(1, Some(UUID))]);
+    let other = write_segment(dir, "hooks", &days_ago(200), 0, &["{\"n\":1}".to_string()]);
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(archive_name("denials", &stamp)),
+        truncated_gzip(),
+    )
+    .unwrap();
+
+    assert_eq!(run_rotate_cli(dir), 1, "the damage is still reported");
+    assert!(
+        dir.join(&held).is_file(),
+        "the damaged archive's segment stays"
+    );
+    assert!(
+        !dir.join(&other).exists(),
+        "another ledger's segment still archives"
+    );
+    assert!(!dir.join("state").join(LAST_SUCCESS_FILE).exists());
+}
+
+/// `cat` reports a damaged archive and still prints every other row.
+#[test]
+fn cat_skips_a_damaged_archive_and_prints_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join("denials.2026-01.jsonl.gz"),
+        truncated_gzip(),
+    )
+    .unwrap();
+    write_segment(dir, "denials", &days_ago(5), 0, &["{\"n\":2}".to_string()]);
+    std::fs::write(dir.join("denials.jsonl"), "{\"n\":3}\n").unwrap();
+    let mut out = Vec::new();
+    let result = crate::ledger_cat::cat(dir, "denials", None, false, &mut out);
+    assert!(result.is_err(), "the damage makes the read fail");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("{\"n\":2}") && text.contains("{\"n\":3}"),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_damaged_test_row_archive_stops_the_quarantine() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1161,6 +1213,34 @@ fn the_session_start_bound_defers_big_segments() {
     assert!(!dir.join("state").join(LAST_SUCCESS_FILE).exists());
     run_ok(dir);
     assert!(!dir.join(&big).exists(), "the CLI run has no bound");
+}
+
+/// An ordinary segment is the live file just past the cap, so the SessionStart
+/// bound must let it through; only a ledger that outgrew the cap before
+/// rotation existed (the upgrade's one big segment) is deferred.
+#[test]
+fn the_session_start_bound_passes_ordinary_segments() {
+    let cap = common::DEFAULT_LEDGER_MAX_BYTES;
+    let ordinary = cap + 64 * 1024;
+    let legacy = 50 * 1024 * 1024;
+    assert!(
+        ordinary <= session_start_bound(Some(cap)),
+        "an ordinary segment passes"
+    );
+    assert!(
+        legacy > session_start_bound(Some(cap)),
+        "a 50 MiB legacy segment waits"
+    );
+    assert_eq!(
+        session_start_bound(None),
+        2 * cap,
+        "rotation off uses the default cap"
+    );
+    assert_eq!(
+        session_start_bound(Some(4 * cap)),
+        8 * cap,
+        "the bound follows a raised cap"
+    );
 }
 
 #[test]

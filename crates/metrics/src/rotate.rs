@@ -77,9 +77,24 @@ pub const STALE_SESSION_STATE_DAYS: u64 = 7;
 pub const SESSION_STATE_PARENTS: [&str; 3] = ["subagents", "bypass", "commits"];
 /// Time the SessionStart run may spend before it stops between segments.
 pub const SESSION_START_BUDGET: Duration = Duration::from_secs(2);
-/// The SessionStart run leaves segments larger than this to `metrics rotate`
-/// run by hand, so one big segment cannot stall a session start.
-pub const SESSION_START_MAX_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// The SessionStart run leaves a segment larger than twice the rotation cap
+/// (32 MiB at the default 16 MiB cap) to `metrics rotate` run by hand. A
+/// segment is the live file at the moment it crossed the cap, so an ordinary
+/// one is just over the cap and must pass; only a ledger that outgrew the cap
+/// before rotation existed is deferred, so it cannot stall a session start.
+pub const SESSION_START_SEGMENT_CAP_FACTOR: u64 = 2;
+
+/// [`SESSION_START_SEGMENT_CAP_FACTOR`] times the rotation cap; with rotation
+/// off, the factor times the default cap.
+pub fn session_start_max_segment_bytes() -> u64 {
+    session_start_bound(common::ledger_max_bytes())
+}
+
+/// Pure form of [`session_start_max_segment_bytes`] over the resolved cap.
+pub fn session_start_bound(cap: Option<u64>) -> u64 {
+    cap.unwrap_or(common::DEFAULT_LEDGER_MAX_BYTES)
+        .saturating_mul(SESSION_START_SEGMENT_CAP_FACTOR)
+}
 /// How long [`try_lock`] keeps retrying a lock that looks held. A test binary
 /// (or any multithreaded caller) that spawns a child shares the lock's open
 /// file description with that child between `fork` and `exec`, so the lock can
@@ -137,7 +152,7 @@ pub struct RotateOptions<'a> {
     /// Stop cleanly between segments once this passes.
     pub deadline: Option<Instant>,
     /// Leave segments larger than this for a later run (the SessionStart run
-    /// sets [`SESSION_START_MAX_SEGMENT_BYTES`]; the CLI sets none).
+    /// sets [`session_start_max_segment_bytes`]; the CLI sets none).
     pub max_segment_bytes: Option<u64>,
     /// Test fault injection.
     pub fault: Fault<'a>,
@@ -159,6 +174,9 @@ pub struct RotateReport {
     pub deferred: usize,
     /// A leftover manifest was completed or rolled back first.
     pub recovered: bool,
+    /// Archives found damaged; their segments were left in place and the
+    /// rest of the run went on.
+    pub damaged: Vec<String>,
 }
 
 /// The crash-recovery record for one move.
@@ -489,10 +507,15 @@ fn check_archive_decodes(archive_dir: &Path, name: &str) -> std::io::Result<()> 
     std::io::copy(&mut MultiGzDecoder::new(&old[..]), &mut std::io::sink())
         .map(|_| ())
         .map_err(|err| {
-            io_err(format!(
-                "expected archive {name} to decode to the end before appending, found it damaged ({err}); \
-                 the segment stays in place and the archive is untouched"
-            ))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "expected archive {name} to decode to the end before appending, found it damaged \
+                     ({err}); its segments stay in place and the archive is untouched. Move \
+                     {ARCHIVE_DIR}/{name} aside (for example to {name}.damaged) and run \
+                     `cadence-hooks metrics rotate` again"
+                ),
+            )
         })
 }
 
@@ -987,8 +1010,12 @@ pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, Stri
     ensure_private_dir(&rollups).map_err(|e| format!("prepare {ROLLUPS_DIR}/: {e}"))?;
     let mut rolled_up = rolled_up_segments(&rollups.join(DENIALS_ROLLUP));
 
+    let mut damage_notes: Vec<String> = Vec::new();
     for (name, stem, stamp) in all_segments(dir) {
         if !past_retention(&stem, &stamp, opts.now) {
+            continue;
+        }
+        if report.damaged.contains(&archive_name(&stem, &stamp)) {
             continue;
         }
         if opts.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -1011,14 +1038,26 @@ pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, Stri
                     .push((name.clone(), archive_name(&stem, &stamp), rows))
             }
             Ok(None) => {}
-            // Stop: a manifest may be pending, and the next move would
-            // overwrite it.
+            // A damaged archive fails before any manifest is written, so the
+            // run can leave that archive's segments and go on with the rest
+            // instead of stopping every ledger's archive until someone acts.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::InvalidData
+                    && matches!(read_manifest(&state), Ok(None)) =>
+            {
+                report.damaged.push(archive_name(&stem, &stamp));
+                report.partial = true;
+                damage_notes.push(format!("archive {name}: {err}"));
+            }
+            // Anything else stops: a manifest may be pending, and the next
+            // move would overwrite it.
             Err(err) => return Err(format!("archive {name}: {err}")),
         }
     }
 
     let (swept, errors) = sweep_session_state(&state, opts.now);
     report.swept = swept;
+    let errors: Vec<String> = damage_notes.into_iter().chain(errors).collect();
     if !errors.is_empty() {
         return Err(errors.join("; "));
     }
@@ -1106,7 +1145,7 @@ pub fn run_daily_at_session_start(dir: &Path) {
     let opts = RotateOptions {
         now: now_unix(),
         deadline: Some(Instant::now() + SESSION_START_BUDGET),
-        max_segment_bytes: Some(SESSION_START_MAX_SEGMENT_BYTES),
+        max_segment_bytes: Some(session_start_max_segment_bytes()),
         fault: &no_fault,
     };
     if let Err(err) = rotate(dir, &opts) {

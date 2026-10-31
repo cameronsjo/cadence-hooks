@@ -151,13 +151,35 @@ pub fn cat(
         })
         .unwrap_or_default();
     months.sort();
+    let mut damaged = false;
     for (month, name) in months {
         // A month's archive holds segments stamped that month, whose rows are
         // no newer than the month's end.
         if since.is_some_and(|s| month.replace('-', "").as_str() < s.get(..6).unwrap_or("")) {
             continue;
         }
-        emitter.emit_gz(&archive_dir.join(name))?;
+        // A damaged archive is reported and skipped, so the rest of the
+        // history (later archives, segments, the live file) still prints; the
+        // run still exits non-zero.
+        match emitter.emit_gz(&archive_dir.join(&name)) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                eprintln!(
+                    "metrics cat: {ARCHIVE_DIR}/{name} could not be decoded to the end ({err}); \
+                     its remaining rows are skipped. Move it aside and run \
+                     `cadence-hooks metrics rotate` again"
+                );
+                damaged = true;
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     for (stamp, path) in common::stamped_segments(&live) {
@@ -175,7 +197,14 @@ pub fn cat(
         };
         emitter.emit_file(&path, &filter)?;
     }
-    emitter.emit_file(&live, &Filter::All)
+    emitter.emit_file(&live, &Filter::All)?;
+    if damaged {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a damaged archive was skipped; every other row printed",
+        ));
+    }
+    Ok(())
 }
 
 /// `metrics cat` (CLI): exit 0 on success, 2 on a bad argument, 1 on a read

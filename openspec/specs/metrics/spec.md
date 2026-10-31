@@ -342,7 +342,7 @@ Before archiving a `denials` segment, `metrics rotate` SHALL append to `rollups/
 - **THEN** the run exits 1, `failopen.jsonl` gains a `metrics_rotate_failed` row, and nothing is written through the symlink
 
 ### Requirement: Daily archive at SessionStart
-`metrics log-session-start` SHALL run the archive at most once per UTC day. It writes `state/rotate.day` before the run, so a failed or skipped run waits for the next day. It SHALL stop between segments after 2 seconds and skip segments over 8 MiB, leaving both for a later run. A run that stops early or skips a segment MUST NOT write `state/rotate.last-success`. It MUST fail open: a failure is a `failopen.jsonl` row and never changes the hook's exit.
+`metrics log-session-start` SHALL run the archive at most once per UTC day. It writes `state/rotate.day` before the run, so a failed or skipped run waits for the next day. It SHALL stop between segments after 2 seconds and skip segments over twice the rotation cap, leaving both for a later run. A run that stops early or skips a segment MUST NOT write `state/rotate.last-success`. It MUST fail open: a failure is a `failopen.jsonl` row and never changes the hook's exit.
 
 #### Scenario: Second session the same day
 - **WHEN** a second session starts on the same UTC day
