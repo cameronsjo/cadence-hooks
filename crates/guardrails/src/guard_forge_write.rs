@@ -1822,7 +1822,7 @@ preferences:
     }
 
     /// Assignment carry-over, `repos` without an owner, a `--repo` that is a
-    /// directory, a remote tea reads differently, and `env -C`.
+    /// directory, and a remote tea reads differently.
     #[test]
     fn tea_and_glab_review_shapes() {
         let cfg = sjo_config("tea-review-shapes-config");
@@ -1883,7 +1883,27 @@ preferences:
         );
         // A remote path tea reads differently is unreadable.
         assert_eq!(outcome("tea pr create --title x", &deep), Outcome::Block);
-        // A runner's own directory flag moves tea.
+    }
+
+    /// A runner's own directory flag (`env -C`) moves tea.
+    // Embeds native paths in a POSIX shell string; Windows paths lose their
+    // backslashes to shell escaping, as in real bash.
+    #[cfg(unix)]
+    #[test]
+    fn env_dash_c_moves_the_directory_tea_runs_in() {
+        let cfg = sjo_config("tea-env-c-config");
+        let root = scratch("tea-env-c");
+        let owned_repo = root.path().join("lectern");
+        let evil = root.path().join("evil");
+        for (dir, url) in [
+            (&owned_repo, "https://git.sjo.lol/cameron/lectern.git"),
+            (&evil, "https://git.sjo.lol/evil/repo.git"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            init_repo(dir);
+            git_in(dir, &["remote", "add", "origin", url]);
+        }
+        let outcome = |cmd: &str, cwd: &Path| run_tea(cmd, Some(cwd), cfg.path()).outcome;
         let env_c = format!("env -C '{}' tea pr create --title x", evil.display());
         assert_eq!(outcome(&env_c, &owned_repo), Outcome::Block);
         let env_c = format!("env -C '{}' tea pr create --title x", owned_repo.display());
