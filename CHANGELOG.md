@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.133.0] - 2026-10-31
+
 ### Added
 
 - **The metrics ledgers rotate once they reach 16 MiB, and rotation keeps every generation.** Nothing rotated or pruned `<metrics_dir>/*.jsonl`, so `subagents.jsonl` and `denials.jsonl` had grown to tens of MiB each (cameronsjo/cadence#2074). Every ledger write now moves a ledger at or past the cap to a dated segment `<name>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl` beside it (`-000`, then `-001` for a second rotation in the same second) and starts a fresh file. A segment is never replaced: the move hard-links before unlinking, so an existing name refuses it, and it unlinks the live name only once the link is confirmed (cameronsjo/cadence-hooks#1585). Nothing deletes a segment yet; age-based archiving is cameronsjo/cadence-hooks#1590. `CADENCE_METRICS_MAX_BYTES` sets the cap in bytes; `0` turns rotation off, and an unset, empty or unparsable value keeps 16 MiB, as does anything under 1 MiB (a `16` meant as MiB would otherwise rotate on every write). Rotation is Unix-only. The first write after upgrading rotates a ledger that is already over the cap, so a 50 MiB `denials.jsonl` becomes one 50 MiB segment. Concurrent hooks are safe: the rotator takes a non-blocking `flock` on the live file and moves it only if the path still names the file it holds. A rotation error never fails or blocks a hook; it is recorded as a `ledger_rotate_failed` row in `failopen.jsonl` and the row is still appended.
