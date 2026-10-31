@@ -20,14 +20,18 @@
 //! **`tea` is read the way tea 0.16 reads itself** (cameronsjo/cadence-hooks#1601):
 //! - The repo flag is `--repo`/`-r`. `-R` is `--remote`, a git remote name.
 //!   Flags are read as tea's urfave/cli parser reads them: one or two
-//!   dashes, a name or alias, `=` or the next word.
+//!   dashes, a name or alias, `=` or the next word, and none after `--`, a
+//!   lone `-`, or a single-dash word whose second character is not a letter.
 //! - A `--repo` slug is `owner/repo` and tea keeps only its first two
 //!   segments, so `--repo host/owner/repo` names owner `host`, repo `owner`.
 //! - A slug names no host: tea sends it to its login's host. That host is
 //!   read from tea's config (the `--login` one, else every login) and from
 //!   `GITEA_INSTANCE_URL`, and the slug is owned only on all of them. A
-//!   config with a login the guard cannot read refuses; only a missing
-//!   config leaves the decision to `CADENCE_EXTRA_HOSTS`.
+//!   config with a login the guard cannot read, or one with content that
+//!   yields no login (`logins :`, JSON, a BOM), refuses; only a missing,
+//!   empty or comment-only config leaves the decision to
+//!   `CADENCE_EXTRA_HOSTS`. An assignment in front of `tea` to `HOME`,
+//!   `XDG_CONFIG_HOME` or a `GITEA_*` variable refuses.
 //! - With no `--repo`, tea uses the repo of the directory it runs in. The
 //!   guard reads that directory's git remotes (the payload `cwd` plus literal
 //!   `cd`s, narrowed by `--remote`) and allows only when every one is owned.
@@ -120,8 +124,9 @@ struct TeaFlags {
     login: Option<String>,
     /// `--remote`/`-R`: the git remote tea reads the repo from.
     remote: Option<String>,
-    /// An inline `GITEA_INSTANCE_URL=…` in front of the command.
-    instance_url: Option<String>,
+    /// An inline assignment in front of `tea` to `HOME`, `XDG_CONFIG_HOME` or
+    /// a `GITEA_*` variable, which moves tea's config or login.
+    env_override: Option<String>,
     /// `--repo`/`-r` or `--owner` was given. tea then never uses the
     /// directory's repo, so a value the guard cannot read is unresolvable
     /// rather than a reason to judge the directory instead.
@@ -261,6 +266,18 @@ fn tea_flag_word(word: &str) -> Option<(&str, Option<&str>)> {
     })
 }
 
+/// Whether tea's parser stops reading flags at `word`, so it and every later
+/// word are positionals: `--` (itself dropped), a lone `-`, or a single-dash
+/// word whose second character is not a letter (`- fixed`, `-1`, `->`), as
+/// urfave/cli v3 does.
+fn tea_flag_stop(word: &str) -> bool {
+    if word == "--" || word == "-" {
+        return true;
+    }
+    let mut chars = word.chars();
+    chars.next() == Some('-') && chars.next().is_some_and(|c| c != '-' && !c.is_alphabetic())
+}
+
 /// The value of the tea flag named by any of `names` (`--repo x`, `-repo x`,
 /// `--r=x`, `-r x`), last one wins. tea does not take a value glued to a
 /// short flag (`-rX`), so neither does this.
@@ -268,7 +285,7 @@ fn tea_flag(args: &[String], names: &[&str]) -> Option<String> {
     let mut found = None;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--" {
+        if tea_flag_stop(&args[i]) {
             break;
         }
         if let Some((name, value)) = tea_flag_word(&args[i]) {
@@ -310,7 +327,7 @@ fn tea_unknown_target_flag(args: &[String]) -> Option<String> {
     // The word after a value flag is its value (`--title "--remote fix"`),
     // so it is skipped, as tea skips it.
     let mut i = 0;
-    while i < args.len() && args[i] != "--" {
+    while i < args.len() && !tea_flag_stop(&args[i]) {
         if let Some((name, value)) = tea_flag_word(&args[i]) {
             if near_miss(name) {
                 return Some(args[i].clone());
@@ -330,8 +347,9 @@ fn tea_positionals(args: &[String]) -> Vec<&str> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "--" {
-            out.extend(args[i + 1..].iter().map(String::as_str));
+        if tea_flag_stop(a) {
+            let from = if a == "--" { i + 1 } else { i };
+            out.extend(args[from..].iter().map(String::as_str));
             break;
         }
         match tea_flag_word(a) {
@@ -579,7 +597,17 @@ fn load_tea_logins() -> TeaConfig {
     if read.is_err() || text.len() as u64 > MAX_CONFIG_BYTES {
         return TeaConfig::Unreadable;
     }
-    parse_tea_logins(&text).map_or(TeaConfig::Unreadable, TeaConfig::Logins)
+    // A config tea wrote with no login holds nothing worth reading, but one
+    // that has content and yields no login is a layout this reader does not
+    // follow (`logins :`, JSON, a BOM, an indented root), so it is refused.
+    let blank = text
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'));
+    match parse_tea_logins(&text) {
+        Some(logins) if !logins.is_empty() => TeaConfig::Logins(logins),
+        Some(_) if blank => TeaConfig::Absent,
+        _ => TeaConfig::Unreadable,
+    }
 }
 
 /// The hosts tea may send a bare `owner/repo` to. A literal `--login` picks
@@ -612,13 +640,7 @@ fn tea_slug_hosts(
         }
         _ => {
             let mut all: Vec<String> = logins.iter().map(|l| l.host.clone()).collect();
-            all.extend(
-                flags
-                    .instance_url
-                    .as_deref()
-                    .or(env_instance)
-                    .and_then(url_host),
-            );
+            all.extend(env_instance.and_then(url_host));
             all
         }
     };
@@ -766,11 +788,14 @@ fn tea_write(segment: &str, args: &[String], prefix: &[String], after_verb: &[&s
             tea_flag(args, TEA_NAME).or_else(|| after_verb.first().map(|s| s.to_string()))?;
         parse_tea_slug(&format!("{owner}/{name}"))
     });
-    let instance_url = prefix
+    let env_override = prefix
         .iter()
-        .rev()
-        .find_map(|t| t.strip_prefix("GITEA_INSTANCE_URL="))
-        .map(str::to_string);
+        .filter(|t| is_assignment_word(t))
+        .find(|t| {
+            let name = t.split('=').next().unwrap_or("");
+            matches!(name, "HOME" | "XDG_CONFIG_HOME") || name.starts_with("GITEA_")
+        })
+        .cloned();
     ForgeWrite {
         forge: Forge::Tea,
         text: segment.trim().to_string(),
@@ -778,7 +803,7 @@ fn tea_write(segment: &str, args: &[String], prefix: &[String], after_verb: &[&s
         tea: TeaFlags {
             login: tea_flag(args, TEA_LOGIN),
             remote: tea_flag(args, TEA_REMOTE),
-            instance_url,
+            env_override,
             repo_given,
             repo_value,
             dir_scoped,
@@ -848,8 +873,8 @@ fn remote_targets(listing: &str, remote: Option<&str>) -> Option<Vec<Target>> {
 /// Whether `target` is covered by the allowlists (see the module docs for the
 /// host rule). `tea_hosts` are the hosts a bare tea slug may go to; the slug
 /// is owned when it is owned on every one of them. The list is empty only when
-/// tea has no config file (or no saved login) and no `GITEA_INSTANCE_URL`;
-/// then a `CADENCE_EXTRA_HOSTS` host decides. An unreadable config never
+/// tea's config is missing, empty or comment-only and no `GITEA_INSTANCE_URL`
+/// is set; then a `CADENCE_EXTRA_HOSTS` host decides. An unreadable config never
 /// reaches here: [`tea_slug_hosts`] refuses it first.
 fn owned(forge: &Forge, target: &Target, lists: &Allowlists, tea_hosts: &[String]) -> bool {
     let check = |host: &str| {
@@ -866,8 +891,8 @@ fn owned(forge: &Forge, target: &Target, lists: &Allowlists, tea_hosts: &[String
         (Some(host), _) => check(host),
         (None, Forge::Glab) => check("gitlab.com") || lists.extra_hosts.iter().any(|h| check(h)),
         // The login hosts are where tea sends the slug, so once any is known
-        // only they decide; CADENCE_EXTRA_HOSTS is the fallback only when tea
-        // has no config file or no saved login.
+        // only they decide; CADENCE_EXTRA_HOSTS is the fallback only when
+        // tea's config is missing, empty or comment-only.
         (None, Forge::Tea) if !tea_hosts.is_empty() => tea_hosts.iter().all(|h| check(h)),
         (None, Forge::Tea) => lists.extra_hosts.iter().any(|h| check(h)),
     }
@@ -908,9 +933,12 @@ const TEA_REMOTES_UNREADABLE: &str = "with no `--repo`, tea writes to the repo o
     it runs in. The guard read that directory (the session's working directory, plus literal \
     `cd`s and `env -C`) and found no git remote it could read, or none named by `--remote`. \
     Name the repo literally with `--repo owner/repo` (tea's `-R` is `--remote`, a git remote name)";
-const TEA_INSTANCE_ELSEWHERE: &str = "`GITEA_INSTANCE_URL` is set somewhere in the command other \
-    than directly in front of this tea call, so the guard cannot tell which host tea writes to. \
-    Set it inline in front of `tea`, or pick the login with `--login`";
+const TEA_INSTANCE_ELSEWHERE: &str = "the command assigns `GITEA_INSTANCE_URL`, which can move \
+    the login tea writes with, and the guard reads only its own environment. Run tea without \
+    it, or pick the login with `--login`";
+const TEA_ENV_INLINE: &str = "an assignment in front of `tea` sets `HOME`, `XDG_CONFIG_HOME` \
+    or a `GITEA_*` variable, which moves the config or login tea uses, and the guard reads only \
+    its own environment. Run tea without it, or pick the login with `--login`";
 
 const TEA_CONFIG_UNREADABLE: &str = "tea's config has a login the guard cannot read (an \
     entry without a plain `name:` and `url:`, a list at the `logins:` key's own column, or a \
@@ -953,7 +981,10 @@ fn judge_tea(
     if write.tea.unknown_target_flag.is_some() {
         return Verdict::Unresolvable(TEA_FLAG_UNREAD);
     }
-    if instance_elsewhere && write.tea.instance_url.is_none() {
+    if write.tea.env_override.is_some() {
+        return Verdict::Unresolvable(TEA_ENV_INLINE);
+    }
+    if instance_elsewhere {
         return Verdict::Unresolvable(TEA_INSTANCE_ELSEWHERE);
     }
     let env_instance = std::env::var("GITEA_INSTANCE_URL")
@@ -1000,8 +1031,7 @@ fn judge_tea(
     // tea takes owner/repo from the remote, but `--login` or an env login
     // replaces the host it sends the write to. Then the remote's owner/repo is
     // judged as a bare slug on those login hosts, as a `--repo` slug is.
-    let login_moved =
-        write.tea.login.is_some() || write.tea.instance_url.is_some() || env_instance.is_some();
+    let login_moved = write.tea.login.is_some() || env_instance.is_some();
     let hosts = if login_moved {
         match slug_hosts() {
             Ok(hosts) => hosts,
@@ -1809,8 +1839,8 @@ preferences:
             outcome(
                 "env GITEA_INSTANCE_URL=https://gitea.example.com tea pr create --title x --login sjo"
             ),
-            Outcome::Allow,
-            "`--login` outranks the env login"
+            Outcome::Block,
+            "an inline GITEA_* assignment refuses, whatever `--login` says"
         );
         assert_eq!(
             outcome(
@@ -2232,5 +2262,156 @@ preferences:
             vec![PathBuf::from("/x/tea/config.yml")]
         );
         assert!(tea_config_candidates(None, None, true).is_empty());
+    }
+
+    /// tea stops reading flags at `--`, a lone `-`, or a single-dash word
+    /// whose second character is not a letter; every later word is a
+    /// positional, so a `--repo` after a comment body like `- fixed` is
+    /// text, and tea writes to the directory's repo.
+    #[test]
+    fn a_flag_after_tea_stops_reading_flags_is_a_positional() {
+        let cfg = sjo_config("tea-flag-stop-config");
+        let root = scratch("tea-flag-stop");
+        let unowned = root.path().join("proj");
+        std::fs::create_dir_all(&unowned).unwrap();
+        init_repo(&unowned);
+        git_in(
+            &unowned,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.sjo.lol/stranger/proj.git",
+            ],
+        );
+        git_in(
+            &unowned,
+            &[
+                "remote",
+                "add",
+                "mine",
+                "https://git.sjo.lol/cameron/proj.git",
+            ],
+        );
+        let outcome = |cmd: &str| run_tea(cmd, Some(&unowned), cfg.path()).outcome;
+        for cmd in [
+            "tea comment 5 \"- fixed in abc\" --repo cameron/x",
+            "tea comment 5 \"-1, not this way\" --repo cameron/x",
+            "tea comment 5 \"-> see #4\" --repo cameron/x",
+            "tea comment 5 - --repo cameron/x",
+            "tea comment 5 \"- hi\" --remote mine",
+            "tea comment 5 -- --repo cameron/x",
+        ] {
+            assert_eq!(outcome(cmd), Outcome::Block, "{cmd}");
+        }
+        // Before the stop word the flag still counts.
+        assert_eq!(
+            outcome("tea comment 5 --repo cameron/x \"- fixed in abc\""),
+            Outcome::Allow
+        );
+        assert!(tea_flag_stop("-1") && tea_flag_stop("- x") && tea_flag_stop("-"));
+        assert!(!tea_flag_stop("-r") && !tea_flag_stop("--repo") && !tea_flag_stop("-é"));
+    }
+
+    /// An existing tea config with content that yields no login is a layout
+    /// the guard does not read, so it refuses rather than falling back.
+    #[test]
+    fn a_config_with_content_but_no_readable_login_refuses() {
+        let (_root, repo) = owned_checkout("tea-zero-logins");
+        for config in [
+            "logins :\n    - name: far\n      url: https://far.example\n",
+            "{\"logins\":[{\"name\":\"far\",\"url\":\"https://far.example\"}]}\n",
+            "\u{feff}logins:\n    - name: far\n      url: https://far.example\n",
+            "  logins:\n    - name: far\n      url: https://far.example\n",
+            "logins: []\npreferences:\n    editor: false\n",
+        ] {
+            let r = run_with_extra_hosts(
+                "tea-zero-logins-cfg",
+                Some(config),
+                &repo,
+                "tea pr create --repo cameron/lectern",
+            );
+            assert_eq!(r.outcome, Outcome::Block, "{config:?}");
+            assert!(
+                r.message.unwrap().contains("a login the guard cannot read"),
+                "{config:?}"
+            );
+        }
+        // An empty or comment-only file holds no login: the extra host decides.
+        for config in ["", "\n# nothing\n"] {
+            let r = run_with_extra_hosts(
+                "tea-zero-logins-cfg",
+                Some(config),
+                &repo,
+                "tea pr create --repo cameron/lectern",
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "{config:?}: {:?}", r.message);
+        }
+    }
+
+    /// An assignment in front of `tea` to HOME, XDG_CONFIG_HOME or a GITEA_*
+    /// variable moves tea's config or login, so it refuses.
+    #[test]
+    fn an_inline_tea_environment_assignment_refuses() {
+        let (_root, repo) = owned_checkout("tea-inline-env");
+        for cmd in [
+            "XDG_CONFIG_HOME=/elsewhere tea pr create --repo cameron/lectern --login sjo",
+            "HOME=/elsewhere tea pr create --repo cameron/lectern --login sjo",
+            "GITEA_TOKEN=x tea pr create --repo cameron/lectern --login sjo",
+            "env GITEA_INSTANCE_URL=https://git.sjo.lol tea pr create --repo cameron/lectern --login sjo",
+        ] {
+            let r = run_with_extra_hosts("tea-inline-env-cfg", Some(TWO_LOGINS), &repo, cmd);
+            assert_eq!(r.outcome, Outcome::Block, "{cmd}");
+            assert!(
+                r.message.unwrap().contains("moves the config or login"),
+                "{cmd}"
+            );
+        }
+        let r = run_with_extra_hosts(
+            "tea-inline-env-cfg",
+            Some(TWO_LOGINS),
+            &repo,
+            "FOO=1 tea pr create --repo cameron/lectern --login sjo",
+        );
+        assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+    }
+
+    /// The near-miss check and the positional reader stop where tea does.
+    #[test]
+    fn every_tea_flag_reader_stops_where_tea_does() {
+        let (_root, repo) = owned_checkout("tea-stop-readers");
+        // `--rep` after `-` is comment text, not a near-miss flag.
+        let r = run_with_extra_hosts(
+            "tea-stop-readers-cfg",
+            Some(TWO_LOGINS),
+            &repo,
+            "tea comment 5 - --rep notes --login sjo",
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "`--rep` after `-` is text: {:?}",
+            r.message
+        );
+        let r = run_with_extra_hosts(
+            "tea-stop-readers-cfg",
+            Some(TWO_LOGINS),
+            &repo,
+            "tea comment 5 --login sjo - --rep notes",
+        );
+        assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let args = words(&["comment", "5", "- x", "--repo", "a/b"]);
+        assert_eq!(
+            tea_positionals(&args),
+            vec!["comment", "5", "- x", "--repo", "a/b"]
+        );
+        let args = words(&["comment", "5", "--", "--repo", "a/b"]);
+        assert_eq!(
+            tea_positionals(&args),
+            vec!["comment", "5", "--repo", "a/b"]
+        );
+        let args = words(&["comment", "5", "--repo", "a/b", "x"]);
+        assert_eq!(tea_positionals(&args), vec!["comment", "5", "x"]);
     }
 }
