@@ -107,7 +107,8 @@ fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBu
 /// ignored, so the append still happens.
 ///
 /// Past the size cap ([`ledger_max_bytes`]) the ledger first rotates to
-/// `<name>.jsonl.1` (cameronsjo/cadence#2074): see [`rotate_if_over_cap`]. A
+/// a dated segment `<name>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl` (cameronsjo/cadence#2074,
+/// cameronsjo/cadence-hooks#1585): see [`rotate_if_over_cap`]. A
 /// rotation problem is logged and ignored, never returned.
 pub fn open_ledger(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     open_ledger_capped(path.as_ref(), ledger_max_bytes())
@@ -118,16 +119,15 @@ pub fn open_ledger(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
 /// [`DEFAULT_LEDGER_MAX_BYTES`].
 pub const LEDGER_MAX_BYTES_ENV: &str = "CADENCE_METRICS_MAX_BYTES";
 
-/// Default rotation cap: 16 MiB per ledger, so at most about 32 MiB of one
-/// ledger (live plus `.1`) stays on disk. A few hundred bytes a row, that is
-/// tens of thousands of rows, past what any reader here needs, and small
-/// enough that a reader's `read_to_string` stays cheap.
+/// Default rotation cap: 16 MiB per ledger file. Rotation never deletes a
+/// segment, so history is kept whole; the cap only bounds the size of each file
+/// a reader loads.
 pub const DEFAULT_LEDGER_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Smallest cap honored. Anything lower is almost certainly a unit slip (`16`
 /// meaning 16 MiB), and at a few hundred bytes a row it would rotate on every
-/// write and leave each ledger holding about two rows, erasing the audit
-/// ledgers with no trace. A lower value keeps [`DEFAULT_LEDGER_MAX_BYTES`].
+/// write, scattering each ledger across thousands of two-row segments. A lower
+/// value keeps [`DEFAULT_LEDGER_MAX_BYTES`].
 pub const MIN_LEDGER_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The rotation cap in bytes, or `None` when `CADENCE_METRICS_MAX_BYTES=0`
@@ -149,55 +149,263 @@ fn parse_ledger_max_bytes(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Where `path` rotates to: the same name with `.1` appended.
-pub fn rotated_ledger_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".1");
-    PathBuf::from(name)
+/// Upper bound on same-second segment names tried before giving up, and the
+/// width of the zero-padded sequence (`000`-`999`). A ledger rotates once per
+/// cap's worth of rows, so even one collision is rare.
+const MAX_SEGMENT_ATTEMPTS: u32 = 1000;
+
+/// The segment `path` rotates to as the `seq`th rotation in the second
+/// `stamp` (compact UTC, `YYYYMMDDTHHMMSSZ`): `denials.jsonl` →
+/// `denials.<stamp>-<seq as 3 digits>.jsonl`, in the same directory. The fixed
+/// width makes byte order of the names equal their time order, so a script
+/// can read `<stem>.*.jsonl` sorted by name, then the live file.
+pub fn ledger_segment_path(path: &Path, stamp: &str, seq: u32) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    debug_assert!(
+        name.ends_with(".jsonl"),
+        "ledger names end in .jsonl: {name}"
+    );
+    let stem = name.strip_suffix(".jsonl").unwrap_or(name);
+    path.with_file_name(format!("{stem}.{stamp}-{seq:03}.jsonl"))
 }
 
-/// Read a ledger as one string, oldest rows first: the rotated `.1` file, then
-/// the live file. `None` when neither can be read.
-///
-/// Every reader that wants history uses this instead of reading the live path,
-/// or it loses everything written before the last rotation. A rotation landing
-/// between the two reads can leave the just-rotated rows out of this one read;
-/// the next read sees them in `.1`.
-pub fn read_ledger(path: &Path) -> Option<String> {
-    // Regular files only: a FIFO at either path would block the read.
+/// Sort key of a rotated segment of the ledger named `ledger_name`
+/// (`denials.jsonl`), or `None` when `candidate` is not one: the stamp, then
+/// the sequence, oldest first. Pure.
+fn segment_sort_key(ledger_name: &str, candidate: &str) -> Option<(String, u32)> {
+    let stem = ledger_name.strip_suffix(".jsonl")?;
+    let (stamp, seq) = candidate
+        .strip_prefix(stem)?
+        .strip_prefix('.')?
+        .strip_suffix(".jsonl")?
+        .split_once('-')?;
+    if !(is_segment_stamp(stamp) && seq.len() == 3 && seq.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    Some((stamp.to_string(), seq.parse().ok()?))
+}
+
+/// `YYYYMMDDTHHMMSSZ`. Pure.
+fn is_segment_stamp(stamp: &str) -> bool {
+    let b = stamp.as_bytes();
+    b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
+}
+
+/// Compact form of an ISO 8601 UTC timestamp (`2026-10-31T03:14:02Z` →
+/// `20261031T031402Z`), comparable with segment stamps. Pure.
+fn compact_stamp(iso: &str) -> String {
+    iso.chars().filter(|c| !matches!(c, '-' | ':')).collect()
+}
+
+/// Whether `file_name` is a rotated segment of some ledger
+/// (`<stem>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl`), as opposed to a live ledger. Pure.
+pub fn is_ledger_segment(file_name: &str) -> bool {
+    file_name
+        .strip_suffix(".jsonl")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .filter(|(stem, _)| !stem.is_empty())
+        .is_some_and(|(stem, _)| segment_sort_key(&format!("{stem}.jsonl"), file_name).is_some())
+}
+
+/// Every rotated segment of the ledger at `path` with its stamp, oldest
+/// first. Regular files only, not followed through a symlink (the writers open
+/// with `O_NOFOLLOW`, and a FIFO would block the read). Empty when the
+/// directory is unreadable.
+fn stamped_segments(path: &Path) -> Vec<(String, PathBuf)> {
+    let Some(ledger_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut segments: Vec<((String, u32), PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let key = segment_sort_key(ledger_name, entry.file_name().to_str()?)?;
+            entry
+                .file_type()
+                .ok()
+                .filter(std::fs::FileType::is_file)
+                .map(|_| (key, entry.path()))
+        })
+        .collect();
+    segments.sort();
+    segments
+        .into_iter()
+        .map(|((stamp, _), path)| (stamp, path))
+        .collect()
+}
+
+/// Every rotated segment of the ledger at `path`, oldest first.
+pub fn ledger_segments(path: &Path) -> Vec<PathBuf> {
+    stamped_segments(path).into_iter().map(|(_, p)| p).collect()
+}
+
+/// Read `parts` in order and join them, never fusing a part that lacks a
+/// trailing newline with the next. Regular files only, not through a symlink.
+/// `None` when nothing can be read.
+fn read_joined<'a>(parts: impl Iterator<Item = &'a Path>) -> Option<String> {
     let read = |p: &Path| {
-        std::fs::metadata(p)
+        std::fs::symlink_metadata(p)
             .ok()
             .filter(std::fs::Metadata::is_file)
             .and_then(|_| std::fs::read_to_string(p).ok())
     };
-    let older = read(&rotated_ledger_path(path));
-    let live = read(path);
-    match (older, live) {
-        (None, None) => None,
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (Some(mut older), Some(live)) => {
-            if !older.is_empty() && !older.ends_with('\n') {
-                older.push('\n');
+    let mut all: Option<String> = None;
+    for part in parts.filter_map(read) {
+        let joined = all.get_or_insert_with(String::new);
+        if !joined.is_empty() && !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined.push_str(&part);
+    }
+    all
+}
+
+/// Read a ledger as one string, oldest rows first: every rotated segment in
+/// time order, then the live file. `None` when nothing can be read.
+///
+/// This reads the ledger's whole history, so prefer [`read_ledger_since`] or
+/// [`read_ledger_recent`] where the caller only needs a window. A rotation
+/// landing between the directory listing and the live read can leave the
+/// just-rotated rows out of this one read; the next read sees them in their
+/// segment.
+pub fn read_ledger(path: &Path) -> Option<String> {
+    let segments = ledger_segments(path);
+    read_joined(
+        segments
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(path)),
+    )
+}
+
+/// [`read_ledger`], skipping segments that can hold no row at or after
+/// `since` (an ISO 8601 UTC timestamp). A segment holds rows written before it
+/// was stamped, so one stamped before `since` is skipped whole. The caller
+/// still filters rows by `ts`.
+pub fn read_ledger_since(path: &Path, since: &str) -> Option<String> {
+    let since = compact_stamp(since);
+    let segments = stamped_segments(path);
+    read_joined(
+        segments
+            .iter()
+            .filter(|(stamp, _)| *stamp >= since)
+            .map(|(_, p)| p.as_path())
+            .chain(std::iter::once(path)),
+    )
+}
+
+/// The newest rotated segment, then the live file: the recent rows a
+/// per-session lookup needs, at a bounded cost (at most about twice the cap).
+pub fn read_ledger_recent(path: &Path) -> Option<String> {
+    let newest = ledger_segments(path).pop();
+    read_joined(newest.as_deref().into_iter().chain(std::iter::once(path)))
+}
+
+/// Compact UTC stamp for a new segment, `YYYYMMDDTHHMMSSZ`, from the ledgers'
+/// shared clock.
+pub(crate) fn segment_stamp_now() -> String {
+    compact_stamp(&utc_timestamp())
+}
+
+/// Whether a failed `link(2)` means this filesystem cannot hard-link, so the
+/// rename fallback applies. Any other error is a real failure to report.
+#[cfg(unix)]
+fn link_unsupported(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+    ) || err.raw_os_error() == Some(libc::EMLINK)
+}
+
+/// Move the live ledger at `path` to a new segment stamped `stamp` without
+/// ever replacing an existing file (cameronsjo/cadence-hooks#1585).
+///
+/// `link(2)` refuses an existing name, so link-then-unlink is a rename that
+/// cannot clobber an older segment. The live name is unlinked only after the
+/// segment is confirmed to be the same inode, and a failed unlink removes the
+/// new link again, so the ledger is never left under two names (which would
+/// count every row twice). A reader listing the directory between the link
+/// and the unlink can still see the rows twice in that one read.
+///
+/// Where the filesystem cannot hard-link, fall back to `rename` onto a name
+/// checked free. The caller's lock on the live inode keeps any other rotator
+/// of this generation out, so the check races only a rotator of another
+/// generation in the same second.
+/// debt: check-then-rename can replace a segment on a filesystem without hard links, renamex_np(RENAME_EXCL) / renameat2(RENAME_NOREPLACE) if a ledger ever lives on one
+#[cfg(unix)]
+fn rotate_aside(path: &Path, stamp: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for seq in 0..MAX_SEGMENT_ATTEMPTS {
+        let candidate = ledger_segment_path(path, stamp, seq);
+        match std::fs::hard_link(path, &candidate) {
+            Ok(()) => {
+                let same = match (
+                    std::fs::symlink_metadata(path),
+                    std::fs::symlink_metadata(&candidate),
+                ) {
+                    (Ok(live), Ok(seg)) => live.ino() == seg.ino() && live.dev() == seg.dev(),
+                    _ => false,
+                };
+                let unlinked = if same {
+                    std::fs::remove_file(path)
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "expected {} to be the live ledger's inode after linking, found another file",
+                        candidate.display()
+                    )))
+                };
+                return match unlinked {
+                    Ok(()) => Ok(()),
+                    // Someone else moved the live name aside: the segment is
+                    // the only name left, which is the goal.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&candidate);
+                        Err(err)
+                    }
+                };
             }
-            older.push_str(&live);
-            Some(older)
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) if link_unsupported(&err) => match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return std::fs::rename(path, &candidate);
+                }
+                Err(err) => return Err(err),
+            },
+            Err(err) => return Err(err),
         }
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "expected a free segment name for stamp {stamp}, found all {MAX_SEGMENT_ATTEMPTS} taken"
+        ),
+    ))
 }
 
 pub(crate) fn open_ledger_capped(path: &Path, cap: Option<u64>) -> std::io::Result<std::fs::File> {
     let file = open_append(path)?;
     #[cfg(unix)]
     if let Some(cap) = cap {
-        return Ok(rotate_if_over_cap(path, file, cap));
+        return Ok(rotate_if_over_cap(path, file, cap, segment_stamp_now));
     }
     #[cfg(not(unix))]
     let _ = cap; // debt: no rotation off Unix (rename-over-open-file semantics differ), flock-free Windows scheme if a Windows ledger ever reaches the doctor warning
     Ok(file)
 }
 
-/// Rotate `path` to `<path>.1` when the already-open `file` is at or past `cap`,
+/// Rotate `path` to a new dated segment ([`rotate_aside`]) when the already-open `file` is at or past `cap`,
 /// and return the handle to append to.
 ///
 /// Safe with several hook processes at once:
@@ -205,15 +413,20 @@ pub(crate) fn open_ledger_capped(path: &Path, cap: Option<u64>) -> std::io::Resu
 ///   loses the race skips rotation and appends as before.
 /// - Under the lock the rotator renames only if the path still names the inode
 ///   it holds, so a process that opened the old file before another rotated it
-///   cannot rename the fresh file over `.1` and drop a whole generation.
-/// - `rename` replaces any older `.1` atomically. A process still holding the
-///   old inode finishes its single `O_APPEND` write into `.1`, the same
+///   cannot rotate the fresh file out from under a newer generation.
+/// - The move never replaces an existing segment. A process still holding the
+///   old inode finishes its single `O_APPEND` write into the segment, the same
 ///   in-flight write a plain archive would catch.
 ///
 /// Every failure returns a usable handle (ADR-0001) and is recorded in
 /// `failopen.jsonl`.
 #[cfg(unix)]
-fn rotate_if_over_cap(path: &Path, file: std::fs::File, cap: u64) -> std::fs::File {
+fn rotate_if_over_cap(
+    path: &Path,
+    file: std::fs::File,
+    cap: u64,
+    stamp: impl FnOnce() -> String,
+) -> std::fs::File {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 
@@ -234,7 +447,7 @@ fn rotate_if_over_cap(path: &Path, file: std::fs::File, cap: u64) -> std::fs::Fi
     }
     let renamed = match std::fs::symlink_metadata(path) {
         Ok(on_disk) if on_disk.ino() == held.ino() && on_disk.dev() == held.dev() => {
-            std::fs::rename(path, rotated_ledger_path(path))
+            rotate_aside(path, &stamp())
         }
         // The path names a different inode: another process already rotated.
         Ok(_) => Ok(()),
@@ -757,10 +970,69 @@ mod tests {
     }
 
     #[test]
-    fn rotated_path_appends_dot_one() {
+    fn segment_path_keeps_the_ledger_stem_and_directory() {
         assert_eq!(
-            rotated_ledger_path(Path::new("/m/denials.jsonl")),
-            PathBuf::from("/m/denials.jsonl.1")
+            ledger_segment_path(Path::new("/m/denials.jsonl"), "20261031T031402Z", 0),
+            PathBuf::from("/m/denials.20261031T031402Z-000.jsonl")
+        );
+        assert_eq!(
+            ledger_segment_path(Path::new("/m/plan-links.jsonl"), "20261031T031402Z", 12),
+            PathBuf::from("/m/plan-links.20261031T031402Z-012.jsonl")
+        );
+    }
+
+    #[test]
+    fn segment_names_parse_and_sort_oldest_first() {
+        let key = |c: &str| segment_sort_key("denials.jsonl", c);
+        assert_eq!(
+            key("denials.20261031T031402Z-000.jsonl"),
+            Some(("20261031T031402Z".to_string(), 0))
+        );
+        assert_eq!(
+            key("denials.20261031T031402Z-012.jsonl"),
+            Some(("20261031T031402Z".to_string(), 12))
+        );
+        // Name order is read order: a script sorting `<stem>.*.jsonl` by name
+        // reads them in the same order `read_ledger` does.
+        let mut names = vec![
+            "denials.20261101T000000Z-000.jsonl",
+            "denials.20261031T031402Z-010.jsonl",
+            "denials.20261031T031402Z-009.jsonl",
+            "denials.20261031T031402Z-000.jsonl",
+        ];
+        let mut by_key = names.clone();
+        names.sort_unstable();
+        by_key.sort_by_key(|n| key(n));
+        assert_eq!(names, by_key);
+        for not_a_segment in [
+            "denials.jsonl",
+            "denials.20261031T031402Z.jsonl",
+            "denials.20261031T031402Z-9.jsonl",
+            "denials.20261031T031402Z-1000.jsonl",
+            "denials.jsonl.1",
+            "denials.archived.jsonl",
+            "denials.20261031T031402Z-000.jsonl.gz",
+            "denials.20261031T031402-000.jsonl",
+            "denials.20261031T031402Z-.jsonl",
+            "denials.20261031T031402Z-00x.jsonl",
+            "subagents.20261031T031402Z-000.jsonl",
+            // Another ledger whose name starts with this one's stem.
+            "denials-extra.20261031T031402Z-000.jsonl",
+        ] {
+            assert_eq!(key(not_a_segment), None, "{not_a_segment}");
+        }
+        assert!(is_ledger_segment("denials.20261031T031402Z-000.jsonl"));
+        assert!(is_ledger_segment("plan-links.20261031T031402Z-003.jsonl"));
+        assert!(!is_ledger_segment("denials.jsonl"));
+        assert!(!is_ledger_segment(".20261031T031402Z-000.jsonl"));
+    }
+
+    #[test]
+    fn segment_stamp_now_is_compact_utc() {
+        assert!(
+            is_segment_stamp(&segment_stamp_now()),
+            "{}",
+            segment_stamp_now()
         );
     }
 
@@ -771,36 +1043,80 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn segment_contents(path: &Path) -> Vec<String> {
+        ledger_segments(path)
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn ledger_at_the_cap_rotates_to_dot_one() {
+    fn ledger_at_the_cap_rotates_to_a_dated_segment() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("denials.jsonl");
         std::fs::write(&path, "old-1\nold-2\n").unwrap();
 
         append_rotating(&path, Some(12), "new\n");
 
-        assert_eq!(
-            std::fs::read_to_string(rotated_ledger_path(&path)).unwrap(),
-            "old-1\nold-2\n"
+        let segments = ledger_segments(&path);
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert!(
+            is_ledger_segment(segments[0].file_name().unwrap().to_str().unwrap()),
+            "{segments:?}"
         );
+        assert_eq!(segment_contents(&path), ["old-1\nold-2\n"]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
-        assert_eq!(mode_of(&rotated_ledger_path(&path)), 0o600);
+        assert_eq!(mode_of(&segments[0]), 0o600);
         assert_eq!(mode_of(&path), 0o600);
     }
 
+    /// The cameronsjo/cadence-hooks#1585 regression: a second rotation must
+    /// keep the first generation, even inside the same second.
     #[cfg(unix)]
     #[test]
-    fn rotation_replaces_an_older_dot_one() {
+    fn rotations_keep_every_generation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("denials.jsonl");
-        std::fs::write(rotated_ledger_path(&path), "ancient\n").unwrap();
-        std::fs::write(&path, "recent\n").unwrap();
+        std::fs::write(&path, "gen-1\n").unwrap();
 
-        append_rotating(&path, Some(7), "new\n");
+        append_rotating(&path, Some(6), "gen-2\n"); // rotates gen-1
+        append_rotating(&path, Some(6), "gen-3\n"); // rotates gen-2
+        append_rotating(&path, Some(6), "gen-4\n"); // rotates gen-3
+
+        assert_eq!(segment_contents(&path), ["gen-1\n", "gen-2\n", "gen-3\n"]);
+        assert_eq!(
+            read_ledger(&path).as_deref(),
+            Some("gen-1\ngen-2\ngen-3\ngen-4\n")
+        );
+    }
+
+    /// An existing segment at the stamp's name is never replaced: the next
+    /// sequence number is used instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_taken_segment_name_moves_to_the_next_sequence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("denials.jsonl");
+        let stamp = "20260101T000000Z";
+        std::fs::write(ledger_segment_path(&path, stamp, 0), "earlier\n").unwrap();
+        std::fs::write(&path, "later\n").unwrap();
+
+        let held = open_append(&path).unwrap();
+        let mut handle = rotate_if_over_cap(&path, held, 1, || stamp.to_string());
+        handle.write_all(b"live\n").unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(rotated_ledger_path(&path)).unwrap(),
-            "recent\n"
+            std::fs::read_to_string(ledger_segment_path(&path, stamp, 0)).unwrap(),
+            "earlier\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ledger_segment_path(&path, stamp, 1)).unwrap(),
+            "later\n"
+        );
+        assert_eq!(
+            read_ledger(&path).as_deref(),
+            Some("earlier\nlater\nlive\n")
         );
     }
 
@@ -814,8 +1130,16 @@ mod tests {
         append_rotating(&path, Some(7), "a\n"); // 6 bytes held < 7
         append_rotating(&path, None, "b\n");
 
-        assert!(!rotated_ledger_path(&path).exists());
+        assert!(ledger_segments(&path).is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "12345\na\nb\n");
+    }
+
+    /// Fill every name a rotation stamped `stamp` could take, so it fails.
+    #[cfg(unix)]
+    fn take_every_segment_name(path: &Path, stamp: &str) {
+        for seq in 0..MAX_SEGMENT_ATTEMPTS {
+            std::fs::write(ledger_segment_path(path, stamp, seq), "").unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -824,12 +1148,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("denials.jsonl");
         std::fs::write(&path, "old\n").unwrap();
-        // A non-empty directory at `.1` makes the rename fail.
-        let blocker = rotated_ledger_path(&path);
-        std::fs::create_dir(&blocker).unwrap();
-        std::fs::write(blocker.join("keep"), "x").unwrap();
+        let stamp = "20260101T000000Z";
+        take_every_segment_name(&path, stamp);
 
-        append_rotating(&path, Some(1), "new\n");
+        let held = open_append(&path).unwrap();
+        let mut handle = rotate_if_over_cap(&path, held, 1, || stamp.to_string());
+        handle.write_all(b"new\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
         let logged = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
@@ -844,21 +1168,22 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("failopen.jsonl");
         std::fs::write(&path, "old\n").unwrap();
-        let blocker = rotated_ledger_path(&path);
-        std::fs::create_dir(&blocker).unwrap();
-        std::fs::write(blocker.join("keep"), "x").unwrap();
+        let stamp = "20260101T000000Z";
+        take_every_segment_name(&path, stamp);
 
-        append_rotating(&path, Some(1), "new\n");
+        let held = open_append(&path).unwrap();
+        let mut handle = rotate_if_over_cap(&path, held, 1, || stamp.to_string());
+        handle.write_all(b"new\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
     }
 
     /// A process that opened the ledger before another rotated it still holds
-    /// the old inode (now `.1`). Rotating from that stale handle must not
-    /// rename the fresh live file over `.1`.
+    /// the old inode (now a segment). Rotating from that stale handle must not
+    /// move the fresh live file aside.
     #[cfg(unix)]
     #[test]
-    fn a_stale_handle_does_not_clobber_the_rotated_generation() {
+    fn a_stale_handle_does_not_rotate_the_newer_generation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("denials.jsonl");
         std::fs::write(&path, "generation-one\n").unwrap();
@@ -866,13 +1191,13 @@ mod tests {
 
         append_rotating(&path, Some(5), "generation-two\n"); // rotates
 
-        let mut handle = rotate_if_over_cap(&path, stale, 5);
+        let mut handle = rotate_if_over_cap(&path, stale, 5, segment_stamp_now);
         handle.write_all(b"from-stale\n").unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(rotated_ledger_path(&path)).unwrap(),
-            "generation-one\n",
-            ".1 must survive the stale rotator"
+            segment_contents(&path),
+            ["generation-one\n"],
+            "one segment, untouched by the stale rotator"
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -901,7 +1226,7 @@ mod tests {
         append_rotating(&path, Some(5), "mine\n");
 
         assert!(
-            !rotated_ledger_path(&path).exists(),
+            ledger_segments(&path).is_empty(),
             "no rotation under a held lock"
         );
         assert_eq!(
@@ -916,7 +1241,7 @@ mod tests {
 
         // Control: once the lock is free the same call rotates.
         append_rotating(&path, Some(5), "later\n");
-        assert!(rotated_ledger_path(&path).exists());
+        assert_eq!(ledger_segments(&path).len(), 1);
     }
 
     /// `doctor`'s remediation moves the ledger aside by hand; a writer that had
@@ -930,38 +1255,42 @@ mod tests {
         let held = open_append(&path).unwrap();
         std::fs::rename(&path, tmp.path().join("denials.jsonl.archived")).unwrap();
 
-        let mut handle = rotate_if_over_cap(&path, held, 5);
+        let mut handle = rotate_if_over_cap(&path, held, 5, segment_stamp_now);
         handle.write_all(b"fresh\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
-        assert!(!rotated_ledger_path(&path).exists());
+        assert!(ledger_segments(&path).is_empty());
         assert!(!tmp.path().join("failopen.jsonl").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn concurrent_appenders_lose_no_row_across_a_rotation() {
+    fn concurrent_appenders_lose_no_row_across_rotations() {
         const THREADS: usize = 8;
         const ROWS: usize = 250;
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("subagents.jsonl");
         let pad = "x".repeat(60);
 
-        // ~85 bytes a row, 2000 rows: one rotation at 120 KB, never two, so
-        // every row must survive between `.1` and the live file.
+        // ~85 bytes a row, 2000 rows, a 40 KB cap: several rotations, many of
+        // them inside one second, and every row must survive across the
+        // segments and the live file.
         std::thread::scope(|scope| {
             for t in 0..THREADS {
                 let (path, pad) = (&path, &pad);
                 scope.spawn(move || {
                     for i in 0..ROWS {
                         let row = format!("{{\"t\":{t},\"i\":{i},\"pad\":\"{pad}\"}}\n");
-                        append_rotating(path, Some(120_000), &row);
+                        append_rotating(path, Some(40_000), &row);
                     }
                 });
             }
         });
 
-        assert!(rotated_ledger_path(&path).exists(), "the cap was crossed");
+        assert!(
+            ledger_segments(&path).len() >= 3,
+            "the cap was crossed several times"
+        );
         let all = read_ledger(&path).unwrap();
         let mut seen = std::collections::HashSet::new();
         for line in all.lines() {
@@ -976,20 +1305,94 @@ mod tests {
     }
 
     #[test]
-    fn read_ledger_returns_dot_one_then_live() {
+    fn read_ledger_returns_segments_in_order_then_live() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("commits.jsonl");
-        assert_eq!(read_ledger(&path), None, "neither file exists");
+        assert_eq!(read_ledger(&path), None, "nothing exists");
 
         std::fs::write(&path, "live\n").unwrap();
         assert_eq!(read_ledger(&path).as_deref(), Some("live\n"));
 
-        // `.1` with no trailing newline must not fuse with the first live row.
-        std::fs::write(rotated_ledger_path(&path), "older").unwrap();
-        assert_eq!(read_ledger(&path).as_deref(), Some("older\nlive\n"));
+        // Written out of order; read back by stamp, then sequence. A segment
+        // with no trailing newline must not fuse with the next part.
+        std::fs::write(ledger_segment_path(&path, "20261002T000000Z", 0), "third").unwrap();
+        std::fs::write(
+            ledger_segment_path(&path, "20261001T000000Z", 10),
+            "second\n",
+        )
+        .unwrap();
+        std::fs::write(ledger_segment_path(&path, "20261001T000000Z", 9), "first\n").unwrap();
+        // Not this ledger's segments.
+        std::fs::write(
+            tmp.path().join("sessions.20261001T000000Z-000.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("commits.jsonl.1"), "x\n").unwrap();
+        assert_eq!(
+            read_ledger(&path).as_deref(),
+            Some("first\nsecond\nthird\nlive\n")
+        );
 
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(read_ledger(&path).as_deref(), Some("older"), "only `.1`");
+        assert_eq!(
+            read_ledger(&path).as_deref(),
+            Some("first\nsecond\nthird"),
+            "segments only"
+        );
+    }
+
+    #[test]
+    fn windowed_reads_skip_segments_that_cannot_hold_the_window() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("failopen.jsonl");
+        std::fs::write(ledger_segment_path(&path, "20261001T000000Z", 0), "oct-1\n").unwrap();
+        std::fs::write(
+            ledger_segment_path(&path, "20261015T120000Z", 0),
+            "oct-15\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ledger_segment_path(&path, "20261015T120000Z", 1),
+            "oct-15b\n",
+        )
+        .unwrap();
+        std::fs::write(&path, "live\n").unwrap();
+
+        // A segment stamped at the cutoff second can hold a row from that
+        // second, so it is kept.
+        assert_eq!(
+            read_ledger_since(&path, "2026-10-15T12:00:00Z").as_deref(),
+            Some("oct-15\noct-15b\nlive\n")
+        );
+        assert_eq!(
+            read_ledger_since(&path, "2026-10-15T12:00:01Z").as_deref(),
+            Some("live\n")
+        );
+        assert_eq!(
+            read_ledger_since(&path, "2026-09-01T00:00:00Z").as_deref(),
+            Some("oct-1\noct-15\noct-15b\nlive\n")
+        );
+        assert_eq!(
+            read_ledger_recent(&path).as_deref(),
+            Some("oct-15b\nlive\n"),
+            "the newest segment, then live"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_like_a_segment_is_not_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("bypasses.jsonl");
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "{\"secret\":1}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, ledger_segment_path(&path, "20261001T000000Z", 0))
+            .unwrap();
+        std::fs::write(&path, "live\n").unwrap();
+
+        assert!(ledger_segments(&path).is_empty());
+        assert_eq!(read_ledger(&path).as_deref(), Some("live\n"));
     }
 
     #[test]

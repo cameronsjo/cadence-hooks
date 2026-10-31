@@ -1682,8 +1682,8 @@ fn telemetry_finding(
 }
 
 /// Size at which a single `<metrics_dir>/*.jsonl` ledger earns a doctor
-/// warning (cadence-hooks#425). Writers rotate a ledger to `<name>.jsonl.1`
-/// past `CADENCE_METRICS_MAX_BYTES` (16 MiB by default), so a live ledger this
+/// warning (cadence-hooks#425). Writers rotate a ledger to a dated segment
+/// (`<name>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl`) past `CADENCE_METRICS_MAX_BYTES` (16 MiB by default), so a live ledger this
 /// large means rotation is off, failing, or capped higher than this, or the
 /// ledger has not been written since an older binary grew it.
 const LEDGER_SIZE_WARN_BYTES: u64 = 64 * 1024 * 1024;
@@ -1705,7 +1705,7 @@ fn rotation_advice(cap: Option<u64>, rotates: bool, len: u64) -> (String, String
         ),
         Some(cap) if len >= cap => (
             format!(
-                "past the {} MiB rotation cap, so the next write rotates it to `.jsonl.1`",
+                "past the {} MiB rotation cap, so the next write rotates it to a dated segment",
                 cap / MIB
             ),
             "if it stays this large after a write, look for `ledger_rotate_failed` rows in \
@@ -1745,12 +1745,10 @@ fn ledger_size_findings(
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
             let meta = entry.metadata().ok()?;
-            // `.jsonl.1` too: the first write after an upgrade moves a ledger
-            // that grew past the threshold into it, and every reader here still
-            // loads it whole.
-            ((name.ends_with(".jsonl") || name.ends_with(".jsonl.1"))
-                && meta.is_file()
-                && meta.len() >= threshold)
+            // Rotated segments end in `.jsonl` too: the first write after an
+            // upgrade moves a ledger that grew past the threshold into one, and
+            // every reader here still loads it whole.
+            (name.ends_with(".jsonl") && meta.is_file() && meta.len() >= threshold)
                 .then_some((name, meta.len()))
         })
         .collect();
@@ -1760,7 +1758,7 @@ fn ledger_size_findings(
         .map(|(name, len)| {
             let path = dir.join(&name);
             let quoted = shell_single_quote(&path.display().to_string());
-            if name.ends_with(".1") {
+            if cadence_hooks_metrics::is_ledger_segment(&name) {
                 return Finding {
                     severity: Severity::Warning,
                     blocker: Blocker::No,
@@ -1769,14 +1767,13 @@ fn ledger_size_findings(
                     line: None,
                     snippet: name,
                     diagnosis: format!(
-                        "rotated ledger copy is {} MiB, larger than a rotation leaves; \
-                         the ledger grew past the cap before rotation existed. The next \
-                         rotation of the live ledger replaces it",
+                        "rotated ledger segment is {} MiB, larger than a rotation leaves; \
+                         the ledger grew past the cap before rotation existed",
                         len / (1024 * 1024)
                     ),
                     remediation: format!(
-                        "readers here load it whole, so remove it once you no longer \
-                         need the older rows: `rm {quoted}`"
+                        "readers here load it whole; `gzip {quoted}` keeps its rows and \
+                         takes it out of what they read"
                     ),
                 };
             }
@@ -4989,23 +4986,23 @@ mod tests {
     #[test]
     fn ledger_size_findings_flags_an_oversized_rotated_copy() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::File::create(tmp.path().join("denials.jsonl.1"))
+        fs::File::create(tmp.path().join("denials.20261001T000000Z-000.jsonl"))
             .unwrap()
             .set_len(2048)
             .unwrap();
-        fs::write(tmp.path().join("hooks.jsonl.1"), "{}\n").unwrap();
+        fs::write(tmp.path().join("hooks.20261001T000000Z-000.jsonl"), "{}\n").unwrap();
 
         let findings = ledger_size_findings(tmp.path(), 1024, Some(1024), true);
 
         assert_eq!(findings.len(), 1, "only the large rotated copy");
         let f = &findings[0];
-        assert_eq!(f.snippet, "denials.jsonl.1");
+        assert_eq!(f.snippet, "denials.20261001T000000Z-000.jsonl");
         assert!(
-            f.diagnosis.contains("rotated ledger copy"),
+            f.diagnosis.contains("rotated ledger segment"),
             "{}",
             f.diagnosis
         );
-        assert!(f.remediation.contains("rm '"), "{}", f.remediation);
+        assert!(f.remediation.contains("gzip '"), "{}", f.remediation);
     }
 
     #[test]

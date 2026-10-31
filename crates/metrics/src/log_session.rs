@@ -136,10 +136,12 @@ impl Logger for LogSession {
     }
 }
 
-/// Commit rows for the session in the commits ledger, rotated `.1` included, so
-/// a session that straddles a rotation does not report fewer commits.
+/// Commit rows for the session in the commits ledger, the newest rotated
+/// segment included, so a session that straddles a rotation does not report
+/// fewer commits. One segment back is enough: a session never writes a cap's
+/// worth of commit rows (cameronsjo/cadence-hooks#1589 replaces this read).
 fn commits_in_ledger(commits_path: &std::path::Path, session_id: &str) -> u64 {
-    common::read_ledger(commits_path)
+    common::read_ledger_recent(commits_path)
         .map(|contents| count_commits(&contents, session_id))
         .unwrap_or(0)
 }
@@ -445,7 +447,7 @@ mod tests {
         let path = tmp.path().join("commits.jsonl");
         assert_eq!(commits_in_ledger(&path, "s1"), 0, "no ledger");
         std::fs::write(
-            common::rotated_ledger_path(&path),
+            common::ledger_segment_path(&path, "20260101T000000Z", 0),
             "{\"sessionId\":\"s1\"}\n{\"sessionId\":\"s2\"}\n",
         )
         .unwrap();

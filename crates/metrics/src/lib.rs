@@ -66,8 +66,9 @@ pub mod warn_stale;
 /// this crate (e.g. `session persist-plan-approval`'s `plan-links.jsonl`) reuses the
 /// resolution instead of re-deriving it.
 pub use common::{
-    DEFAULT_LEDGER_MAX_BYTES, LEDGER_MAX_BYTES_ENV, ledger_max_bytes, metrics_dir, open_ledger,
-    read_ledger, rotated_ledger_path,
+    DEFAULT_LEDGER_MAX_BYTES, LEDGER_MAX_BYTES_ENV, is_ledger_segment, ledger_max_bytes,
+    ledger_segment_path, ledger_segments, metrics_dir, open_ledger, read_ledger,
+    read_ledger_recent, read_ledger_since,
 };
 
 pub use log_askuserquestion::LogAskUserQuestion;

@@ -125,11 +125,13 @@ impl Logger for LogCommit {
     }
 }
 
-/// The session's previous `lastMessageId` in the commits ledger, rotated `.1`
-/// included: a session that straddles a rotation must still find its previous
-/// row, or its next commit re-prices the whole transcript.
+/// The session's previous `lastMessageId` in the commits ledger, the newest
+/// rotated segment included: a session that straddles a rotation must still
+/// find its previous row, or its next commit re-prices the whole transcript.
+/// One segment back is enough, since a session never writes a cap's worth of
+/// commit rows.
 fn previous_message_id(commits_path: &std::path::Path, session_id: &str) -> Option<String> {
-    common::read_ledger(commits_path)
+    common::read_ledger_recent(commits_path)
         .and_then(|contents| parse_last_message_id(&contents, session_id))
 }
 
@@ -219,11 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn previous_message_id_finds_a_row_the_rotation_moved_to_dot_one() {
+    fn previous_message_id_finds_a_row_the_rotation_moved_to_a_segment() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("commits.jsonl");
         std::fs::write(
-            common::rotated_ledger_path(&path),
+            common::ledger_segment_path(&path, "20260101T000000Z", 0),
             "{\"sessionId\":\"s1\",\"lastMessageId\":\"m1\"}\n",
         )
         .unwrap();
