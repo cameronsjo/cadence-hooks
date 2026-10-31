@@ -508,6 +508,17 @@ fn shell_quote(s: &str) -> String {
 /// damaged member's partial output, which ends mid-row), and compress that back
 /// under the archive's name, owner-only. Then rerun `metrics rotate`.
 pub fn salvage_hint(archive_dir: &Path, name: &str) -> String {
+    // Every place this text reaches a person strips invisible and control
+    // characters, so a command built from such a name would name a different
+    // file once displayed (a stripped zero-width character turns it into the
+    // intact archive's name). Give no command then.
+    let dir_text = archive_dir.display().to_string();
+    if common::display_safe(name) != name || common::display_safe(&dir_text) != dir_text {
+        return "its name or directory holds invisible or control characters, so no commands are \
+                given: list the directory with `ls -b`, rename the file to a plain name by hand, \
+                and run `cadence-hooks metrics rotate` again"
+            .to_string();
+    }
     let aside = shell_quote(&format!("./{name}.damaged"));
     format!(
         "save its intact rows with: {}, then run `cadence-hooks metrics rotate` again; keep {aside} \
@@ -796,92 +807,139 @@ fn dirs(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
 // Recovery
 // ---------------------------------------------------------------------------
 
+/// Where a manifest's move stands, judged from the archive and the segment's
+/// current bytes. One answer for both [`recover`] (which acts on it) and
+/// `metrics cat` (which prints what the segment will hold), so the two can
+/// never disagree about which rows are where.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MoveState {
+    /// The archive does not hold the member: nothing moved, the segment keeps
+    /// every row.
+    NotDone,
+    /// The member is archived and the segment already holds what it should
+    /// (gone, or the kept rows).
+    Finished,
+    /// The member is archived and proven to be this segment's rows; the
+    /// segment should be left holding `remaining`: rows appended after the
+    /// read, after the kept rows for a quarantine.
+    Pending {
+        /// What the segment holds once the move finishes.
+        remaining: Vec<u8>,
+    },
+    /// Nothing proves the archived member is this segment's rows.
+    Unproven(String),
+}
+
+/// Judge `manifest` against the archive and `current`, the segment's bytes
+/// now (`None` when it is gone). The archived member must decode to exactly
+/// what the segment's first `source_len` bytes give (the segment itself for an
+/// archive, its test rows for a quarantine); a manifest's own hashes are never
+/// enough on their own.
+pub(crate) fn move_state(
+    archive_dir: &Path,
+    manifest: &Manifest,
+    current: Option<&[u8]>,
+) -> std::io::Result<MoveState> {
+    if !manifest_names_ok(manifest) {
+        return Ok(MoveState::Unproven(format!(
+            "expected the rotate manifest to name a segment and its archive, found {:?} and {:?}",
+            manifest.segment, manifest.archive
+        )));
+    }
+    if !archive_holds(archive_dir, manifest)? {
+        return Ok(MoveState::NotDone);
+    }
+    let len = usize::try_from(manifest.source_len).unwrap_or(usize::MAX);
+    // The segment as it was read, if it still starts with exactly that.
+    let original = current
+        .and_then(|b| b.get(..len))
+        .filter(|p| sha256_hex(p) == manifest.sha256);
+    let suffix = |bytes: &[u8]| bytes.get(len..).unwrap_or_default().to_vec();
+    match manifest.op.as_str() {
+        "archive" => match (current, original) {
+            (None, _) => Ok(MoveState::Finished),
+            (Some(bytes), Some(original))
+                if sha256_hex(&normalized(original)) == manifest.archived_sha256 =>
+            {
+                Ok(MoveState::Pending {
+                    remaining: suffix(bytes),
+                })
+            }
+            (Some(_), _) => Ok(MoveState::Unproven(format!(
+                "expected {} to start with the archived copy (sha256 {}), found different bytes; \
+                 compare it with {} by hand, then remove {MANIFEST_FILE}",
+                manifest.segment, manifest.sha256, manifest.archive
+            ))),
+        },
+        "quarantine" => {
+            let kept_sha = manifest.kept_sha256.clone().unwrap_or_default();
+            match (current, original) {
+                (Some(bytes), _) if sha256_hex(bytes) == kept_sha => Ok(MoveState::Finished),
+                (None, _) if kept_sha == sha256_hex(b"") => Ok(MoveState::Finished),
+                (Some(bytes), Some(original)) => {
+                    let (mut kept, test) = split_test_rows(&normalized(original));
+                    if sha256_hex(&test) != manifest.archived_sha256
+                        || row_count(&test) != manifest.rows
+                        || sha256_hex(&kept) != kept_sha
+                    {
+                        return Ok(MoveState::Unproven(format!(
+                            "expected the test rows of {} to be the archived member, found others",
+                            manifest.segment
+                        )));
+                    }
+                    kept.extend_from_slice(&suffix(bytes));
+                    Ok(MoveState::Pending { remaining: kept })
+                }
+                (Some(_), None) => Ok(MoveState::Unproven(format!(
+                    "expected {} to start with the quarantined original (sha256 {}), found different bytes",
+                    manifest.segment, manifest.sha256
+                ))),
+                (None, _) => Ok(MoveState::Unproven(format!(
+                    "expected {} to hold its kept rows, found it missing",
+                    manifest.segment
+                ))),
+            }
+        }
+        other => Ok(MoveState::Unproven(format!(
+            "expected a rotate manifest op of archive or quarantine, found {other:?}"
+        ))),
+    }
+}
+
 /// Finish or roll back the move a leftover manifest names. Returns whether
-/// there was one. A manifest whose state cannot be explained is left in place
-/// and reported, so `metrics cat` keeps deduplicating against it and an
-/// operator can look.
+/// there was one. A manifest whose state cannot be proven ([`MoveState`]) is
+/// left in place and reported, so `metrics cat` keeps printing the segment as
+/// it is and an operator can look.
 pub(crate) fn recover(dir: &Path, fault: Fault<'_>) -> std::io::Result<bool> {
     let (state, archive_dir, _) = dirs(dir);
     let Some(manifest) = read_manifest(&state)? else {
         return Ok(false);
     };
     let source = dir.join(&manifest.segment);
-    if !manifest_names_ok(&manifest) {
-        return Err(io_err(format!(
-            "expected the rotate manifest to name a segment and its archive, found {:?} and {:?}",
-            manifest.segment, manifest.archive
-        )));
-    }
-    let done = archive_holds(&archive_dir, &manifest)?;
-    let current = read_regular(&source)?;
-    if !done {
-        // The archive rename never happened, so the archive is as it was; at
-        // most a temp file is left. The source still holds every row.
-        remove_if_present(&archive_dir.join(format!(".{}.tmp", manifest.archive)))?;
-        remove_if_present(&dir.join(format!(".{}.tmp", manifest.segment)))?;
-        if current.is_none() {
-            return Err(io_err(format!(
-                "expected {} to exist while its archive move is incomplete, found it missing",
-                manifest.segment
-            )));
-        }
-        return remove_manifest(&state).map(|()| true);
-    }
-    match manifest.op.as_str() {
-        // `archive_holds` proved the archive's new tail decodes to content
-        // hashing to `archived_sha256`; tying that hash to this segment's own
-        // bytes means the tail is the segment, not whatever the manifest says.
-        "archive" => match current {
-            Some(bytes)
-                if sha256_hex(&bytes) == manifest.sha256
-                    && sha256_hex(&normalized(&bytes)) == manifest.archived_sha256 =>
-            {
-                std::fs::remove_file(&source)?;
-                fsync_dir(dir)?;
-            }
-            Some(_) => {
+    let current = if manifest_names_ok(&manifest) {
+        read_regular(&source)?
+    } else {
+        None
+    };
+    match move_state(&archive_dir, &manifest, current.as_deref())? {
+        MoveState::NotDone => {
+            // The archive rename never happened, so the archive is as it was;
+            // at most a temp file is left. The source still holds every row.
+            remove_if_present(&archive_dir.join(format!(".{}.tmp", manifest.archive)))?;
+            remove_if_present(&dir.join(format!(".{}.tmp", manifest.segment)))?;
+            if current.is_none() {
                 return Err(io_err(format!(
-                    "expected {} to match the archived copy (sha256 {}), found different bytes",
-                    manifest.segment, manifest.sha256
+                    "expected {} to exist while its archive move is incomplete, found it missing",
+                    manifest.segment
                 )));
             }
-            None => {}
-        },
-        "quarantine" => {
-            let kept_sha = manifest.kept_sha256.clone().unwrap_or_default();
-            match current {
-                Some(bytes) if sha256_hex(&bytes) == kept_sha => {}
-                None if kept_sha == sha256_hex(b"") => {}
-                Some(bytes) => {
-                    let len = usize::try_from(manifest.source_len).unwrap_or(usize::MAX);
-                    let original = bytes
-                        .get(..len)
-                        .filter(|p| sha256_hex(p) == manifest.sha256);
-                    let Some(original) = original else {
-                        return Err(io_err(format!(
-                            "expected {} to start with the quarantined original (sha256 {}), found different bytes",
-                            manifest.segment, manifest.sha256
-                        )));
-                    };
-                    // Rows appended after the read keep their place after
-                    // the kept rows; the next quarantine run sees them.
-                    let (mut kept, _) = split_test_rows(&normalized(original));
-                    kept.extend_from_slice(&bytes[len..]);
-                    replace_source(dir, &manifest.segment, &kept, fault)?;
-                }
-                None => {
-                    return Err(io_err(format!(
-                        "expected {} to hold its kept rows, found it missing",
-                        manifest.segment
-                    )));
-                }
-            }
         }
-        other => {
-            return Err(io_err(format!(
-                "expected a rotate manifest op of archive or quarantine, found {other:?}"
-            )));
+        MoveState::Finished => {}
+        // Rows appended after the read stay, in their segment.
+        MoveState::Pending { remaining } => {
+            replace_source(dir, &manifest.segment, &remaining, fault)?;
         }
+        MoveState::Unproven(why) => return Err(io_err(why)),
     }
     remove_manifest(&state).map(|()| true)
 }

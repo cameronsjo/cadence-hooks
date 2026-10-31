@@ -40,13 +40,6 @@ pub fn parse_since(value: &str) -> Option<String> {
     ))
 }
 
-/// What to print of one source.
-enum Filter {
-    All,
-    /// Kept rows only (a quarantine whose archive half is done).
-    KeptOnly,
-}
-
 struct Emitter<'a, W: Write> {
     out: &'a mut W,
     since: Option<jiff::Timestamp>,
@@ -55,15 +48,10 @@ struct Emitter<'a, W: Write> {
 impl<W: Write> Emitter<'_, W> {
     /// Print `reader`'s rows. A read error names `source`; a write error (a
     /// closed pipe) passes through as is.
-    fn emit(&mut self, reader: impl Read, filter: &Filter, source: &Path) -> std::io::Result<()> {
+    fn emit(&mut self, reader: impl Read, source: &Path) -> std::io::Result<()> {
         for line in BufReader::new(reader).split(b'\n') {
             let line = line.map_err(|err| named(source, &err))?;
             if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            if matches!(filter, Filter::KeptOnly)
-                && std::str::from_utf8(&line).is_ok_and(rotate::is_test_row)
-            {
                 continue;
             }
             if let Some(since) = self.since {
@@ -84,9 +72,9 @@ impl<W: Write> Emitter<'_, W> {
         Ok(())
     }
 
-    fn emit_file(&mut self, path: &Path, filter: &Filter) -> std::io::Result<()> {
+    fn emit_file(&mut self, path: &Path) -> std::io::Result<()> {
         match rotate::open_read_nofollow(path) {
-            Ok(file) => self.emit(file, filter, path),
+            Ok(file) => self.emit(file, path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(named(path, &err)),
         }
@@ -94,7 +82,7 @@ impl<W: Write> Emitter<'_, W> {
 
     fn emit_gz(&mut self, path: &Path) -> std::io::Result<()> {
         match rotate::open_read_nofollow(path) {
-            Ok(file) => self.emit(flate2::read::MultiGzDecoder::new(file), &Filter::All, path),
+            Ok(file) => self.emit(flate2::read::MultiGzDecoder::new(file), path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(named(path, &err)),
         }
@@ -148,15 +136,20 @@ pub fn cat(
     // A manifest left by a crash names one segment whose rows may be in two
     // places. Unreadable manifest: print everything (fail toward completeness).
     let manifest = rotate::read_manifest(&dir.join("state")).ok().flatten();
-    let pending = manifest
-        .filter(rotate::manifest_names_ok)
-        .filter(|m| rotate::archive_holds(&archive_dir, m).unwrap_or(false))
-        .filter(|m| {
-            rotate::read_regular(&dir.join(&m.segment))
-                .ok()
-                .flatten()
-                .is_some_and(|b| rotate::sha256_hex(&b) == m.sha256)
-        });
+    // The same judgement `recover` acts on: a segment whose move is proven
+    // archived prints only what it will hold once the move finishes (rows
+    // appended since, after the kept rows of a quarantine); anything unproven
+    // prints as it is.
+    let pending: Option<(String, Vec<u8>)> = manifest.and_then(|m| {
+        if !rotate::manifest_names_ok(&m) {
+            return None;
+        }
+        let current = rotate::read_regular(&dir.join(&m.segment)).ok().flatten();
+        match rotate::move_state(&archive_dir, &m, current.as_deref()) {
+            Ok(rotate::MoveState::Pending { remaining }) => Some((m.segment, remaining)),
+            _ => None,
+        }
+    });
 
     let since_ts = since
         .and_then(rotate::stamp_unix)
@@ -230,14 +223,14 @@ pub fn cat(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let filter = match &pending {
-            Some(m) if m.segment == name && m.op == "archive" => continue,
-            Some(m) if m.segment == name => Filter::KeptOnly,
-            _ => Filter::All,
-        };
-        emitter.emit_file(&path, &filter)?;
+        match &pending {
+            Some((segment, remaining)) if segment == name => {
+                emitter.emit(&remaining[..], &path)?;
+            }
+            _ => emitter.emit_file(&path)?,
+        }
     }
-    emitter.emit_file(&live, &Filter::All)?;
+    emitter.emit_file(&live)?;
     if damaged {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

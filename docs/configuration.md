@@ -432,7 +432,7 @@ cd '<metrics_dir>/archive' &&
 cadence-hooks metrics rotate
 ```
 
-The commands stop, without moving anything, when `<name>.damaged` already exists, so a second run never replaces the first copy and the rows still undecoded in it. Remove or rename an older `.damaged` file deliberately before you run them again.
+The commands stop, without moving anything, when `<name>.damaged` already exists, so a second run never replaces the first copy and the rows still undecoded in it. Remove or rename an older `.damaged` file deliberately before you run them again. When the archive's name or directory holds invisible or control characters, the message gives no commands, because a displayed command would name a different file: list the directory with `ls -b` and rename the file to a plain name by hand first.
 
 `gzip -dc` writes every member it decoded before the damage. It can also write part of the damaged member, which ends mid-row, so the `perl` step keeps only complete lines. Keep `<name>.damaged` until `metrics cat` shows the rows you expect. The error text and `metrics cat`'s stderr line carry the same commands with the real path. `metrics cat` prints a stderr line for a damaged archive, skips its remaining rows, prints every other row, and exits 1. Every other read error names the file or directory and exits 1; an unreadable `archive/` is an error, never an empty history. `metrics rotate` and `--quarantine-test-rows` run only on Unix; elsewhere they exit 1 without changing anything, and the SessionStart run does nothing (cap rotation is Unix-only too, so there are no segments there).
 

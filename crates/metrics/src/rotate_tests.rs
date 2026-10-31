@@ -1784,6 +1784,14 @@ fn recovery_checks_the_archive_tail_against_the_segment() {
         bytes,
         "segment kept"
     );
+    // `cat` judges the manifest the way recovery does, so the segment's row
+    // still prints, once.
+    let printed = cat_rows(dir, "denials", None, false);
+    let ones = printed
+        .iter()
+        .filter(|r| **r == denial(1, Some(UUID)))
+        .count();
+    assert_eq!(ones, 1, "{printed:?}");
 }
 
 #[test]
@@ -1816,4 +1824,136 @@ fn a_fifo_lock_file_does_not_hang_cat() {
         .expect("cat hung on a FIFO lock file");
     let err = result.unwrap_err();
     assert!(err.to_string().contains(LOCK_FILE), "{err}");
+}
+
+// --- round 5 (cameronsjo/cadence-hooks#1600) -------------------------------
+
+/// A row appended to a segment after its archive read, with the move killed
+/// after the archive rename: recovery keeps only the new row in the segment,
+/// and `cat` prints every row once both before and after.
+#[test]
+fn a_late_append_after_the_archive_read_is_kept_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(100),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+    );
+    let fault = fail_at(Step::AfterArchiveRename);
+    assert!(rotate(dir, &opts(&fault)).is_err());
+    let late = denial(3, Some(UUID));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(&seg))
+            .unwrap();
+        f.write_all(format!("{late}\n").as_bytes()).unwrap();
+    }
+    let mut expect = vec![denial(1, Some(UUID)), denial(2, Some(UUID)), late.clone()];
+    expect.sort();
+    let mut mid = cat_rows(dir, "denials", None, false);
+    mid.sort();
+    assert_eq!(mid, expect, "mid-move: every row once");
+
+    assert!(recover(dir, &no_fault).unwrap(), "a manifest was pending");
+    assert_eq!(
+        lines_of(&std::fs::read(dir.join(&seg)).unwrap()),
+        std::slice::from_ref(&late),
+        "recovery keeps only the row appended after the read"
+    );
+    assert!(
+        dir.join("state").join(MANIFEST_FILE).metadata().is_err(),
+        "manifest cleared"
+    );
+    run_ok(dir);
+    // Recovery left only the new row in the segment, which is still past
+    // retention, so the same run archived it as a second member.
+    assert!(!dir.join(&seg).exists());
+    let mut after = cat_rows(dir, "denials", None, false);
+    after.sort();
+    assert_eq!(after, expect);
+    assert_eq!(raw_rows(dir, &["denials"]), expect, "stored once");
+}
+
+/// A quarantine manifest whose test-row member is real but holds other rows
+/// strips nothing.
+#[test]
+fn a_forged_quarantine_manifest_on_denials_strips_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let rows = [denial(1, Some(UUID)), denial(2, Some("t")), denial(3, None)];
+    let seg = write_segment(dir, "denials", &days_ago(5), 0, &rows);
+    let bytes = std::fs::read(dir.join(&seg)).unwrap();
+    let (kept, _) = split_test_rows(&normalized(&bytes));
+    let other = format!("{}\n", denial(9, Some("other"))).into_bytes();
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(TESTROWS_ARCHIVE),
+        gzip_member(&other).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest {
+        op: "quarantine".to_string(),
+        segment: seg.clone(),
+        archive: TESTROWS_ARCHIVE.to_string(),
+        rows: 1,
+        sha256: sha256_hex(&bytes),
+        source_len: bytes.len() as u64,
+        archived_sha256: sha256_hex(&other),
+        archive_len_before: 0,
+        kept_sha256: Some(sha256_hex(&kept)),
+    };
+    assert!(manifest_names_ok(&manifest));
+    assert!(archive_holds(&dir.join(ARCHIVE_DIR), &manifest).unwrap());
+    ensure_private_dir(&dir.join("state")).unwrap();
+    write_manifest(&dir.join("state"), &manifest).unwrap();
+    assert!(rotate(dir, &opts(&no_fault)).is_err());
+    assert_eq!(
+        std::fs::read(dir.join(&seg)).unwrap(),
+        bytes,
+        "no row stripped"
+    );
+    let mut printed = cat_rows(dir, "denials", None, false);
+    printed.sort();
+    let mut expect = rows.to_vec();
+    expect.sort();
+    assert_eq!(printed, expect, "cat prints every row");
+}
+
+#[test]
+fn no_salvage_commands_for_a_name_that_displays_differently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hidden = "denials\u{200B}.2026-01.jsonl.gz";
+    let shown = common::display_safe(&salvage_hint(tmp.path(), hidden));
+    assert!(!shown.contains("mv "), "{shown}");
+    assert!(shown.contains("invisible or control characters"), "{shown}");
+    let plain = common::display_safe(&salvage_hint(tmp.path(), "denials.2026-01.jsonl.gz"));
+    assert!(plain.contains("mv "), "positive control: {plain}");
+}
+
+#[test]
+fn a_fifo_lock_file_fails_rotate_without_hanging() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores file modes");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let fifo = std::ffi::CString::new(dir.join("state").join(LOCK_FILE).to_str().unwrap()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path for the duration of the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(rotate(&dir, &opts(&no_fault)));
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("rotate hung on a FIFO lock file");
+    let err = result.unwrap_err();
+    assert!(err.contains("regular file"), "{err}");
 }
