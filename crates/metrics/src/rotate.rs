@@ -308,6 +308,20 @@ fn normalized(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// How recently a segment must have changed for its torn last row to be held
+/// back for its writer: far longer than a hook takes to finish one append.
+const TORN_TAIL_HOLD: Duration = Duration::from_secs(60);
+
+/// Whether `path` changed within [`TORN_TAIL_HOLD`]. Unreadable reads as
+/// recent, which only holds a torn row back one more run.
+fn recently_modified(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .is_none_or(|age| age < TORN_TAIL_HOLD)
+}
+
 /// Length of the bytes up to and including the last newline: the rows a move
 /// may take. A torn last row (no newline yet, its writer still mid-append)
 /// stays in the segment. Pure.
@@ -343,9 +357,12 @@ fn split_test_rows(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Per-(day, hook, repo, decision) counts of the `denials` rows in `bytes`,
-/// as rollup rows naming `segment`. Rows that do not parse are left out of the
-/// counts (their bytes still go to the archive). Pure.
+/// as rollup rows naming `segment` and `movedSha256`, the hash of the bytes
+/// being moved, so a segment moved twice (rows left behind the first time)
+/// rolls each part up once. Rows that do not parse are left out of the counts
+/// (their bytes still go to the archive). Pure.
 pub(crate) fn denial_rollup_rows(bytes: &[u8], segment: &str) -> Vec<Value> {
+    let moved = sha256_hex(bytes);
     let mut counts: BTreeMap<(String, String, String, String), u64> = BTreeMap::new();
     for line in bytes.split(|b| *b == b'\n') {
         let Ok(row) = serde_json::from_slice::<Value>(line) else {
@@ -374,6 +391,7 @@ pub(crate) fn denial_rollup_rows(bytes: &[u8], segment: &str) -> Vec<Value> {
                 "decision": decision,
                 "count": count,
                 "segment": segment,
+                "movedSha256": moved,
             })
         })
         .collect()
@@ -999,7 +1017,7 @@ pub(crate) fn recover(dir: &Path, fault: Fault<'_>) -> std::io::Result<bool> {
 /// Leave the segment holding exactly `remaining` and clear the manifest. What
 /// it will hold is recorded in the manifest first, so a crash anywhere after
 /// that reads as finished on the next run.
-// debt: an append landing after `remaining` was read and before the rename is lost; closes only with writers that flock every append, and the segments moved here are archive-age (or, for the quarantine, read after QUARANTINE_GRACE)
+// debt: a writer still holding the segment open after `remaining` is read loses every write it makes after that (it writes to the replaced file); rows from writers that reopen by path, or that land before the re-read, are kept. Exposure is the quarantine's freshly moved live file within QUARANTINE_GRACE (archive segments are archive-age); closes only with writers that flock every append
 fn finish_move(
     dir: &Path,
     manifest: &Manifest,
@@ -1045,12 +1063,25 @@ fn replace_source(dir: &Path, name: &str, kept: &[u8], fault: Fault<'_>) -> std:
 // ---------------------------------------------------------------------------
 
 /// Segment names already rolled up, from every rollup row's `segment`.
+/// The rollup key for moving `bytes` out of `segment`. Pure.
+fn rollup_key(segment: &str, moved_sha256: &str) -> String {
+    format!("{segment}#{moved_sha256}")
+}
+
+/// Every (segment, moved bytes) already rolled up, as [`rollup_key`]s.
 fn rolled_up_segments(rollup: &Path) -> BTreeSet<String> {
     common::read_ledger(rollup)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|row| row.get("segment").and_then(Value::as_str).map(String::from))
+        .filter_map(|row| {
+            let segment = row.get("segment").and_then(Value::as_str)?;
+            let moved = row
+                .get("movedSha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(rollup_key(segment, moved))
+        })
         .collect()
 }
 
@@ -1079,14 +1110,23 @@ fn archive_segment(
     let Some(bytes) = read_regular(&dir.join(name))? else {
         return Ok(None);
     };
-    // Only whole rows move; a torn last row stays for its writer to finish.
-    let content = bytes[..complete_len(&bytes)].to_vec();
+    // A torn last row is held back only while a writer could still be
+    // finishing it (the file changed within TORN_TAIL_HOLD). A segment old
+    // enough to archive has no writer left, so its torn or newline-less last
+    // row moves too, closed with a newline, rather than staying forever.
+    let (moved, content) = if recently_modified(&dir.join(name)) {
+        let cut = complete_len(&bytes);
+        (bytes[..cut].to_vec(), bytes[..cut].to_vec())
+    } else {
+        (bytes.clone(), normalized(&bytes))
+    };
     if content.is_empty() {
         return Ok(None);
     }
     let rows = row_count(&content);
+    let key = rollup_key(name, &sha256_hex(&content));
 
-    if stem == "denials" && !rolled_up.contains(name) {
+    if stem == "denials" && !rolled_up.contains(&key) {
         let mut out = String::new();
         for row in denial_rollup_rows(&content, name) {
             out.push_str(&row.to_string());
@@ -1103,7 +1143,7 @@ fn archive_segment(
             file.write_all(out.as_bytes())?;
             file.sync_all()?;
         }
-        rolled_up.insert(name.to_string());
+        rolled_up.insert(key);
     }
     fault(Step::AfterRollup)?;
 
@@ -1124,8 +1164,8 @@ fn archive_segment(
         segment: name.to_string(),
         archive: archive.clone(),
         rows,
-        sha256: sha256_hex(&content),
-        source_len: content.len() as u64,
+        sha256: sha256_hex(&moved),
+        source_len: moved.len() as u64,
         archived_sha256: sha256_hex(&content),
         archive_len_before,
         kept_sha256: None,
@@ -1142,7 +1182,9 @@ fn archive_segment(
         )));
     }
     // Finish through the same judgement recovery uses: it re-reads the
-    // segment, so rows appended since the read (and a torn last row) stay.
+    // segment, so rows appended by path before that re-read (and a torn last
+    // row held back) stay. A writer still holding the file open loses what
+    // it writes after the re-read (see `finish_move`).
     recover(dir, fault)?;
     Ok(Some(rows))
 }
@@ -1482,9 +1524,14 @@ fn quarantine_segment(
     let mut bytes = Vec::new();
     held.read_to_end(&mut bytes)?;
     drop(held);
-    let counts = count_file(name, &bytes);
-    // Only whole rows move; a torn last row stays for its writer to finish.
+    // Only whole rows move: the live file was just moved aside, so a writer
+    // may still be finishing its last row. Counts come from the bytes that
+    // move; the recorded sha256 is the whole file's.
     let moved = &bytes[..complete_len(&bytes)];
+    let counts = QuarantineFile {
+        sha256: sha256_hex(&bytes),
+        ..count_file(name, moved)
+    };
     let (kept, test) = split_test_rows(moved);
     if test.is_empty() {
         return Ok(Some(counts));
@@ -1513,11 +1560,14 @@ fn quarantine_segment(
     if !archive_holds(&archive_dir, &manifest)? {
         return Err(io_err(format!(
             "expected {TESTROWS_ARCHIVE} to hold {} new rows from {name} after the write, found otherwise",
-            counts.test_rows
+            manifest.rows
         )));
     }
     // Finish through recovery's judgement: it re-reads the segment, so rows
-    // appended since the read (and a torn last row) stay after the kept rows.
+    // appended before that re-read (and the torn last row held back) stay
+    // after the kept rows. A writer still holding the moved live file open
+    // loses what it writes after the re-read (see `finish_move`); that is
+    // the exposure QUARANTINE_GRACE narrows.
     recover(dir, fault)?;
     Ok(Some(counts))
 }

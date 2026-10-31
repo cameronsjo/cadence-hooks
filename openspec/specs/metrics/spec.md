@@ -317,11 +317,15 @@ Before each move `metrics rotate` SHALL write `state/rotate-manifest.json` namin
 - **THEN** the next run removes the temp file and manifest, archives the segment once, and loses no row
 
 ### Requirement: Denial rollups
-Before archiving a `denials` segment, `metrics rotate` SHALL append to `rollups/denials-daily.jsonl` one row per (day, hook, repo, decision) with its `count` and the `segment` name, in one write. A segment already named by a rollup row MUST NOT be rolled up again.
+Before archiving rows of a `denials` segment, `metrics rotate` SHALL append to `rollups/denials-daily.jsonl` one row per (day, hook, repo, decision) with its `count`, the `segment` name and `movedSha256` (the moved bytes' hash), in one write. A (segment, moved bytes) pair already rolled up MUST NOT be rolled up again.
 
 #### Scenario: Killed after the rollup
 - **WHEN** a run stops after appending a segment's rollup rows and `metrics rotate` runs again
 - **THEN** the segment is archived and its rows are counted in the rollup once
+
+#### Scenario: One segment moved twice
+- **WHEN** a move leaves a row appended during it in the segment, and a later run archives that row
+- **THEN** the rollup counts equal the rows archived
 
 ### Requirement: Stale per-session state is swept
 `metrics rotate` SHALL remove `state/subagents/<session>/`, `state/bypass/<session>/` and `state/commits/<session>/` when the newest entry inside is older than 7 days. It MUST only remove real directories whose name passes the session-id check, under parents that are real directories, and MUST NOT follow a symlink.
@@ -470,8 +474,12 @@ Before a move replaces or empties a segment that keeps bytes, the manifest SHALL
 - **THEN** `metrics cat` prints every row once, and the next run finishes and clears the manifest
 
 ### Requirement: Only whole rows move
-A move SHALL take only the bytes up to the segment's last newline; a torn last row stays in the segment. A pending move whose moved prefix ends mid-row and has bytes after it MUST be unproven.
+A move SHALL hold back a last row with no newline only while its segment changed within the last minute; an older segment's last row SHALL move with the rest, closed with a newline. A pending move whose moved prefix ends mid-row and has bytes after it MUST be unproven. A writer still holding the file open after the move re-reads it loses what it writes after that; only the quarantine's freshly moved live file is exposed, within its grace wait.
 
 #### Scenario: Last row half written
-- **WHEN** a segment is read while its last row is half written, and the writer finishes the row during the move
+- **WHEN** a fresh segment is read while its last row is half written, and the writer appends the rest by path before the move re-reads it
 - **THEN** the row is whole, parses, and is stored in exactly one place
+
+#### Scenario: Old segment ends mid-row
+- **WHEN** a segment past retention, unchanged for over a minute, ends in a fragment with no newline
+- **THEN** one run archives it whole, the segment is gone, and `metrics cat` prints the fragment once

@@ -2260,3 +2260,111 @@ fn no_salvage_commands_for_a_directory_that_is_not_utf8() {
     assert!(!hint.contains("mv "), "{hint}");
     assert!(hint.contains("not UTF-8"), "{hint}");
 }
+
+// --- round 7 (cameronsjo/cadence-hooks#1600) -------------------------------
+
+fn age_file(path: &Path, secs: u64) {
+    let t = SystemTime::now() - Duration::from_secs(secs);
+    std::fs::File::options()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+}
+
+/// A segment past retention whose last bytes never got a newline (a hook
+/// killed mid-write, or a final row written without one) is archived whole in
+/// one run, not left behind forever.
+#[test]
+fn an_old_segment_ending_mid_row_is_archived_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let torn = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    append_row(&dir.join(&torn), r#"{"partial"#);
+    let no_newline = write_segment(dir, "commits", &days_ago(200), 0, &[denial(2, Some(UUID))]);
+    append_row(&dir.join(&no_newline), &denial(3, Some(UUID)));
+    age_file(&dir.join(&torn), 3600);
+    age_file(&dir.join(&no_newline), 3600);
+
+    let report = run_ok(dir);
+    assert_eq!(report.archived.len(), 2);
+    assert!(!dir.join(&torn).exists(), "the torn segment is gone");
+    assert!(!dir.join(&no_newline).exists());
+    assert!(dir.join("state").join(LAST_SUCCESS_FILE).is_file());
+    let printed = cat_rows(dir, "denials", None, false);
+    assert_eq!(
+        printed.iter().filter(|r| *r == r#"{"partial"#).count(),
+        1,
+        "{printed:?}"
+    );
+    assert_eq!(printed.len(), 2);
+    assert_eq!(
+        sorted(cat_rows(dir, "commits", None, false)),
+        sorted(vec![denial(2, Some(UUID)), denial(3, Some(UUID))])
+    );
+    assert!(
+        run_ok(dir).archived.is_empty(),
+        "nothing left for a later run"
+    );
+}
+
+/// Rows left behind by one move and archived by the next are rolled up once,
+/// so the rollup counts equal the rows archived.
+#[test]
+fn a_segment_moved_twice_rolls_up_each_row_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(100),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+    );
+    let path = dir.join(&seg);
+    let fault = |s: Step| {
+        if s == Step::AfterArchiveRename {
+            append_row(&path, &format!("{}\n", denial(3, Some(UUID))));
+        }
+        Ok(())
+    };
+    run_with(dir, &fault);
+    assert!(path.is_file(), "the appended row stayed behind");
+    run_ok(dir);
+    assert!(!path.exists(), "the second move archived it");
+    let total: u64 = common::read_ledger(&dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP))
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["count"]
+                .as_u64()
+                .unwrap()
+        })
+        .sum();
+    assert_eq!(total, 3, "every archived row is counted once");
+}
+
+/// The quarantine's counts come from the bytes it moves, not a torn last row
+/// it leaves behind.
+#[test]
+fn quarantine_counts_only_the_rows_it_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(5),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some("t"))],
+    );
+    // A whole test row with no newline yet: held back on a fresh file.
+    append_row(&dir.join(&seg), &denial(3, Some("t")));
+    let report = quarantine(dir, &qopts(false, &no_fault)).unwrap();
+    let file = report.files.iter().find(|f| f.file == seg).unwrap();
+    assert_eq!(file.test_rows, 1, "{file:?}");
+    assert_eq!(file.rows_before, 2, "{file:?}");
+    assert_eq!(file.sha256.len(), 64);
+}
