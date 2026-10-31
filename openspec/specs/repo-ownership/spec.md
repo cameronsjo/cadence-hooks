@@ -192,11 +192,15 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook allows
 
 ### Requirement: tea targets read as tea reads them
-For `tea` the target SHALL be `--repo`/`-r` (`-R` is tea's `--remote`), its first two `/` parts being owner and repo. A bare slug MUST be owned on every tea login host (the `--login` one, else every login in tea's `config.yml`, plus a `GITEA_INSTANCE_URL` host), or, when none is known, on a `CADENCE_EXTRA_HOSTS` host.
+For `tea` the target SHALL be `--repo`/`-r` (`-R` is tea's `--remote`), its first two `/` parts being owner and repo, and tea's flags SHALL be read as tea's parser reads them: one or two dashes, a name or alias, `=` or the next word. A bare slug MUST be owned on every tea login host (the `--login` one, else every saved login, plus a `GITEA_INSTANCE_URL` host). Only with no tea config file and no such host does `CADENCE_EXTRA_HOSTS` decide.
 
 #### Scenario: Bare tea slug on the login host
 - **WHEN** tea's only login is `https://git.sjo.lol`, `git.sjo.lol/cameron` is allowed, and the command is `tea pr create --repo cameron/lectern`
 - **THEN** the hook allows
+
+#### Scenario: Single-dash login flag
+- **WHEN** the checkout's remote is owned and the command is `tea pr create --title t -login work`, where `work` is a login on an unowned host
+- **THEN** the hook exits 2
 
 #### Scenario: Host-qualified tea slug
 - **WHEN** the command is `tea pr create --repo git.sjo.lol/cameron/lectern`
@@ -214,11 +218,18 @@ A `tea` `pulls`, `issues` or `comment` write with no `--repo` or `--owner` SHALL
 - **THEN** the hook exits 2
 
 ### Requirement: tea targets the guard cannot read
-`guard-forge-write` MUST block as unreadable a `tea` write whose `--repo`/`--owner` is not a literal `owner/repo`, whose `--repo` names an existing directory, that is `repos create|delete` without `--owner`, or that runs under a `GITEA_INSTANCE_URL` set other than directly in front of `tea`.
+`guard-forge-write` MUST block as unreadable a `tea` write whose `--repo`/`--owner` is not a literal `owner/repo`, whose `--repo` names an existing directory, that is `repos create|delete` without `--owner`, that carries a near miss of a repo, login, remote or owner flag (`--rep`, `-logi`), or whose command assigns `GITEA_INSTANCE_URL` other than directly in front of `tea`. Each is a shape where tea's write target can differ from what the guard read.
 
 #### Scenario: Repo from a variable
 - **WHEN** the command is `tea pr create --repo "$REPO"` in an owned checkout
 - **THEN** the hook exits 2 with rule `forge-write-target-unresolvable`
+
+### Requirement: tea login config the guard cannot read
+A `tea` write judged on a login host MUST block when tea's config has a login the guard cannot read (an entry without a plain `name:` and `url:`, a list at the `logins:` key's own column, an inline non-empty list, or a file over 1 MiB), or when a literal `--login` names no saved login. It MUST NOT fall back to `CADENCE_EXTRA_HOSTS`.
+
+#### Scenario: One unreadable login with extra hosts set
+- **WHEN** `CADENCE_EXTRA_HOSTS` names the owned host and tea's config has a readable `sjo` login and a `work` login written with a quoted `"url":` key
+- **THEN** `tea pr create --repo cameron/lectern` exits 2
 
 ### Requirement: Repository deletion
 `guard-gh-dangerous` (PreToolUse, Bash) SHALL block (exit 2, `gh repo delete is blocked`) `gh repo delete` and `gh api -X DELETE repos/<owner>/<repo>` on any repository, owned or not, including inside shell wrappers, a literal piped into a shell, and quoted or brace-built spellings the shell runs as a delete. It SHALL block a `gh` command too large to read when its text could spell a delete. Other `gh` commands, and the phrase in quoted prose, SHALL be allowed.
