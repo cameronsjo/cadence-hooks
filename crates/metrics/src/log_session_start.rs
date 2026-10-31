@@ -34,12 +34,25 @@ impl Logger for LogSessionStart {
         if common::create_private_dir(&dir).is_err() {
             return;
         }
+        if starts_a_counter(input.source.as_deref()) {
+            crate::session_commits::start(&dir, session_id);
+        }
         if let Ok(mut file) =
             common::open_state_marker(&dir.join(format!("{session_id}.start")), false)
         {
             let _ = std::io::Write::write_all(&mut file, common::utc_timestamp().as_bytes());
         }
     }
+}
+
+/// Only a session that is new under its id starts a commit counter: `startup`,
+/// and `clear` (a fresh id and transcript). A `resume` reuses an id whose
+/// earlier commits sit in the ledger, and `compact` may too, so an empty
+/// counter would hide them and re-price the whole transcript at the next
+/// commit; those stay on the ledger. A missing `source` also stays on the
+/// ledger, which is slower but still counts correctly. Pure.
+fn starts_a_counter(source: Option<&str>) -> bool {
+    matches!(source, Some("startup" | "clear"))
 }
 
 #[cfg(test)]
@@ -51,6 +64,15 @@ mod tests {
             session_id: session.map(String::from),
             hook_event_name: Some(event.to_string()),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_new_sessions_start_a_counter() {
+        assert!(starts_a_counter(Some("startup")));
+        assert!(starts_a_counter(Some("clear")));
+        for source in [Some("resume"), Some("compact"), Some("other"), None] {
+            assert!(!starts_a_counter(source), "{source:?}");
         }
     }
 
