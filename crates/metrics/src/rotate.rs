@@ -34,7 +34,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -315,11 +315,15 @@ const TORN_TAIL_HOLD: Duration = Duration::from_secs(60);
 /// Whether `path` changed within [`TORN_TAIL_HOLD`]. Unreadable reads as
 /// recent, which only holds a torn row back one more run.
 fn recently_modified(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_none_or(|age| age < TORN_TAIL_HOLD)
+    let Ok(modified) = std::fs::symlink_metadata(path).and_then(|m| m.modified()) else {
+        return true;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age < TORN_TAIL_HOLD,
+        // A small skew into the future reads as recent; more than a day is a
+        // wrong clock or a hand-set mtime, which must not hold a row forever.
+        Err(ahead) => ahead.duration() <= Duration::from_secs(DAY_SECS),
+    }
 }
 
 /// Length of the bytes up to and including the last newline: the rows a move
@@ -357,12 +361,17 @@ fn split_test_rows(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Per-(day, hook, repo, decision) counts of the `denials` rows in `bytes`,
-/// as rollup rows naming `segment` and `movedSha256`, the hash of the bytes
-/// being moved, so a segment moved twice (rows left behind the first time)
-/// rolls each part up once. Rows that do not parse are left out of the counts
-/// (their bytes still go to the archive). Pure.
-pub(crate) fn denial_rollup_rows(bytes: &[u8], segment: &str) -> Vec<Value> {
-    let moved = sha256_hex(bytes);
+/// as rollup rows naming `segment` and the byte range being moved:
+/// `movedSha256` and `movedLen` describe the segment's first `movedLen`
+/// bytes, so a retry or a second move rolls up only the rows past them. Rows
+/// that do not parse are left out of the counts (their bytes still go to the
+/// archive). Pure.
+pub(crate) fn denial_rollup_rows(
+    bytes: &[u8],
+    segment: &str,
+    moved_sha256: &str,
+    moved_len: u64,
+) -> Vec<Value> {
     let mut counts: BTreeMap<(String, String, String, String), u64> = BTreeMap::new();
     for line in bytes.split(|b| *b == b'\n') {
         let Ok(row) = serde_json::from_slice::<Value>(line) else {
@@ -391,7 +400,8 @@ pub(crate) fn denial_rollup_rows(bytes: &[u8], segment: &str) -> Vec<Value> {
                 "decision": decision,
                 "count": count,
                 "segment": segment,
-                "movedSha256": moved,
+                "movedSha256": moved_sha256,
+                "movedLen": moved_len,
             })
         })
         .collect()
@@ -911,12 +921,17 @@ pub(crate) fn move_state(
         .filter(|p| sha256_hex(p) == manifest.sha256);
     let suffix = |bytes: &[u8]| bytes.get(len..).unwrap_or_default().to_vec();
     // Bytes after the moved prefix are kept only when that prefix ended on a
-    // row boundary; otherwise the first of them would be the rest of a row
-    // the move split.
+    // row boundary, or when an archive closed its torn last row with a newline
+    // (an old segment's fragment): then the bytes after it, the fragment's
+    // late completion, stay as their own fragment and archive later.
+    // Otherwise the first of them would be the rest of a row the move split.
+    let closed_by_archive = manifest.op == "archive"
+        && original.is_some_and(|o| sha256_hex(&normalized(o)) == manifest.archived_sha256);
     if let (Some(bytes), Some(original)) = (current, original)
         && bytes.len() > len
         && !original.is_empty()
         && !original.ends_with(b"\n")
+        && !closed_by_archive
     {
         return Ok(MoveState::Unproven(format!(
             "expected the moved part of {} to end on a row boundary, found a split row",
@@ -1062,27 +1077,51 @@ fn replace_source(dir: &Path, name: &str, kept: &[u8], fault: Fault<'_>) -> std:
 // Archive run
 // ---------------------------------------------------------------------------
 
-/// Segment names already rolled up, from every rollup row's `segment`.
-/// The rollup key for moving `bytes` out of `segment`. Pure.
-fn rollup_key(segment: &str, moved_sha256: &str) -> String {
-    format!("{segment}#{moved_sha256}")
-}
+/// What has been rolled up per segment: each rolled-up range as the
+/// (sha256, length) of the segment's first bytes, or `None` for a row from an
+/// earlier build without a range, which means the segment was rolled up in
+/// full.
+type RolledUp = BTreeMap<String, Vec<Option<(String, u64)>>>;
 
-/// Every (segment, moved bytes) already rolled up, as [`rollup_key`]s.
-fn rolled_up_segments(rollup: &Path) -> BTreeSet<String> {
-    common::read_ledger(rollup)
+/// Every segment's rolled-up ranges, from the rollup rows.
+fn rolled_up_segments(rollup: &Path) -> RolledUp {
+    let mut out = RolledUp::new();
+    for row in common::read_ledger(rollup)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|row| {
-            let segment = row.get("segment").and_then(Value::as_str)?;
-            let moved = row
-                .get("movedSha256")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            Some(rollup_key(segment, moved))
+    {
+        let Some(segment) = row.get("segment").and_then(Value::as_str) else {
+            continue;
+        };
+        let range = row
+            .get("movedSha256")
+            .and_then(Value::as_str)
+            .zip(row.get("movedLen").and_then(Value::as_u64))
+            .map(|(sha, len)| (sha.to_string(), len));
+        out.entry(segment.to_string()).or_default().push(range);
+    }
+    out
+}
+
+/// How many of `bytes` (a segment's bytes as read) are already rolled up:
+/// the longest recorded range that is a prefix of them, or all of them when a
+/// row without a range covers the segment. Pure.
+fn rolled_up_len(rolled: &RolledUp, segment: &str, bytes: &[u8]) -> usize {
+    let Some(ranges) = rolled.get(segment) else {
+        return 0;
+    };
+    ranges
+        .iter()
+        .map(|range| match range {
+            None => usize::MAX,
+            Some((sha, len)) => usize::try_from(*len)
+                .ok()
+                .filter(|len| bytes.get(..*len).is_some_and(|p| sha256_hex(p) == *sha))
+                .unwrap_or(0),
         })
-        .collect()
+        .max()
+        .unwrap_or(0)
 }
 
 /// Whether the file at `path`, `len` bytes long, ends without a newline.
@@ -1103,7 +1142,7 @@ fn archive_segment(
     name: &str,
     stem: &str,
     stamp: &str,
-    rolled_up: &mut BTreeSet<String>,
+    rolled_up: &mut RolledUp,
     fault: Fault<'_>,
 ) -> std::io::Result<Option<u64>> {
     let (state, archive_dir, rollups) = dirs(dir);
@@ -1124,11 +1163,17 @@ fn archive_segment(
         return Ok(None);
     }
     let rows = row_count(&content);
-    let key = rollup_key(name, &sha256_hex(&content));
 
-    if stem == "denials" && !rolled_up.contains(&key) {
+    // Roll up only the rows past what an earlier attempt or move already
+    // rolled up of these same bytes (keyed on the moved byte range, so a
+    // retry after a crash plus an append, or a second move, counts each row
+    // once).
+    let done = rolled_up_len(rolled_up, name, &moved);
+    if stem == "denials" && done < moved.len() {
         let mut out = String::new();
-        for row in denial_rollup_rows(&content, name) {
+        let fresh = content.get(done..).unwrap_or_default();
+        let moved_sha = sha256_hex(&moved);
+        for row in denial_rollup_rows(fresh, name, &moved_sha, moved.len() as u64) {
             out.push_str(&row.to_string());
             out.push('\n');
         }
@@ -1143,7 +1188,10 @@ fn archive_segment(
             file.write_all(out.as_bytes())?;
             file.sync_all()?;
         }
-        rolled_up.insert(key);
+        rolled_up
+            .entry(name.to_string())
+            .or_default()
+            .push(Some((moved_sha, moved.len() as u64)));
     }
     fault(Step::AfterRollup)?;
 

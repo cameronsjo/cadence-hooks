@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -203,7 +204,7 @@ fn rollup_counts_by_day_hook_repo_decision() {
         "garbage",
     ]
     .join("\n");
-    let out = denial_rollup_rows(rows.as_bytes(), "denials.x.jsonl");
+    let out = denial_rollup_rows(rows.as_bytes(), "denials.x.jsonl", "abc", 7);
     assert_eq!(out.len(), 2);
     assert_eq!(out[0]["day"], "2026-01-01");
     assert_eq!(out[0]["count"], 2);
@@ -2187,10 +2188,11 @@ fn run_with(dir: &Path, fault: Fault<'_>) -> RotateReport {
     report
 }
 
-/// A move whose recorded prefix ends mid-row, with bytes after it, is
-/// unproven: those bytes would start with the rest of a split row.
+/// A prefix that ends mid-row with bytes after it: an archive that closed the
+/// torn row with a newline keeps the bytes after it as their own fragment; a
+/// quarantine (which never closes a row) is unproven.
 #[test]
-fn a_split_row_in_a_manifest_is_unproven() {
+fn a_split_row_is_kept_after_a_closed_archive_and_unproven_otherwise() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     quarantined(dir);
@@ -2207,7 +2209,7 @@ fn a_split_row_in_a_manifest_is_unproven() {
         gzip_member(&normalized(prefix)).unwrap(),
     )
     .unwrap();
-    let manifest = Manifest {
+    let closed = Manifest {
         op: "archive".to_string(),
         segment: seg.clone(),
         archive,
@@ -2220,8 +2222,28 @@ fn a_split_row_in_a_manifest_is_unproven() {
         final_sha256: None,
         final_len: None,
     };
+    assert_eq!(
+        move_state(&dir.join(ARCHIVE_DIR), &closed, Some(&bytes)).unwrap(),
+        MoveState::Pending {
+            remaining: bytes[cut..].to_vec()
+        }
+    );
+
+    let member = b"{\"x\":1}\n";
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(TESTROWS_ARCHIVE),
+        gzip_member(member).unwrap(),
+    )
+    .unwrap();
+    let quarantine = Manifest {
+        op: "quarantine".to_string(),
+        archive: TESTROWS_ARCHIVE.to_string(),
+        archived_sha256: sha256_hex(member),
+        kept_sha256: Some(String::new()),
+        ..closed
+    };
     assert!(matches!(
-        move_state(&dir.join(ARCHIVE_DIR), &manifest, Some(&bytes)).unwrap(),
+        move_state(&dir.join(ARCHIVE_DIR), &quarantine, Some(&bytes)).unwrap(),
         MoveState::Unproven(_)
     ));
 }
@@ -2362,9 +2384,212 @@ fn quarantine_counts_only_the_rows_it_moves() {
     );
     // A whole test row with no newline yet: held back on a fresh file.
     append_row(&dir.join(&seg), &denial(3, Some("t")));
+    let read_before = std::fs::read(dir.join(&seg)).unwrap();
     let report = quarantine(dir, &qopts(false, &no_fault)).unwrap();
     let file = report.files.iter().find(|f| f.file == seg).unwrap();
     assert_eq!(file.test_rows, 1, "{file:?}");
     assert_eq!(file.rows_before, 2, "{file:?}");
-    assert_eq!(file.sha256.len(), 64);
+    // The whole file as read, torn tail included, not just the moved bytes.
+    assert_eq!(file.sha256, sha256_hex(&read_before));
+}
+
+// --- round 8 (cameronsjo/cadence-hooks#1600) -------------------------------
+
+fn rollup_total(dir: &Path) -> u64 {
+    common::read_ledger(&dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["count"]
+                .as_u64()
+                .unwrap()
+        })
+        .sum()
+}
+
+/// An old `denials` segment ending in a fragment, aged past the torn-row hold.
+fn old_torn(dir: &Path) -> PathBuf {
+    quarantined(dir);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(100),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+    );
+    let path = dir.join(&seg);
+    append_row(&path, r#"{"partial"#);
+    age_file(&path, 3600);
+    path
+}
+
+/// The reviewer's crash walk: an old torn segment killed at each step; `cat`
+/// prints the three rows once mid-move, and a clean run ends with the three
+/// rows stored once and two rows rolled up (the fragment does not parse).
+#[test]
+fn an_old_torn_segment_survives_a_kill_at_each_step() {
+    for step in [
+        Step::AfterRollup,
+        Step::AfterManifest,
+        Step::AfterArchiveTemp,
+        Step::AfterArchiveRename,
+        Step::AfterSourceDone,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        old_torn(dir);
+        assert!(rotate(dir, &opts(&fail_at(step))).is_err(), "{step:?}");
+        let mid = cat_rows(dir, "denials", None, false);
+        assert_eq!(mid.len(), 3, "{step:?}: {mid:?}");
+        assert_eq!(
+            mid.iter().filter(|r| *r == r#"{"partial"#).count(),
+            1,
+            "{step:?}"
+        );
+        run_ok(dir);
+        assert!(
+            dir.join("state").join(MANIFEST_FILE).metadata().is_err(),
+            "{step:?}"
+        );
+        assert_eq!(raw_rows(dir, &["denials"]).len(), 3, "{step:?}");
+        assert_eq!(rollup_total(dir), 2, "{step:?}: rollup");
+    }
+}
+
+/// A writer that still holds an old torn segment finishes its row after the
+/// read: the archive keeps the fragment as it was read (closed with a
+/// newline), the completion stays in the segment as its own fragment, and the
+/// run completes.
+#[test]
+fn an_old_fragment_finished_after_the_read_stays_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let path = old_torn(dir);
+    let fault = |s: Step| {
+        if s == Step::AfterManifest {
+            append_row(&path, "\"}\n");
+        }
+        Ok(())
+    };
+    run_with(dir, &fault);
+    assert!(
+        dir.join("state").join(MANIFEST_FILE).metadata().is_err(),
+        "manifest cleared"
+    );
+    assert_eq!(lines_of(&std::fs::read(&path).unwrap()), ["\"}"]);
+    let printed = cat_rows(dir, "denials", None, false);
+    assert_eq!(
+        printed.iter().filter(|r| *r == r#"{"partial"#).count(),
+        1,
+        "{printed:?}"
+    );
+    assert_eq!(
+        printed.iter().filter(|r| *r == "\"}").count(),
+        1,
+        "{printed:?}"
+    );
+    assert_eq!(printed.len(), 4, "{printed:?}");
+    // The completion is a whole line of its own, so the next run archives it.
+    run_ok(dir);
+    assert!(!path.exists());
+    let after = cat_rows(dir, "denials", None, false);
+    assert_eq!(sorted(after), sorted(printed));
+}
+
+/// A kill after the rollup, then an append, then a clean run: the rollup
+/// counts equal the rows archived.
+#[test]
+fn a_rollup_retry_after_an_append_counts_each_row_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(100),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+    );
+    let path = dir.join(&seg);
+    assert!(rotate(dir, &opts(&fail_at(Step::AfterRollup))).is_err());
+    append_row(&path, &format!("{}\n", denial(3, Some(UUID))));
+    run_ok(dir);
+    assert_eq!(raw_rows(dir, &["denials"]).len(), 3);
+    assert_eq!(rollup_total(dir), 3);
+}
+
+/// A first attempt on a fresh torn segment (fragment held back) killed after
+/// its rollup, retried once the segment is old (fragment taken): the two rows
+/// are rolled up once.
+#[test]
+fn a_rollup_retry_from_the_recent_to_the_old_branch_counts_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(100),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+    );
+    let path = dir.join(&seg);
+    append_row(&path, r#"{"partial"#);
+    assert!(rotate(dir, &opts(&fail_at(Step::AfterRollup))).is_err());
+    assert_eq!(rollup_total(dir), 2);
+    age_file(&path, 3600);
+    run_ok(dir);
+    assert!(!path.exists());
+    assert_eq!(raw_rows(dir, &["denials"]).len(), 3);
+    assert_eq!(rollup_total(dir), 2, "no row counted twice");
+}
+
+/// The reverse: an old-branch attempt killed after its rollup, the fragment
+/// then finished by its writer (fresh again): still counted once.
+#[test]
+fn a_rollup_retry_from_the_old_to_the_recent_branch_counts_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let path = old_torn(dir);
+    assert!(rotate(dir, &opts(&fail_at(Step::AfterRollup))).is_err());
+    assert_eq!(rollup_total(dir), 2);
+    append_row(&path, "\"}\n");
+    run_ok(dir);
+    assert_eq!(rollup_total(dir), 2, "the two parsed rows once");
+}
+
+/// A row from an earlier build with no moved range means the segment was
+/// rolled up in full.
+#[test]
+fn a_rollup_row_without_a_range_covers_the_segment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    ensure_private_dir(&dir.join(ROLLUPS_DIR)).unwrap();
+    std::fs::write(
+        dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP),
+        format!("{}\n", json!({"day":"2026-01-02","hook":"h1","repo":"r","decision":"deny","count":1,"segment":seg})),
+    )
+    .unwrap();
+    run_ok(dir);
+    assert_eq!(rollup_total(dir), 1);
+}
+
+#[test]
+fn a_far_future_mtime_does_not_hold_a_fragment_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    let path = dir.join(&seg);
+    append_row(&path, r#"{"partial"#);
+    std::fs::File::options()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(365 * 86_400))
+        .unwrap();
+    run_ok(dir);
+    assert!(!path.exists(), "archived whole in one run");
 }
