@@ -240,14 +240,17 @@ fn once_per_session_marker(
     Some(state_dir.join("bypass").join(session).join(key))
 }
 
-/// Encode one key part injectively as a filename piece: ASCII letters and
-/// digits stay, every other byte becomes `_` plus two hex digits. `my.app` and
-/// `my_app` therefore stay distinct (`my_2eapp`, `my_5fapp`), and `-`, the
-/// part separator, never appears inside a part. Pure.
+/// Encode one key part injectively as a filename piece: lowercase ASCII
+/// letters and digits stay, every other byte (uppercase included) becomes `_`
+/// plus two lowercase hex digits. `my.app` and `my_app` stay distinct
+/// (`my_2eapp`, `my_5fapp`), and so do `Foo` and `foo` (`_46oo`, `foo`) on a
+/// case-insensitive filesystem such as APFS, where two names differing only
+/// in case are one file. `-`, the part separator, never appears in a part.
+/// Pure.
 fn marker_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() {
             out.push(char::from(b));
         } else {
             out.push_str(&format!("_{b:02x}"));
@@ -862,6 +865,31 @@ mod tests {
         assert_eq!(tools, ["Edit", "Bash"]);
     }
 
+    /// Repos `Foo` and `foo` are two repos even on a case-insensitive
+    /// filesystem: each gets its first row.
+    #[test]
+    fn repos_differing_only_in_case_each_get_a_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = env_switch_prov("CADENCE_ALLOW_MAIN");
+        let (upper, lower) = (tmp.path().join("cased/Foo"), tmp.path().join("plain/foo"));
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&lower).unwrap();
+        let mut a = used_input();
+        a.cwd = Some(upper.to_string_lossy().into_owned());
+        let mut b = used_input();
+        b.cwd = Some(lower.to_string_lossy().into_owned());
+        let metrics = tmp.path().join("metrics");
+        with_metrics_dir(&metrics, || {
+            log_bypass(BypassEvent::used("enforce-worktree", &a, &allow));
+            log_bypass(BypassEvent::used("enforce-worktree", &b, &allow));
+        });
+        let repos: Vec<_> = read_lines(&metrics)
+            .iter()
+            .map(|r| r["repo"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(repos, ["Foo", "foo"]);
+    }
+
     /// A secret-class escape is a distinct event on every use: never deduped.
     #[test]
     fn secret_class_env_switch_is_logged_on_every_use() {
@@ -944,6 +972,11 @@ mod tests {
         assert_eq!(marker_component("my_app"), "my_5fapp");
         assert_eq!(marker_component("../x"), "_2e_2e_2fx");
         assert_eq!(marker_component(""), "");
+        // No two encodings differ only in case, so a case-insensitive
+        // filesystem cannot fold them into one claim file.
+        let (upper, lower) = (marker_component("Foo"), marker_component("foo"));
+        assert_ne!(upper.to_ascii_lowercase(), lower.to_ascii_lowercase());
+        assert!(!upper.bytes().any(|b| b.is_ascii_uppercase()));
         assert_ne!(marker_name(&["a-b", "c"]), marker_name(&["a", "b-c"]));
     }
 
