@@ -1375,8 +1375,8 @@ mod tests {
         let path = tmp.path().join("subagents.jsonl");
         let pad = "x".repeat(60);
 
-        // ~85 bytes a row, 2000 rows, a 40 KB cap: several rotations, many of
-        // them inside one second, and every row must survive across the
+        // ~85 bytes a row, 2000 rows, a 40 KB cap: usually several rotations,
+        // often inside one second, and every row must survive across the
         // segments and the live file.
         std::thread::scope(|scope| {
             for t in 0..THREADS {
@@ -1390,9 +1390,13 @@ mod tests {
             }
         });
 
+        // A rotation that loses the non-blocking flock to a busy appender is
+        // skipped, so how many segments appear depends on scheduling (CI saw
+        // fewer than 3). What the test needs is that the rows crossed at least
+        // one rotation.
         assert!(
-            ledger_segments(&path).len() >= 3,
-            "the cap was crossed several times"
+            !ledger_segments(&path).is_empty(),
+            "the cap was crossed at least once"
         );
         let all = read_ledger(&path).unwrap();
         let mut seen = std::collections::HashSet::new();

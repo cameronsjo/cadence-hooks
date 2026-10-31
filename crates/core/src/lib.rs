@@ -1497,6 +1497,11 @@ pub struct MetricsInput {
     /// than failing the whole payload parse (see `lenient_option`).
     #[serde(default, deserialize_with = "lenient_option")]
     pub tool_response: Option<ToolResponse>,
+    /// Why a `SessionStart` fired (`startup`, `resume`, `clear`, `compact`).
+    /// Mirrors [`HookInput::source`]; a non-string value reads as `None`
+    /// rather than failing the parse.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub source: Option<String>,
     /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
     /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
     /// surfaces schema additions across Claude Code releases.

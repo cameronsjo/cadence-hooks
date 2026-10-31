@@ -7,6 +7,7 @@
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
+use crate::session_commits;
 use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
@@ -70,7 +71,11 @@ impl Logger for LogCommit {
         }
         let commits_path = dir.join("commits.jsonl");
 
-        let last_message_id = previous_message_id(&commits_path, session_id);
+        let state = common::state_dir();
+        let last_message_id = match session_commits::last_message_id(&state, session_id) {
+            session_commits::LastMessage::Known(id) => id,
+            session_commits::LastMessage::Unknown => previous_message_id(&commits_path, session_id),
+        };
 
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
@@ -120,12 +125,19 @@ impl Logger for LogCommit {
             // JSON, so this is one line with no embedded newlines.
             let mut line = record.to_string();
             line.push('\n');
-            let _ = file.write_all(line.as_bytes());
+            if file.write_all(line.as_bytes()).is_ok() {
+                session_commits::record(
+                    &state,
+                    session_id,
+                    record.get("lastMessageId").and_then(Value::as_str),
+                );
+            }
         }
     }
 }
 
-/// The session's previous `lastMessageId` in the commits ledger, the newest
+/// Fallback for a session with no commit state (it started before that state
+/// existed): the session's previous `lastMessageId` in the commits ledger, the newest
 /// rotated segment included: a session that straddles a rotation must still
 /// find its previous row, or its next commit re-prices the whole transcript.
 /// One segment back is enough, since a session never writes a cap's worth of
