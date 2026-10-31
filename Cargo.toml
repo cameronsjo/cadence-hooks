@@ -22,6 +22,9 @@ dialoguer = "0.11"
 jiff = "0.2"
 gethostname = "0.5"
 sha2 = "0.10"
+# gzip for `metrics rotate` archives (cadence-hooks#1590). Default backend is
+# the pure-Rust miniz_oxide, so no C toolchain or system zlib is needed.
+flate2 = "1"
 # Only for `signal(2)` — the SIGPIPE disposition has no std equivalent on
 # stable Rust. Already in the lock file as a transitive dependency, so this
 # adds no new code to the build.
@@ -51,6 +54,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 serde_json.workspace = true
+# Timestamps for the `doctor` rotate-health tests.
+jiff.workspace = true
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 
 [dependencies]

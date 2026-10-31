@@ -17,6 +17,8 @@ pub mod common;
 pub mod compute_cost;
 /// Disclose at SessionStart when the guard suite has recently been failing open.
 pub mod failopen_disclose;
+/// `metrics cat`: one ledger's archives, segments and live file as JSONL.
+pub mod ledger_cat;
 /// Append AskUserQuestion stance/shape records to `askuserquestion.jsonl`.
 pub mod log_askuserquestion;
 /// Append guard-bypass audit records (armed/used) to `bypasses.jsonl`.
@@ -49,6 +51,9 @@ pub mod model_breakdown;
 pub mod price_transcript;
 /// Embedded + overridable model price table.
 pub mod prices;
+/// `metrics rotate`: age-based archive, `denials` rollups, the stale
+/// session-state sweep, and the test-row quarantine.
+pub mod rotate;
 /// Sum transcript token usage over a range.
 pub mod scan_tokens;
 /// Deterministic session grading: gaps, cold-restart dollars, peak context.

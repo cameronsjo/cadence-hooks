@@ -1772,8 +1772,10 @@ fn ledger_size_findings(
                         len / (1024 * 1024)
                     ),
                     remediation: format!(
-                        "readers here load it whole; `gzip {quoted}` keeps its rows and \
-                         takes it out of what they read"
+                        "readers here load it whole until it ages past its retention \
+                         window, when `cadence-hooks metrics rotate` moves it into \
+                         `archive/`; do not gzip {quoted} by hand, which hides its rows \
+                         from `metrics cat`"
                     ),
                 };
             }
@@ -1794,6 +1796,70 @@ fn ledger_size_findings(
             }
         })
         .collect()
+}
+
+/// How old `state/rotate.last-success` may get before `doctor` warns
+/// (cadence-hooks#1590). SessionStart tries a run once a UTC day, so three
+/// days without a complete one means it keeps failing or never runs.
+const ROTATE_STALE_SECS: i64 = 3 * 24 * 60 * 60;
+
+/// Combined size of `archive/` and `rollups/` past which `doctor` warns.
+const ARCHIVE_WARN_BYTES: u64 = 500 * 1024 * 1024;
+
+/// `metrics rotate` health: a last complete run older than
+/// [`ROTATE_STALE_SECS`] (or none while segments wait), and `archive/` plus
+/// `rollups/` past `size_threshold` bytes. Warnings only; reads, never writes.
+fn rotate_findings(dir: &Path, now: i64, size_threshold: u64) -> Vec<Finding> {
+    use cadence_hooks_metrics::rotate::{ARCHIVE_DIR, LAST_SUCCESS_FILE, ROLLUPS_DIR};
+    let health = cadence_hooks_metrics::rotate::rotate_health(dir);
+    let finding = |file: PathBuf, snippet: &str, diagnosis: String, remediation: &str| Finding {
+        severity: Severity::Warning,
+        blocker: Blocker::No,
+        plugin: "cadence-metrics".to_string(),
+        file,
+        line: None,
+        snippet: snippet.to_string(),
+        diagnosis,
+        remediation: remediation.to_string(),
+    };
+    let marker = dir.join("state").join(LAST_SUCCESS_FILE);
+    let failopen = failopen_inspect_cmd(dir, cadence_hooks_metrics::rotate::FAILOPEN_REASON);
+    let remedy = format!(
+        "run `cadence-hooks metrics rotate` and read its error; past failures: `{failopen}`"
+    );
+    let mut findings = Vec::new();
+    match health.last_success {
+        Some(at) if now.saturating_sub(at) > ROTATE_STALE_SECS => findings.push(finding(
+            marker,
+            LAST_SUCCESS_FILE,
+            format!(
+                "the last complete `metrics rotate` run was {} days ago, so old segments are not being archived",
+                now.saturating_sub(at) / 86_400
+            ),
+            &remedy,
+        )),
+        None if health.segments_present => findings.push(finding(
+            marker,
+            LAST_SUCCESS_FILE,
+            "rotated ledger segments exist but `metrics rotate` has never completed a run".to_string(),
+            &remedy,
+        )),
+        _ => {}
+    }
+    let size = dir_size_bytes(&dir.join(ARCHIVE_DIR)) + dir_size_bytes(&dir.join(ROLLUPS_DIR));
+    if size > size_threshold {
+        findings.push(finding(
+            dir.join(ARCHIVE_DIR),
+            ARCHIVE_DIR,
+            format!(
+                "metrics archives and rollups hold {} MiB, past the {} MiB warning size",
+                size / (1024 * 1024),
+                size_threshold / (1024 * 1024)
+            ),
+            "nothing drops archived rows; move old `archive/*.jsonl.gz` months to other storage once nothing reads them",
+        ));
+    }
+    findings
 }
 
 /// A copy-pasteable command that lists the recent `failopen.jsonl` rows for one
@@ -4628,6 +4694,14 @@ pub fn run(
             cadence_hooks_metrics::ledger_max_bytes(),
             cfg!(unix),
         ));
+        findings.extend(rotate_findings(
+            &metrics_dir,
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+                .unwrap_or(0),
+            ARCHIVE_WARN_BYTES,
+        ));
         // Names the CAUSE the deadline finding above can only tell the operator
         // to go looking for (#278). Gated with the other live-machine reads:
         // under `--root` these would report the dev machine's real dirs, not
@@ -5032,7 +5106,82 @@ mod tests {
             "{}",
             f.diagnosis
         );
-        assert!(f.remediation.contains("gzip '"), "{}", f.remediation);
+        assert!(
+            f.remediation.contains("metrics rotate"),
+            "{}",
+            f.remediation
+        );
+        assert!(f.remediation.contains("do not gzip"), "{}", f.remediation);
+    }
+
+    #[test]
+    fn rotate_findings_warn_on_a_stale_or_missing_success() {
+        use cadence_hooks_metrics::rotate::LAST_SUCCESS_FILE;
+        let now = 1_793_000_000_i64;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(
+            rotate_findings(dir, now, u64::MAX).is_empty(),
+            "fresh install"
+        );
+
+        fs::write(dir.join("denials.20261001T000000Z-000.jsonl"), "{}\n").unwrap();
+        let findings = rotate_findings(dir, now, u64::MAX);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains("never completed"),
+            "{}",
+            findings[0].diagnosis
+        );
+
+        fs::create_dir_all(dir.join("state")).unwrap();
+        let at = |secs: i64| jiff::Timestamp::from_second(secs).unwrap().to_string();
+        fs::write(
+            dir.join("state").join(LAST_SUCCESS_FILE),
+            at(now - 2 * 86_400),
+        )
+        .unwrap();
+        assert!(
+            rotate_findings(dir, now, u64::MAX).is_empty(),
+            "two days is fine"
+        );
+        fs::write(
+            dir.join("state").join(LAST_SUCCESS_FILE),
+            at(now - 4 * 86_400),
+        )
+        .unwrap();
+        let findings = rotate_findings(dir, now, u64::MAX);
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains("4 days ago"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(findings[0].remediation.contains("metrics_rotate_failed"));
+    }
+
+    #[test]
+    fn rotate_findings_warn_when_archives_grow_past_the_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("archive")).unwrap();
+        fs::create_dir_all(dir.join("rollups")).unwrap();
+        fs::File::create(dir.join("archive").join("denials.2026-01.jsonl.gz"))
+            .unwrap()
+            .set_len(600)
+            .unwrap();
+        fs::File::create(dir.join("rollups").join("denials-daily.jsonl"))
+            .unwrap()
+            .set_len(600)
+            .unwrap();
+        assert!(rotate_findings(dir, 0, 2000).is_empty());
+        let findings = rotate_findings(dir, 0, 1000);
+        assert_eq!(
+            findings.len(),
+            1,
+            "archive + rollups together pass 1000 bytes"
+        );
+        assert_eq!(findings[0].snippet, "archive");
     }
 
     #[test]

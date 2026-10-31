@@ -57,7 +57,9 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
             // piping them to `jq` reads the absent output as "no cold
             // restarts" or "$0" rather than "the command never ran" — the
             // exact failure their fail-closed exit codes exist to prevent.
-            | (Some("metrics"), Some("grade" | "price"))
+            // `metrics rotate` and `metrics cat` likewise: cat bypassed would
+            // print no rows, which reads as an empty ledger.
+            | (Some("metrics"), Some("grade" | "price" | "rotate" | "cat"))
             // The one ENFORCEMENT-path hook that must survive the bypass, and
             // deliberately its own arm rather than a widened `guardrails`
             // alternation — namespace-wide exemption would run every guardrails
@@ -584,6 +586,27 @@ enum MetricsCommands {
         #[arg(long, value_name = "PATH")]
         prices: Option<String>,
     },
+    /// Archive ledger segments past retention into archive/*.jsonl.gz, roll up denials, sweep stale session state (CLI action)
+    Rotate {
+        /// Instead, move `denials` rows whose sessionId is not a UUID into
+        /// archive/denials.testrows.jsonl.gz (one-time cleanup).
+        #[arg(long)]
+        quarantine_test_rows: bool,
+        /// With --quarantine-test-rows: print the counts and change nothing.
+        #[arg(long, requires = "quarantine_test_rows")]
+        dry_run: bool,
+    },
+    /// Print one ledger's archives, segments and live file as JSONL, oldest first (CLI action)
+    Cat {
+        /// Ledger name, e.g. `denials` or `commits`.
+        ledger: String,
+        /// Only rows whose `ts` is at or after this ISO 8601 UTC time (or YYYY-MM-DD).
+        #[arg(long, value_name = "ISO8601")]
+        since: Option<String>,
+        /// For `denials`: also print the quarantined test rows first.
+        #[arg(long)]
+        include_test_rows: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -769,7 +792,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             // A CLI action, not a hook: no hooks.json wiring, no stdin
             // payload, not subject to CADENCE_DISABLE (same treatment as
             // redact-scan / declare / status / dismiss-*).
-            MetricsCommands::Grade { .. } | MetricsCommands::Price { .. } => return None,
+            MetricsCommands::Grade { .. }
+            | MetricsCommands::Price { .. }
+            | MetricsCommands::Rotate { .. }
+            | MetricsCommands::Cat { .. } => return None,
         }),
         Commands::Session(s) => Some(match s {
             SessionCommands::Start => "start",
@@ -1891,6 +1917,35 @@ fn main() {
                     .into(),
                 );
             }
+            MetricsCommands::Rotate {
+                quarantine_test_rows,
+                dry_run,
+            } => {
+                let dir = cadence_hooks_metrics::metrics_dir();
+                process::exit(
+                    if quarantine_test_rows {
+                        cadence_hooks_metrics::rotate::run_quarantine_cli(&dir, dry_run)
+                    } else {
+                        cadence_hooks_metrics::rotate::run_rotate_cli(&dir)
+                    }
+                    .into(),
+                );
+            }
+            MetricsCommands::Cat {
+                ledger,
+                since,
+                include_test_rows,
+            } => {
+                process::exit(
+                    cadence_hooks_metrics::ledger_cat::run_cat_cli(
+                        &cadence_hooks_metrics::metrics_dir(),
+                        &ledger,
+                        since.as_deref(),
+                        include_test_rows,
+                    )
+                    .into(),
+                );
+            }
             // Hook checks dispatched above, through `check_plan`.
             _ => unreachable!("check subcommands dispatch through check_plan"),
         },
@@ -2266,6 +2321,8 @@ mod tests {
             "redact-scan",
             "grade",
             "price",
+            "rotate",
+            "cat",
         ];
         for skipped in non_hooks {
             let is_real_subcommand = namespaces.iter().any(|ns| {

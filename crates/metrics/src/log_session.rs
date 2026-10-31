@@ -141,8 +141,8 @@ impl Logger for LogSession {
 /// subagent Start times (`subagents/<session>/`) and the once-per-session
 /// bypass claims (`bypass/<session>/`). `session_id` has passed
 /// `is_safe_session_id`, so the join stays inside `state_dir`. Fail-open.
-// debt: a session that never reaches SessionEnd (crash, kill) leaves its two
-// small dirs behind; sweep them by age when `metrics rotate` lands (#1590).
+// A session that never reaches SessionEnd (crash, kill) leaves its dirs
+// behind; `metrics rotate` sweeps them once untouched for 7 days (#1590).
 fn clear_session_state(state_dir: &std::path::Path, session_id: &str) {
     for kind in ["subagents", "bypass"] {
         let _ = std::fs::remove_dir_all(state_dir.join(kind).join(session_id));

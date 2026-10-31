@@ -200,8 +200,20 @@ fn is_segment_stamp(stamp: &str) -> bool {
 
 /// Compact form of an ISO 8601 UTC timestamp (`2026-10-31T03:14:02Z` →
 /// `20261031T031402Z`), comparable with segment stamps. Pure.
-fn compact_stamp(iso: &str) -> String {
+pub(crate) fn compact_stamp(iso: &str) -> String {
     iso.chars().filter(|c| !matches!(c, '-' | ':')).collect()
+}
+
+/// Split a rotated segment's file name into its ledger stem, stamp and
+/// sequence (`denials.20261031T031402Z-001.jsonl` → `("denials",
+/// "20261031T031402Z", 1)`), or `None` when `file_name` is not a segment. Pure.
+pub(crate) fn split_segment_name(file_name: &str) -> Option<(String, String, u32)> {
+    let (stem, _) = file_name.strip_suffix(".jsonl")?.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    let (stamp, seq) = segment_sort_key(&format!("{stem}.jsonl"), file_name)?;
+    Some((stem.to_string(), stamp, seq))
 }
 
 /// Whether `file_name` is a rotated segment of some ledger
@@ -218,7 +230,7 @@ pub fn is_ledger_segment(file_name: &str) -> bool {
 /// first. Regular files only, not followed through a symlink (the writers open
 /// with `O_NOFOLLOW`, and a FIFO would block the read). Empty when the
 /// directory is unreadable.
-fn stamped_segments(path: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn stamped_segments(path: &Path) -> Vec<(String, PathBuf)> {
     let Some(ledger_name) = path.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
     };
@@ -394,6 +406,62 @@ fn rotate_aside(path: &Path, stamp: &str) -> std::io::Result<()> {
             "expected a free segment name for stamp {stamp}, found all {MAX_SEGMENT_ATTEMPTS} taken"
         ),
     ))
+}
+
+/// Move the live ledger at `path` aside to a new dated segment now, whatever
+/// its size, under the same protocol as a cap rotation: an exclusive `flock` on
+/// the live inode, the move only while the path still names that inode, and
+/// [`rotate_aside`]'s never-replace rename. Concurrent appenders that open the
+/// path afterwards start a fresh live file. Returns the segment name, or `None`
+/// when there is no live file to move. Used by `metrics rotate
+/// --quarantine-test-rows`, which must split rows without rewriting a live file.
+#[cfg(unix)]
+pub(crate) fn rotate_live_now(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
+    // touches no memory. Blocking is fine: a cap rotator holds it for one rename.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let held = file.metadata()?;
+    match std::fs::symlink_metadata(path) {
+        Ok(on_disk) if on_disk.ino() == held.ino() && on_disk.dev() == held.dev() => {}
+        // Another process rotated it between our open and our lock: its rows
+        // are already in a segment, and the fresh live file is someone else's.
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let stamp = segment_stamp_now();
+    rotate_aside(path, &stamp)?;
+    // `rotate_aside` picked the first free sequence for `stamp`; find the one
+    // that is this inode.
+    for seq in 0..MAX_SEGMENT_ATTEMPTS {
+        let candidate = ledger_segment_path(path, &stamp, seq);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.ino() == held.ino() && meta.dev() == held.dev() => {
+                return Ok(Some(candidate));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "expected the moved ledger under a {stamp} segment name beside {}, found none",
+        path.display()
+    )))
 }
 
 pub(crate) fn open_ledger_capped(path: &Path, cap: Option<u64>) -> std::io::Result<std::fs::File> {
