@@ -83,6 +83,15 @@ jobs:
         run: |
           bash scripts/test-check-metrics-isolation.sh
           bash scripts/check-metrics-isolation.sh
+          # Positive control: a row the binary writes to its own default dir
+          # must fail the check, or the check is not looking where the binary
+          # writes (Git Bash's HOME vs the binary's USERPROFILE on Windows).
+          printf '%s' '{"hook_event_name":"SubagentStart","session_id":"ci-control","agent_id":"a1","agent_type":"Explore"}' \
+            | env -u CADENCE_METRICS_DIR cargo run -q --bin cadence-hooks -- metrics log-subagent
+          if bash scripts/check-metrics-isolation.sh; then
+            echo "the check passed with a row the binary just wrote: it reads the wrong dir" >&2
+            exit 1
+          fi
 
   openspec:
     # openspec/ holds the capability specs and the change proposals (#1446).

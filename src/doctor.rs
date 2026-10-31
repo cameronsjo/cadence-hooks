@@ -4829,10 +4829,13 @@ mod tests {
     use cadence_hooks_core::capability::is_executable_at;
     use std::fs;
 
-    /// The only lock on `CADENCE_METRICS_DIR` in this crate's test process.
-    /// Reading an unparsable session record logs a `registry-parse-skips` row,
-    /// so a test that plants one must run inside this, or the row lands in the
-    /// operator's real ledger (cadence-hooks#1586). It mirrors the session
+    /// Serializes every change to `CADENCE_METRICS_DIR` in this crate's test
+    /// process; no other test here sets it. It protects only the tests that
+    /// call [`with_scratch_metrics_dir`]: reading an unparsable session record
+    /// logs a `registry-parse-skips` row, so a test that plants one must run
+    /// inside it, or the row lands in the operator's real ledger
+    /// (cadence-hooks#1586). A test that forgets is caught by CI's
+    /// `scripts/check-metrics-isolation.sh` step, not here. It mirrors the session
     /// crate's `registry::test_metrics_env`, which is `pub(crate)` there; the
     /// two never share a process, so two locks do not race.
     static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
