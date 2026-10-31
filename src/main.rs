@@ -588,8 +588,10 @@ enum MetricsCommands {
     },
     /// Archive ledger segments past retention into archive/*.jsonl.gz, roll up denials, sweep stale session state (CLI action)
     Rotate {
-        /// Instead, move `denials` rows whose sessionId is not a UUID into
-        /// archive/denials.testrows.jsonl.gz (one-time cleanup).
+        /// Instead, move `denials` rows whose sessionId is not a UUID (null or
+        /// absent counts too) into archive/denials.testrows.jsonl.gz. Nothing
+        /// is deleted: `metrics cat denials --include-test-rows` still prints
+        /// them. Must run once before any `denials` segment is archived.
         #[arg(long)]
         quarantine_test_rows: bool,
         /// With --quarantine-test-rows: print the counts and change nothing.

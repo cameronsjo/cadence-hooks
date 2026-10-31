@@ -35,6 +35,13 @@ fn write_segment(dir: &Path, stem: &str, stamp: &str, seq: u32, rows: &[String])
     file_name(&path)
 }
 
+/// Mark `dir` as quarantined, so `denials` segments may be archived (the
+/// gate itself is tested in `denials_wait_for_the_quarantine`).
+fn quarantined(dir: &Path) {
+    ensure_private_dir(&dir.join("state")).unwrap();
+    std::fs::write(dir.join("state").join("quarantine-2000-01-01.json"), "{}").unwrap();
+}
+
 fn opts(fault: Fault<'_>) -> RotateOptions<'_> {
     RotateOptions {
         now: NOW,
@@ -219,6 +226,7 @@ fn gzip_members_round_trip_and_concatenate() {
 fn retention_boundaries_archive_only_segments_past_their_window() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let mut expect_archived = Vec::new();
     let mut expect_kept = Vec::new();
     for (stem, window) in [("denials", 90), ("commits", 180), ("skills", 180)] {
@@ -247,6 +255,7 @@ fn retention_boundaries_archive_only_segments_past_their_window() {
 fn a_second_run_is_a_no_op() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     for seq in 0..3 {
         let rows: Vec<String> = (0..5)
             .map(|i| denial(i + seq as usize * 10, Some(UUID)))
@@ -300,6 +309,8 @@ fn a_kill_at_each_step_loses_and_duplicates_nothing() {
     for (step, nth) in cases {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        quarantined(dir);
+        quarantined(dir);
         let mut names = Vec::new();
         for seq in 0..2 {
             let rows: Vec<String> = (0..4).map(|i| denial(i + seq * 10, Some(UUID))).collect();
@@ -375,6 +386,7 @@ fn a_kill_at_each_step_loses_and_duplicates_nothing() {
 fn the_time_budget_stops_between_segments_and_withholds_the_success_marker() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
     let report = rotate(
         dir,
@@ -397,6 +409,7 @@ fn the_time_budget_stops_between_segments_and_withholds_the_success_marker() {
 fn a_held_lock_skips_the_run() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let name = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
     ensure_private_dir(&dir.join("state")).unwrap();
     let _held = try_lock(&dir.join("state")).unwrap().unwrap();
@@ -411,6 +424,7 @@ fn a_held_lock_skips_the_run() {
 fn a_failure_is_a_failopen_row_and_a_non_zero_exit() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let outside = tempfile::tempdir().unwrap();
     write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
     #[cfg(unix)]
@@ -432,6 +446,7 @@ fn a_concurrent_appender_during_rotate_loses_no_row() {
     let _guard = common::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
+    quarantined(&dir);
     for seq in 0..20 {
         let rows: Vec<String> = (0..50).map(|i| denial(i + seq * 100, Some(UUID))).collect();
         write_segment(&dir, "denials", &days_ago(200), seq as u32, &rows);
@@ -604,6 +619,7 @@ fn mode(path: &Path) -> u32 {
 fn created_files_are_0600_and_dirs_0700() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     write_segment(
         dir,
         "denials",
@@ -645,6 +661,7 @@ fn created_files_are_0600_and_dirs_0700() {
 fn the_session_start_run_happens_once_a_day() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     run_daily_at_session_start(dir);
     let marker = dir.join("state").join(DAILY_MARKER_FILE);
     assert_eq!(
@@ -664,6 +681,7 @@ fn the_session_start_run_happens_once_a_day() {
 fn the_session_start_run_fails_open() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     std::fs::write(dir.join(ARCHIVE_DIR), "a file where the archive dir goes").unwrap();
     write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
     run_daily_at_session_start(dir);
@@ -677,6 +695,7 @@ fn the_session_start_run_fails_open() {
 fn cat_prints_archives_then_segments_then_live() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     // Two months archived out of order of creation.
     write_segment(
         dir,
@@ -722,6 +741,7 @@ fn cat_prints_archives_then_segments_then_live() {
 fn cat_since_filters_rows_by_ts() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     write_segment(
         dir,
         "denials",
@@ -820,6 +840,7 @@ fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 fn quarantine_dry_run_changes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     seed_quarantine(dir);
     let before = snapshot(dir);
     let report = quarantine(dir, &qopts(true, &no_fault)).unwrap();
@@ -833,6 +854,7 @@ fn quarantine_dry_run_changes_nothing() {
 fn quarantine_moves_test_rows_and_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let before = seed_quarantine(dir);
     let segments_before = common::ledger_segments(&dir.join("denials.jsonl"));
     let first = quarantine(dir, &qopts(false, &no_fault)).unwrap();
@@ -867,7 +889,10 @@ fn quarantine_moves_test_rows_and_is_idempotent() {
     let archive = std::fs::read(dir.join(ARCHIVE_DIR).join(TESTROWS_ARCHIVE)).unwrap();
     let second = quarantine(dir, &qopts(false, &no_fault)).unwrap();
     assert_eq!(second.files.iter().map(|f| f.test_rows).sum::<u64>(), 0);
-    assert!(second.record.is_none());
+    assert!(
+        second.record.is_some(),
+        "a run that moved nothing still records itself"
+    );
     assert_eq!(
         std::fs::read(dir.join(ARCHIVE_DIR).join(TESTROWS_ARCHIVE)).unwrap(),
         archive
@@ -891,6 +916,8 @@ fn a_kill_at_each_quarantine_step_loses_and_duplicates_nothing() {
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
+        quarantined(dir);
+        quarantined(dir);
         let before = seed_quarantine(dir);
         let fault = fail_at(step);
         assert!(quarantine(dir, &qopts(false, &fault)).is_err(), "{step:?}");
@@ -924,6 +951,7 @@ fn a_concurrent_appender_during_quarantine_loses_no_row() {
     let _guard = common::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
+    quarantined(&dir);
     let before = seed_quarantine(&dir);
     // SAFETY: serialized against every other env-mutating test crate-wide via `common::ENV_LOCK`.
     unsafe { std::env::set_var("CADENCE_METRICS_DIR", &dir) };
@@ -946,6 +974,7 @@ fn a_late_append_into_the_quarantined_segment_is_kept() {
     // The append lands after the read: recovery keeps it after the kept rows.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let name = write_segment(
         dir,
         "denials",
@@ -1022,6 +1051,7 @@ fn truncated_gzip() -> Vec<u8> {
 fn a_damaged_archive_stops_the_move_and_keeps_the_segment() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let stamp = days_ago(100);
     let name = write_segment(dir, "denials", &stamp, 0, &[denial(1, Some(UUID))]);
     ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
@@ -1052,6 +1082,7 @@ fn a_damaged_archive_stops_the_move_and_keeps_the_segment() {
 fn a_damaged_archive_holds_back_only_its_own_segments() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let stamp = days_ago(100);
     let held = write_segment(dir, "denials", &stamp, 0, &[denial(1, Some(UUID))]);
     let other = write_segment(dir, "hooks", &days_ago(200), 0, &["{\"n\":1}".to_string()]);
@@ -1079,6 +1110,7 @@ fn a_damaged_archive_holds_back_only_its_own_segments() {
 fn cat_skips_a_damaged_archive_and_prints_the_rest() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
     std::fs::write(
         dir.join(ARCHIVE_DIR).join("denials.2026-01.jsonl.gz"),
@@ -1101,6 +1133,7 @@ fn cat_skips_a_damaged_archive_and_prints_the_rest() {
 fn a_damaged_test_row_archive_stops_the_quarantine() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let name = write_segment(dir, "denials", &days_ago(5), 0, &[denial(1, Some("t"))]);
     let before = std::fs::read(dir.join(&name)).unwrap();
     ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
@@ -1139,6 +1172,7 @@ impl Write for RotateMidCat<'_> {
 fn a_rotate_during_cat_skips_and_every_row_prints_once() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     // One row archived already, so `cat` writes during the archive phase;
     // a second segment of the same month is past retention and still waiting.
     let stamp = days_ago(100);
@@ -1167,6 +1201,7 @@ fn a_rotate_during_cat_skips_and_every_row_prints_once() {
 fn cat_waits_for_a_running_rotate() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
+    quarantined(&dir);
     write_segment(&dir, "denials", &days_ago(10), 0, &[denial(1, Some(UUID))]);
     ensure_private_dir(&dir.join("state")).unwrap();
     let held = try_lock(&dir.join("state")).unwrap().unwrap();
@@ -1192,6 +1227,7 @@ fn cat_waits_for_a_running_rotate() {
 fn the_session_start_bound_defers_big_segments() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let small = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
     let rows: Vec<String> = (0..40).map(|i| denial(i, Some(UUID))).collect();
     let big = write_segment(dir, "denials", &days_ago(100), 1, &rows);
@@ -1247,6 +1283,7 @@ fn the_session_start_bound_passes_ordinary_segments() {
 fn a_manifest_naming_an_outside_archive_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     let name = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
     let outside = dir.join("victim.tmp");
     std::fs::write(&outside, "keep").unwrap();
@@ -1305,6 +1342,7 @@ fn archive_holds_stops_decoding_past_the_segment_size() {
 fn a_rollup_append_never_joins_a_partial_line() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     ensure_private_dir(&dir.join(ROLLUPS_DIR)).unwrap();
     let rollup = dir.join(ROLLUPS_DIR).join(DENIALS_ROLLUP);
     std::fs::write(&rollup, r#"{"day":"2026-01-01","count":1,"segm"#).unwrap();
@@ -1320,6 +1358,7 @@ fn a_rollup_append_never_joins_a_partial_line() {
 fn cat_since_compares_instants_not_spellings() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
+    quarantined(dir);
     std::fs::write(
         dir.join("denials.jsonl"),
         concat!(
@@ -1334,4 +1373,233 @@ fn cat_since_compares_instants_not_spellings() {
     .unwrap();
     let since = crate::ledger_cat::parse_since("2026-01-12").unwrap();
     assert_eq!(cat_rows(dir, "denials", Some(&since), false).len(), 2);
+}
+
+// --- round 3 (cameronsjo/cadence-hooks#1600) -------------------------------
+
+#[test]
+fn denials_wait_for_the_quarantine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let denials = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    let commits = write_segment(dir, "commits", &days_ago(200), 0, &[denial(2, Some(UUID))]);
+
+    let before = run_ok(dir);
+    assert_eq!(before.awaiting_quarantine, 1);
+    assert!(before.partial);
+    assert!(
+        dir.join(&denials).is_file(),
+        "denials waits for the quarantine"
+    );
+    assert!(
+        !dir.join(&commits).exists(),
+        "other ledgers are not held back"
+    );
+    assert!(!dir.join("state").join(LAST_SUCCESS_FILE).exists());
+
+    // A quarantine that moves nothing still writes its record and opens the gate.
+    let q = quarantine(dir, &qopts(false, &no_fault)).unwrap();
+    assert_eq!(q.files.iter().map(|f| f.test_rows).sum::<u64>(), 0);
+    assert!(q.record.is_some());
+    assert!(quarantine_has_run(dir));
+
+    let after = run_ok(dir);
+    assert_eq!(after.awaiting_quarantine, 0);
+    assert!(!dir.join(&denials).exists(), "archived once quarantined");
+    assert!(dir.join("state").join(LAST_SUCCESS_FILE).is_file());
+}
+
+/// The salvage commands in `salvage_hint`, run for real on a truncated
+/// three-member archive: the two intact members survive, no partial row is
+/// kept, and the archive takes new members again.
+#[test]
+fn the_salvage_recipe_keeps_the_intact_members() {
+    let have = |tool: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !(have("gzip") && have("perl")) {
+        eprintln!("skipping: gzip or perl is not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    let stamp = days_ago(100);
+    let name = archive_name("denials", &stamp);
+    let rows =
+        |r: std::ops::Range<usize>| -> Vec<String> { r.map(|i| denial(i, Some(UUID))).collect() };
+    let member =
+        |rows: &[String]| gzip_member(format!("{}\n", rows.join("\n")).as_bytes()).unwrap();
+    let (a, b, c) = (rows(0..3), rows(3..6), rows(6..2000));
+    let third = member(&c);
+    let damaged = [member(&a), member(&b), third[..third.len() / 2].to_vec()].concat();
+    std::fs::write(dir.join(ARCHIVE_DIR).join(&name), &damaged).unwrap();
+    let seg = write_segment(dir, "denials", &stamp, 0, &[denial(5000, Some(UUID))]);
+    let err = rotate(dir, &opts(&no_fault)).unwrap_err();
+    assert!(
+        err.contains("gzip -dc"),
+        "the error carries the recipe: {err}"
+    );
+
+    // Run exactly the commands the hint names.
+    let hint = salvage_hint(&dir.join(ARCHIVE_DIR), &name);
+    let commands = hint
+        .split_once("with: ")
+        .and_then(|(_, rest)| rest.split_once(", then run"))
+        .map(|(cmd, _)| cmd.to_string())
+        .unwrap();
+    let status = std::process::Command::new("sh")
+        .args(["-c", &commands])
+        .status()
+        .unwrap();
+    assert!(status.success(), "{commands}");
+
+    let salvaged =
+        lines_of(&gunzip_all(&std::fs::read(dir.join(ARCHIVE_DIR).join(&name)).unwrap()).unwrap());
+    let all: BTreeSet<String> = a.iter().chain(&b).chain(&c).cloned().collect();
+    for row in a.iter().chain(&b) {
+        assert!(salvaged.contains(row), "intact row lost: {row}");
+    }
+    assert!(
+        salvaged.iter().all(|r| all.contains(r)),
+        "no partial or invented row"
+    );
+    assert_eq!(mode(&dir.join(ARCHIVE_DIR).join(&name)), 0o600);
+
+    run_ok(dir);
+    assert!(
+        !dir.join(&seg).exists(),
+        "the archive takes new members again"
+    );
+    let printed = cat_rows(dir, "denials", None, false);
+    assert!(printed.contains(&denial(5000, Some(UUID))));
+    assert!(printed.contains(&a[0]));
+}
+
+/// Reset a test's chmod so the temp dir can be removed.
+struct Chmod(PathBuf, u32);
+
+impl Drop for Chmod {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+fn chmod(path: &Path, mode: u32) -> Chmod {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    Chmod(path.to_path_buf(), 0o700)
+}
+
+#[test]
+fn cat_reports_an_unreadable_archive_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    std::fs::write(
+        dir.join("denials.jsonl"),
+        format!("{}\n", denial(1, Some(UUID))),
+    )
+    .unwrap();
+    let _reset = chmod(&dir.join(ARCHIVE_DIR), 0o000);
+    let mut out = Vec::new();
+    let err = crate::ledger_cat::cat(dir, "denials", None, false, &mut out).unwrap_err();
+    assert!(err.to_string().contains(ARCHIVE_DIR), "{err}");
+}
+
+#[test]
+fn cat_read_errors_name_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let seg = write_segment(dir, "denials", &days_ago(5), 0, &[denial(1, Some(UUID))]);
+    let reset = chmod(&dir.join(&seg), 0o000);
+    let mut out = Vec::new();
+    let err = crate::ledger_cat::cat(dir, "denials", None, false, &mut out).unwrap_err();
+    assert!(err.to_string().contains(&seg), "{err}");
+    drop(reset);
+}
+
+#[test]
+fn cat_reads_unlocked_when_the_lock_cannot_be_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("denials.jsonl"),
+        format!("{}\n", denial(1, Some(UUID))),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    // No lock file and a read-only state/: it cannot be created.
+    let reset = chmod(&dir.join("state"), 0o500);
+    assert_eq!(
+        cat_rows(dir, "denials", None, false),
+        [denial(1, Some(UUID))]
+    );
+    drop(reset);
+    // An existing lock file the reader cannot write is still locked read-only.
+    std::fs::write(dir.join("state").join(LOCK_FILE), "").unwrap();
+    let _file = chmod(&dir.join("state").join(LOCK_FILE), 0o400);
+    let _dir = chmod(&dir.join("state"), 0o500);
+    assert!(lock_shared(&dir.join("state")).unwrap().is_some());
+    assert_eq!(
+        cat_rows(dir, "denials", None, false),
+        [denial(1, Some(UUID))]
+    );
+}
+
+#[test]
+fn a_forged_quarantine_manifest_on_another_ledger_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // A `sessions` segment whose rows would all count as test rows.
+    let rows = [
+        r#"{"sessionId":null,"n":1}"#.to_string(),
+        r#"{"n":2}"#.to_string(),
+    ];
+    let seg = write_segment(dir, "sessions", &days_ago(5), 0, &rows);
+    let bytes = std::fs::read(dir.join(&seg)).unwrap();
+    // A test-row archive whose only member matches what the manifest claims.
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    let content = normalized(&bytes);
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(TESTROWS_ARCHIVE),
+        gzip_member(&content).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest {
+        op: "quarantine".to_string(),
+        segment: seg.clone(),
+        archive: TESTROWS_ARCHIVE.to_string(),
+        rows: row_count(&content),
+        sha256: sha256_hex(&bytes),
+        source_len: bytes.len() as u64,
+        archived_sha256: sha256_hex(&content),
+        archive_len_before: 0,
+        kept_sha256: Some(sha256_hex(b"")),
+    };
+    assert!(
+        archive_holds(&dir.join(ARCHIVE_DIR), &manifest).unwrap(),
+        "the forgery is otherwise complete"
+    );
+    assert!(!manifest_names_ok(&manifest));
+    ensure_private_dir(&dir.join("state")).unwrap();
+    write_manifest(&dir.join("state"), &manifest).unwrap();
+    assert!(rotate(dir, &opts(&no_fault)).is_err());
+    assert_eq!(
+        std::fs::read(dir.join(&seg)).unwrap(),
+        bytes,
+        "no row deleted"
+    );
+    // An archive op must name its segment's own month archive.
+    let cross = Manifest {
+        op: "archive".to_string(),
+        archive: "denials.2026-01.jsonl.gz".to_string(),
+        ..manifest
+    };
+    assert!(!manifest_names_ok(&cross));
 }

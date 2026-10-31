@@ -398,11 +398,11 @@ Every metrics file lives under the metrics directory (`CADENCE_METRICS_DIR`, els
 | `<ledger>.jsonl` | The live ledger hooks append to. Nothing rewrites it. |
 | `<ledger>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl` | A rotated segment: the live file moved aside at the 16 MiB cap (`CADENCE_METRICS_MAX_BYTES`). |
 | `archive/<ledger>.<YYYY-MM>.jsonl.gz` | Segments past retention, by the month of the segment stamp. One gzip member per archived segment; `zcat` reads it whole. |
-| `archive/denials.testrows.jsonl.gz` | `denials` rows moved by `metrics rotate --quarantine-test-rows` (no UUID `sessionId`). |
+| `archive/denials.testrows.jsonl.gz` | `denials` rows moved by `metrics rotate --quarantine-test-rows`: every row whose `sessionId` is not a UUID, including a null or absent one. They stay readable with `metrics cat denials --include-test-rows`. |
 | `rollups/denials-daily.jsonl` | Per-day `denials` counts by hook, repo and decision, one row per (day, hook, repo, decision, segment), written before the segment is archived. |
 | `state/rotate.lock`, `state/rotate-manifest.json` | The run lock, and the record of a move in flight; a leftover manifest is finished or rolled back by the next run. |
 | `state/rotate.last-success`, `state/rotate.day` | The UTC time of the last complete run (`doctor` warns past 3 days), and the date of the last SessionStart attempt. |
-| `state/quarantine-<YYYY-MM-DD>.json` | Host, per-file row counts and source sha256 of a quarantine run. |
+| `state/quarantine-<YYYY-MM-DD>.json` | Host, per-file row counts and source sha256 of a quarantine run. Written on every real run, even one that moved nothing; its presence lets `denials` segments be archived. |
 
 `cadence-hooks metrics rotate` moves segments into the archive by age; it never drops a row:
 
@@ -414,13 +414,26 @@ Every metrics file lives under the metrics directory (`CADENCE_METRICS_DIR`, els
 
 Age is measured from the segment's stamp, the time it was rotated aside, so its rows are at least that old.
 
+**Run `cadence-hooks metrics rotate --quarantine-test-rows` once on each machine.** Until a `state/quarantine-*.json` record exists, `metrics rotate` (by hand or at SessionStart) archives no `denials` segment: it counts them as waiting, writes no `rotate.last-success`, and prints one line naming `--quarantine-test-rows`. This keeps test rows out of the monthly archives and the rollup, which the quarantine cannot reach. Every other ledger archives as usual. The quarantine writes its record on every real run, even one that moved nothing, so a machine with no test rows opens the gate on its first run. `--dry-run` shows the counts first and writes no record.
+
+A test row is a `denials` row whose `sessionId` is not a UUID; a null or absent `sessionId` counts. A real denial whose hook payload carried no session id would match too. Quarantined rows are not deleted: `metrics cat denials --include-test-rows` prints them, and the record lists each file's counts and source sha256.
+
 The first SessionStart of each UTC day runs it through `metrics log-session-start`. That run stops between segments once 2 seconds have passed, and it skips any segment larger than twice the rotation cap (32 MiB at the default 16 MiB cap, so an ordinary segment passes and only a ledger that outgrew the cap before rotation existed waits); both leave the rest for a later run, and neither writes `state/rotate.last-success`. The day marker `state/rotate.day` is written before the run starts, so a run that fails or is skipped (another run holds the lock) is not retried until the next UTC day; `state/rotate.last-success` records only complete runs, and `doctor` warns once it is 3 days old. Run `cadence-hooks metrics rotate` by hand to finish a backlog or archive a big segment.
 
 The same run removes per-session state left by sessions that never reached SessionEnd, once untouched for 7 days: `state/subagents/<session>/` (subagent Start markers), `state/bypass/<session>/` (bypass claims) and `state/commits/<session>/` (the per-session commit counter, cameronsjo/cadence-hooks#1599).
 
-An archive that no longer decodes to the end (a truncated or damaged gzip member) is never appended to: the move fails with a `metrics_rotate_failed` row in `failopen.jsonl` naming it, that archive's segments stay, the archive is left as it is, and the rest of the run goes on with other archives (it writes no `rotate.last-success`). To recover, move the damaged file aside (for example to `<name>.damaged`) and run `cadence-hooks metrics rotate` again. `metrics cat` prints a stderr line for a damaged archive, skips its remaining rows, prints every other row, and exits 1. `metrics rotate` and `--quarantine-test-rows` run only on Unix; elsewhere they exit 1 without changing anything, and the SessionStart run does nothing (cap rotation is Unix-only too, so there are no segments there).
+An archive that no longer decodes to the end (a truncated or damaged gzip member) is never appended to: the move fails with a `metrics_rotate_failed` row in `failopen.jsonl` naming it, that archive's segments stay, the archive is left as it is, and the rest of the run goes on with other archives (it writes no `rotate.last-success`). To recover, save its intact rows and rerun:
 
-Read a ledger's whole history, archives included, with `cadence-hooks metrics cat <ledger>`; `--since 2026-10-01` limits it to rows whose `ts` is at or after that instant, and `--include-test-rows` adds the quarantined `denials` rows. `cat` holds `state/rotate.lock` shared while it reads, so it waits for an archive move in progress, and a rotate that starts meanwhile skips; no row prints twice or goes missing.
+```bash
+cd <metrics_dir>/archive
+mv <name> <name>.damaged
+(umask 077; gzip -dc <name>.damaged 2>/dev/null | perl -ne 'print if /\n\z/' | gzip > <name>)
+cadence-hooks metrics rotate
+```
+
+`gzip -dc` writes every member it decoded before the damage. It can also write part of the damaged member, which ends mid-row, so the `perl` step keeps only complete lines. Keep `<name>.damaged` until `metrics cat` shows the rows you expect. The error text and `metrics cat`'s stderr line carry the same commands with the real path. `metrics cat` prints a stderr line for a damaged archive, skips its remaining rows, prints every other row, and exits 1. Every other read error names the file or directory and exits 1; an unreadable `archive/` is an error, never an empty history. `metrics rotate` and `--quarantine-test-rows` run only on Unix; elsewhere they exit 1 without changing anything, and the SessionStart run does nothing (cap rotation is Unix-only too, so there are no segments there).
+
+Read a ledger's whole history, archives included, with `cadence-hooks metrics cat <ledger>`; `--since 2026-10-01` limits it to rows whose `ts` is at or after that instant, and `--include-test-rows` adds the quarantined `denials` rows. `cat` holds `state/rotate.lock` shared while it reads, so it waits for an archive move in progress, and a rotate that starts meanwhile skips; no row prints twice or goes missing because of `rotate`. When it cannot open or create the lock file (no write permission, a read-only filesystem), it prints a stderr note and reads unlocked.
 
 ## Bypass provenance
 

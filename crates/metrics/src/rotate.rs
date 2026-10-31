@@ -177,6 +177,9 @@ pub struct RotateReport {
     /// Archives found damaged; their segments were left in place and the
     /// rest of the run went on.
     pub damaged: Vec<String>,
+    /// `denials` segments past retention held back because
+    /// `--quarantine-test-rows` has not run here yet ([`quarantine_has_run`]).
+    pub awaiting_quarantine: usize,
 }
 
 /// The crash-recovery record for one move.
@@ -497,6 +500,25 @@ fn gunzip_capped(bytes: &[u8], cap: u64) -> std::io::Result<Option<Vec<u8>>> {
 /// Refuse to grow an archive whose existing bytes do not decode to the end:
 /// gzip cannot resync past a damaged member, so every member appended after it
 /// would be unreadable while its source segment is deleted.
+/// `s` as one single-quoted shell word. Pure.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The commands that save a damaged archive's intact rows: move it aside,
+/// decode every member up to the damage (`gzip -dc` writes what it decoded
+/// before it stops), keep only complete lines (a streaming gzip also writes the
+/// damaged member's partial output, which ends mid-row), and compress that back
+/// under the archive's name, owner-only. Then rerun `metrics rotate`.
+pub fn salvage_hint(archive_dir: &Path, name: &str) -> String {
+    let dir = shell_quote(&archive_dir.display().to_string());
+    format!(
+        "save its intact rows with: cd {dir} && mv {name} {name}.damaged && \
+         (umask 077; gzip -dc {name}.damaged 2>/dev/null | perl -ne 'print if /\\n\\z/' | gzip > {name}), \
+         then run `cadence-hooks metrics rotate` again; keep {name}.damaged until the rows check out"
+    )
+}
+
 fn check_archive_decodes(archive_dir: &Path, name: &str) -> std::io::Result<()> {
     let Some(old) = read_regular(&archive_dir.join(name))? else {
         return Ok(());
@@ -511,9 +533,8 @@ fn check_archive_decodes(archive_dir: &Path, name: &str) -> std::io::Result<()> 
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "expected archive {name} to decode to the end before appending, found it damaged \
-                     ({err}); its segments stay in place and the archive is untouched. Move \
-                     {ARCHIVE_DIR}/{name} aside (for example to {name}.damaged) and run \
-                     `cadence-hooks metrics rotate` again"
+                     ({err}); its segments stay in place and the archive is untouched. {}",
+                    salvage_hint(archive_dir, name)
                 ),
             )
         })
@@ -572,9 +593,14 @@ pub(crate) fn manifest_names_ok(manifest: &Manifest) -> bool {
     let Some((stem, _, _)) = common::split_segment_name(&manifest.segment) else {
         return false;
     };
-    !manifest.segment.contains('/')
-        && (archive_month(&stem, &manifest.archive).is_some()
-            || manifest.archive == TESTROWS_ARCHIVE)
+    if manifest.segment.contains('/') {
+        return false;
+    }
+    match manifest.op.as_str() {
+        "archive" => archive_month(&stem, &manifest.archive).is_some(),
+        "quarantine" => stem == "denials" && manifest.archive == TESTROWS_ARCHIVE,
+        _ => false,
+    }
 }
 
 pub(crate) fn read_manifest(state: &Path) -> std::io::Result<Option<Manifest>> {
@@ -651,14 +677,36 @@ pub(crate) fn lock_shared(state: &Path) -> std::io::Result<Option<std::fs::File>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     }
-    let file = std::fs::OpenOptions::new()
+    let path = state.join(LOCK_FILE);
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(state.join(LOCK_FILE))?;
+        .open(&path)
+    {
+        Ok(file) => file,
+        // A reader without write access can still take a shared lock on an
+        // existing lock file opened read-only; the caller handles the rest.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(_) => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
     // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
     // touches no memory.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
@@ -990,6 +1038,23 @@ pub(crate) fn sweep_session_state(state: &Path, now: i64) -> (usize, Vec<String>
 /// it), recovers a leftover manifest, archives every segment past retention
 /// in name order until the deadline, sweeps stale per-session state, and
 /// writes `state/rotate.last-success` only when all of it succeeded.
+/// Whether `--quarantine-test-rows` has completed a real run in `dir`: a
+/// regular `state/quarantine-*.json` record exists. Until then no `denials`
+/// segment is archived, so test rows are moved out before they reach a monthly
+/// archive and the rollup.
+pub fn quarantine_has_run(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir.join("state")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("quarantine-")
+            && name.ends_with(".json")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+    })
+}
+
 pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, String> {
     if cfg!(not(unix)) {
         return Err(UNSUPPORTED.to_string());
@@ -1011,8 +1076,15 @@ pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, Stri
     let mut rolled_up = rolled_up_segments(&rollups.join(DENIALS_ROLLUP));
 
     let mut damage_notes: Vec<String> = Vec::new();
+    let quarantined = quarantine_has_run(dir);
     for (name, stem, stamp) in all_segments(dir) {
         if !past_retention(&stem, &stamp, opts.now) {
+            continue;
+        }
+        if stem == "denials" && !quarantined {
+            // Held until the test rows are out; the run is not complete.
+            report.awaiting_quarantine += 1;
+            report.partial = true;
             continue;
         }
         if report.damaged.contains(&archive_name(&stem, &stamp)) {
@@ -1106,6 +1178,12 @@ pub fn run_rotate_cli(dir: &Path) -> u8 {
                     ""
                 }
             );
+            if report.awaiting_quarantine > 0 {
+                cadence_hooks_core::outln!(
+                    "metrics rotate: {} denials segments wait for `cadence-hooks metrics rotate --quarantine-test-rows` (check first with --dry-run)",
+                    report.awaiting_quarantine
+                );
+            }
             0
         }
         Err(err) => {
@@ -1336,8 +1414,9 @@ pub fn quarantine(dir: &Path, opts: &QuarantineOptions<'_>) -> Result<Quarantine
         report.files.push(count_file("denials.jsonl", &bytes));
     }
 
-    let moved: u64 = report.files.iter().map(|f| f.test_rows).sum();
-    if moved > 0 || report.live_moved_to.is_some() {
+    // Written on every real run, even one that moved nothing, so a clean
+    // machine also opens the `denials` archive gate (`quarantine_has_run`).
+    {
         let record = json!({
             "schemaVersion": 1,
             "ts": common::utc_timestamp(),

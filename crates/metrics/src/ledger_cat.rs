@@ -53,9 +53,11 @@ struct Emitter<'a, W: Write> {
 }
 
 impl<W: Write> Emitter<'_, W> {
-    fn emit(&mut self, reader: impl Read, filter: &Filter) -> std::io::Result<()> {
+    /// Print `reader`'s rows. A read error names `source`; a write error (a
+    /// closed pipe) passes through as is.
+    fn emit(&mut self, reader: impl Read, filter: &Filter, source: &Path) -> std::io::Result<()> {
         for line in BufReader::new(reader).split(b'\n') {
-            let line = line?;
+            let line = line.map_err(|err| named(source, &err))?;
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
@@ -84,18 +86,46 @@ impl<W: Write> Emitter<'_, W> {
 
     fn emit_file(&mut self, path: &Path, filter: &Filter) -> std::io::Result<()> {
         match rotate::open_read_nofollow(path) {
-            Ok(file) => self.emit(file, filter),
+            Ok(file) => self.emit(file, filter, path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
+            Err(err) => Err(named(path, &err)),
         }
     }
 
     fn emit_gz(&mut self, path: &Path) -> std::io::Result<()> {
         match rotate::open_read_nofollow(path) {
-            Ok(file) => self.emit(flate2::read::MultiGzDecoder::new(file), &Filter::All),
+            Ok(file) => self.emit(flate2::read::MultiGzDecoder::new(file), &Filter::All, path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
+            Err(err) => Err(named(path, &err)),
         }
+    }
+}
+
+/// `err` with the path it happened on, keeping its kind.
+fn named(path: &Path, err: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("read {}: {err}", path.display()))
+}
+
+/// Take the shared rotate lock, or read unlocked with a stderr note when the
+/// lock file cannot be opened for lack of permission or a read-only
+/// filesystem: reading must not need write access to the metrics dir.
+fn shared_lock_or_note(state: &Path) -> std::io::Result<Option<std::fs::File>> {
+    match rotate::lock_shared(state) {
+        Ok(lock) => Ok(lock),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "metrics cat: cannot lock {}/{} ({err}); reading without it, so a rotate running now could make a row print twice or not at all",
+                state.display(),
+                rotate::LOCK_FILE
+            );
+            Ok(None)
+        }
+        Err(err) => Err(named(&state.join(rotate::LOCK_FILE), &err)),
     }
 }
 
@@ -114,7 +144,7 @@ pub fn cat(
     // Shared lock for the whole read: a running archive move finishes first,
     // and a rotate that starts meanwhile skips, so no row moves between the
     // archive and segment phases below.
-    let _lock = rotate::lock_shared(&dir.join("state"))?;
+    let _lock = shared_lock_or_note(&dir.join("state"))?;
     // A manifest left by a crash names one segment whose rows may be in two
     // places. Unreadable manifest: print everything (fail toward completeness).
     let manifest = rotate::read_manifest(&dir.join("state")).ok().flatten();
@@ -139,17 +169,24 @@ pub fn cat(
         emitter.emit_gz(&archive_dir.join(TESTROWS_ARCHIVE))?;
     }
 
-    let mut months: Vec<(String, String)> = std::fs::read_dir(&archive_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_str()?.to_string();
-                    rotate::archive_month(ledger, &name).map(|m| (m, name))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Only an absent `archive/` means "nothing archived"; an unreadable one
+    // is an error, or every archived row would silently go missing.
+    let mut months: Vec<(String, String)> = match std::fs::read_dir(&archive_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                rotate::archive_month(ledger, &name).map(|m| (m, name))
+            })
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("list {}: {err}", archive_dir.display()),
+            ));
+        }
+    };
     months.sort();
     let mut damaged = false;
     for (month, name) in months {
@@ -173,8 +210,8 @@ pub fn cat(
             {
                 eprintln!(
                     "metrics cat: {ARCHIVE_DIR}/{name} could not be decoded to the end ({err}); \
-                     its remaining rows are skipped. Move it aside and run \
-                     `cadence-hooks metrics rotate` again"
+                     its remaining rows are skipped. {}",
+                    rotate::salvage_hint(&archive_dir, &name)
                 );
                 damaged = true;
             }
@@ -236,7 +273,7 @@ pub fn run_cat_cli(dir: &Path, ledger: &str, since: Option<&str>, include_test_r
         Ok(()) => 0,
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => 0,
         Err(err) => {
-            eprintln!("metrics cat: read {ledger}: {err}");
+            eprintln!("metrics cat: {ledger}: {err}");
             1
         }
     }
