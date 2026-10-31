@@ -910,6 +910,7 @@ fn a_kill_at_each_quarantine_step_loses_and_duplicates_nothing() {
         Step::AfterManifest,
         Step::AfterArchiveTemp,
         Step::AfterArchiveRename,
+        Step::AfterFinalRecorded,
         Step::AfterKeptTemp,
         Step::AfterSourceDone,
     ] {
@@ -1303,6 +1304,8 @@ fn a_manifest_naming_an_outside_archive_is_refused() {
         archived_sha256: String::new(),
         archive_len_before: 0,
         kept_sha256: None,
+        final_sha256: None,
+        final_len: None,
     };
     assert!(!manifest_names_ok(&manifest));
     write_manifest(&dir.join("state"), &manifest).unwrap();
@@ -1331,6 +1334,8 @@ fn archive_holds_stops_decoding_past_the_segment_size() {
         archived_sha256: sha256_hex(&big),
         archive_len_before: 0,
         kept_sha256: None,
+        final_sha256: None,
+        final_len: None,
     };
     assert!(!archive_holds(archive_dir, &manifest).unwrap());
     let fits = Manifest {
@@ -1600,6 +1605,8 @@ fn a_forged_quarantine_manifest_on_another_ledger_is_refused() {
         archived_sha256: sha256_hex(&content),
         archive_len_before: 0,
         kept_sha256: Some(sha256_hex(b"")),
+        final_sha256: None,
+        final_len: None,
     };
     assert!(
         archive_holds(&dir.join(ARCHIVE_DIR), &manifest).unwrap(),
@@ -1737,6 +1744,8 @@ fn an_archive_manifest_must_name_its_own_month() {
         archived_sha256: String::new(),
         archive_len_before: 0,
         kept_sha256: None,
+        final_sha256: None,
+        final_len: None,
     };
     assert!(manifest_names_ok(&base));
     let wrong_month = Manifest {
@@ -1774,6 +1783,8 @@ fn recovery_checks_the_archive_tail_against_the_segment() {
         archived_sha256: sha256_hex(&other),
         archive_len_before: 0,
         kept_sha256: None,
+        final_sha256: None,
+        final_len: None,
     };
     assert!(manifest_names_ok(&manifest));
     assert!(archive_holds(&dir.join(ARCHIVE_DIR), &manifest).unwrap());
@@ -1906,6 +1917,8 @@ fn a_forged_quarantine_manifest_on_denials_strips_nothing() {
         archived_sha256: sha256_hex(&other),
         archive_len_before: 0,
         kept_sha256: Some(sha256_hex(&kept)),
+        final_sha256: None,
+        final_len: None,
     };
     assert!(manifest_names_ok(&manifest));
     assert!(archive_holds(&dir.join(ARCHIVE_DIR), &manifest).unwrap());
@@ -1956,4 +1969,294 @@ fn a_fifo_lock_file_fails_rotate_without_hanging() {
         .expect("rotate hung on a FIFO lock file");
     let err = result.unwrap_err();
     assert!(err.contains("regular file"), "{err}");
+}
+
+// --- round 6 (cameronsjo/cadence-hooks#1600) -------------------------------
+
+fn append_row(path: &Path, row: &str) {
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(row.as_bytes()).unwrap();
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// A move killed after the archive rename, a row appended, then recovery
+/// itself killed at each of its own steps (record, temp, replace): `cat`
+/// prints every row once at each point, and the next run finishes and clears
+/// the manifest. Archive op.
+#[test]
+fn a_kill_inside_recovery_never_wedges_an_archive_move() {
+    for step in [
+        Step::AfterFinalRecorded,
+        Step::AfterKeptTemp,
+        Step::AfterSourceDone,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        quarantined(dir);
+        let seg = write_segment(
+            dir,
+            "denials",
+            &days_ago(100),
+            0,
+            &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+        );
+        assert!(rotate(dir, &opts(&fail_at(Step::AfterArchiveRename))).is_err());
+        append_row(&dir.join(&seg), &format!("{}\n", denial(3, Some(UUID))));
+        let all = sorted(vec![
+            denial(1, Some(UUID)),
+            denial(2, Some(UUID)),
+            denial(3, Some(UUID)),
+        ]);
+
+        assert!(
+            rotate(dir, &opts(&fail_at(step))).is_err(),
+            "{step:?}: recovery killed"
+        );
+        assert_eq!(
+            sorted(cat_rows(dir, "denials", None, false)),
+            all,
+            "{step:?}: cat mid-recovery"
+        );
+
+        run_ok(dir);
+        assert!(
+            dir.join("state").join(MANIFEST_FILE).metadata().is_err(),
+            "{step:?}: cleared"
+        );
+        assert_eq!(
+            sorted(cat_rows(dir, "denials", None, false)),
+            all,
+            "{step:?}: cat after"
+        );
+        assert_eq!(raw_rows(dir, &["denials"]), all, "{step:?}: stored once");
+    }
+}
+
+/// The same for a quarantine, read through `cat` both with and without
+/// `--include-test-rows` while the move is pending.
+#[test]
+fn a_kill_inside_recovery_never_wedges_a_quarantine() {
+    for step in [
+        Step::AfterFinalRecorded,
+        Step::AfterKeptTemp,
+        Step::AfterSourceDone,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let rows = [denial(1, Some(UUID)), denial(2, Some("t")), denial(3, None)];
+        let seg = write_segment(dir, "denials", &days_ago(5), 0, &rows);
+        assert!(quarantine(dir, &qopts(false, &fail_at(Step::AfterArchiveRename))).is_err());
+        let late = denial(4, Some(UUID));
+        append_row(&dir.join(&seg), &format!("{late}\n"));
+        let all = sorted(vec![
+            rows[0].clone(),
+            rows[1].clone(),
+            rows[2].clone(),
+            late.clone(),
+        ]);
+        let real = sorted(vec![rows[0].clone(), late.clone()]);
+        // Pending with a late append, before recovery runs.
+        assert_eq!(
+            sorted(cat_rows(dir, "denials", None, true)),
+            all,
+            "pending, with test rows"
+        );
+        assert_eq!(
+            sorted(cat_rows(dir, "denials", None, false)),
+            real,
+            "pending, without"
+        );
+
+        assert!(
+            quarantine(dir, &qopts(false, &fail_at(step))).is_err(),
+            "{step:?}: recovery killed"
+        );
+        assert_eq!(
+            sorted(cat_rows(dir, "denials", None, true)),
+            all,
+            "{step:?}: with test rows"
+        );
+        assert_eq!(
+            sorted(cat_rows(dir, "denials", None, false)),
+            real,
+            "{step:?}: without"
+        );
+
+        quarantine(dir, &qopts(false, &no_fault)).unwrap();
+        assert!(
+            dir.join("state").join(MANIFEST_FILE).metadata().is_err(),
+            "{step:?}: cleared"
+        );
+        assert_eq!(raw_rows(dir, &["denials"]), all, "{step:?}: stored once");
+        assert_eq!(
+            sorted(lines_of(&std::fs::read(dir.join(&seg)).unwrap())),
+            real,
+            "{step:?}"
+        );
+    }
+}
+
+/// A segment read while its last row is half written: only whole rows move,
+/// and once the writer finishes, the row is whole, parses, and is in one place.
+#[test]
+fn a_torn_last_row_stays_whole_through_an_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let torn = denial(3, Some(UUID));
+    let (head, rest) = torn.split_at(torn.len() / 2);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(100),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some(UUID))],
+    );
+    append_row(&dir.join(&seg), head);
+    let path = dir.join(&seg);
+    let fault = |s: Step| {
+        if s == Step::AfterArchiveRename {
+            append_row(&path, &format!("{rest}\n"));
+        }
+        Ok(())
+    };
+    run_with(dir, &fault);
+    let in_segment = lines_of(&std::fs::read(&path).unwrap());
+    assert_eq!(
+        in_segment,
+        std::slice::from_ref(&torn),
+        "the finished row stays, whole"
+    );
+    assert!(serde_json::from_str::<Value>(&in_segment[0]).is_ok());
+    let all = sorted(vec![denial(1, Some(UUID)), denial(2, Some(UUID)), torn]);
+    assert_eq!(sorted(cat_rows(dir, "denials", None, false)), all);
+    assert_eq!(raw_rows(dir, &["denials"]), all);
+}
+
+#[test]
+fn a_torn_last_row_stays_whole_through_a_quarantine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let torn = denial(3, Some(UUID));
+    let (head, rest) = torn.split_at(torn.len() / 2);
+    let seg = write_segment(
+        dir,
+        "denials",
+        &days_ago(5),
+        0,
+        &[denial(1, Some(UUID)), denial(2, Some("t"))],
+    );
+    let path = dir.join(&seg);
+    append_row(&path, head);
+    let fault = |s: Step| {
+        if s == Step::AfterArchiveRename {
+            append_row(&path, &format!("{rest}\n"));
+        }
+        Ok(())
+    };
+    quarantine(dir, &qopts(false, &fault)).unwrap();
+    let in_segment = lines_of(&std::fs::read(&path).unwrap());
+    assert_eq!(in_segment, [denial(1, Some(UUID)), torn.clone()]);
+    assert!(
+        in_segment
+            .iter()
+            .all(|l| serde_json::from_str::<Value>(l).is_ok())
+    );
+    assert_eq!(
+        raw_rows(dir, &["denials"]),
+        sorted(vec![denial(1, Some(UUID)), denial(2, Some("t")), torn])
+    );
+}
+
+fn run_with(dir: &Path, fault: Fault<'_>) -> RotateReport {
+    let report = rotate(
+        dir,
+        &RotateOptions {
+            now: NOW,
+            deadline: None,
+            max_segment_bytes: None,
+            fault,
+        },
+    )
+    .unwrap();
+    assert!(!report.skipped);
+    report
+}
+
+/// A move whose recorded prefix ends mid-row, with bytes after it, is
+/// unproven: those bytes would start with the rest of a split row.
+#[test]
+fn a_split_row_in_a_manifest_is_unproven() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let stamp = days_ago(100);
+    let row = denial(1, Some(UUID));
+    let seg = write_segment(dir, "denials", &stamp, 0, std::slice::from_ref(&row));
+    let bytes = std::fs::read(dir.join(&seg)).unwrap();
+    let cut = bytes.len() / 2;
+    let prefix = &bytes[..cut];
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    let archive = archive_name("denials", &stamp);
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(&archive),
+        gzip_member(&normalized(prefix)).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest {
+        op: "archive".to_string(),
+        segment: seg.clone(),
+        archive,
+        rows: 1,
+        sha256: sha256_hex(prefix),
+        source_len: cut as u64,
+        archived_sha256: sha256_hex(&normalized(prefix)),
+        archive_len_before: 0,
+        kept_sha256: None,
+        final_sha256: None,
+        final_len: None,
+    };
+    assert!(matches!(
+        move_state(&dir.join(ARCHIVE_DIR), &manifest, Some(&bytes)).unwrap(),
+        MoveState::Unproven(_)
+    ));
+}
+
+/// A row appended between the forward read and the delete stays.
+#[test]
+fn a_row_appended_during_an_archive_move_is_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let seg = write_segment(dir, "denials", &days_ago(100), 0, &[denial(1, Some(UUID))]);
+    let path = dir.join(&seg);
+    let late = denial(2, Some(UUID));
+    let fault = |s: Step| {
+        if s == Step::AfterArchiveRename {
+            append_row(&path, &format!("{late}\n"));
+        }
+        Ok(())
+    };
+    run_with(dir, &fault);
+    assert_eq!(
+        lines_of(&std::fs::read(&path).unwrap()),
+        std::slice::from_ref(&late)
+    );
+    assert_eq!(
+        raw_rows(dir, &["denials"]),
+        sorted(vec![denial(1, Some(UUID)), late])
+    );
+}
+
+#[test]
+fn no_salvage_commands_for_a_directory_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/arch\xffive"));
+    let hint = salvage_hint(dir, "denials.2026-01.jsonl.gz");
+    assert!(!hint.contains("mv "), "{hint}");
+    assert!(hint.contains("not UTF-8"), "{hint}");
 }

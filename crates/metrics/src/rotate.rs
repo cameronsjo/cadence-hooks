@@ -129,10 +129,14 @@ pub enum Step {
     AfterArchiveTemp,
     /// The new archive is renamed into place.
     AfterArchiveRename,
-    /// Quarantine: the kept rows are written to their temp file.
+    /// What the segment will hold is recorded in the manifest
+    /// (`final_sha256`/`final_len`), before the segment is replaced.
+    AfterFinalRecorded,
+    /// The segment's new contents (kept rows, rows appended since the read, a
+    /// torn last row) are written to their temp file.
     AfterKeptTemp,
-    /// The segment is deleted (archive) or replaced by its kept rows
-    /// (quarantine); only the manifest is left.
+    /// The segment is deleted or replaced by what it keeps; only the manifest
+    /// is left.
     AfterSourceDone,
 }
 
@@ -205,6 +209,14 @@ pub(crate) struct Manifest {
     /// Quarantine: sha256 of the rows that stay in the segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_sha256: Option<String>,
+    /// sha256 of exactly what the segment holds once the move finishes,
+    /// recorded (with [`Manifest::final_len`]) before the segment is replaced,
+    /// so a crash after the replace reads as finished rather than unproven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_sha256: Option<String>,
+    /// Byte length that goes with [`Manifest::final_sha256`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_len: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +306,13 @@ fn normalized(bytes: &[u8]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+/// Length of the bytes up to and including the last newline: the rows a move
+/// may take. A torn last row (no newline yet, its writer still mid-append)
+/// stays in the segment. Pure.
+fn complete_len(bytes: &[u8]) -> usize {
+    bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1)
 }
 
 /// Non-blank lines in `bytes`. Pure.
@@ -497,6 +516,12 @@ fn gunzip_capped(bytes: &[u8], cap: u64) -> std::io::Result<Option<Vec<u8>>> {
     Ok((out.len() as u64 <= cap).then_some(out))
 }
 
+/// What [`salvage_hint`] says instead of commands when a name or directory
+/// would display differently from what it is.
+const UNSAFE_NAME_HINT: &str = "its name or directory holds invisible or control characters (or is \
+     not UTF-8), so no commands are given: list the directory with `ls -b`, rename the file to a \
+     plain name by hand, and run `cadence-hooks metrics rotate` again";
+
 /// `s` as one single-quoted shell word. Pure.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -512,12 +537,12 @@ pub fn salvage_hint(archive_dir: &Path, name: &str) -> String {
     // characters, so a command built from such a name would name a different
     // file once displayed (a stripped zero-width character turns it into the
     // intact archive's name). Give no command then.
-    let dir_text = archive_dir.display().to_string();
-    if common::display_safe(name) != name || common::display_safe(&dir_text) != dir_text {
-        return "its name or directory holds invisible or control characters, so no commands are \
-                given: list the directory with `ls -b`, rename the file to a plain name by hand, \
-                and run `cadence-hooks metrics rotate` again"
-            .to_string();
+    // A directory that is not UTF-8 displays lossily, so it counts too.
+    let Some(dir_text) = archive_dir.to_str() else {
+        return UNSAFE_NAME_HINT.to_string();
+    };
+    if common::display_safe(name) != name || common::display_safe(dir_text) != dir_text {
+        return UNSAFE_NAME_HINT.to_string();
     }
     let aside = shell_quote(&format!("./{name}.damaged"));
     format!(
@@ -849,12 +874,37 @@ pub(crate) fn move_state(
     if !archive_holds(archive_dir, manifest)? {
         return Ok(MoveState::NotDone);
     }
+    // A crash after the segment was replaced: it holds exactly what the
+    // manifest recorded it would. Exact, not a prefix: before the replace the
+    // segment can start with those bytes (the kept rows lead a quarantined
+    // segment). Before the replace it cannot equal them, since the original
+    // holds the moved rows as well.
+    if let (Some(sha), Some(flen), Some(bytes)) =
+        (&manifest.final_sha256, manifest.final_len, current)
+        && bytes.len() as u64 == flen
+        && sha256_hex(bytes) == *sha
+    {
+        return Ok(MoveState::Finished);
+    }
     let len = usize::try_from(manifest.source_len).unwrap_or(usize::MAX);
     // The segment as it was read, if it still starts with exactly that.
     let original = current
         .and_then(|b| b.get(..len))
         .filter(|p| sha256_hex(p) == manifest.sha256);
     let suffix = |bytes: &[u8]| bytes.get(len..).unwrap_or_default().to_vec();
+    // Bytes after the moved prefix are kept only when that prefix ended on a
+    // row boundary; otherwise the first of them would be the rest of a row
+    // the move split.
+    if let (Some(bytes), Some(original)) = (current, original)
+        && bytes.len() > len
+        && !original.is_empty()
+        && !original.ends_with(b"\n")
+    {
+        return Ok(MoveState::Unproven(format!(
+            "expected the moved part of {} to end on a row boundary, found a split row",
+            manifest.segment
+        )));
+    }
     match manifest.op.as_str() {
         "archive" => match (current, original) {
             (None, _) => Ok(MoveState::Finished),
@@ -935,13 +985,40 @@ pub(crate) fn recover(dir: &Path, fault: Fault<'_>) -> std::io::Result<bool> {
             }
         }
         MoveState::Finished => {}
-        // Rows appended after the read stay, in their segment.
+        // Rows appended after the read (and a torn last row) stay, in their
+        // segment.
         MoveState::Pending { remaining } => {
-            replace_source(dir, &manifest.segment, &remaining, fault)?;
+            finish_move(dir, &manifest, &remaining, fault)?;
+            return Ok(true);
         }
         MoveState::Unproven(why) => return Err(io_err(why)),
     }
     remove_manifest(&state).map(|()| true)
+}
+
+/// Leave the segment holding exactly `remaining` and clear the manifest. What
+/// it will hold is recorded in the manifest first, so a crash anywhere after
+/// that reads as finished on the next run.
+// debt: an append landing after `remaining` was read and before the rename is lost; closes only with writers that flock every append, and the segments moved here are archive-age (or, for the quarantine, read after QUARANTINE_GRACE)
+fn finish_move(
+    dir: &Path,
+    manifest: &Manifest,
+    remaining: &[u8],
+    fault: Fault<'_>,
+) -> std::io::Result<()> {
+    let (state, _, _) = dirs(dir);
+    if !remaining.is_empty() {
+        let recorded = Manifest {
+            final_sha256: Some(sha256_hex(remaining)),
+            final_len: Some(remaining.len() as u64),
+            ..manifest.clone()
+        };
+        write_manifest(&state, &recorded)?;
+        fault(Step::AfterFinalRecorded)?;
+    }
+    replace_source(dir, &manifest.segment, remaining, fault)?;
+    fault(Step::AfterSourceDone)?;
+    remove_manifest(&state)
 }
 
 /// Replace segment `name` with `kept` through a temp file and a rename, or
@@ -1002,7 +1079,11 @@ fn archive_segment(
     let Some(bytes) = read_regular(&dir.join(name))? else {
         return Ok(None);
     };
-    let content = normalized(&bytes);
+    // Only whole rows move; a torn last row stays for its writer to finish.
+    let content = bytes[..complete_len(&bytes)].to_vec();
+    if content.is_empty() {
+        return Ok(None);
+    }
     let rows = row_count(&content);
 
     if stem == "denials" && !rolled_up.contains(name) {
@@ -1043,11 +1124,13 @@ fn archive_segment(
         segment: name.to_string(),
         archive: archive.clone(),
         rows,
-        sha256: sha256_hex(&bytes),
-        source_len: bytes.len() as u64,
+        sha256: sha256_hex(&content),
+        source_len: content.len() as u64,
         archived_sha256: sha256_hex(&content),
         archive_len_before,
         kept_sha256: None,
+        final_sha256: None,
+        final_len: None,
     };
     write_manifest(&state, &manifest)?;
     fault(Step::AfterManifest)?;
@@ -1058,10 +1141,9 @@ fn archive_segment(
             "expected {archive} to hold {rows} new rows from {name} after the write, found otherwise"
         )));
     }
-    std::fs::remove_file(dir.join(name))?;
-    fsync_dir(dir)?;
-    fault(Step::AfterSourceDone)?;
-    remove_manifest(&state)?;
+    // Finish through the same judgement recovery uses: it re-reads the
+    // segment, so rows appended since the read (and a torn last row) stay.
+    recover(dir, fault)?;
     Ok(Some(rows))
 }
 
@@ -1399,11 +1481,14 @@ fn quarantine_segment(
     };
     let mut bytes = Vec::new();
     held.read_to_end(&mut bytes)?;
+    drop(held);
     let counts = count_file(name, &bytes);
-    if counts.test_rows == 0 {
+    // Only whole rows move; a torn last row stays for its writer to finish.
+    let moved = &bytes[..complete_len(&bytes)];
+    let (kept, test) = split_test_rows(moved);
+    if test.is_empty() {
         return Ok(Some(counts));
     }
-    let (kept, test) = split_test_rows(&normalized(&bytes));
     check_archive_decodes(&archive_dir, TESTROWS_ARCHIVE)?;
     let archive_len_before = std::fs::symlink_metadata(archive_dir.join(TESTROWS_ARCHIVE))
         .map(|m| m.len())
@@ -1412,12 +1497,14 @@ fn quarantine_segment(
         op: "quarantine".to_string(),
         segment: name.to_string(),
         archive: TESTROWS_ARCHIVE.to_string(),
-        rows: counts.test_rows,
-        sha256: counts.sha256.clone(),
-        source_len: bytes.len() as u64,
+        rows: row_count(&test),
+        sha256: sha256_hex(moved),
+        source_len: moved.len() as u64,
         archived_sha256: sha256_hex(&test),
         archive_len_before,
         kept_sha256: Some(sha256_hex(&kept)),
+        final_sha256: None,
+        final_len: None,
     };
     write_manifest(&state, &manifest)?;
     fault(Step::AfterManifest)?;
@@ -1429,15 +1516,9 @@ fn quarantine_segment(
             counts.test_rows
         )));
     }
-    // A late append into the segment since the read: recovery keeps it after
-    // the kept rows rather than losing it to the rename.
-    if held.metadata()?.len() != bytes.len() as u64 {
-        return recover(dir, fault).map(|_| Some(counts));
-    }
-    // debt: an append landing between this length check and the rename is lost, closes only with writers that flock every append; QUARANTINE_GRACE makes the window a writer that opened over a second ago and has not written
-    replace_source(dir, name, &kept, fault)?;
-    fault(Step::AfterSourceDone)?;
-    remove_manifest(&state)?;
+    // Finish through recovery's judgement: it re-reads the segment, so rows
+    // appended since the read (and a torn last row) stay after the kept rows.
+    recover(dir, fault)?;
     Ok(Some(counts))
 }
 
