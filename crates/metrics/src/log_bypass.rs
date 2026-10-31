@@ -198,12 +198,20 @@ pub fn log_bypass(event: BypassEvent) {
 /// the ledger, up to 206 rows per session (cadence-hooks#1588). Every other env
 /// switch (a secret push, a SOPS decrypt, a redaction bypass) keeps one row per
 /// use, since each use is a distinct escape worth its own audit row.
+/// Exact names, not a prefix, so a future switch is never deduped without a
+/// review of whether its uses are distinct events.
+const DEDUPED_MECHANISMS: [&str; 3] = [
+    "CADENCE_ALLOW_MAIN",
+    "CADENCE_ALLOW_MAIN (repo settings)",
+    "CADENCE_NO_ENFORCE_WORKTREE",
+];
+
 fn is_deduped_mechanism(mechanism: &str) -> bool {
-    mechanism.starts_with("CADENCE_ALLOW_MAIN") || mechanism == "CADENCE_NO_ENFORCE_WORKTREE"
+    DEDUPED_MECHANISMS.contains(&mechanism)
 }
 
-/// The claim for a deduped `used` row: one per session, hook, mechanism, repo,
-/// and agent, at `<state>/bypass/<session>/<hook>--<mechanism>--<repo>--<agent>`,
+/// The claim for a deduped `used` row: one per session, hook, mechanism,
+/// working-directory repo (the row's `repo`, from the payload `cwd`), and agent, at `<state>/bypass/<session>/<hook>--<mechanism>--<repo>--<agent>`,
 /// so a second repo or a subagent riding the same switch still gets its own
 /// row. `None` (always write) for any other row or a session id unsafe in a
 /// path. Pure.

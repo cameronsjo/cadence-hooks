@@ -31,14 +31,14 @@ impl Logger for LogSessionStart {
         };
 
         let dir = common::state_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
+        if common::create_private_dir(&dir).is_err() {
             return;
         }
-
-        let _ = std::fs::write(
-            dir.join(format!("{session_id}.start")),
-            common::utc_timestamp(),
-        );
+        if let Ok(mut file) =
+            common::open_state_marker(&dir.join(format!("{session_id}.start")), false)
+        {
+            let _ = std::io::Write::write_all(&mut file, common::utc_timestamp().as_bytes());
+        }
     }
 }
 
