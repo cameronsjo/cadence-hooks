@@ -7,10 +7,11 @@
 //!   increment is lost.
 //! - `last`: the newest commit row's `lastMessageId`, overwritten per commit.
 //!
-//! `log-session-start` creates an empty `count`, so a session that never
-//! commits reads as zero without a ledger read. A session that started before
-//! this state existed has no `count`; its readers fall back to the bounded
-//! ledger read. `log-session` removes the directory at `SessionEnd`, after
+//! `log-session-start` creates an empty `count` on a fresh `startup`, so a
+//! session that never commits reads as zero without a ledger read. A session
+//! that started before this state existed, or resumed after its SessionEnd,
+//! has no `count`; `record` never creates one, and its readers fall back to
+//! the bounded ledger read. `log-session` removes the directory at `SessionEnd`, after
 //! reading it. Every step is fail-open (ADR-0001): a write that fails leaves
 //! the fallback in charge.
 
@@ -33,26 +34,35 @@ pub fn start(state_dir: &Path, session_id: &str) {
         return;
     };
     if common::create_private_dir(&dir).is_ok() {
-        let _ = open_count(&dir.join(COUNT_FILE));
+        let _ = open_count(&dir.join(COUNT_FILE), true);
     }
 }
 
-/// Record one commit and its `lastMessageId`.
+/// Record one commit and its `lastMessageId`, only for a session whose counter
+/// [`start`] created. A session without one (started before this state
+/// existed, or resumed after its SessionEnd) has earlier commits only in the
+/// ledger, so creating a counter here would hide them; it stays on the ledger.
 pub fn record(state_dir: &Path, session_id: &str, last_message_id: Option<&str>) {
     let Some(dir) = session_dir(state_dir, session_id) else {
         return;
     };
-    if common::create_private_dir(&dir).is_err() {
+    let Ok(mut file) = open_count(&dir.join(COUNT_FILE), false) else {
         return;
-    }
-    if let Ok(mut file) = open_count(&dir.join(COUNT_FILE)) {
-        let _ = file.write_all(b".");
+    };
+    if file.write_all(b".").is_err() {
+        return;
     }
     let last = dir.join(LAST_FILE);
     match last_message_id {
         Some(id) => {
-            if let Ok(mut file) = common::open_state_marker(&last, false) {
-                let _ = file.write_all(id.as_bytes());
+            // Write a temp file and rename it over `last`, so a concurrent
+            // reader sees the old id or the new one, never an empty or partial
+            // file (an empty one would re-price from session start).
+            let tmp = dir.join(format!("{LAST_FILE}.{}.tmp", std::process::id()));
+            let written = common::open_state_marker(&tmp, false)
+                .and_then(|mut file| file.write_all(id.as_bytes()));
+            if written.is_err() || std::fs::rename(&tmp, &last).is_err() {
+                let _ = std::fs::remove_file(&tmp);
             }
         }
         None => {
@@ -89,10 +99,7 @@ pub fn last_message_id(state_dir: &Path, session_id: &str) -> LastMessage {
     if count(state_dir, session_id).is_none() {
         return LastMessage::Unknown;
     }
-    if std::fs::symlink_metadata(dir.join(LAST_FILE)).is_ok_and(|m| m.is_symlink()) {
-        return LastMessage::Unknown;
-    }
-    match std::fs::read_to_string(dir.join(LAST_FILE)) {
+    match read_nofollow(&dir.join(LAST_FILE)) {
         Ok(id) if !id.trim().is_empty() => LastMessage::Known(Some(id.trim().to_string())),
         Ok(_) => LastMessage::Known(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => LastMessage::Known(None),
@@ -100,10 +107,26 @@ pub fn last_message_id(state_dir: &Path, session_id: &str) -> LastMessage {
     }
 }
 
-/// Append-only, `0600`, never through a symlink.
-fn open_count(path: &Path) -> std::io::Result<std::fs::File> {
+/// Read a small state file in one open that refuses a symlink, so there is no
+/// check-then-read gap.
+fn read_nofollow(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut text = String::new();
+    options.open(path)?.take(4096).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Append-only, `0600`, never through a symlink. `create` only from [`start`].
+fn open_count(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(create).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -135,6 +158,7 @@ mod tests {
     fn commits_count_up_and_keep_the_newest_message_id() {
         let tmp = tempfile::tempdir().unwrap();
         start(tmp.path(), "s1");
+        start(tmp.path(), "s2");
         record(tmp.path(), "s1", Some("m1"));
         record(tmp.path(), "s1", Some("m2"));
         record(tmp.path(), "s2", Some("x"));
@@ -144,6 +168,16 @@ mod tests {
             last_message_id(tmp.path(), "s1"),
             LastMessage::Known(Some("m2".into()))
         );
+    }
+
+    /// A session with no counter stays on the ledger: a commit does not create
+    /// one (that would hide its earlier ledger commits).
+    #[test]
+    fn a_commit_without_a_counter_creates_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        record(tmp.path(), "s1", Some("m1"));
+        assert_eq!(count(tmp.path(), "s1"), None);
+        assert_eq!(last_message_id(tmp.path(), "s1"), LastMessage::Unknown);
     }
 
     #[test]
@@ -177,6 +211,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         start(tmp.path(), "../x");
         record(tmp.path(), "../x", Some("m"));
+        assert!(!tmp.path().join("commits").exists());
         assert_eq!(count(tmp.path(), "../x"), None);
         assert!(!tmp.path().join("x").exists());
     }

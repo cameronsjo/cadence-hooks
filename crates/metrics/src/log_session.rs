@@ -145,7 +145,7 @@ impl Logger for LogSession {
 /// bypass claims (`bypass/<session>/`), and the commit counter
 /// (`commits/<session>/`, read before this runs). `session_id` has passed
 /// `is_safe_session_id`, so the join stays inside `state_dir`. Fail-open.
-// debt: a session that never reaches SessionEnd (crash, kill) leaves its two
+// debt: a session that never reaches SessionEnd (crash, kill) leaves its three
 // small dirs behind; sweep them by age when `metrics rotate` lands (#1590).
 fn clear_session_state(state_dir: &std::path::Path, session_id: &str) {
     for kind in ["subagents", "bypass", "commits"] {

@@ -34,7 +34,13 @@ impl Logger for LogSessionStart {
         if common::create_private_dir(&dir).is_err() {
             return;
         }
-        crate::session_commits::start(&dir, session_id);
+        // Only a fresh session starts a counter. A resume after SessionEnd has
+        // no counter, so its commits fall back to the ledger, which still holds
+        // the commits made before the resume; an empty counter would hide them
+        // and re-price the whole transcript at the next commit.
+        if input.source.as_deref() == Some("startup") {
+            crate::session_commits::start(&dir, session_id);
+        }
         if let Ok(mut file) =
             common::open_state_marker(&dir.join(format!("{session_id}.start")), false)
         {

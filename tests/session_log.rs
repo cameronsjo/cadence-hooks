@@ -284,11 +284,11 @@ fn session_end_counts_commits_from_the_counter_not_the_ledger() {
         ("log-session-start", "SessionStart"),
         ("log-session", "SessionEnd"),
     ] {
-        let mut cmd = cadence_hooks();
-        cmd.env("CADENCE_METRICS_DIR", dir.path());
-        cmd.args(["metrics", sub]);
-        let payload = session_payload("sess-counted", event, &transcript, None);
-        assert_eq!(run_with_stdin(cmd, &payload).status.code(), Some(0));
+        let payload = with_source(
+            &session_payload("sess-counted", event, &transcript, None),
+            "startup",
+        );
+        run_metrics(dir.path(), sub, &payload);
     }
 
     let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl")).expect("row written");
@@ -299,6 +299,230 @@ fn session_end_counts_commits_from_the_counter_not_the_ledger() {
         !dir.path().join("state/commits/sess-counted").exists(),
         "SessionEnd removes the counter it read"
     );
+}
+
+fn with_source(payload: &str, source: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(payload).expect("payload json");
+    v["source"] = serde_json::Value::String(source.into());
+    v.to_string()
+}
+
+fn run_metrics(metrics: &std::path::Path, sub: &str, payload: &str) {
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", metrics);
+    cmd.args(["metrics", sub]);
+    assert_eq!(run_with_stdin(cmd, payload).status.code(), Some(0), "{sub}");
+}
+
+/// A resume after SessionEnd gets no counter, so its commit count comes from
+/// the ledger and still includes the commits made before the resume.
+#[test]
+fn a_resumed_session_counts_its_earlier_commits_from_the_ledger() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+    let start = |src: &str| {
+        with_source(
+            &session_payload("sess-resumed", "SessionStart", &transcript, None),
+            src,
+        )
+    };
+    let end = session_payload("sess-resumed", "SessionEnd", &transcript, None);
+    run_metrics(dir.path(), "log-session-start", &start("startup"));
+    run_metrics(dir.path(), "log-session", &end);
+    // Two commits landed in the ledger before the resume.
+    let ledger = [
+        r#"{"sessionId":"sess-resumed"}"#,
+        r#"{"sessionId":"sess-resumed"}"#,
+    ]
+    .join("\n");
+    std::fs::write(dir.path().join("commits.jsonl"), ledger).expect("seed commits.jsonl");
+    run_metrics(dir.path(), "log-session-start", &start("resume"));
+    assert!(
+        !dir.path().join("state/commits/sess-resumed").exists(),
+        "a resume starts no counter"
+    );
+    run_metrics(dir.path(), "log-session", &end);
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl")).expect("rows");
+    let last: serde_json::Value =
+        serde_json::from_str(contents.lines().last().unwrap()).expect("parse");
+    assert_eq!(last["commits"], 2, "the pre-resume commits still count");
+}
+
+/// A scratch repo with one commit; returns its HEAD. Isolated from the
+/// operator's git config.
+fn git_repo(dir: &std::path::Path) -> String {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@invalid")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    std::fs::create_dir_all(dir).unwrap();
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    git(&["rev-parse", "HEAD"])
+}
+
+/// Land a second commit in `repo` with `before` as the snapshot, then run
+/// `log-commit` for `session`.
+fn commit_and_log(
+    metrics: &std::path::Path,
+    repo: &std::path::Path,
+    session: &str,
+    transcript: &std::path::Path,
+) {
+    let before = git_repo_head(repo);
+    let state = metrics.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join(format!("{session}.before")), &before).unwrap();
+    let status = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "two",
+        ])
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@invalid")
+        .status()
+        .expect("git commit");
+    assert!(status.success());
+    let payload = serde_json::json!({
+        "session_id": session,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git commit -m two"},
+        "transcript_path": transcript.to_string_lossy(),
+        "cwd": repo.to_string_lossy(),
+    })
+    .to_string();
+    run_metrics(metrics, "log-commit", &payload);
+}
+
+fn git_repo_head(repo: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn commit_rows(metrics: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(metrics.join("commits.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("row"))
+        .collect()
+}
+
+/// With a counter, log-commit resumes from the counter's `last`, not from the
+/// ledger: `last` says m1 and the ledger says m2, and the new row's
+/// `sinceMarker` is m1. The commit then bumps the counter and moves `last`.
+#[test]
+fn log_commit_resumes_from_the_counter_not_the_ledger() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (metrics, repo) = (dir.path().join("metrics"), dir.path().join("repo"));
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+    git_repo(&repo);
+    let start = with_source(
+        &session_payload("sess-c", "SessionStart", &transcript, None),
+        "startup",
+    );
+    run_metrics(&metrics, "log-session-start", &start);
+    std::fs::write(metrics.join("state/commits/sess-c/last"), "m1").unwrap();
+    std::fs::write(
+        metrics.join("commits.jsonl"),
+        "{\"sessionId\":\"sess-c\",\"lastMessageId\":\"m2\"}\n",
+    )
+    .unwrap();
+    commit_and_log(&metrics, &repo, "sess-c", &transcript);
+    let rows = commit_rows(&metrics);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1]["sinceMarker"], "m1");
+    let count = std::fs::metadata(metrics.join("state/commits/sess-c/count"))
+        .unwrap()
+        .len();
+    assert_eq!(count, 1);
+    assert_eq!(
+        std::fs::read_to_string(metrics.join("state/commits/sess-c/last")).unwrap(),
+        "m2"
+    );
+}
+
+/// Without a counter (a session from before the upgrade), log-commit resumes
+/// from the ledger and creates no counter.
+#[test]
+fn log_commit_without_a_counter_uses_the_ledger_and_creates_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (metrics, repo) = (dir.path().join("metrics"), dir.path().join("repo"));
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+    git_repo(&repo);
+    std::fs::create_dir_all(&metrics).unwrap();
+    std::fs::write(
+        metrics.join("commits.jsonl"),
+        "{\"sessionId\":\"sess-old\",\"lastMessageId\":\"m1\"}\n",
+    )
+    .unwrap();
+    commit_and_log(&metrics, &repo, "sess-old", &transcript);
+    let rows = commit_rows(&metrics);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1]["sinceMarker"], "m1");
+    assert!(!metrics.join("state/commits/sess-old").exists());
+}
+
+/// A row that fails to write leaves the counter where it was.
+#[test]
+fn a_failed_commit_row_leaves_the_counter_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (metrics, repo) = (dir.path().join("metrics"), dir.path().join("repo"));
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+    git_repo(&repo);
+    let start = with_source(
+        &session_payload("sess-f", "SessionStart", &transcript, None),
+        "startup",
+    );
+    run_metrics(&metrics, "log-session-start", &start);
+    std::fs::create_dir_all(metrics.join("commits.jsonl")).unwrap();
+    commit_and_log(&metrics, &repo, "sess-f", &transcript);
+    let count = std::fs::metadata(metrics.join("state/commits/sess-f/count"))
+        .unwrap()
+        .len();
+    assert_eq!(count, 0);
 }
 
 // ── Fail-open: an unwritable metrics dir never perturbs the exit code ─────

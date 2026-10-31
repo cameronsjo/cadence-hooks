@@ -5,7 +5,7 @@
 ## What Changes
 
 - Per-session commit state lives at `<state>/commits/<session>/`: `count` gets one byte appended per commit, so concurrent commits lose no increment and the count is the file length. `last` holds the newest `lastMessageId`. Both are `0600` and never opened through a symlink.
-- `log-session-start` creates an empty `count`, so a session that never commits reads zero with no ledger read. `log-commit` takes the previous `lastMessageId` from `last` and updates both after its row lands. `log-session` reads `count` before clearing the directory at `SessionEnd`.
+- `log-session-start` creates an empty `count` on a fresh `startup`, so a session that never commits reads zero with no ledger read. A resume after `SessionEnd` gets no counter and falls back to the ledger, which still holds its earlier commits. `last` is replaced by a temp file and rename. `log-commit` takes the previous `lastMessageId` from `last` and updates both after its row lands. `log-session` reads `count` before clearing the directory at `SessionEnd`.
 - A session with no `count`, one that started before this change, falls back to the existing bounded ledger read in both loggers.
 - The bypass claim name encodes each part injectively (letters and digits kept, every other byte `_` plus two hex digits), joins the parts with `-`, adds the tool, and above 200 bytes keeps a 160-byte prefix plus a 64-bit FNV-1a hash.
 
