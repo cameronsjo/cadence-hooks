@@ -4832,7 +4832,9 @@ mod tests {
     /// The only lock on `CADENCE_METRICS_DIR` in this crate's test process.
     /// Reading an unparsable session record logs a `registry-parse-skips` row,
     /// so a test that plants one must run inside this, or the row lands in the
-    /// operator's real ledger (cadence-hooks#1586).
+    /// operator's real ledger (cadence-hooks#1586). It mirrors the session
+    /// crate's `registry::test_metrics_env`, which is `pub(crate)` there; the
+    /// two never share a process, so two locks do not race.
     static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_scratch_metrics_dir<T>(f: impl FnOnce() -> T) -> T {

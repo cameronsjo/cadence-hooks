@@ -3,7 +3,8 @@
 # command on the last line of a carried span vs an earlier line of it.
 set -uo pipefail
 # Probe verdicts are not session outcomes; keep their rows out of the real ledgers.
-export CADENCE_METRICS_DIR="$(mktemp -d)"
+CADENCE_METRICS_DIR="$(mktemp -d)"
+export CADENCE_METRICS_DIR
 trap 'rm -rf "$CADENCE_METRICS_DIR"' EXIT
 BIN=/tmp/wt-shellcluster/target/release/cadence-hooks
 PY=$(command -v python3)

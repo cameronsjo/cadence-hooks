@@ -80,7 +80,9 @@ jobs:
       - name: Tests leave the default metrics dir empty
         if: ${{ !cancelled() }}
         shell: bash
-        run: bash scripts/check-metrics-isolation.sh
+        run: |
+          bash scripts/test-check-metrics-isolation.sh
+          bash scripts/check-metrics-isolation.sh
 
   openspec:
     # openspec/ holds the capability specs and the change proposals (#1446).
