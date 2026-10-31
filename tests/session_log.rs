@@ -264,6 +264,43 @@ fn session_end_counts_commits_for_this_session() {
     assert_eq!(row["commits"], 2, "only this session's commit rows count");
 }
 
+/// cadence-hooks#1589: a session started under this binary has a commit
+/// counter, and SessionEnd takes its count from it, not from the ledger. The
+/// seeded ledger rows would say 2; the counter says 0, and wins. The counter
+/// is removed once read.
+#[test]
+fn session_end_counts_commits_from_the_counter_not_the_ledger() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+    let ledger = [
+        r#"{"sessionId":"sess-counted"}"#,
+        r#"{"sessionId":"sess-counted"}"#,
+    ]
+    .join("\n");
+    std::fs::write(dir.path().join("commits.jsonl"), ledger).expect("seed commits.jsonl");
+
+    for (sub, event) in [
+        ("log-session-start", "SessionStart"),
+        ("log-session", "SessionEnd"),
+    ] {
+        let mut cmd = cadence_hooks();
+        cmd.env("CADENCE_METRICS_DIR", dir.path());
+        cmd.args(["metrics", sub]);
+        let payload = session_payload("sess-counted", event, &transcript, None);
+        assert_eq!(run_with_stdin(cmd, &payload).status.code(), Some(0));
+    }
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl")).expect("row written");
+    let row: serde_json::Value =
+        serde_json::from_str(contents.lines().next().unwrap()).expect("parse");
+    assert_eq!(row["commits"], 0, "the counter, not the ledger, decides");
+    assert!(
+        !dir.path().join("state/commits/sess-counted").exists(),
+        "SessionEnd removes the counter it read"
+    );
+}
+
 // ── Fail-open: an unwritable metrics dir never perturbs the exit code ─────
 
 #[test]

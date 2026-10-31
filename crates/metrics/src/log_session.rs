@@ -43,7 +43,9 @@ impl Logger for LogSession {
         else {
             return;
         };
-        clear_session_state(&common::state_dir(), session_id);
+        let state = common::state_dir();
+        let counted = crate::session_commits::count(&state, session_id);
+        clear_session_state(&state, session_id);
         let Some(transcript_path) = input.transcript_path.as_deref() else {
             return;
         };
@@ -93,7 +95,8 @@ impl Logger for LogSession {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let commits = commits_in_ledger(&dir.join("commits.jsonl"), session_id);
+        let commits =
+            counted.unwrap_or_else(|| commits_in_ledger(&dir.join("commits.jsonl"), session_id));
 
         // Graded from the same transcript string already in memory, at the same
         // price table cost is computed from — so `costUsd` and
@@ -138,18 +141,20 @@ impl Logger for LogSession {
 }
 
 /// Remove the per-session markers other loggers leave under `state/`: the
-/// subagent Start times (`subagents/<session>/`) and the once-per-session
-/// bypass claims (`bypass/<session>/`). `session_id` has passed
+/// subagent Start times (`subagents/<session>/`), the once-per-session
+/// bypass claims (`bypass/<session>/`), and the commit counter
+/// (`commits/<session>/`, read before this runs). `session_id` has passed
 /// `is_safe_session_id`, so the join stays inside `state_dir`. Fail-open.
 // debt: a session that never reaches SessionEnd (crash, kill) leaves its two
 // small dirs behind; sweep them by age when `metrics rotate` lands (#1590).
 fn clear_session_state(state_dir: &std::path::Path, session_id: &str) {
-    for kind in ["subagents", "bypass"] {
+    for kind in ["subagents", "bypass", "commits"] {
         let _ = std::fs::remove_dir_all(state_dir.join(kind).join(session_id));
     }
 }
 
-/// Commit rows for the session in the commits ledger, the newest rotated
+/// Fallback for a session with no commit counter (it started before the
+/// counter existed): commit rows for the session in the commits ledger, the newest rotated
 /// segment included, so a session that straddles a rotation does not report
 /// fewer commits. One segment back is enough: a session never writes a cap's
 /// worth of commit rows (cameronsjo/cadence-hooks#1589 replaces this read).

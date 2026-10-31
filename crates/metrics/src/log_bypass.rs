@@ -211,8 +211,8 @@ fn is_deduped_mechanism(mechanism: &str) -> bool {
 }
 
 /// The claim for a deduped `used` row: one per session, hook, mechanism,
-/// working-directory repo (the row's `repo`, from the payload `cwd`), and
-/// agent, at `<state>/bypass/<session>/<hook>--<mechanism>--<repo>--<agent>`,
+/// working-directory repo (the row's `repo`, from the payload `cwd`), agent,
+/// and tool, at `<state>/bypass/<session>/<hook>-<mechanism>-<repo>-<agent>-<tool>`,
 /// so a second repo or a subagent riding the same switch still gets its own
 /// row. `None` (always write) for any other row or a session id unsafe in a
 /// path. Pure.
@@ -230,36 +230,51 @@ fn once_per_session_marker(
         .session
         .as_deref()
         .filter(|s| common::is_safe_session_id(s))?;
-    let key = [
+    let key = marker_name(&[
         event.hook.as_deref().unwrap_or(""),
         event.mechanism.as_str(),
         event.repo.as_deref().unwrap_or(""),
         event.agent.as_deref().unwrap_or("main"),
-    ]
-    .map(marker_component)
-    .join("--");
+        event.tool.as_deref().unwrap_or(""),
+    ]);
     Some(state_dir.join("bypass").join(session).join(key))
 }
 
-/// Map anything outside `[A-Za-z0-9_-]` to `_`, so a mechanism like
-/// `CADENCE_ALLOW_MAIN (repo settings)` is one safe filename component.
+/// Encode one key part injectively as a filename piece: ASCII letters and
+/// digits stay, every other byte becomes `_` plus two hex digits. `my.app` and
+/// `my_app` therefore stay distinct (`my_2eapp`, `my_5fapp`), and `-`, the
+/// part separator, never appears inside a part. Pure.
 fn marker_component(s: &str) -> String {
-    let mapped: String = s
-        .chars()
-        .take(80)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if mapped.is_empty() {
-        "_".to_string()
-    } else {
-        mapped
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("_{b:02x}"));
+        }
     }
+    out
+}
+
+/// Longest marker filename kept verbatim; past it the name is a prefix plus a
+/// hash of the whole key, staying under the common 255-byte filename limit.
+const MAX_MARKER_NAME: usize = 200;
+
+/// Join the encoded parts with `-`. A name past [`MAX_MARKER_NAME`] keeps its
+/// first 160 bytes and appends `~` and the key's 64-bit FNV-1a hash. Pure.
+fn marker_name(parts: &[&str]) -> String {
+    let name = parts
+        .iter()
+        .map(|p| marker_component(p))
+        .collect::<Vec<_>>()
+        .join("-");
+    if name.len() <= MAX_MARKER_NAME {
+        return name;
+    }
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{}~{hash:016x}", &name[..160])
 }
 
 /// Claim the marker with an exclusive create (`0600`, never through a
@@ -826,6 +841,27 @@ mod tests {
         assert_eq!(rows, want);
     }
 
+    /// The tool is part of the key: a Bash commit and an Edit riding the same
+    /// switch in one session are two rows.
+    #[test]
+    fn allow_main_used_by_a_second_tool_gets_its_own_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = env_switch_prov("CADENCE_ALLOW_MAIN");
+        let mut bash = used_input();
+        bash.tool_name = Some("Bash".into());
+        with_metrics_dir(tmp.path(), || {
+            for _ in 0..2 {
+                log_bypass(BypassEvent::used("enforce-worktree", &used_input(), &allow));
+                log_bypass(BypassEvent::used("enforce-worktree", &bash, &allow));
+            }
+        });
+        let tools: Vec<_> = read_lines(tmp.path())
+            .iter()
+            .map(|r| r["tool"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tools, ["Edit", "Bash"]);
+    }
+
     /// A secret-class escape is a distinct event on every use: never deduped.
     #[test]
     fn secret_class_env_switch_is_logged_on_every_use() {
@@ -903,13 +939,21 @@ mod tests {
     }
 
     #[test]
-    fn marker_component_maps_unsafe_characters() {
-        assert_eq!(
-            marker_component("CADENCE_ALLOW_MAIN (repo settings)"),
-            "CADENCE_ALLOW_MAIN__repo_settings_"
-        );
-        assert_eq!(marker_component("../x"), "___x");
-        assert_eq!(marker_component(""), "_");
+    fn marker_component_is_injective_and_path_safe() {
+        assert_eq!(marker_component("my.app"), "my_2eapp");
+        assert_eq!(marker_component("my_app"), "my_5fapp");
+        assert_eq!(marker_component("../x"), "_2e_2e_2fx");
+        assert_eq!(marker_component(""), "");
+        assert_ne!(marker_name(&["a-b", "c"]), marker_name(&["a", "b-c"]));
+    }
+
+    #[test]
+    fn a_long_marker_name_is_capped_and_still_distinct() {
+        let long = "x".repeat(300);
+        let a = marker_name(&[&long, "a"]);
+        let b = marker_name(&[&long, "b"]);
+        assert!(a.len() <= MAX_MARKER_NAME, "{}", a.len());
+        assert_ne!(a, b);
     }
 
     #[test]

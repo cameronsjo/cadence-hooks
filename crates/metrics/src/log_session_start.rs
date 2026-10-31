@@ -34,6 +34,7 @@ impl Logger for LogSessionStart {
         if common::create_private_dir(&dir).is_err() {
             return;
         }
+        crate::session_commits::start(&dir, session_id);
         if let Ok(mut file) =
             common::open_state_marker(&dir.join(format!("{session_id}.start")), false)
         {

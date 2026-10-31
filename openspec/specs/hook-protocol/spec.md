@@ -175,7 +175,7 @@ Hooks SHALL append JSONL rows under the metrics directory (`CADENCE_METRICS_DIR`
 
 #### Scenario: Env switch used twice in one session
 - **WHEN** `CADENCE_ALLOW_MAIN` lets two commits through `enforce-worktree` in one session
-- **THEN** `bypasses.jsonl` gains one `used` row for that session, hook, mechanism, working-directory repo and agent; a secret-class switch such as `CADENCE_ALLOW_SECRET_PUSH` keeps a row per use
+- **THEN** `bypasses.jsonl` gains one `used` row for that session, hook, mechanism, working-directory repo, agent and tool; a secret-class switch such as `CADENCE_ALLOW_SECRET_PUSH` keeps a row per use
 
 #### Scenario: Fail-open reasons
 - **WHEN** a hook fails open

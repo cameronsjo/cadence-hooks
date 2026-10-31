@@ -51,6 +51,8 @@ pub mod price_transcript;
 pub mod prices;
 /// Sum transcript token usage over a range.
 pub mod scan_tokens;
+/// Per-session commit count and last message id, kept out of the commits ledger.
+pub mod session_commits;
 /// Deterministic session grading: gaps, cold-restart dollars, peak context.
 pub mod session_grade;
 /// Snapshot HEAD before a `git commit`.
