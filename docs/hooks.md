@@ -223,7 +223,7 @@ exit 0. They never block a tool call (see
 | `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` | self-disable |
 | `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` | self-disable |
 | `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` | self-disable |
-| `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd` | self-disable |
+| `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd`; the first SessionStart of each UTC day also runs `metrics rotate` for up to 2 s, failing open | self-disable |
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` | self-disable |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` | self-disable |
 | `log-skill` | PostToolUse (`Skill`) | Append each Skill invocation to `skills.jsonl` | self-disable |
@@ -242,6 +242,12 @@ cadence-hooks metrics grade                        # defaults to $CLAUDE_CODE_SE
 The same grading is written to every `sessions.jsonl` row under a `grading` key.
 Unlike a guard, `grade` fails closed: a transcript it cannot identify or read
 exits 1 with the reason on stderr rather than printing a partial grading.
+
+`metrics rotate` and `metrics cat` are CLI actions too. `rotate` archives ledger
+segments past retention into `archive/*.jsonl.gz` (and, with
+`--quarantine-test-rows`, moves non-UUID `denials` rows aside); `cat <ledger>`
+prints a ledger's archives, segments and live file in order. Layout and
+retention: [Metrics ledgers and archives](configuration.md#metrics-ledgers-and-archives).
 
 `metrics price` is the same kind of CLI action. It scans one transcript with the
 scan `log-session` uses, prices it with the same table, and prints one JSON line,

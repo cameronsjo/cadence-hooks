@@ -53,11 +53,15 @@ In default mode without `--root`, `doctor` SHALL warn about: an installed hook-s
 - **THEN** no unenabled finding is reported for it
 
 ### Requirement: Telemetry and environment checks
-In default mode without `--root`, `doctor` SHALL warn about: stale or flatlined telemetry; fail-open telemetry over its thresholds in the last 7 days; slow hooks found in session logs; a metrics ledger of 64 MiB or more; a working or Claude config directory inside a cloud-synced tree; and inert `Bash(...)` rows in `permissions.deny` or `permissions.ask` of the user and project settings files.
+In default mode without `--root`, `doctor` SHALL warn about: stale or flatlined telemetry; fail-open telemetry over its thresholds in the last 7 days; slow hooks found in session logs; a metrics ledger of 64 MiB or more; a last `metrics rotate` success over 3 days old (or none with segments); archives over 500 MiB; a working or Claude config directory inside a cloud-synced tree; and inert `Bash(...)` rows in `permissions.deny` or `permissions.ask` of the user and project settings files.
 
 #### Scenario: Oversized ledger
 - **WHEN** a `*.jsonl` file in the metrics directory is 64 MiB
 - **THEN** `doctor` warns about it and deletes nothing
+
+#### Scenario: Archive not running
+- **WHEN** `state/rotate.last-success` is 4 days old
+- **THEN** `doctor` warns and names the `metrics_rotate_failed` rows to read
 
 ### Requirement: Configuration health checks
 In default mode without `--root`, `doctor` SHALL warn about an unset `CADENCE_ALLOWED_OWNERS` or leftover `GIT_GUARDRAILS_ALLOWED_*` keys in the user settings, and, for the current repo, a leftover `.claude/redaction.json` or `.claude/terminology.json`, an unparseable `.claude/cadence.json`, and invalid `nudges` or `feedbackFooter` entries. Every check in default mode MUST fail open: an unreadable or malformed input yields no finding about itself unless that is what the check reports.

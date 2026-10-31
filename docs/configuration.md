@@ -147,7 +147,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_NO_DAILY_GATE` | daily-gated nudges (`platform-drift`) | Set to any non-empty value to disable the once-per-calendar-day gate so a gated nudge fires every session again — for debugging a nudge you would otherwise have to wait until tomorrow to see. The gate keys on the nudge's *content*, not just the date, so a genuinely changed state (a partial upgrade) already re-fires the same day without this |
 | `CADENCE_METRICS_PRICES` | `log-commit`, `log-session`, `grade` | Path to a model price-table JSON; takes precedence over the `--prices` flag and the embedded default. Each model entry takes `inputPerMTok`, `outputPerMTok`, `cacheWritePerMTok` (5-minute TTL), `cacheReadPerMTok`, and the optional `cacheWrite1hPerMTok` (1-hour TTL) — omitting the last one falls back to `inputPerMTok * 2`, which is right only for models on the standard multiplier. An unreadable, unparseable, non-regular, over-1-MiB, empty (no models) or negative-rate file degrades silently to the embedded table; `metrics price` exits 1 instead |
 | `CADENCE_METRICS_DIR` | metrics loggers | When set non-empty, the metrics root (JSONL files and the `state/` subdir live directly inside it); otherwise `<config_dir>/metrics` (honoring `CLAUDE_CONFIG_DIR`). Moving it also moves the bypass and fail-open ledgers away from where `doctor` and your tooling read them |
-| `CADENCE_METRICS_MAX_BYTES` | every metrics ledger writer | Size cap in bytes for each `<metrics_dir>/*.jsonl` ledger (default 16 MiB, 16777216). A write that finds the ledger at or past the cap moves it to a dated segment `<name>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl` (`-000`, then `-001` for a further rotation in the same second) and starts a fresh file. A segment is never replaced or deleted. `0` turns rotation off; an empty, unparsable or under-1-MiB value keeps the default (a floor, because a cap of `16` meant as MiB would rotate on every write). Unix only. `doctor` and the other in-repo readers read the segments in name order (which is time order), then the live file; a script of yours that reads a ledger directly must do the same. A rotation error never blocks a hook and is recorded as a `ledger_rotate_failed` row in `failopen.jsonl` |
+| `CADENCE_METRICS_MAX_BYTES` | every metrics ledger writer | Size cap in bytes for each `<metrics_dir>/*.jsonl` ledger (default 16 MiB, 16777216). A write that finds the ledger at or past the cap moves it to a dated segment `<name>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl` (`-000`, then `-001` for a further rotation in the same second) and starts a fresh file. A segment is never replaced; `metrics rotate` later moves it into `archive/` (see [Metrics ledgers and archives](#metrics-ledgers-and-archives)). `0` turns rotation off; an empty, unparsable or under-1-MiB value keeps the default (a floor, because a cap of `16` meant as MiB would rotate on every write). Unix only. `doctor` and the other in-repo readers read the segments in name order (which is time order), then the live file; a script of yours reads the whole history with `cadence-hooks metrics cat <ledger>`. A rotation error never blocks a hook and is recorded as a `ledger_rotate_failed` row in `failopen.jsonl` |
 | `CADENCE_METRICS_DEBUG` | `log-subagent` | Set to `1` to append a `_keys` array of the raw payload's top-level keys to subagent records — surfaces schema additions across Claude Code releases |
 | `CADENCE_LOG_NUDGES` | denial log | Nudge-fire rows in `denials.jsonl` are ON by default (#420); set `0`/`false`/`off` (case-insensitive) or set-but-empty to opt out. Any other value, including the legacy opt-in `1`, keeps them on. Deny/Ask rows are unconditional either way |
 | `CADENCE_METRICS_STALE_DAYS` | `warn-stale` | Days of metrics-write silence before the SessionStart alarm fires and `doctor` reports staleness (default 4); zero or unparseable falls back to the default |
@@ -388,6 +388,33 @@ The marker lives at `<repo>/.git/cadence-hooks/enforce-worktree-snoozed-until` �
 **`CADENCE_ALLOW_MAIN` in process env is session-wide.** Claude Code exports a repo's `.claude/settings.json` `env` block into the whole session, so a session rooted in a main-by-design repo that declares the flag carries it into every Bash call, and `enforce-worktree` exempts **every** repo that session edits — including branch-mode repos checked out beneath it or reached by absolute path — not just the repo that declared it (#1242). The target-repo read above only ever adds exemptions; it never narrows a process-env one. For anything narrower, declare the flag per repo: put it in each main-by-design repo's own `.claude/settings.json` (or `settings.local.json`) and start sessions that edit branch-mode repos from those repos, not from the main-by-design root, so the flag reaches only the targets that declare it. For a one-off edit on a branch-mode repo's primary checkout, use the time-boxed `dismiss-enforce-worktree` snooze instead.
 
 This dismissal is **repo-scoped** — on a shared checkout it lowers the guard for every session, not just yours — so `--reason` is **required over 1h** (nudged at or under). The reason, arming session, and expiry land in a provenance sidecar (`enforce-worktree-snoozed-meta.json`, next to the marker) and in the bypass log below.
+
+## Metrics ledgers and archives
+
+Every metrics file lives under the metrics directory (`CADENCE_METRICS_DIR`, else `<config_dir>/cadence/metrics`, or the legacy `<config_dir>/metrics` while only it exists):
+
+| Path | What it holds |
+|---|---|
+| `<ledger>.jsonl` | The live ledger hooks append to. Nothing rewrites it. |
+| `<ledger>.<YYYYMMDDTHHMMSSZ>-<NNN>.jsonl` | A rotated segment: the live file moved aside at the 16 MiB cap (`CADENCE_METRICS_MAX_BYTES`). |
+| `archive/<ledger>.<YYYY-MM>.jsonl.gz` | Segments past retention, by the month of the segment stamp. One gzip member per archived segment; `zcat` reads it whole. |
+| `archive/denials.testrows.jsonl.gz` | `denials` rows moved by `metrics rotate --quarantine-test-rows` (no UUID `sessionId`). |
+| `rollups/denials-daily.jsonl` | Per-day `denials` counts by hook, repo and decision, one row per (day, hook, repo, decision, segment), written before the segment is archived. |
+| `state/rotate.lock`, `state/rotate-manifest.json` | The run lock, and the record of a move in flight; a leftover manifest is finished or rolled back by the next run. |
+| `state/rotate.last-success`, `state/rotate.day` | The UTC time of the last complete run (`doctor` warns past 3 days), and the date of the last SessionStart attempt. |
+| `state/quarantine-<YYYY-MM-DD>.json` | Host, per-file row counts and source sha256 of a quarantine run. |
+
+`cadence-hooks metrics rotate` moves segments into the archive by age; it never drops a row:
+
+| Ledger | Archived after |
+|---|---|
+| `denials` | 90 days (rolled up into `rollups/denials-daily.jsonl` first) |
+| `commits`, `sessions`, `plan-links` | 180 days; never dropped by any future policy |
+| every other ledger, including ones not listed | 180 days |
+
+Age is measured from the segment's stamp, the time it was rotated aside, so its rows are at least that old. The first SessionStart of each UTC day runs it (through `metrics log-session-start`) for up to 2 seconds; the rest waits for the next day. Run it by hand to finish a backlog. The same run removes `state/subagents/<session>/`, `state/bypass/<session>/` and `state/commits/<session>/` left by sessions that never reached SessionEnd, once untouched for 7 days.
+
+Read a ledger's whole history, archives included, with `cadence-hooks metrics cat <ledger>`; `--since 2026-10-01` limits it to recent rows, and `--include-test-rows` adds the quarantined `denials` rows.
 
 ## Bypass provenance
 
