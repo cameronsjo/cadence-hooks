@@ -497,9 +497,6 @@ fn gunzip_capped(bytes: &[u8], cap: u64) -> std::io::Result<Option<Vec<u8>>> {
     Ok((out.len() as u64 <= cap).then_some(out))
 }
 
-/// Refuse to grow an archive whose existing bytes do not decode to the end:
-/// gzip cannot resync past a damaged member, so every member appended after it
-/// would be unreadable while its source segment is deleted.
 /// `s` as one single-quoted shell word. Pure.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -511,14 +508,32 @@ fn shell_quote(s: &str) -> String {
 /// damaged member's partial output, which ends mid-row), and compress that back
 /// under the archive's name, owner-only. Then rerun `metrics rotate`.
 pub fn salvage_hint(archive_dir: &Path, name: &str) -> String {
-    let dir = shell_quote(&archive_dir.display().to_string());
+    let aside = shell_quote(&format!("./{name}.damaged"));
     format!(
-        "save its intact rows with: cd {dir} && mv {name} {name}.damaged && \
-         (umask 077; gzip -dc {name}.damaged 2>/dev/null | perl -ne 'print if /\\n\\z/' | gzip > {name}), \
-         then run `cadence-hooks metrics rotate` again; keep {name}.damaged until the rows check out"
+        "save its intact rows with: {}, then run `cadence-hooks metrics rotate` again; keep {aside} \
+         until the rows check out (the commands stop if an older {aside} exists: remove or rename it first)",
+        salvage_commands(archive_dir, name)
     )
 }
 
+/// The shell commands [`salvage_hint`] names. Every path is one single-quoted
+/// word and every name starts with `./`, so no file name can run a command or
+/// read as an option. The chain stops, non-zero, when `<name>.damaged`
+/// already exists (`mv -n` would exit 0 when it declines), so a rerun never
+/// replaces the first copy and the rows still undecoded in it. Pure.
+pub fn salvage_commands(archive_dir: &Path, name: &str) -> String {
+    let dir = shell_quote(&archive_dir.display().to_string());
+    let live = shell_quote(&format!("./{name}"));
+    let aside = shell_quote(&format!("./{name}.damaged"));
+    format!(
+        "cd {dir} && [ ! -e {aside} ] && [ ! -L {aside} ] && mv {live} {aside} && \
+         (umask 077; gzip -dc {aside} 2>/dev/null | perl -ne 'print if /\\n\\z/' | gzip > {live})"
+    )
+}
+
+/// Refuse to grow an archive whose existing bytes do not decode to the end:
+/// gzip cannot resync past a damaged member, so every member appended after it
+/// would be unreadable while its source segment is deleted.
 fn check_archive_decodes(archive_dir: &Path, name: &str) -> std::io::Result<()> {
     let Some(old) = read_regular(&archive_dir.join(name))? else {
         return Ok(());
@@ -590,14 +605,14 @@ pub(crate) fn archive_holds(archive_dir: &Path, manifest: &Manifest) -> std::io:
 /// segment name and `archive` is that ledger's monthly archive or the test-row
 /// archive. Pure.
 pub(crate) fn manifest_names_ok(manifest: &Manifest) -> bool {
-    let Some((stem, _, _)) = common::split_segment_name(&manifest.segment) else {
+    let Some((stem, stamp, _)) = common::split_segment_name(&manifest.segment) else {
         return false;
     };
     if manifest.segment.contains('/') {
         return false;
     }
     match manifest.op.as_str() {
-        "archive" => archive_month(&stem, &manifest.archive).is_some(),
+        "archive" => manifest.archive == archive_name(&stem, &stamp),
         "quarantine" => stem == "denials" && manifest.archive == TESTROWS_ARCHIVE,
         _ => false,
     }
@@ -636,8 +651,14 @@ fn try_lock(state: &Path) -> std::io::Result<Option<std::fs::File>> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(state.join(LOCK_FILE))?;
+    if !file.metadata()?.is_file() {
+        return Err(io_err(format!(
+            "expected {} to be a regular file",
+            state.join(LOCK_FILE).display()
+        )));
+    }
     let give_up = Instant::now() + LOCK_RETRY;
     loop {
         // SAFETY: `file` owns a valid descriptor for the whole call, and
@@ -684,7 +705,7 @@ pub(crate) fn lock_shared(state: &Path) -> std::io::Result<Option<std::fs::File>
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
     {
         Ok(file) => file,
@@ -696,9 +717,11 @@ pub(crate) fn lock_shared(state: &Path) -> std::io::Result<Option<std::fs::File>
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
             ) =>
         {
+            // O_NONBLOCK: a FIFO planted under the lock name must not hang
+            // the open; the regular-file check below refuses it.
             match std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&path)
             {
                 Ok(file) => file,
@@ -707,6 +730,12 @@ pub(crate) fn lock_shared(state: &Path) -> std::io::Result<Option<std::fs::File>
         }
         Err(err) => return Err(err),
     };
+    if !file.metadata()?.is_file() {
+        return Err(io_err(format!(
+            "expected {} to be a regular file",
+            path.display()
+        )));
+    }
     // SAFETY: `file` owns a valid descriptor for the whole call, and `flock`
     // touches no memory.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
@@ -799,8 +828,14 @@ pub(crate) fn recover(dir: &Path, fault: Fault<'_>) -> std::io::Result<bool> {
         return remove_manifest(&state).map(|()| true);
     }
     match manifest.op.as_str() {
+        // `archive_holds` proved the archive's new tail decodes to content
+        // hashing to `archived_sha256`; tying that hash to this segment's own
+        // bytes means the tail is the segment, not whatever the manifest says.
         "archive" => match current {
-            Some(bytes) if sha256_hex(&bytes) == manifest.sha256 => {
+            Some(bytes)
+                if sha256_hex(&bytes) == manifest.sha256
+                    && sha256_hex(&normalized(&bytes)) == manifest.archived_sha256 =>
+            {
                 std::fs::remove_file(&source)?;
                 fsync_dir(dir)?;
             }
@@ -1034,10 +1069,6 @@ pub(crate) fn sweep_session_state(state: &Path, now: i64) -> (usize, Vec<String>
     (removed, errors)
 }
 
-/// One archive run over `dir`. Takes the lock (skipping when another run has
-/// it), recovers a leftover manifest, archives every segment past retention
-/// in name order until the deadline, sweeps stale per-session state, and
-/// writes `state/rotate.last-success` only when all of it succeeded.
 /// Whether `--quarantine-test-rows` has completed a real run in `dir`: a
 /// regular `state/quarantine-*.json` record exists. Until then no `denials`
 /// segment is archived, so test rows are moved out before they reach a monthly
@@ -1055,6 +1086,11 @@ pub fn quarantine_has_run(dir: &Path) -> bool {
     })
 }
 
+/// One archive run over `dir`. Takes the lock (skipping when another run has
+/// it), recovers a leftover manifest, archives every segment past retention
+/// in name order until the deadline (`denials` only once the quarantine has
+/// run), sweeps stale per-session state, and writes `state/rotate.last-success`
+/// only when all of it succeeded.
 pub fn rotate(dir: &Path, opts: &RotateOptions<'_>) -> Result<RotateReport, String> {
     if cfg!(not(unix)) {
         return Err(UNSUPPORTED.to_string());
@@ -1268,7 +1304,8 @@ pub struct QuarantineReport {
     pub files: Vec<QuarantineFile>,
     /// The segment the live file moved to, when it held test rows.
     pub live_moved_to: Option<String>,
-    /// The `state/quarantine-*.json` record written, when rows moved.
+    /// The `state/quarantine-*.json` record this real run wrote (every real
+    /// run writes one, even when nothing moved; a dry run writes none).
     pub record: Option<String>,
 }
 

@@ -414,7 +414,7 @@ Every metrics file lives under the metrics directory (`CADENCE_METRICS_DIR`, els
 
 Age is measured from the segment's stamp, the time it was rotated aside, so its rows are at least that old.
 
-**Run `cadence-hooks metrics rotate --quarantine-test-rows` once on each machine.** Until a `state/quarantine-*.json` record exists, `metrics rotate` (by hand or at SessionStart) archives no `denials` segment: it counts them as waiting, writes no `rotate.last-success`, and prints one line naming `--quarantine-test-rows`. This keeps test rows out of the monthly archives and the rollup, which the quarantine cannot reach. Every other ledger archives as usual. The quarantine writes its record on every real run, even one that moved nothing, so a machine with no test rows opens the gate on its first run. `--dry-run` shows the counts first and writes no record.
+**Run `cadence-hooks metrics rotate --quarantine-test-rows` once on each machine.** Until a `state/quarantine-*.json` record exists, `metrics rotate` (by hand or at SessionStart) archives no `denials` segment: it counts them as waiting and writes no `rotate.last-success`. A hand run prints one line naming `--quarantine-test-rows`; the SessionStart run prints nothing, and `doctor` names the quarantine in its fix once the last success is 3 days old or missing. This keeps test rows out of the monthly archives and the rollup, which the quarantine cannot reach. Every other ledger archives as usual. The quarantine writes its record on every real run, even one that moved nothing, so a machine with no test rows opens the gate on its first run. `--dry-run` shows the counts first and writes no record.
 
 A test row is a `denials` row whose `sessionId` is not a UUID; a null or absent `sessionId` counts. A real denial whose hook payload carried no session id would match too. Quarantined rows are not deleted: `metrics cat denials --include-test-rows` prints them, and the record lists each file's counts and source sha256.
 
@@ -425,11 +425,14 @@ The same run removes per-session state left by sessions that never reached Sessi
 An archive that no longer decodes to the end (a truncated or damaged gzip member) is never appended to: the move fails with a `metrics_rotate_failed` row in `failopen.jsonl` naming it, that archive's segments stay, the archive is left as it is, and the rest of the run goes on with other archives (it writes no `rotate.last-success`). To recover, save its intact rows and rerun:
 
 ```bash
-cd <metrics_dir>/archive
-mv <name> <name>.damaged
-(umask 077; gzip -dc <name>.damaged 2>/dev/null | perl -ne 'print if /\n\z/' | gzip > <name>)
+cd '<metrics_dir>/archive' &&
+  [ ! -e './<name>.damaged' ] && [ ! -L './<name>.damaged' ] &&
+  mv './<name>' './<name>.damaged' &&
+  (umask 077; gzip -dc './<name>.damaged' 2>/dev/null | perl -ne 'print if /\n\z/' | gzip > './<name>')
 cadence-hooks metrics rotate
 ```
+
+The commands stop, without moving anything, when `<name>.damaged` already exists, so a second run never replaces the first copy and the rows still undecoded in it. Remove or rename an older `.damaged` file deliberately before you run them again.
 
 `gzip -dc` writes every member it decoded before the damage. It can also write part of the damaged member, which ends mid-row, so the `perl` step keeps only complete lines. Keep `<name>.damaged` until `metrics cat` shows the rows you expect. The error text and `metrics cat`'s stderr line carry the same commands with the real path. `metrics cat` prints a stderr line for a damaged archive, skips its remaining rows, prints every other row, and exits 1. Every other read error names the file or directory and exits 1; an unreadable `archive/` is an error, never an empty history. `metrics rotate` and `--quarantine-test-rows` run only on Unix; elsewhere they exit 1 without changing anything, and the SessionStart run does nothing (cap rotation is Unix-only too, so there are no segments there).
 

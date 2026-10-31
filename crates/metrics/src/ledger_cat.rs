@@ -208,10 +208,13 @@ pub fn cat(
                         | std::io::ErrorKind::UnexpectedEof
                 ) =>
             {
+                // The name comes from a directory listing, so it is shown
+                // through `display_safe`; the commands quote it for the shell.
                 eprintln!(
-                    "metrics cat: {ARCHIVE_DIR}/{name} could not be decoded to the end ({err}); \
+                    "metrics cat: {ARCHIVE_DIR}/{} could not be decoded to the end ({err}); \
                      its remaining rows are skipped. {}",
-                    rotate::salvage_hint(&archive_dir, &name)
+                    common::display_safe(&name),
+                    common::display_safe(&rotate::salvage_hint(&archive_dir, &name))
                 );
                 damaged = true;
             }

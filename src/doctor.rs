@@ -1824,9 +1824,19 @@ fn rotate_findings(dir: &Path, now: i64, size_threshold: u64) -> Vec<Finding> {
     };
     let marker = dir.join("state").join(LAST_SUCCESS_FILE);
     let failopen = failopen_inspect_cmd(dir, cadence_hooks_metrics::rotate::FAILOPEN_REASON);
-    let remedy = format!(
-        "run `cadence-hooks metrics rotate` and read its error; past failures: `{failopen}`"
-    );
+    // Until the quarantine has run, `denials` segments wait and no run can
+    // complete, so the first thing to run is the quarantine itself.
+    let remedy = if cadence_hooks_metrics::rotate::quarantine_has_run(dir) {
+        format!(
+            "run `cadence-hooks metrics rotate` and read its error; past failures: `{failopen}`"
+        )
+    } else {
+        format!(
+            "run `cadence-hooks metrics rotate --quarantine-test-rows --dry-run`, then without \
+             `--dry-run` (`denials` segments wait for it), then `cadence-hooks metrics rotate`; \
+             past failures: `{failopen}`"
+        )
+    };
     let mut findings = Vec::new();
     match health.last_success {
         Some(at) if now.saturating_sub(at) > ROTATE_STALE_SECS => findings.push(finding(
@@ -5158,6 +5168,14 @@ mod tests {
             findings[0].diagnosis
         );
         assert!(findings[0].remediation.contains("metrics_rotate_failed"));
+        assert!(
+            findings[0].remediation.contains("--quarantine-test-rows"),
+            "no quarantine record yet: {}",
+            findings[0].remediation
+        );
+        fs::write(dir.join("state").join("quarantine-2026-10-31.json"), "{}").unwrap();
+        let findings = rotate_findings(dir, now, u64::MAX);
+        assert!(!findings[0].remediation.contains("--quarantine-test-rows"));
     }
 
     #[test]

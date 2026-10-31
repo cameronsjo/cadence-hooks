@@ -310,7 +310,6 @@ fn a_kill_at_each_step_loses_and_duplicates_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         quarantined(dir);
-        quarantined(dir);
         let mut names = Vec::new();
         for seq in 0..2 {
             let rows: Vec<String> = (0..4).map(|i| denial(i + seq * 10, Some(UUID))).collect();
@@ -916,16 +915,22 @@ fn a_kill_at_each_quarantine_step_loses_and_duplicates_nothing() {
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        quarantined(dir);
-        quarantined(dir);
         let before = seed_quarantine(dir);
         let fault = fail_at(step);
         assert!(quarantine(dir, &qopts(false, &fault)).is_err(), "{step:?}");
+        assert!(
+            !quarantine_has_run(dir),
+            "{step:?}: a failed quarantine leaves the gate closed"
+        );
         let mut cat = cat_rows(dir, "denials", None, true);
         cat.sort();
         assert_eq!(cat, before, "{step:?}: cat prints each row once mid-move");
 
         quarantine(dir, &qopts(false, &no_fault)).unwrap();
+        assert!(
+            quarantine_has_run(dir),
+            "{step:?}: the completing run opens it"
+        );
         assert_eq!(
             raw_rows(dir, &["denials"]),
             before,
@@ -1446,12 +1451,8 @@ fn the_salvage_recipe_keeps_the_intact_members() {
     );
 
     // Run exactly the commands the hint names.
-    let hint = salvage_hint(&dir.join(ARCHIVE_DIR), &name);
-    let commands = hint
-        .split_once("with: ")
-        .and_then(|(_, rest)| rest.split_once(", then run"))
-        .map(|(cmd, _)| cmd.to_string())
-        .unwrap();
+    let commands = salvage_commands(&dir.join(ARCHIVE_DIR), &name);
+    assert!(salvage_hint(&dir.join(ARCHIVE_DIR), &name).contains(&commands));
     let status = std::process::Command::new("sh")
         .args(["-c", &commands])
         .status()
@@ -1490,6 +1491,12 @@ impl Drop for Chmod {
     }
 }
 
+/// Permission tests mean nothing as root, which ignores file modes.
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
 fn chmod(path: &Path, mode: u32) -> Chmod {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1498,6 +1505,10 @@ fn chmod(path: &Path, mode: u32) -> Chmod {
 
 #[test]
 fn cat_reports_an_unreadable_archive_dir() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores file modes");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
@@ -1514,6 +1525,10 @@ fn cat_reports_an_unreadable_archive_dir() {
 
 #[test]
 fn cat_read_errors_name_the_file() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores file modes");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let seg = write_segment(dir, "denials", &days_ago(5), 0, &[denial(1, Some(UUID))]);
@@ -1526,6 +1541,10 @@ fn cat_read_errors_name_the_file() {
 
 #[test]
 fn cat_reads_unlocked_when_the_lock_cannot_be_made() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores file modes");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     std::fs::write(
@@ -1602,4 +1621,199 @@ fn a_forged_quarantine_manifest_on_another_ledger_is_refused() {
         ..manifest
     };
     assert!(!manifest_names_ok(&cross));
+}
+
+// --- round 4 (cameronsjo/cadence-hooks#1600) -------------------------------
+
+fn bash_ok(script: &str, cwd: &Path) -> bool {
+    std::process::Command::new("bash")
+        .args(["-c", script])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn every_file_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(p.clone());
+            }
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A hostile archive name (a quote, a substitution, a space, a leading `-`)
+/// stays one inert word in the salvage commands.
+#[test]
+fn salvage_commands_quote_a_hostile_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let archive_dir = root.join("archive dir");
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let name = "-r a'b $(touch PWNED) `touch PWNED2`.2026-01.jsonl.gz";
+    let member = gzip_member(b"{\"n\":1}\n").unwrap();
+    std::fs::write(archive_dir.join(name), &member).unwrap();
+    let commands = salvage_commands(&archive_dir, name);
+
+    let syntax = std::process::Command::new("bash")
+        .args(["-n", "-c", &commands])
+        .status()
+        .unwrap();
+    assert!(syntax.success(), "bash -n rejects: {commands}");
+    assert!(bash_ok(&commands, &elsewhere), "{commands}");
+
+    let files = every_file_under(root);
+    assert!(
+        files.iter().all(|f| !f.to_string_lossy().contains("PWNED")
+            || f.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("$(touch PWNED)"))),
+        "a substitution ran: {files:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "nothing written outside"
+    );
+    let damaged = archive_dir.join(format!("{name}.damaged"));
+    assert_eq!(
+        std::fs::read(&damaged).unwrap(),
+        member,
+        "moved aside as one file"
+    );
+    assert_eq!(
+        gunzip_all(&std::fs::read(archive_dir.join(name)).unwrap()).unwrap(),
+        b"{\"n\":1}\n"
+    );
+    assert!(
+        files
+            .iter()
+            .all(|f| f.starts_with(&archive_dir) || f == &archive_dir || f == &elsewhere)
+    );
+}
+
+#[test]
+fn a_second_salvage_never_replaces_the_first_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive_dir = tmp.path();
+    let name = "denials.2026-01.jsonl.gz";
+    let damaged_bytes = truncated_gzip();
+    std::fs::write(archive_dir.join(name), &damaged_bytes).unwrap();
+    let commands = salvage_commands(archive_dir, name);
+    assert!(bash_ok(&commands, archive_dir), "first run");
+    let aside = archive_dir.join(format!("{name}.damaged"));
+    assert_eq!(std::fs::read(&aside).unwrap(), damaged_bytes);
+    // The salvaged archive is damaged again; a rerun must stop.
+    std::fs::write(archive_dir.join(name), b"not gzip").unwrap();
+    assert!(!bash_ok(&commands, archive_dir), "the rerun stops non-zero");
+    assert_eq!(
+        std::fs::read(&aside).unwrap(),
+        damaged_bytes,
+        "first copy untouched"
+    );
+    assert_eq!(std::fs::read(archive_dir.join(name)).unwrap(), b"not gzip");
+}
+
+#[test]
+fn an_archive_manifest_must_name_its_own_month() {
+    let seg = "denials.20260115T000000Z-000.jsonl".to_string();
+    let base = Manifest {
+        op: "archive".to_string(),
+        segment: seg,
+        archive: "denials.2026-01.jsonl.gz".to_string(),
+        rows: 0,
+        sha256: String::new(),
+        source_len: 0,
+        archived_sha256: String::new(),
+        archive_len_before: 0,
+        kept_sha256: None,
+    };
+    assert!(manifest_names_ok(&base));
+    let wrong_month = Manifest {
+        archive: "denials.2026-02.jsonl.gz".to_string(),
+        ..base
+    };
+    assert!(!manifest_names_ok(&wrong_month));
+}
+
+/// A manifest whose archive tail is real but is not this segment's content is
+/// refused and the segment kept: recovery checks the tail against the segment.
+#[test]
+fn recovery_checks_the_archive_tail_against_the_segment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    quarantined(dir);
+    let stamp = days_ago(100);
+    let seg = write_segment(dir, "denials", &stamp, 0, &[denial(1, Some(UUID))]);
+    let bytes = std::fs::read(dir.join(&seg)).unwrap();
+    let other = format!("{}\n", denial(2, Some(UUID))).into_bytes();
+    ensure_private_dir(&dir.join(ARCHIVE_DIR)).unwrap();
+    let archive = archive_name("denials", &stamp);
+    std::fs::write(
+        dir.join(ARCHIVE_DIR).join(&archive),
+        gzip_member(&other).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest {
+        op: "archive".to_string(),
+        segment: seg.clone(),
+        archive,
+        rows: 1,
+        sha256: sha256_hex(&bytes),
+        source_len: bytes.len() as u64,
+        archived_sha256: sha256_hex(&other),
+        archive_len_before: 0,
+        kept_sha256: None,
+    };
+    assert!(manifest_names_ok(&manifest));
+    assert!(archive_holds(&dir.join(ARCHIVE_DIR), &manifest).unwrap());
+    write_manifest(&dir.join("state"), &manifest).unwrap();
+    assert!(rotate(dir, &opts(&no_fault)).is_err());
+    assert_eq!(
+        std::fs::read(dir.join(&seg)).unwrap(),
+        bytes,
+        "segment kept"
+    );
+}
+
+#[test]
+fn a_fifo_lock_file_does_not_hang_cat() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores file modes");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(
+        dir.join("denials.jsonl"),
+        format!("{}\n", denial(1, Some(UUID))),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let fifo = std::ffi::CString::new(dir.join("state").join(LOCK_FILE).to_str().unwrap()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path for the duration of the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o444) }, 0);
+    let _dir = chmod(&dir.join("state"), 0o500);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = dir.clone();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = tx
+            .send(crate::ledger_cat::cat(&reader, "denials", None, false, &mut out).map(|()| out));
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cat hung on a FIFO lock file");
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains(LOCK_FILE), "{err}");
 }
