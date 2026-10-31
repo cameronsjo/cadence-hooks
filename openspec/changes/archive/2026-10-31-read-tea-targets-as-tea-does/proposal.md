@@ -1,0 +1,16 @@
+## Why
+
+`guard-forge-write` refused `tea pr create` on an owned Gitea repo three ways (cameronsjo/cadence-hooks#1601). Reading tea 0.16.0's source and running it showed the guard did not read `tea` the way tea does: tea's repo flag is `--repo`/`-r` and `-R` is `--remote` (a git remote name); tea keeps the first two parts of a slug, so `--repo git.sjo.lol/cameron/lectern` requests `/repos/git.sjo.lol/cameron`; a slug goes to the tea login's host; and with no `--repo` tea uses the repo of the directory it runs in, which the guard never read.
+
+## What Changes
+
+- The tea target is `--repo`/`-r`, read as tea reads it (first two parts; a URL or one-part slug is unreadable). `-R`/`--remote` names the git remote tea reads, never a repo.
+- A bare tea slug is owned when it is owned on every tea login host: the `--login` one, else every login in tea's `config.yml` plus a `GITEA_INSTANCE_URL` host. `CADENCE_EXTRA_HOSTS` decides only when no login host is known. The guard reads only each login's `name` and `url` keys.
+- A tea write with no `--repo` is judged on the git remotes of the directory it runs in (the payload `cwd` plus literal `cd`s, both the whole-command and per-segment readings): every remote, or the one `--remote` names, must be owned. No `cwd`, no repo, an unreadable remote or a `cd` the guard cannot read stays unresolvable. A git timeout fails open.
+- Review (security and code) added refusals where the guard would otherwise judge something tea does not use: a `--repo`/`--owner` it cannot read literally, a `--repo` that is also a local directory, `repos create|delete` without `--owner`, a remote path that is not exactly `owner/repo` (tea reads the last two parts of an https remote), a tea config entry it cannot read, and a `GITEA_INSTANCE_URL` set outside the tea call's own prefix. `--login` and an env login move the host a directory remote is judged on, and `env -C` moves the directory.
+- Tea block messages say `--repo owner/repo`, say `-R` is `--remote`, and name the reason. `glab` is unchanged.
+
+## Impact
+
+- Code: `crates/guardrails/src/guard_forge_write.rs`.
+- Case 3 of the issue stays blocked: `--repo host/owner/repo` names owner `host` to tea, so allowing it would allow a write tea sends elsewhere.

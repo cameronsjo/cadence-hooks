@@ -181,7 +181,7 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook exits 0 with a nudge that a bare `#12` resolves against `cameronsjo/forgectl`
 
 ### Requirement: tea and glab writes
-`guard-forge-write` (PreToolUse, Bash) SHALL block (exit 2) a `tea` or `glab` write whose `-R`/`--repo` target is outside the allowlist or cannot be read, and SHALL allow reads and any verb outside its write table. A bare target MUST match a bare entry only on a host in `CADENCE_EXTRA_HOSTS`, never on the GitHub default host; for `glab` it also matches a `gitlab.com/<owner>` entry. With no allowlist every write it reaches MUST block. `glab api` and `tea api` SHALL be allowed.
+`guard-forge-write` (PreToolUse, Bash) SHALL block (exit 2) a `tea` or `glab` write whose target is outside the allowlist or cannot be read, and SHALL allow reads and any verb outside its write table. For `glab` the target is `-R`/`--repo`; a bare target MUST match a bare entry only on a host in `CADENCE_EXTRA_HOSTS` or a `gitlab.com/<owner>` entry, never on the GitHub default host. With no allowlist every write it reaches MUST block. `glab api` and `tea api` SHALL be allowed.
 
 #### Scenario: Unowned GitLab write
 - **WHEN** the command is `glab mr create -R evil/r --title t`
@@ -190,6 +190,35 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 #### Scenario: GitLab read
 - **WHEN** the command is `glab mr list -R evil/r`
 - **THEN** the hook allows
+
+### Requirement: tea targets read as tea reads them
+For `tea` the target SHALL be `--repo`/`-r` (`-R` is tea's `--remote`), its first two `/` parts being owner and repo. A bare slug MUST be owned on every tea login host (the `--login` one, else every login in tea's `config.yml`, plus a `GITEA_INSTANCE_URL` host), or, when none is known, on a `CADENCE_EXTRA_HOSTS` host.
+
+#### Scenario: Bare tea slug on the login host
+- **WHEN** tea's only login is `https://git.sjo.lol`, `git.sjo.lol/cameron` is allowed, and the command is `tea pr create --repo cameron/lectern`
+- **THEN** the hook allows
+
+#### Scenario: Host-qualified tea slug
+- **WHEN** the command is `tea pr create --repo git.sjo.lol/cameron/lectern`
+- **THEN** the hook exits 2 naming `tea write targets git.sjo.lol/cameron`, since tea reads owner `git.sjo.lol`
+
+### Requirement: tea writes judged on their directory
+A `tea` `pulls`, `issues` or `comment` write with no `--repo` or `--owner` SHALL be judged on the git remotes of the directory it runs in (payload `cwd`, literal `cd`s, `env -C`); every remote, or the `--remote` one, MUST be owned, and on the login host when `--login` or `GITEA_INSTANCE_URL` moves it. No readable two-part remote MUST block as unreadable.
+
+#### Scenario: tea write in an owned checkout
+- **WHEN** the command is `cd <repo> && tea pr create --title t` and every remote of `<repo>` is an owned repo
+- **THEN** the hook allows
+
+#### Scenario: Login on another host
+- **WHEN** the checkout's remote is owned on `git.sjo.lol` and the command is `tea pr create --title t --login work`, where `work` is a login on an unowned host
+- **THEN** the hook exits 2
+
+### Requirement: tea targets the guard cannot read
+`guard-forge-write` MUST block as unreadable a `tea` write whose `--repo`/`--owner` is not a literal `owner/repo`, whose `--repo` names an existing directory, that is `repos create|delete` without `--owner`, or that runs under a `GITEA_INSTANCE_URL` set other than directly in front of `tea`.
+
+#### Scenario: Repo from a variable
+- **WHEN** the command is `tea pr create --repo "$REPO"` in an owned checkout
+- **THEN** the hook exits 2 with rule `forge-write-target-unresolvable`
 
 ### Requirement: Repository deletion
 `guard-gh-dangerous` (PreToolUse, Bash) SHALL block (exit 2, `gh repo delete is blocked`) `gh repo delete` and `gh api -X DELETE repos/<owner>/<repo>` on any repository, owned or not, including inside shell wrappers, a literal piped into a shell, and quoted or brace-built spellings the shell runs as a delete. It SHALL block a `gh` command too large to read when its text could spell a delete. Other `gh` commands, and the phrase in quoted prose, SHALL be allowed.
