@@ -35,6 +35,9 @@ impl Logger for LogSubagent {
         if event != "SubagentStart" && event != "SubagentStop" {
             return;
         }
+        if is_side_agent_stop(event, input.agent_type.as_deref()) {
+            return;
+        }
 
         let dir = common::metrics_dir();
         if std::fs::create_dir_all(&dir).is_err() {
@@ -43,7 +46,22 @@ impl Logger for LogSubagent {
 
         let debug = std::env::var("CADENCE_METRICS_DEBUG").as_deref() == Ok("1");
         let mut record = build_subagent_record(input, &common::utc_timestamp(), debug);
-        if event == "SubagentStop" {
+        let marker = start_marker_path(
+            &common::state_dir(),
+            input.session_id.as_deref(),
+            input.agent_id.as_deref(),
+        );
+        if event == "SubagentStart" {
+            if let Some(marker) = marker {
+                write_start_marker(&marker, now_ms());
+            }
+        } else {
+            if input.duration_ms.is_none()
+                && let Some(ms) = marker.as_deref().and_then(take_start_marker)
+                && let Some(elapsed) = elapsed_ms(ms, now_ms())
+            {
+                record["durationMs"] = json!(elapsed);
+            }
             let prices = Prices::load(None);
             let usage = agent_transcript_path(input).and_then(|p| scan_agent_transcript(&p));
             add_cost_fields(&mut record, usage.as_ref(), &prices);
@@ -59,6 +77,63 @@ impl Logger for LogSubagent {
             let _ = file.write_all(line.as_bytes());
         }
     }
+}
+
+/// A `SubagentStop` with no agent type is one of the harness's own side agents,
+/// not one the session dispatched: every dispatched agent, `general-purpose`
+/// included, carries a type and has a `SubagentStart`, and these have neither a
+/// Start nor a transcript. They were 62k of 75k Stop rows (cadence-hooks#1587).
+/// Pure.
+fn is_side_agent_stop(event: &str, agent_type: Option<&str>) -> bool {
+    event == "SubagentStop" && agent_type.is_none_or(|t| t.trim().is_empty())
+}
+
+/// `<state>/subagents/<session>/<agent>.start`, holding the Start time in epoch
+/// milliseconds. `None` when either id is missing or could steer the path out
+/// of the state dir. `log-session` removes the session's directory at
+/// SessionEnd, so a Start whose Stop never arrives does not linger. Pure.
+fn start_marker_path(
+    state_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Option<PathBuf> {
+    let session = session_id.filter(|s| common::is_safe_session_id(s))?;
+    let agent = agent_id.filter(|s| common::is_safe_session_id(s))?;
+    Some(
+        state_dir
+            .join("subagents")
+            .join(session)
+            .join(format!("{agent}.start")),
+    )
+}
+
+/// Milliseconds from Start to Stop, or `None` when the clock went backwards.
+/// Pure.
+fn elapsed_ms(start_ms: u64, now_ms: u64) -> Option<u64> {
+    now_ms.checked_sub(start_ms)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Fail-open (ADR-0001): a write that fails leaves the Stop row without a
+/// duration, nothing more.
+fn write_start_marker(marker: &Path, ms: u64) {
+    if let Some(parent) = marker.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+    {
+        let _ = std::fs::write(marker, ms.to_string());
+    }
+}
+
+/// Read and remove the Start marker. `None` when it is missing or unparsable.
+fn take_start_marker(marker: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(marker).ok()?;
+    let _ = std::fs::remove_file(marker);
+    text.trim().parse().ok()
 }
 
 /// Build the JSONL record for a subagent event. Pure — no I/O.
@@ -203,6 +278,112 @@ mod tests {
             ..Default::default()
         };
         LogSubagent.run(&input);
+    }
+
+    fn with_metrics_dir<F: FnOnce()>(dir: &Path, f: F) {
+        let _guard = crate::common::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against every other env-mutating test via ENV_LOCK.
+        unsafe {
+            std::env::set_var("CADENCE_METRICS_DIR", dir);
+        }
+        f();
+        // SAFETY: serialized against every other env-mutating test via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+    }
+
+    fn rows(dir: &Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("subagents.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn event(name: &str, agent_type: Option<&str>) -> MetricsInput {
+        MetricsInput {
+            hook_event_name: Some(name.into()),
+            session_id: Some("s1".into()),
+            agent_id: Some("a1".into()),
+            agent_type: agent_type.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    /// cadence-hooks#1587: a Stop with no agent type is a harness side agent
+    /// and writes no row; a typed Stop still does.
+    #[test]
+    fn side_agent_stop_writes_no_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            LogSubagent.run(&event("SubagentStop", Some("")));
+            LogSubagent.run(&event("SubagentStop", None));
+            LogSubagent.run(&event("SubagentStop", Some("Explore")));
+        });
+        let rows = rows(tmp.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["agentType"], "Explore");
+    }
+
+    #[test]
+    fn side_agent_predicate() {
+        assert!(is_side_agent_stop("SubagentStop", None));
+        assert!(is_side_agent_stop("SubagentStop", Some(" ")));
+        assert!(!is_side_agent_stop("SubagentStop", Some("general-purpose")));
+        assert!(!is_side_agent_stop("SubagentStart", None));
+    }
+
+    /// A Stop with no payload duration takes it from the Start marker, then
+    /// removes the marker.
+    #[test]
+    fn stop_fills_duration_from_the_start_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            LogSubagent.run(&event("SubagentStart", Some("Explore")));
+            LogSubagent.run(&event("SubagentStop", Some("Explore")));
+        });
+        let rows = rows(tmp.path());
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0]["durationMs"].is_null(), "Start has no duration");
+        assert!(rows[1]["durationMs"].is_u64(), "{}", rows[1]);
+        assert!(
+            !tmp.path().join("state/subagents/s1/a1.start").exists(),
+            "the marker is consumed"
+        );
+    }
+
+    /// A duration the payload already carries wins over the marker.
+    #[test]
+    fn payload_duration_wins_over_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stop = event("SubagentStop", Some("Explore"));
+        stop.duration_ms = Some(4200);
+        with_metrics_dir(tmp.path(), || {
+            LogSubagent.run(&event("SubagentStart", Some("Explore")));
+            LogSubagent.run(&stop);
+        });
+        assert_eq!(rows(tmp.path())[1]["durationMs"], 4200);
+    }
+
+    #[test]
+    fn start_marker_path_refuses_unsafe_ids() {
+        let state = Path::new("/state");
+        assert_eq!(
+            start_marker_path(state, Some("s1"), Some("a1")),
+            Some(PathBuf::from("/state/subagents/s1/a1.start"))
+        );
+        assert_eq!(start_marker_path(state, Some("../x"), Some("a1")), None);
+        assert_eq!(start_marker_path(state, Some("s1"), Some("a/b")), None);
+        assert_eq!(start_marker_path(state, None, Some("a1")), None);
+    }
+
+    #[test]
+    fn elapsed_ms_refuses_a_backwards_clock() {
+        assert_eq!(elapsed_ms(1_000, 1_500), Some(500));
+        assert_eq!(elapsed_ms(2_000, 1_500), None);
     }
 
     #[test]

@@ -166,12 +166,16 @@ impl BypassEvent {
 /// Fully fail-open (ADR-0001): a missing dir it can't create, or a failed open /
 /// write, degrades to a no-op — the caller's allow and exit code are untouched.
 pub fn log_bypass(event: BypassEvent) {
-    let record = event.to_record();
-
     let dir = common::metrics_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
+    if let Some(marker) = once_per_session_marker(&dir.join("state"), &event)
+        && !claim_marker(&marker)
+    {
+        return;
+    }
+    let record = event.to_record();
     let path = dir.join("bypasses.jsonl");
 
     if let Ok(mut file) = common::open_ledger(&path) {
@@ -180,6 +184,70 @@ pub fn log_bypass(event: BypassEvent) {
         let mut line = record.to_string();
         line.push('\n');
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// An env switch such as `CADENCE_ALLOW_MAIN` stays set for the whole session,
+/// so a `used` row per allowed call says nothing new after the first: they
+/// were 86% of the ledger, up to 206 per session (cadence-hooks#1588). Such a
+/// row is written once per session, hook, and mechanism, claimed through
+/// `<state>/bypass/<session>/<hook>--<mechanism>`. A dismissal is not
+/// deduped: it carries its own reason and expiry. `None` (always write) for
+/// a dismissal, an `armed` event, or a session id unsafe in a path. Pure.
+fn once_per_session_marker(
+    state_dir: &std::path::Path,
+    event: &BypassEvent,
+) -> Option<std::path::PathBuf> {
+    if event.event != "used" || event.kind != "env_switch" {
+        return None;
+    }
+    let session = event
+        .session
+        .as_deref()
+        .filter(|s| common::is_safe_session_id(s))?;
+    let key = format!(
+        "{}--{}",
+        marker_component(event.hook.as_deref().unwrap_or("")),
+        marker_component(&event.mechanism)
+    );
+    Some(state_dir.join("bypass").join(session).join(key))
+}
+
+/// Map anything outside `[A-Za-z0-9_-]` to `_`, so a mechanism like
+/// `CADENCE_ALLOW_MAIN (repo settings)` is one safe filename component.
+fn marker_component(s: &str) -> String {
+    let mapped: String = s
+        .chars()
+        .take(80)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if mapped.is_empty() {
+        "_".to_string()
+    } else {
+        mapped
+    }
+}
+
+/// Claim the marker with an exclusive create. `false` only when it already
+/// exists; any other error claims it anyway, so a broken state dir costs a
+/// repeated row rather than a missing one (ADR-0001).
+fn claim_marker(marker: &std::path::Path) -> bool {
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
     }
 }
 
@@ -604,6 +672,106 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event"], "used");
         assert_eq!(rows[0]["mechanism"], "dismiss-enforce-worktree");
+    }
+
+    fn env_switch_prov(mechanism: &str) -> BypassProvenance {
+        BypassProvenance {
+            kind: BypassKind::EnvSwitch,
+            mechanism: mechanism.into(),
+            reason: None,
+            expires_at: None,
+            armed_by_session: None,
+        }
+    }
+
+    /// cadence-hooks#1588: an env switch is logged once per session, hook and
+    /// mechanism; a second hook, a second mechanism, or a second session each
+    /// still get their first row.
+    #[test]
+    fn env_switch_used_is_logged_once_per_session_hook_and_mechanism() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allow = env_switch_prov("CADENCE_ALLOW_MAIN");
+        let repo_settings = env_switch_prov("CADENCE_ALLOW_MAIN (repo settings)");
+        let mut other_session = used_input();
+        other_session.session_id = Some("sess-2".into());
+        with_metrics_dir(tmp.path(), || {
+            for _ in 0..3 {
+                log_bypass(BypassEvent::used("enforce-worktree", &used_input(), &allow));
+            }
+            log_bypass(BypassEvent::used(
+                "guard-body-budget",
+                &used_input(),
+                &allow,
+            ));
+            log_bypass(BypassEvent::used(
+                "enforce-worktree",
+                &used_input(),
+                &repo_settings,
+            ));
+            log_bypass(BypassEvent::used(
+                "enforce-worktree",
+                &other_session,
+                &allow,
+            ));
+        });
+        let rows = read_lines(tmp.path());
+        let seen: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["sessionId"].as_str().unwrap().to_string(),
+                    r["hook"].as_str().unwrap().to_string(),
+                    r["mechanism"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 4, "{seen:?}");
+    }
+
+    /// A dismissal carries its own reason and expiry, so every use stays a row.
+    #[test]
+    fn dismissal_used_is_never_deduped() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            for _ in 0..2 {
+                log_bypass(BypassEvent::used(
+                    "enforce-worktree",
+                    &used_input(),
+                    &dismissal_prov(),
+                ));
+            }
+        });
+        assert_eq!(read_lines(tmp.path()).len(), 2);
+    }
+
+    /// No usable session id means no marker to claim: write every row rather
+    /// than drop one.
+    #[test]
+    fn env_switch_used_without_a_safe_session_is_always_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut input = used_input();
+        input.session_id = Some("../escape".into());
+        with_metrics_dir(tmp.path(), || {
+            for _ in 0..2 {
+                log_bypass(BypassEvent::used(
+                    "enforce-worktree",
+                    &input,
+                    &env_switch_prov("CADENCE_ALLOW_MAIN"),
+                ));
+            }
+        });
+        assert_eq!(read_lines(tmp.path()).len(), 2);
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[test]
+    fn marker_component_maps_unsafe_characters() {
+        assert_eq!(
+            marker_component("CADENCE_ALLOW_MAIN (repo settings)"),
+            "CADENCE_ALLOW_MAIN__repo_settings_"
+        );
+        assert_eq!(marker_component("../x"), "___x");
+        assert_eq!(marker_component(""), "_");
     }
 
     #[test]
