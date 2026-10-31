@@ -6,7 +6,7 @@ Two ledgers were mostly repeats that answered nothing. In `subagents.jsonl`, 62,
 
 - `log-subagent` writes no row for a `SubagentStop` whose agent type is empty or absent. Every dispatched agent, `general-purpose` included, carries a type and a Start; these are the harness's own side agents.
 - `log-subagent` records each typed Start's time at `<state>/subagents/<session>/<agent>.start`, and a Stop without a payload `durationMs` takes the elapsed time from it, then removes it.
-- An env-switch `used` bypass row is written once per session, hook, and mechanism, claimed with an exclusive create at `<state>/bypass/<session>/<hook>--<mechanism>`. A claim that fails for any reason other than "already claimed" still writes the row. Dismissals, `armed` rows, the global gates, and a session id unsafe in a path are never deduped.
+- A `CADENCE_ALLOW_MAIN`-family (or `CADENCE_NO_ENFORCE_WORKTREE`) `used` bypass row is written once per session, hook, mechanism, repo, and agent, claimed with an exclusive `0600` create at `<state>/bypass/<session>/<hook>--<mechanism>--<repo>--<agent>`. A claim that fails for any reason other than "already claimed" still writes the row, and a claim whose row fails to write is released. Every other env switch (secret push, SOPS decrypt, redaction bypass), dismissals, `armed` rows, the global gates, and a session id unsafe in a path are never deduped.
 - `log-session` removes the session's `subagents/` and `bypass/` state at `SessionEnd`.
 
 ## Impact

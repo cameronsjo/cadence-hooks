@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Subagent lifecycle
-`log-subagent` SHALL append a `subagents.jsonl` row for each `SubagentStart` and each `SubagentStop` that names an agent type, with `event`, the session, agent, and parent ids, `cwd`, `transcriptPath`, and `durationMs`. A Stop with no payload `durationMs` SHALL take it from the Start. On `SubagentStop` it SHALL add `model`, `tokens`, `byModel`, `unpricedModels`, and `costUsd` from the agent's transcript, `null` when absent.
+`log-subagent` SHALL append a `subagents.jsonl` row for each `SubagentStart` and each `SubagentStop` that names an agent type, with `event`, the session, agent, and parent ids, `cwd`, `transcriptPath`, and `durationMs`. A Stop with no payload `durationMs` SHALL take it from the Start. A Stop SHALL add `model`, `tokens`, `byModel`, `unpricedModels`, `costUsd` from `<parent transcript stem>/subagents/agent-<agentId>.jsonl`, `null` if missing, unreadable, over 256 MiB, or without usage.
 
 #### Scenario: Read-only reviewer finishes
 - **WHEN** a `SubagentStop` arrives and the agent's transcript has usage

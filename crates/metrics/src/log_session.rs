@@ -137,10 +137,6 @@ impl Logger for LogSession {
     }
 }
 
-/// Commit rows for the session in the commits ledger, the newest rotated
-/// segment included, so a session that straddles a rotation does not report
-/// fewer commits. One segment back is enough: a session never writes a cap's
-/// worth of commit rows (cameronsjo/cadence-hooks#1589 replaces this read).
 /// Remove the per-session markers other loggers leave under `state/`: the
 /// subagent Start times (`subagents/<session>/`) and the once-per-session
 /// bypass claims (`bypass/<session>/`). `session_id` has passed
@@ -153,6 +149,10 @@ fn clear_session_state(state_dir: &std::path::Path, session_id: &str) {
     }
 }
 
+/// Commit rows for the session in the commits ledger, the newest rotated
+/// segment included, so a session that straddles a rotation does not report
+/// fewer commits. One segment back is enough: a session never writes a cap's
+/// worth of commit rows (cameronsjo/cadence-hooks#1589 replaces this read).
 fn commits_in_ledger(commits_path: &std::path::Path, session_id: &str) -> u64 {
     common::read_ledger_recent(commits_path)
         .map(|contents| count_commits(&contents, session_id))

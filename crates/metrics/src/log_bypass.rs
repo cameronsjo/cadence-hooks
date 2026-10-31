@@ -170,46 +170,65 @@ pub fn log_bypass(event: BypassEvent) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    if let Some(marker) = once_per_session_marker(&dir.join("state"), &event)
-        && !claim_marker(&marker)
+    let marker = once_per_session_marker(&dir.join("state"), &event);
+    if let Some(marker) = marker.as_deref()
+        && !claim_marker(marker)
     {
         return;
     }
     let record = event.to_record();
     let path = dir.join("bypasses.jsonl");
 
-    if let Ok(mut file) = common::open_ledger(&path) {
-        // One `write_all` of the record + newline, so a concurrent append from
-        // another session can't interleave a record with its trailing newline.
-        let mut line = record.to_string();
-        line.push('\n');
-        let _ = file.write_all(line.as_bytes());
+    // One `write_all` of the record + newline, so a concurrent append from
+    // another session can't interleave a record with its trailing newline.
+    let mut line = record.to_string();
+    line.push('\n');
+    let written = common::open_ledger(&path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .is_ok();
+    // A claim whose row never landed is released, so the next use retries
+    // instead of the session's only row being lost.
+    if !written && let Some(marker) = marker {
+        let _ = std::fs::remove_file(marker);
     }
 }
 
-/// An env switch such as `CADENCE_ALLOW_MAIN` stays set for the whole session,
-/// so a `used` row per allowed call says nothing new after the first: they
-/// were 86% of the ledger, up to 206 per session (cadence-hooks#1588). Such a
-/// row is written once per session, hook, and mechanism, claimed through
-/// `<state>/bypass/<session>/<hook>--<mechanism>`. A dismissal is not
-/// deduped: it carries its own reason and expiry. `None` (always write) for
-/// a dismissal, an `armed` event, or a session id unsafe in a path. Pure.
+/// Only the main-checkout switches are deduped. `CADENCE_ALLOW_MAIN` stays set
+/// for a whole session and wrote a `used` row on every allowed call: 86% of
+/// the ledger, up to 206 rows per session (cadence-hooks#1588). Every other env
+/// switch (a secret push, a SOPS decrypt, a redaction bypass) keeps one row per
+/// use, since each use is a distinct escape worth its own audit row.
+fn is_deduped_mechanism(mechanism: &str) -> bool {
+    mechanism.starts_with("CADENCE_ALLOW_MAIN") || mechanism == "CADENCE_NO_ENFORCE_WORKTREE"
+}
+
+/// The claim for a deduped `used` row: one per session, hook, mechanism, repo,
+/// and agent, at `<state>/bypass/<session>/<hook>--<mechanism>--<repo>--<agent>`,
+/// so a second repo or a subagent riding the same switch still gets its own
+/// row. `None` (always write) for any other row or a session id unsafe in a
+/// path. Pure.
 fn once_per_session_marker(
     state_dir: &std::path::Path,
     event: &BypassEvent,
 ) -> Option<std::path::PathBuf> {
-    if event.event != "used" || event.kind != "env_switch" {
+    if event.event != "used"
+        || event.kind != "env_switch"
+        || !is_deduped_mechanism(&event.mechanism)
+    {
         return None;
     }
     let session = event
         .session
         .as_deref()
         .filter(|s| common::is_safe_session_id(s))?;
-    let key = format!(
-        "{}--{}",
-        marker_component(event.hook.as_deref().unwrap_or("")),
-        marker_component(&event.mechanism)
-    );
+    let key = [
+        event.hook.as_deref().unwrap_or(""),
+        event.mechanism.as_str(),
+        event.repo.as_deref().unwrap_or(""),
+        event.agent.as_deref().unwrap_or("main"),
+    ]
+    .map(marker_component)
+    .join("--");
     Some(state_dir.join("bypass").join(session).join(key))
 }
 
@@ -234,18 +253,15 @@ fn marker_component(s: &str) -> String {
     }
 }
 
-/// Claim the marker with an exclusive create. `false` only when it already
-/// exists; any other error claims it anyway, so a broken state dir costs a
-/// repeated row rather than a missing one (ADR-0001).
+/// Claim the marker with an exclusive create (`0600`, never through a
+/// symlink). `false` only when it already exists; any other error claims it
+/// anyway, so a broken state dir costs a repeated row rather than a missing
+/// one (ADR-0001).
 fn claim_marker(marker: &std::path::Path) -> bool {
     if let Some(parent) = marker.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = common::create_private_dir(parent);
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker)
-    {
+    match common::open_state_marker(marker, true) {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
     }
@@ -274,7 +290,7 @@ fn plain_label(s: &str) -> bool {
 /// - **Active dismissals**: `armed` rows whose `expiresAt` is still ahead of
 ///   `now`, one per distinct hook.
 /// - **Used**: `used` rows in the last 24h, tallied by `kind` — this is where a
-///   standing env switch's per-edit noise collapses into one count.
+///   `CADENCE_ALLOW_MAIN` counts first uses per session, hook, repo and agent.
 ///
 /// Counts and hook names only: never a `reason`, path, or command (privacy
 /// contract of the ledger). Malformed lines are skipped (fail-open).
@@ -684,17 +700,41 @@ mod tests {
         }
     }
 
-    /// cadence-hooks#1588: an env switch is logged once per session, hook and
-    /// mechanism; a second hook, a second mechanism, or a second session each
-    /// still get their first row.
+    fn used_rows(dir: &std::path::Path) -> Vec<(String, String, String, String, String)> {
+        let mut rows: Vec<_> = read_lines(dir)
+            .iter()
+            .map(|r| {
+                let f = |k: &str| r[k].as_str().unwrap_or("-").to_string();
+                (
+                    f("sessionId"),
+                    f("hook"),
+                    f("mechanism"),
+                    f("repo"),
+                    f("agentId"),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// cadence-hooks#1588: `CADENCE_ALLOW_MAIN` is logged once per session,
+    /// hook, mechanism, repo and agent. Repeats collapse; each other dimension
+    /// still gets its own first row.
     #[test]
-    fn env_switch_used_is_logged_once_per_session_hook_and_mechanism() {
+    fn allow_main_used_is_logged_once_per_session_hook_mechanism_repo_and_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let allow = env_switch_prov("CADENCE_ALLOW_MAIN");
         let repo_settings = env_switch_prov("CADENCE_ALLOW_MAIN (repo settings)");
         let mut other_session = used_input();
         other_session.session_id = Some("sess-2".into());
-        with_metrics_dir(tmp.path(), || {
+        let mut other_repo = used_input();
+        other_repo.cwd = Some(tmp.path().join("other-repo").to_string_lossy().into_owned());
+        std::fs::create_dir_all(tmp.path().join("other-repo")).unwrap();
+        let mut main_agent = used_input();
+        main_agent.agent_id = None;
+        let metrics = tmp.path().join("metrics");
+        with_metrics_dir(&metrics, || {
             for _ in 0..3 {
                 log_bypass(BypassEvent::used("enforce-worktree", &used_input(), &allow));
             }
@@ -713,19 +753,108 @@ mod tests {
                 &other_session,
                 &allow,
             ));
+            for _ in 0..2 {
+                log_bypass(BypassEvent::used("enforce-worktree", &other_repo, &allow));
+                log_bypass(BypassEvent::used("enforce-worktree", &main_agent, &allow));
+            }
         });
-        let rows = read_lines(tmp.path());
-        let seen: Vec<(String, String, String)> = rows
-            .iter()
-            .map(|r| {
-                (
-                    r["sessionId"].as_str().unwrap().to_string(),
-                    r["hook"].as_str().unwrap().to_string(),
-                    r["mechanism"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        assert_eq!(rows.len(), 4, "{seen:?}");
+        let rows = used_rows(&metrics);
+        let repo = |i: &HookInput| common::repo_basename(i.cwd.as_deref());
+        let row = |s: &str, h: &str, m: &str, r: String, a: &str| {
+            (
+                s.to_string(),
+                h.to_string(),
+                m.to_string(),
+                r,
+                a.to_string(),
+            )
+        };
+        let mut want = vec![
+            row(
+                "sess-1",
+                "enforce-worktree",
+                "CADENCE_ALLOW_MAIN",
+                repo(&used_input()),
+                "agent-9",
+            ),
+            row(
+                "sess-1",
+                "guard-body-budget",
+                "CADENCE_ALLOW_MAIN",
+                repo(&used_input()),
+                "agent-9",
+            ),
+            row(
+                "sess-1",
+                "enforce-worktree",
+                "CADENCE_ALLOW_MAIN (repo settings)",
+                repo(&used_input()),
+                "agent-9",
+            ),
+            row(
+                "sess-2",
+                "enforce-worktree",
+                "CADENCE_ALLOW_MAIN",
+                repo(&used_input()),
+                "agent-9",
+            ),
+            row(
+                "sess-1",
+                "enforce-worktree",
+                "CADENCE_ALLOW_MAIN",
+                repo(&other_repo),
+                "agent-9",
+            ),
+            row(
+                "sess-1",
+                "enforce-worktree",
+                "CADENCE_ALLOW_MAIN",
+                repo(&used_input()),
+                "-",
+            ),
+        ];
+        want.sort();
+        assert_eq!(rows, want);
+    }
+
+    /// A secret-class escape is a distinct event on every use: never deduped.
+    #[test]
+    fn secret_class_env_switch_is_logged_on_every_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            for _ in 0..3 {
+                log_bypass(BypassEvent::used(
+                    "prevent-secret-push",
+                    &used_input(),
+                    &env_switch_prov("CADENCE_ALLOW_SECRET_PUSH"),
+                ));
+            }
+        });
+        assert_eq!(read_lines(tmp.path()).len(), 3);
+    }
+
+    /// A claim whose row could not be written is released, so the next use
+    /// writes the row instead of the session losing it.
+    #[test]
+    fn a_failed_write_releases_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("bypasses.jsonl");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let allow = env_switch_prov("CADENCE_ALLOW_MAIN");
+        with_metrics_dir(tmp.path(), || {
+            log_bypass(BypassEvent::used("enforce-worktree", &used_input(), &allow));
+        });
+        let claims = tmp.path().join("state/bypass/sess-1");
+        assert_eq!(
+            std::fs::read_dir(&claims).map(|d| d.count()).unwrap_or(0),
+            0,
+            "the claim is released when the row did not land"
+        );
+        std::fs::remove_dir(&ledger).unwrap();
+        with_metrics_dir(tmp.path(), || {
+            log_bypass(BypassEvent::used("enforce-worktree", &used_input(), &allow));
+        });
+        assert_eq!(read_lines(tmp.path()).len(), 1);
     }
 
     /// A dismissal carries its own reason and expiry, so every use stays a row.

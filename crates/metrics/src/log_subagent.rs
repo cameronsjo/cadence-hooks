@@ -52,7 +52,9 @@ impl Logger for LogSubagent {
             input.agent_id.as_deref(),
         );
         if event == "SubagentStart" {
-            if let Some(marker) = marker {
+            if let Some(marker) = marker
+                && has_agent_type(input.agent_type.as_deref())
+            {
                 write_start_marker(&marker, now_ms());
             }
         } else {
@@ -85,7 +87,13 @@ impl Logger for LogSubagent {
 /// Start nor a transcript. They were 62k of 75k Stop rows (cadence-hooks#1587).
 /// Pure.
 fn is_side_agent_stop(event: &str, agent_type: Option<&str>) -> bool {
-    event == "SubagentStop" && agent_type.is_none_or(|t| t.trim().is_empty())
+    event == "SubagentStop" && !has_agent_type(agent_type)
+}
+
+/// True when the payload names an agent type. A Start marker is written only
+/// for a typed Start, since only a typed Stop reads it back. Pure.
+fn has_agent_type(agent_type: Option<&str>) -> bool {
+    agent_type.is_some_and(|t| !t.trim().is_empty())
 }
 
 /// `<state>/subagents/<session>/<agent>.start`, holding the Start time in epoch
@@ -123,9 +131,10 @@ fn now_ms() -> u64 {
 /// duration, nothing more.
 fn write_start_marker(marker: &Path, ms: u64) {
     if let Some(parent) = marker.parent()
-        && std::fs::create_dir_all(parent).is_ok()
+        && common::create_private_dir(parent).is_ok()
+        && let Ok(mut file) = common::open_state_marker(marker, false)
     {
-        let _ = std::fs::write(marker, ms.to_string());
+        let _ = file.write_all(ms.to_string().as_bytes());
     }
 }
 
@@ -353,6 +362,31 @@ mod tests {
             !tmp.path().join("state/subagents/s1/a1.start").exists(),
             "the marker is consumed"
         );
+    }
+
+    /// The duration is measured from the marker's time: a Start ten seconds
+    /// ago yields at least ten seconds.
+    #[test]
+    fn duration_is_measured_from_the_marker_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("state/subagents/s1/a1.start");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, (now_ms() - 10_000).to_string()).unwrap();
+        with_metrics_dir(tmp.path(), || {
+            LogSubagent.run(&event("SubagentStop", Some("Explore")));
+        });
+        let ms = rows(tmp.path())[0]["durationMs"].as_u64().unwrap();
+        assert!((10_000..60_000).contains(&ms), "{ms}");
+    }
+
+    /// An untyped Start would never be read back, so it writes no marker.
+    #[test]
+    fn untyped_start_writes_no_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            LogSubagent.run(&event("SubagentStart", Some("")));
+        });
+        assert!(!tmp.path().join("state/subagents/s1/a1.start").exists());
     }
 
     /// A duration the payload already carries wins over the marker.

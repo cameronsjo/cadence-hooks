@@ -5,7 +5,7 @@
 
 ## 2. Bypass rows
 
-- [x] 2.1 Write an env-switch `used` row once per session, hook, and mechanism, through an exclusive-create claim that fails toward writing
+- [x] 2.1 Write a `CADENCE_ALLOW_MAIN` `used` row once per session, hook, mechanism, repo, and agent, through an exclusive-create claim that fails toward writing and is released when the row fails
 
 ## 3. Cleanup and tests
 

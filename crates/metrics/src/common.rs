@@ -468,6 +468,39 @@ fn rotate_if_over_cap(
     }
 }
 
+/// Create `dir` and any missing parents, each new one mode `0700` on Unix, so
+/// per-session state names (session ids, which switch a session used) are not
+/// listable by other local users.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Open a per-session state marker for writing, mode `0600` and never through
+/// a symlink on Unix. `exclusive` fails with `AlreadyExists` when the file is
+/// there; otherwise an existing file is truncated.
+pub fn open_state_marker(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if exclusive {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
