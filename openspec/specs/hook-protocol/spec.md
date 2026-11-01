@@ -114,7 +114,7 @@ When `CADENCE_BYPASS` is exactly `1`, every hook subcommand SHALL exit 0 before 
 - **THEN** it blocks
 
 #### Scenario: Exempt commands
-- **WHEN** `CADENCE_BYPASS=1` and `list`, `manifest`, `configure`, `doctor`, `try`, `migrate-config`, `session declare|status|plans|timer` or `metrics grade|price` runs
+- **WHEN** `CADENCE_BYPASS=1` and `list`, `manifest`, `configure`, `doctor`, `try`, `migrate-config`, `session declare|status|plans|timer` or `metrics grade|price|rotate|cat` runs
 - **THEN** it runs normally
 
 #### Scenario: Argument that names a CLI command

@@ -100,6 +100,24 @@ pub fn log_failopen(
     }
 }
 
+/// [`log_failopen`] into an explicit metrics directory `dir` rather than the
+/// resolved one: `metrics rotate` works on the directory it was handed, so its
+/// failure rows land beside the ledgers it failed on. Fail-open like the rest.
+pub(crate) fn log_failopen_at(dir: &Path, reason: &str, subcommand: &str, error: &str) {
+    let record = build_failopen_record(
+        reason,
+        Some("metrics"),
+        Some(subcommand),
+        env!("CARGO_PKG_VERSION"),
+        Some(error),
+    );
+    if let Ok(mut file) = common::open_ledger(dir.join("failopen.jsonl")) {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// Record a failed ledger rotation (`reason` `ledger_rotate_failed`, the ledger
 /// name in `subcommand`) next to `ledger`, in the same directory.
 ///

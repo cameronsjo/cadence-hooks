@@ -1,7 +1,7 @@
 # metrics Specification
 
 ## Purpose
-Metrics is the local telemetry layer: fire-and-forget loggers that append JSONL ledgers (`cadence-hooks metrics snapshot`, `cadence-hooks metrics log-commit`, `cadence-hooks metrics log-subagent`, `cadence-hooks metrics log-session`, `cadence-hooks metrics log-session-start`, `cadence-hooks metrics log-polish-nudge`, `cadence-hooks metrics log-ask-user-question`, `cadence-hooks metrics log-skill`), a SessionStart staleness alarm (`cadence-hooks metrics warn-stale`), and two CLI actions that read a transcript (`cadence-hooks metrics grade`, `cadence-hooks metrics price`).
+Metrics is the local telemetry layer: fire-and-forget loggers that append JSONL ledgers (`cadence-hooks metrics snapshot`, `cadence-hooks metrics log-commit`, `cadence-hooks metrics log-subagent`, `cadence-hooks metrics log-session`, `cadence-hooks metrics log-session-start`, `cadence-hooks metrics log-polish-nudge`, `cadence-hooks metrics log-ask-user-question`, `cadence-hooks metrics log-skill`), a SessionStart staleness alarm (`cadence-hooks metrics warn-stale`), two CLI actions that read a transcript (`cadence-hooks metrics grade`, `cadence-hooks metrics price`), and two that keep the ledgers' history (`cadence-hooks metrics rotate`, `cadence-hooks metrics cat`).
 
 ## Requirements
 
@@ -289,3 +289,205 @@ The rotator MUST take a non-blocking `flock` on the live file and move it only w
 #### Scenario: Session ends with markers
 - **WHEN** a session with a pending subagent Start marker and a bypass claim ends
 - **THEN** both directories for that session are gone and another session's markers remain
+
+### Requirement: Segments past retention are archived, never dropped
+`cadence-hooks metrics rotate` SHALL move every rotated segment older than its window (by segment stamp: `denials` 90 days; every other ledger 180 days, the never-dropped `commits`, `sessions` and `plan-links` included) into `archive/<ledger>.<YYYY-MM>.jsonl.gz`, the month of the stamp. It MUST NOT drop a row or touch a live `*.jsonl` file. It SHALL hold an exclusive non-blocking `flock` on `state/rotate.lock`; a run that loses it prints a skip line and exits 0.
+
+#### Scenario: Window boundaries
+- **WHEN** `denials` segments stamped 89 and 91 days ago and `commits` segments stamped 179 and 181 days ago exist
+- **THEN** only the 91-day and 181-day segments move to their monthly archives, and the row multiset across archives and segments is unchanged
+
+#### Scenario: Second run
+- **WHEN** `metrics rotate` runs again with nothing new past its window
+- **THEN** it archives nothing and every archive and rollup is byte-identical
+
+#### Scenario: Lock held
+- **WHEN** another run holds `state/rotate.lock`
+- **THEN** the run changes nothing and exits 0
+
+### Requirement: Archive moves survive a crash
+Before each move `metrics rotate` SHALL write `state/rotate-manifest.json` naming the segment, archive, row count, sha256 and archive length. The archive MUST grow only by a temp file holding its old bytes plus a new gzip member, fsynced and renamed over it. The segment SHALL be deleted only after that member decodes to its bytes, then the manifest. A run SHALL first finish or roll back a leftover manifest and MUST NOT archive a segment twice.
+
+#### Scenario: Killed after the archive rename
+- **WHEN** a run stops after renaming the new archive and before deleting the segment, and `metrics rotate` runs again
+- **THEN** the segment is deleted without a second append, and every row is stored exactly once
+
+#### Scenario: Killed before the archive rename
+- **WHEN** a run stops after writing the manifest or the temp archive
+- **THEN** the next run removes the temp file and manifest, archives the segment once, and loses no row
+
+### Requirement: Denial rollups
+Before archiving rows of a `denials` segment, `metrics rotate` SHALL append to `rollups/denials-daily.jsonl` one row per (day, hook, repo, decision) with its `count`, the `segment` name and the moved byte range (`movedSha256`, `movedLen`), in one write. Only rows past a recorded range that is a prefix of the bytes moved SHALL be rolled up; a row with no range covers the whole segment.
+
+#### Scenario: Killed after the rollup
+- **WHEN** a run stops after appending a segment's rollup rows and `metrics rotate` runs again
+- **THEN** the segment is archived and its rows are counted in the rollup once
+
+#### Scenario: One segment moved twice
+- **WHEN** a move leaves a row appended during it in the segment, and a later run archives that row
+- **THEN** the rollup counts equal the rows archived
+
+#### Scenario: Killed after the rollup, then appended to
+- **WHEN** a run stops after the rollup, a row is appended to the segment, and `metrics rotate` runs again
+- **THEN** the rollup counts equal the rows archived
+
+### Requirement: Stale per-session state is swept
+`metrics rotate` SHALL remove `state/subagents/<session>/`, `state/bypass/<session>/` and `state/commits/<session>/` when the newest entry inside is older than 7 days. It MUST only remove real directories whose name passes the session-id check, under parents that are real directories, and MUST NOT follow a symlink.
+
+#### Scenario: A session that never ended
+- **WHEN** `state/subagents/<id>/` was last written 8 days ago and `state/subagents/<other>/` 6 days ago
+- **THEN** the first is removed and the second stays
+
+#### Scenario: Symlinked state
+- **WHEN** `state/bypass/<id>` or `state/commits` is a symlink to a directory with old entries
+- **THEN** nothing the symlink points at is removed
+
+### Requirement: Rotate success marker, failures and file modes
+`metrics rotate` SHALL write the UTC time to `state/rotate.last-success` only after a complete run. Any failure SHALL append a `metrics_rotate_failed` row to `failopen.jsonl` and exit 1. Files it creates MUST be `0600` and directories `0700`, opened without following a symlink; a symlinked `archive/`, `rollups/` or `state/` is a failure, never written through.
+
+#### Scenario: Symlinked archive directory
+- **WHEN** `archive/` is a symlink and a segment is past its window
+- **THEN** the run exits 1, `failopen.jsonl` gains a `metrics_rotate_failed` row, and nothing is written through the symlink
+
+### Requirement: Daily archive at SessionStart
+`metrics log-session-start` SHALL run the archive at most once per UTC day. It writes `state/rotate.day` before the run, so a failed or skipped run waits for the next day. It SHALL stop between segments after 2 seconds and skip segments over twice the rotation cap, leaving both for a later run. A run that stops early or skips a segment MUST NOT write `state/rotate.last-success`. It MUST fail open: a failure is a `failopen.jsonl` row and never changes the hook's exit.
+
+#### Scenario: Second session the same day
+- **WHEN** a second session starts on the same UTC day
+- **THEN** no archive run happens
+
+#### Scenario: A segment over the bound
+- **WHEN** the SessionStart run finds a 9 MiB segment past its window beside a small one
+- **THEN** the small one is archived, the large one stays for `metrics rotate`, and `state/rotate.last-success` is not written
+
+### Requirement: Test-row quarantine
+`metrics rotate --quarantine-test-rows` SHALL move `denials` rows whose `sessionId` is absent, null or not a UUID out of the live file and its segments into `archive/denials.testrows.jsonl.gz`, where `cat --include-test-rows` still reads them. It MUST move the live file aside first under the rotation `flock`, rewrite each segment under its own name through a temp file, and use the manifest discipline. Every real run SHALL write `state/quarantine-<date>.json`. `--dry-run` changes nothing.
+
+#### Scenario: Quarantine run
+- **WHEN** the live file and two segments hold three non-UUID rows among UUID rows
+- **THEN** the three rows are in the test-row archive, the UUID rows stay in their segments, and the record names the host, per-file counts and source sha256
+
+#### Scenario: Dry run
+- **WHEN** `--quarantine-test-rows --dry-run` runs
+- **THEN** it prints the counts and every file is byte-identical
+
+#### Scenario: Concurrent appender
+- **WHEN** hooks append denial rows while the quarantine runs
+- **THEN** every appended row is stored exactly once, and a second run moves nothing it already moved
+
+#### Scenario: Nothing to move
+- **WHEN** a quarantine run finds no test rows
+- **THEN** it still writes its record
+
+### Requirement: Ledger cat
+`cadence-hooks metrics cat <ledger>` SHALL print the ledger's monthly archives in month order, then its segments in name order, then the live file, one row per line. A segment whose bytes a leftover manifest shows already archived MUST print once. `--since` keeps rows whose `ts` is at or after it. `--include-test-rows` prepends the test-row archive for `denials`. A name other than letters, digits, `-` and `_` exits 2.
+
+#### Scenario: History in order
+- **WHEN** a ledger has two monthly archives, two segments and a live file
+- **THEN** `metrics cat` prints the January archive, the February archive, the segments, then the live rows
+
+#### Scenario: Half-done move
+- **WHEN** a crash left a manifest whose archive already holds its segment
+- **THEN** `metrics cat` prints that segment's rows once
+
+### Requirement: A damaged archive is never appended to
+Before growing an archive, `metrics rotate` and `--quarantine-test-rows` SHALL decode it to the end. When that fails, the move MUST fail with a `metrics_rotate_failed` row naming the archive, the source segment MUST stay, and the archive MUST be left byte-identical. The message SHALL give commands that save the intact members under the archive's name, quote every path as one word, and stop without moving anything when `<name>.damaged` exists.
+
+#### Scenario: Truncated monthly archive
+- **WHEN** `archive/denials.2026-07.jsonl.gz` ends in a truncated member and a July segment is past its window
+- **THEN** the run exits 1, the segment and the archive are unchanged, and no manifest is left
+
+#### Scenario: Salvage
+- **WHEN** the operator runs the commands the message gives and then `metrics rotate`
+- **THEN** every row of the intact members is kept, no partial row is, and the segment is archived
+
+#### Scenario: Hostile name
+- **WHEN** the archive name holds a quote, a `$(…)` substitution, a space and a leading `-`
+- **THEN** the commands parse, run nothing from the name, and write only inside the archive directory
+
+#### Scenario: Second salvage
+- **WHEN** the commands run again while `<name>.damaged` exists
+- **THEN** they exit non-zero and the first `.damaged` copy is byte-identical
+
+### Requirement: Cat reads under the rotate lock
+`metrics cat` SHALL hold a shared `flock` on `state/rotate.lock` for its whole read, waiting for a running move to finish. A rotate that starts while it reads SHALL find the exclusive lock unavailable and skip, so no row prints twice or goes missing.
+
+#### Scenario: Rotate starts mid-read
+- **WHEN** a rotate starts while `metrics cat` is printing an archive and a segment of that month is past its window
+- **THEN** the rotate skips and `metrics cat` prints every row once
+
+### Requirement: Rotate runs only on Unix
+Off Unix, `metrics rotate` and `--quarantine-test-rows` SHALL exit 1 with a message and change nothing, and the SessionStart run SHALL do nothing, until a run lock exists there.
+
+#### Scenario: Windows
+- **WHEN** `metrics rotate` runs on Windows
+- **THEN** it exits 1 and no file under the metrics directory changes
+
+### Requirement: Denials archive waits for the quarantine
+`metrics rotate` MUST NOT archive a `denials` segment until a `state/quarantine-*.json` record exists. Such segments SHALL count as waiting: the run is partial, writes no `state/rotate.last-success`, and the CLI prints one line naming `--quarantine-test-rows`. Other ledgers archive as usual.
+
+#### Scenario: Before and after the quarantine
+- **WHEN** a `denials` segment and a `commits` segment are past their windows and no quarantine record exists
+- **THEN** only the `commits` segment is archived; after a quarantine run, the next run archives the `denials` segment
+
+### Requirement: Cat reports read failures
+`metrics cat` SHALL treat only an absent `archive/` as empty; any other error listing it MUST fail naming the directory. Every read error SHALL name its file. When the lock file cannot be opened or created for lack of permission or a read-only filesystem, `cat` SHALL print a stderr note and read unlocked.
+
+#### Scenario: Unreadable archive directory
+- **WHEN** `archive/` cannot be listed
+- **THEN** `metrics cat` exits 1 naming `archive/`
+
+#### Scenario: Read-only state directory
+- **WHEN** `state/` is not writable and holds no lock file
+- **THEN** `metrics cat` prints every row
+
+### Requirement: Recovery checks what a manifest names
+Recovery and `metrics cat` SHALL share one judgement of a leftover manifest. An `archive` manifest must name its segment's own month, and its member must decode to the segment's first `source_len` bytes. A `quarantine` manifest must name a `denials` segment and the test-row archive, and its member must be exactly those bytes' test rows. An unproven manifest MUST change nothing on disk, and `cat` SHALL print that segment as it is.
+
+#### Scenario: Forged quarantine manifest
+- **WHEN** a `quarantine` manifest names a `sessions` segment and the test-row archive
+- **THEN** the run exits 1 and the segment is byte-identical
+
+#### Scenario: Tail is another segment's content
+- **WHEN** an `archive` manifest's archive tail decodes to rows that are not its segment's
+- **THEN** the run exits 1, the segment is byte-identical, and `metrics cat` prints its rows once
+
+#### Scenario: Unrelated test-row member
+- **WHEN** a `quarantine` manifest on a `denials` segment points at a test-row member holding other rows
+- **THEN** the run exits 1, no row is stripped, and `metrics cat` prints every row of the segment
+
+### Requirement: Rows appended after an archive read stay
+When a proven move's segment has grown past `source_len`, recovery SHALL leave only the appended bytes in the segment (after the kept rows for a quarantine) and clear the manifest. Before that, `metrics cat` SHALL print the archived member and only the appended bytes.
+
+#### Scenario: Append after the archive rename
+- **WHEN** a run stops after renaming the new archive, a row is appended to the segment, and `metrics rotate` runs again
+- **THEN** the manifest is cleared, the appended row is kept, and every row is stored and printed once
+
+### Requirement: No salvage commands for names that display differently
+When a damaged archive's name or directory changes under `display_safe`, the message MUST give no commands and SHALL say to rename the file to a plain name by hand.
+
+#### Scenario: Zero-width character in the name
+- **WHEN** a damaged archive's name holds U+200B
+- **THEN** the displayed message holds no `mv` command and names the rename-by-hand step
+
+### Requirement: A rewritten segment is recorded first
+Before a move replaces or empties a segment that keeps bytes, the manifest SHALL record the sha256 and length of exactly what the segment will hold, durably. A segment equal to that record SHALL read as finished, so a crash after the rewrite never blocks a later run. Both forward moves SHALL finish through the same judgement as recovery, re-reading the segment.
+
+#### Scenario: Killed inside recovery
+- **WHEN** recovery of a move with a late append is killed after recording, after the temp file, or after the rewrite
+- **THEN** `metrics cat` prints every row once, and the next run finishes and clears the manifest
+
+### Requirement: Only whole rows move
+A move SHALL hold back a last row with no newline only while its segment changed within the last minute (or over a day in the future); an older segment's last row SHALL move with the rest, closed with a newline, and bytes appended after that read SHALL stay as their own fragment. A quarantine whose moved prefix ends mid-row and has bytes after it MUST be unproven. A writer still holding the file open after the move re-reads it loses its later writes.
+
+#### Scenario: Last row half written
+- **WHEN** a fresh segment is read while its last row is half written, and the writer appends the rest by path before the move re-reads it
+- **THEN** the row is whole, parses, and is stored in exactly one place
+
+#### Scenario: Old segment ends mid-row
+- **WHEN** a segment past retention, unchanged for over a minute, ends in a fragment with no newline
+- **THEN** one run archives it whole, the segment is gone, and `metrics cat` prints the fragment once
+
+#### Scenario: Old fragment finished after the read
+- **WHEN** the writer of an old segment's fragment appends its end after the move read the segment
+- **THEN** the run completes, the archive holds the fragment as read, the end stays in the segment as its own fragment, and `metrics cat` prints each once

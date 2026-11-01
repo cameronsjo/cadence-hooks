@@ -5,6 +5,10 @@
 //! Sibling of [`crate::snapshot`]: same before-marker shape, different pairing
 //! (`log-session` reads and consumes the marker instead of `log-commit`).
 //! Fire-and-forget: silent no-op on any failure, never blocks.
+//!
+//! It is also where the daily `metrics rotate` run starts
+//! ([`crate::rotate::run_daily_at_session_start`]): already wired on
+//! SessionStart, so the archive needs no new hooks.json entry.
 
 use crate::common;
 use cadence_hooks_core::{Logger, MetricsInput};
@@ -42,6 +46,9 @@ impl Logger for LogSessionStart {
         {
             let _ = std::io::Write::write_all(&mut file, common::utc_timestamp().as_bytes());
         }
+        // The first SessionStart of each UTC day also ages old segments into
+        // the archive, within a 2 s budget and failing open (#1590).
+        crate::rotate::run_daily_at_session_start(&common::metrics_dir());
     }
 }
 
