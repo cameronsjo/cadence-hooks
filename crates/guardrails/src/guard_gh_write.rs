@@ -5433,7 +5433,7 @@ fn runner_chdir_target(dir: &str, target: &str) -> String {
 /// does not model leaves the directory unknown too, so the write is judged in
 /// [`UNRESOLVABLE_DIR`] and blocks, the same refusal
 /// `push.rs`'s `hides_a_push_behind_a_prefix` makes for a push.
-fn dir_after_runners(segment: &str, dir: &str) -> String {
+pub(crate) fn dir_after_runners(segment: &str, dir: &str) -> String {
     peel_runners(segment, dir).0
 }
 
