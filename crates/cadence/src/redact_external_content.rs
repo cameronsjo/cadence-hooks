@@ -16,7 +16,9 @@
 //!   work-identifiable terms from `~/.config/cadence/redaction.toml`, outside
 //!   every repo, and is config-blind by signature — no per-repo file can
 //!   soften it. `mode = "warn"` downgrades it to advisory, and it is inert
-//!   when the term source is absent or unreadable (fail-open per ADR-0001).
+//!   when the term source is absent, malformed or empty (fail-open per
+//!   ADR-0001). A term source that exists but cannot be read blocks posts and
+//!   commit messages instead (#1617).
 //!
 //! Both tiers run on every body, deliberately without a short-circuit, and
 //! [`combine`] folds them: only the identity tier can produce a block.
@@ -1318,9 +1320,10 @@ fn unreadable_source_message() -> String {
         .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
     format!(
         "⛔  redact-external-content: BLOCKED — the identity term source exists but could not be \
-         read, so this post cannot be checked for work-identifiable terms.\n\
-         Found: {path} (permissions, not a regular file, or over the size cap)\n\
-         Fix: make it a readable regular file (`chmod 600 {path}`), then retry. To run this \
+         read, so this post or commit message cannot be checked for work-identifiable terms.\n\
+         Found: {path} (permissions on it or its directory, a dangling link, not a regular \
+         file, or over the size cap)\n\
+         Fix: make it a readable regular file (`chmod 600 '{path}'`), then retry. To run this \
          machine without the identity tier on purpose, remove the file instead.\n\
          Check: cadence-hooks cadence redact-scan --status"
     )
@@ -1577,7 +1580,8 @@ pub struct TermMatch {
 ///
 /// Config-blind like the tier itself: no repo file and no other guard's ignore
 /// list can soften a match. Empty when the source is absent, unreadable, or
-/// unarmed (fail-open, ADR-0001).
+/// unarmed: this reader only nudges, so it never blocks on the source's state
+/// (the posting hook's unreadable-source block is separate, #1617).
 pub fn identity_matches(text: &str) -> Vec<TermMatch> {
     let (list, _) = identity::load();
     to_term_matches(text, &list)
@@ -2187,9 +2191,9 @@ pub fn status_report() -> (String, bool) {
         ),
         identity::Status::Unreadable => format!(
             "⚠️  redaction identity tier: NOT ARMED — term source at {path} exists but \
-             could not be read (permissions, or not a regular file).\n\
-             This is reported exactly like an absent file on purpose: from the outcome \
-             alone the two are indistinguishable, and both mean nothing is being caught."
+             could not be read (permissions, a dangling link, or not a regular file).\n\
+             Nothing is being caught, so posts and commit messages are BLOCKED until the \
+             file is readable. Fix its permissions, or remove it to run without the tier."
         ),
         identity::Status::ZeroTerms => format!(
             "⚠️  redaction identity tier: NOT ARMED — term source at {path} parsed but \
@@ -6341,6 +6345,25 @@ destinations = ["me/*", "them/exact"]
         let msg = r.message.unwrap_or_default();
         assert!(msg.contains("could not be"), "{msg}");
         assert!(msg.contains("Fix:"), "{msg}");
+        let source = unreadable.path().join(".config/cadence/redaction.toml");
+        assert!(msg.contains(&source.display().to_string()), "{msg}");
+        // A commit message is a post to this tier.
+        let r = with_account_home(unreadable.path(), || post("git commit -m 'wip'"));
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+
+        // A dangling link where the file should be: unreadable, not absent.
+        #[cfg(unix)]
+        {
+            let dangling = tempfile::tempdir().unwrap();
+            let cfg = dangling.path().join(".config/cadence");
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::os::unix::fs::symlink(cfg.join("gone.toml"), cfg.join("redaction.toml")).unwrap();
+            let r = with_account_home(dangling.path(), || {
+                assert_eq!(identity::load().1, identity::Status::Unreadable);
+                post("gh issue comment 1 -R them/x --body hello")
+            });
+            assert_eq!(r.outcome, Outcome::Block, "dangling link: {:?}", r.message);
+        }
 
         // No file at all: a machine without the tier stays inert.
         let absent = tempfile::tempdir().unwrap();

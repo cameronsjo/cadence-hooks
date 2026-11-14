@@ -428,8 +428,16 @@ pub(crate) fn load() -> (IdentityList, Status) {
 /// [`load`] against an explicit path — the one reader both the resolved term
 /// source and a test fixture go through.
 pub(crate) fn load_from(path: &std::path::Path) -> (IdentityList, Status) {
-    if !path.exists() {
-        return (IdentityList::default(), Status::Absent);
+    // `symlink_metadata`, not `exists`: `exists` reads a permission error on
+    // a parent directory, and a dangling link, as absent, which would make an
+    // unreadable source inert instead of Unreadable (#1617). Only a real
+    // `NotFound` on the path itself is absent.
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (IdentityList::default(), Status::Absent);
+        }
+        Err(_) => return (IdentityList::default(), Status::Unreadable),
+        Ok(_) => {}
     }
     // Same bounded, regular-file-only reader the body-file path uses: a symlink
     // to /dev/zero or a multi-GB file must not hang the hook (#157/#194).
@@ -795,6 +803,35 @@ mod tests {
         // Not via load() (which reads the real path) — parse directly.
         let err = toml::from_str::<IdentityList>("terms = [ this is not toml").unwrap_err();
         assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn load_from_tells_absent_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_from(&dir.path().join("none.toml")).1, Status::Absent);
+        assert_eq!(load_from(dir.path()).1, Status::Unreadable, "a directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A directory the reader cannot search: `exists` reads this as
+            // absent, which would leave an unreadable source inert (#1617).
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(
+                locked.join("redaction.toml"),
+                "[[terms]]\nid=\"T1\"\nterm=\"x\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let searchable = std::fs::read_dir(&locked).is_ok();
+            let status = load_from(&locked.join("redaction.toml")).1;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if searchable {
+                eprintln!("mode-000 row skipped: running as a user who can read it");
+            } else {
+                assert_eq!(status, Status::Unreadable, "unsearchable parent");
+            }
+        }
     }
 
     #[test]
