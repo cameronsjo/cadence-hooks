@@ -18,10 +18,15 @@
 //!
 //! # Fail directions, which run in two different directions on purpose
 //!
-//! - **The guard's own failure is fail-open** (ADR-0001): no file, unreadable,
-//!   malformed, zero terms → the tier is inert and the check allows. A guard
-//!   that hard-fails on a missing config makes every commit impossible on a
-//!   machine that never had the file.
+//! - **The guard's own failure is fail-open** (ADR-0001): no file, malformed,
+//!   zero terms → the tier is inert and the check allows. A guard that
+//!   hard-fails on a missing config makes every commit impossible on a machine
+//!   that never had the file.
+//! - **A term source that exists but cannot be read stops posts**
+//!   (cameronsjo/cadence-hooks#1617). The file being there says the machine is
+//!   set up to scan, so an unreadable one is a disarm, not a machine without
+//!   the tier. The block names the path and both ways out: fix the file's
+//!   permissions, or remove it to run without the tier on purpose.
 //! - **A term match is fail-closed**: it blocks, and no repo config can excuse
 //!   it.
 //!
@@ -253,7 +258,8 @@ pub(crate) enum Status {
     /// No file at the resolved path.
     Absent,
     /// File exists but could not be read — permissions, a directory, a special
-    /// file, or over the bounded-read cap. **Notified exactly like `Absent`**:
+    /// file, or over the bounded-read cap. The posting hook blocks on it
+    /// ([`Status::blocks_posts`], #1617). **Notified exactly like `Absent`**:
     /// silent-inert on a permissions error is the same silent-disarm class the
     /// lenient-config work closed, and the operator cannot tell the difference
     /// from the outcome alone.
@@ -269,10 +275,28 @@ impl Status {
     pub fn needs_notice(&self) -> bool {
         !matches!(self, Status::Armed(_))
     }
+
+    /// Does this state stop external posts? Only [`Status::Unreadable`]: a
+    /// file is there, so the machine expects the tier, and nothing can be
+    /// scanned against it (cameronsjo/cadence-hooks#1617). An absent file is a
+    /// machine without the tier and stays inert.
+    pub fn blocks_posts(&self) -> bool {
+        matches!(self, Status::Unreadable)
+    }
 }
 
-/// Resolve the term-source path: `$HOME/.config/cadence/redaction.toml`, and
-/// nothing else.
+/// Resolve the term-source path: `<home>/.config/cadence/redaction.toml`, where
+/// `<home>` is the account's home directory from the user database
+/// ([`cadence_hooks_core::paths::account_home`]), and nothing else.
+///
+/// # Why not `HOME`
+///
+/// `HOME` is an environment variable too, and the same settings `env` block
+/// described below can set it. A repo that points `HOME` at a directory with
+/// no term source would make the tier load zero terms and allow every post
+/// (cameronsjo/cadence-hooks#1617). The passwd entry is out of a repo's reach.
+/// When the lookup fails there is no path, which reads as an absent file, the
+/// same as an unset `HOME` did before.
 ///
 /// # Why no environment override in production
 ///
@@ -303,15 +327,48 @@ pub(crate) fn terms_path() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("cadence")
-                .join("redaction.toml")
-        })
+    terms_path_under(account_home())
+}
+
+/// The term-source path under a given home directory.
+fn terms_path_under(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|h| !h.as_os_str().is_empty())
+        .map(|h| h.join(".config").join("cadence").join("redaction.toml"))
+}
+
+/// The account home directory: the user database in production, a
+/// per-thread stand-in in tests that need one (so a test can place a term
+/// source under a fake account home without touching the real one).
+fn account_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = test_seam::ACCOUNT_HOME.with(|h| h.borrow().clone()) {
+        return Some(home);
+    }
+    cadence_hooks_core::paths::account_home()
+}
+
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        pub(super) static ACCOUNT_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` with `home` standing in for the account database's answer on
+    /// this thread.
+    pub(crate) fn with_account_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACCOUNT_HOME.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        ACCOUNT_HOME.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+        let _reset = Reset;
+        f()
+    }
 }
 
 /// Is this edit targeting the term source itself?

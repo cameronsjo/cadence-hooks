@@ -1185,7 +1185,17 @@ impl Check for RedactExternalContent {
                 cred_hits.extend(credential_scan::scan(text));
             }
         }
-        let (identity_list, _status) = identity::load();
+        let (identity_list, status) = identity::load();
+        // A term source that is there but cannot be read: the machine expects
+        // the tier, and nothing can be checked against it, so the post stops
+        // (cameronsjo/cadence-hooks#1617). An absent file stays inert.
+        if status.blocks_posts() && !bodies.is_empty() {
+            let mut message = unreadable_source_message();
+            if !cred_hits.is_empty() {
+                message = format!("{}\n{message}", credential_scan::render(&cred_hits));
+            }
+            return CheckResult::block(message);
+        }
         // A text the identity scan could not read is said once on stderr, and
         // only where the tier is armed — a machine with no term source has
         // nothing the scan failed to do. The verdict is unchanged: fail open.
@@ -1299,6 +1309,21 @@ impl Check for RedactExternalContent {
         }
         CheckResult::block(message)
     }
+}
+
+/// The block for a term source that exists but cannot be read (#1617).
+fn unreadable_source_message() -> String {
+    let path = identity::terms_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
+    format!(
+        "⛔  redact-external-content: BLOCKED — the identity term source exists but could not be \
+         read, so this post cannot be checked for work-identifiable terms.\n\
+         Found: {path} (permissions, not a regular file, or over the size cap)\n\
+         Fix: make it a readable regular file (`chmod 600 {path}`), then retry. To run this \
+         machine without the identity tier on purpose, remove the file instead.\n\
+         Check: cadence-hooks cadence redact-scan --status"
+    )
 }
 
 /// What one repo's `redaction` config makes of the posted bodies: the shaped
@@ -2141,7 +2166,7 @@ pub fn status_report() -> (String, bool) {
     let (list, status) = identity::load();
     let path = identity::terms_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
+        .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
     let mut report = match &status {
         identity::Status::Armed(n) => {
             let mode = match list.mode {
@@ -2195,7 +2220,7 @@ pub fn run_validate_config() -> u8 {
     let (list, status) = identity::load();
     let path = identity::terms_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
+        .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
     let mut errors: Vec<String> = Vec::new();
     match &status {
         identity::Status::Absent => errors.push(format!("no term source at {path}")),
@@ -6261,5 +6286,72 @@ destinations = ["me/*", "them/exact"]
                 assert!(report.contains("cadence-hooks >="), "{report}");
             },
         );
+    }
+
+    // --- #1617: the term source comes from the account home, not HOME ------
+
+    /// Hold the env lock with the test-only path override cleared, so the
+    /// production lookup runs, with `account` standing in for the passwd entry.
+    fn with_account_home<R>(account: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        with_terms_cleared(|| identity::test_seam::with_account_home(account, f))
+    }
+
+    /// An account home holding `toml_body` as its term source.
+    fn account_with_terms(toml_body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".config/cadence");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("redaction.toml"), toml_body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_term_source_path_is_under_the_account_home() {
+        let account = account_with_terms(FIXTURE);
+        let path = with_account_home(account.path(), identity::terms_path);
+        assert_eq!(
+            path,
+            Some(account.path().join(".config/cadence/redaction.toml"))
+        );
+    }
+
+    #[test]
+    fn the_account_homes_terms_block_a_post_whatever_home_says() {
+        // The real HOME is left alone (other tests and git read it); the seam
+        // stands in for the passwd entry. Read from HOME, this loads the real
+        // machine's list or none, and neither carries the fixture term.
+        let account = account_with_terms(FIXTURE);
+        let r = with_account_home(account.path(), || {
+            post("gh issue comment 1 -R them/x --body 'ships acmecorp tooling'")
+        });
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+        assert!(r.message.as_deref().unwrap_or("").contains("[T1]"));
+    }
+
+    #[test]
+    fn an_unreadable_term_source_blocks_posts_and_an_absent_one_does_not() {
+        // A directory where the file should be reads as Unreadable.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unreadable.path().join(".config/cadence/redaction.toml")).unwrap();
+        let r = with_account_home(unreadable.path(), || {
+            assert_eq!(identity::load().1, identity::Status::Unreadable);
+            post("gh issue comment 1 -R them/x --body hello")
+        });
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+        let msg = r.message.unwrap_or_default();
+        assert!(msg.contains("could not be"), "{msg}");
+        assert!(msg.contains("Fix:"), "{msg}");
+
+        // No file at all: a machine without the tier stays inert.
+        let absent = tempfile::tempdir().unwrap();
+        let r = with_account_home(absent.path(), || {
+            assert_eq!(identity::load().1, identity::Status::Absent);
+            post("gh issue comment 1 -R them/x --body hello")
+        });
+        assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+
+        // A command that posts nothing is untouched by an unreadable source.
+        let r = with_account_home(unreadable.path(), || post("ls -la"));
+        assert_eq!(r.outcome, Outcome::Allow);
     }
 }
