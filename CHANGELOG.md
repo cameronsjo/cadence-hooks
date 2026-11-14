@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`redact-external-content` no longer scans an edit to `~/.ssh/config`.** Since cameronsjo/cadence-hooks#1431 a Write or Edit skips the identity scan only in fixed local locations, and `~/.ssh/config` was not one, so adding a work host to it blocked. That exact file, resolved under the account's home directory, is now a local location read as config. Every other check still applies (no repo, sync tree, remote mount, hard link, or symlink that lands elsewhere). `~/.aws/config`, `~/.kube/config`, every other path under `~/.ssh` (`config.d/…`, `known_hosts`) and any path with `..` stay scanned.
 
+### Fixed
+
+- **`pulldown-cmark` is bumped from 0.13.5 to 0.13.6 for RUSTSEC-2026-0433** (quadratic parsing of nested image wikilinks), which failed the RustSec advisory audit on `main` and on every open PR (cameronsjo/cadence-hooks#1611). The skill-frontmatter validator parses with default options and never turns on `ENABLE_WIKILINKS`, so the slow path was never reachable; the bump clears the audit.
+
 ## [0.133.0] - 2026-11-01
 
 ### Added
