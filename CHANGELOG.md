@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`redact-external-content` no longer scans an edit to `~/.ssh/config`.** Since cameronsjo/cadence-hooks#1431 a Write or Edit skips the identity scan only in fixed local locations, and `~/.ssh/config` was not one, so adding a work host to it blocked. That exact file, resolved under the account's home directory, is now a local location read as config. Every other check still applies (no repo, sync tree, remote mount, hard link, or symlink that lands elsewhere). `~/.aws/config`, `~/.kube/config`, every other path under `~/.ssh` (`config.d/…`, `known_hosts`) and any path with `..` stay scanned.
+
 ## [0.133.0] - 2026-11-01
 
 ### Added
