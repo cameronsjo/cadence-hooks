@@ -144,13 +144,18 @@ impl LocalRoots {
 #[cfg(test)]
 pub(super) mod test_seam {
     use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
 
     thread_local! {
         pub(super) static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
 
     /// Run `f` with `home` as the account home on this thread.
+    // Unix-only: every caller is a unix-gated test, so on Windows it is dead
+    // code and `-D warnings` fails the clippy leg.
+    #[cfg(unix)]
     pub(in crate::redact_external_content) fn with_home<R>(
         home: &Path,
         f: impl FnOnce() -> R,
