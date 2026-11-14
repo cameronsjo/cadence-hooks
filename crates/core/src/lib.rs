@@ -358,6 +358,16 @@ pub struct HookInput {
     /// [`salvage_top_level`]). Derived, never deserialized.
     #[serde(skip)]
     pub mistyped_top_level: Vec<&'static str>,
+    /// An MCP call's `tool_input` exactly as the payload sent it, captured by
+    /// [`Self::from_json`] before the per-field salvage drops anything that
+    /// fails [`ToolInput`]'s typed shape (Linear CAM-714). A
+    /// third-party server's `content` can be an array of blocks or its
+    /// `description` an object, and the salvage would remove either from the
+    /// typed view; a guard that must read every string the call publishes
+    /// reads this instead. `None` for non-MCP tools. Derived, never
+    /// deserialized, so a payload cannot supply a sanitized copy of itself.
+    #[serde(skip)]
+    pub mcp_tool_input: Option<serde_json::Value>,
 }
 
 /// `tool_input` keys that carry the operation a guard judges, for a
@@ -471,7 +481,11 @@ pub struct ToolInput {
     /// fan-out, and only an ordered map serializes deterministically.
     ///
     /// NEVER logged, and never a guard input: an attacker-supplied key here
-    /// would otherwise be a free channel into whatever read it.
+    /// would otherwise be a free channel into whatever read it. The one
+    /// exception reads it only to match against a fixed term list, never to
+    /// echo it: `redact-external-content` scans every string of an MCP call,
+    /// and falls back to this struct's serialized form when
+    /// [`HookInput::mcp_tool_input`] is absent (a hand-built input).
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
@@ -949,6 +963,12 @@ impl HookInput {
         let tool_input_non_object = value
             .get("tool_input")
             .is_some_and(|v| !v.is_null() && !v.is_object());
+        // Before the salvage below can drop a mistyped field from it.
+        let mcp_tool_input = tool_name
+            .starts_with("mcp__")
+            .then(|| value.get("tool_input").cloned())
+            .flatten()
+            .filter(|v| !v.is_null());
         let mistyped = salvage_tool_input(&mut value);
         let mistyped_top_level = salvage_top_level::<HookInput>(&mut value);
         let mut input: HookInput = serde_json::from_value(value).map_err(|e| {
@@ -962,6 +982,7 @@ impl HookInput {
         input.mistyped_tool_input = mistyped;
         input.mistyped_top_level = mistyped_top_level;
         input.tool_input_non_object = tool_input_non_object;
+        input.mcp_tool_input = mcp_tool_input;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -1156,6 +1177,16 @@ impl HookInput {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.command.as_deref())
+    }
+
+    /// Is this an MCP tool's call? Keyed on the literal name the harness sent,
+    /// never the derived [`Self::normalized_tool`], which classifies `mcp__*`
+    /// names as Write/Edit and so cannot tell them apart from Claude Code's
+    /// own tools.
+    pub fn is_mcp(&self) -> bool {
+        self.tool_name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("mcp__"))
     }
 
     /// The subagent isolation mode for an Agent/Task spawn, if set.

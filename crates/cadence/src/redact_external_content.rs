@@ -21,6 +21,10 @@
 //! Both tiers run on every body, deliberately without a short-circuit, and
 //! [`combine`] folds them: only the identity tier can produce a block.
 //!
+//! Two more surfaces run the identity tier alone: a Write/Edit's introduced
+//! text ([`run_edit`]), and every string of an MCP call's input
+//! ([`run_mcp`]), whatever its server names the fields.
+//!
 //! ## Why the SHAPED tier is a nudge, never a block (developing-guards "block vs nudge")
 //!
 //! There is a routine, intentional workflow that legitimately mentions these
@@ -65,7 +69,7 @@ use cadence_hooks_core::shell::{
     parse_gh_repo_value, peel_command_runners, redirect_operator_span, skip_git_global_options,
     split_segments_with_ops, strip_quotes, unescape_word,
 };
-use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
+use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 mod context;
 mod identity;
 
@@ -1141,6 +1145,23 @@ impl Check for RedactExternalContent {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        // An MCP call publishes whatever its server does with its input, and
+        // the field names are the server's (`body`, `title`, `description`,
+        // `comment`, nested blocks), so every string in it is scanned (see
+        // `run_mcp`). Routed before the command and edit-text checks below,
+        // which read only the fields Claude Code's own tools use.
+        if input.is_mcp() {
+            let (identity_list, _status) = identity::load();
+            let verdict = run_mcp(input, &identity_list);
+            // An MCP tool that carries a shell `command` also gets the Bash
+            // surface below, which reads what that command posts (its
+            // `--body-file`, its credential tier); `run_mcp` leaves the
+            // command string to it.
+            if input.command().is_none() || verdict.outcome == Outcome::Block {
+                return verdict;
+            }
+        }
+
         // Phase 0 — a call that carries neither a command nor editable text is
         // a tool this check never judges (Read, Grep, an Agent spawn…). It
         // returns before the term source is touched: under a single-dispatch
@@ -1504,35 +1525,225 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
     // there: it is the file a later `--body "$(cat F)"` or `cat F |` posts,
     // and the post-time scan does not read through either. A file inside a
     // work tree keeps the scan, because the post-time scan never sees a
-    // commit's file content. An MCP write has no path and is scanned.
+    // commit's file content. MCP calls never reach here (`run_mcp`).
     if !context::is_prose_draft(file_path) && context::is_provably_local(file_path) {
         return CheckResult::allow();
     }
 
+    let identity_hits = introduced_identity_hits(
+        fragments
+            .iter()
+            .map(|(new, old)| (new.as_str(), old.as_str())),
+        identity_list,
+        file_path,
+    );
+    combine(&identity_hits, &[], &[], &[], identity_list.mode)
+}
+
+/// The identity hits each `(new, old)` pair introduces: each term's matches in
+/// `new` beyond that term's matches in `old`.
+///
+/// Scan only what the edit introduces. A term already present in `old` is
+/// pre-existing: it is not this edit's doing, and blocking on it would make
+/// the removal edit impossible.
+///
+/// Compare OCCURRENCE COUNTS, not presence. A bare `old.contains(…)`
+/// suppresses every match in `new` the moment `old` contains the term even
+/// once — so an edit that rewrites a paragraph and duplicates the term goes
+/// unflagged. That is an ordinary accidental edit, not an adversarial one, and
+/// it silently breaks the introduced-only property this function's whole
+/// contract rests on. (Both review seats found this independently.)
+fn introduced_identity_hits<'a>(
+    fragments: impl IntoIterator<Item = (&'a str, &'a str)>,
+    identity_list: &identity::IdentityList,
+    file_path: Option<&str>,
+) -> Vec<identity::IdentityHit> {
     let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
-    for (new, old) in &fragments {
-        // Scan only what the edit introduces. A term already present in `old`
-        // is pre-existing: it is not this edit's doing, and blocking on it
-        // would make the removal edit impossible.
-        //
-        // Compare OCCURRENCE COUNTS, not presence. A bare `old.contains(…)`
-        // suppresses every match in `new` the moment `old` contains the term
-        // even once — so an edit that rewrites a paragraph and duplicates the
-        // term goes unflagged. That is an ordinary accidental edit, not an
-        // adversarial one, and it silently breaks the introduced-only property
-        // this function's whole contract rests on. (Both review seats found
-        // this independently.)
-        let mut by_snippet: HashMap<String, Vec<identity::IdentityHit>> = HashMap::new();
+    for (new, old) in fragments {
+        let mut by_term: HashMap<String, Vec<identity::IdentityHit>> = HashMap::new();
         for hit in identity::scan_identity(new, identity_list, file_path, None) {
-            by_snippet.entry(hit.snippet.clone()).or_default().push(hit);
+            by_term.entry(hit.id.clone()).or_default().push(hit);
         }
-        for (snippet, found) in by_snippet {
-            let already = old.matches(snippet.as_str()).count();
+        if by_term.is_empty() {
+            continue;
+        }
+        // Count `old` with the same term matcher, so a carried-through term
+        // whose case or spelling variant changed is not "introduced" (the
+        // matcher is case-insensitive; a literal substring count is not).
+        let mut already: HashMap<String, usize> = HashMap::new();
+        if !old.is_empty() {
+            for hit in identity::scan_identity(old, identity_list, file_path, None) {
+                *already.entry(hit.id).or_default() += 1;
+            }
+        }
+        for (id, found) in by_term {
             // Report only the surplus — the occurrences this edit added beyond
             // what was already there.
-            identity_hits.extend(found.into_iter().skip(already));
+            let skip = already.get(&id).copied().unwrap_or(0);
+            identity_hits.extend(found.into_iter().skip(skip));
         }
     }
+    identity_hits
+}
+
+/// Keys whose string value is the text an edit REPLACES, not text it
+/// publishes: the old side of an edit, spelled the ways MCP servers spell it.
+/// Such a value is never scanned; it is the baseline its paired new-side value
+/// ([`NEW_TEXT_KEYS`]) is counted against, so an MCP edit that removes a term
+/// stays possible. A missing spelling here costs a false block on a removal
+/// edit, never a missed post.
+const PRIOR_TEXT_KEYS: &[&str] = &["old_string", "oldString", "old_str", "old_text", "oldText"];
+
+/// Keys whose string value replaces a sibling [`PRIOR_TEXT_KEYS`] value, and
+/// the file content an MCP filesystem write carries. Only these are counted
+/// against the old side; every other sibling (a commit `message`, a `comment`)
+/// is scanned in full.
+const NEW_TEXT_KEYS: &[&str] = &[
+    "new_string",
+    "newString",
+    "new_str",
+    "new_text",
+    "newText",
+    "content",
+];
+
+/// Top-level keys that carry a file's content: what the path exemptions cover.
+const FILE_CONTENT_KEYS: &[&str] = &["edits"];
+
+/// Top-level keys naming the call's local target (`file_path`, `path`). They
+/// decide the exemptions and are not scanned as published text: scanning them
+/// would refuse every clean MCP write into a directory whose name holds a
+/// term, which the same write through `Write` is allowed.
+const TARGET_PATH_KEYS: &[&str] = &["file_path", "path"];
+
+/// Top-level keys the Bash surface reads instead, when the call carries a
+/// shell command: it judges what the command posts, not every word of it.
+const COMMAND_KEYS: &[&str] = &["command", "cmd"];
+
+/// One string an MCP call carries and the old-side text it replaces (empty
+/// when none).
+type McpText<'a> = (&'a str, Cow<'a, str>);
+
+/// Every string in `value` at any depth, object keys included, each paired
+/// with the old-side text it replaces. Only a [`NEW_TEXT_KEYS`] string is
+/// paired with its object's [`PRIOR_TEXT_KEYS`] text; the old-side text itself
+/// is left out. A key holding anything but a string is walked like any other
+/// value.
+fn mcp_texts<'a>(value: &'a serde_json::Value, out: &mut Vec<McpText<'a>>) {
+    match value {
+        serde_json::Value::String(s) => out.push((s, Cow::Borrowed(""))),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| mcp_texts(v, out)),
+        serde_json::Value::Object(map) => mcp_object_texts(map, &[], out),
+        _ => {}
+    }
+}
+
+/// [`mcp_texts`] over one object, leaving out the keys in `skip`.
+fn mcp_object_texts<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    skip: &[&str],
+    out: &mut Vec<McpText<'a>>,
+) {
+    let is_prior = |k: &str, v: &serde_json::Value| PRIOR_TEXT_KEYS.contains(&k) && v.is_string();
+    let priors: Vec<&str> = map
+        .iter()
+        .filter(|(k, v)| is_prior(k, v))
+        .filter_map(|(_, v)| v.as_str())
+        .collect();
+    let prior: Cow<'a, str> = match priors.as_slice() {
+        [] => Cow::Borrowed(""),
+        [one] => Cow::Borrowed(one),
+        many => Cow::Owned(many.join("\n")),
+    };
+    for (k, v) in map {
+        if skip.contains(&k.as_str()) || is_prior(k, v) {
+            continue;
+        }
+        out.push((k, Cow::Borrowed("")));
+        match v.as_str() {
+            Some(s) if NEW_TEXT_KEYS.contains(&k.as_str()) => out.push((s, prior.clone())),
+            Some(s) => out.push((s, Cow::Borrowed(""))),
+            None => mcp_texts(v, out),
+        }
+    }
+}
+
+/// The MCP surface: the identity pass over EVERY string the call carries.
+///
+/// Why every string and not an allowlist of text fields per tool family: the
+/// field names belong to each server, not to Claude Code. GitHub's tools post
+/// `body` and `title`, Linear's `description` and `body`, Gmail's `subject`,
+/// Notion's nested block arrays, and the next server will pick its own. An
+/// allowlist misses every field nobody listed, silently, which is the
+/// failure this guard exists to prevent; scanning every string fails safe as
+/// servers appear. The cost is that a non-published string (a repo `owner`,
+/// a label id) can carry a term and block. A term in those is a leak too
+/// (the owner and repo name a GitHub URL shows), so that is accepted.
+///
+/// What stays as on the Write/Edit surface ([`run_edit`]):
+///
+/// - **The identity tier only.** The shaped tier does not run: its audience
+///   algebra resolves the destination from a shell command's target repo,
+///   which an MCP call does not have, so it would fall back to public and
+///   nudge on every local path in tools that never leave the machine. A shell
+///   `command` the call carries is left to the Bash surface, which `run`
+///   also applies, credential tier included.
+/// - **Removal edits stay possible.** Old-side text ([`PRIOR_TEXT_KEYS`]) is
+///   not scanned, and is counted against its paired new-side value only.
+/// - **The term source and provably-local files** are exempt, read from the
+///   call's `file_path`/`path`. The exemption covers the file's content (the
+///   top-level [`NEW_TEXT_KEYS`] and `edits`) and nothing else: a `title` or
+///   `initial_comment` beside a local attachment's path is still published,
+///   and still scanned.
+///
+/// The input read is the payload's own `tool_input`, before the typed parse
+/// dropped any field that failed its shape ([`HookInput::mcp_tool_input`]),
+/// so a `content` array or an object `description` is still read. Unarmed or
+/// absent term source: allow (fail-open, ADR-0001), as on every surface.
+fn run_mcp(input: &HookInput, identity_list: &identity::IdentityList) -> CheckResult {
+    if !identity_list.is_armed() {
+        return CheckResult::allow();
+    }
+    let raw: Cow<serde_json::Value> = match &input.mcp_tool_input {
+        Some(v) => Cow::Borrowed(v),
+        None => match input
+            .tool_input
+            .as_ref()
+            .and_then(|ti| serde_json::to_value(ti).ok())
+        {
+            Some(v) => Cow::Owned(v),
+            None => return CheckResult::allow(),
+        },
+    };
+    let file_path = input
+        .tool_input
+        .as_ref()
+        .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
+    let local_file = identity::is_term_source(file_path)
+        || (!context::is_prose_draft(file_path) && context::is_provably_local(file_path));
+
+    let mut skip: Vec<&str> = TARGET_PATH_KEYS.to_vec();
+    if input.command().is_some() {
+        skip.extend(COMMAND_KEYS);
+    }
+    if local_file {
+        skip.extend(NEW_TEXT_KEYS);
+        skip.extend(PRIOR_TEXT_KEYS);
+        skip.extend(FILE_CONTENT_KEYS);
+    }
+    let mut texts: Vec<McpText> = Vec::new();
+    match raw.as_ref() {
+        serde_json::Value::Object(map) => mcp_object_texts(map, &skip, &mut texts),
+        other => mcp_texts(other, &mut texts),
+    }
+    // A repeated (text, prior) pair adds nothing to an identity report, which
+    // dedups by (id, snippet).
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let unique = texts
+        .iter()
+        .map(|(text, prior)| (*text, prior.as_ref()))
+        .filter(|pair| seen.insert(*pair));
+    let identity_hits = introduced_identity_hits(unique, identity_list, file_path);
     combine(&identity_hits, &[], &[], &[], identity_list.mode)
 }
 
@@ -4307,6 +4518,243 @@ term = "acmecorp"
             ] {
                 assert_eq!(run(cmd).outcome, Outcome::Allow, "must allow: {cmd}");
             }
+        });
+    }
+
+    /// Run an MCP call through the guard, parsed from the wire the way the
+    /// binary parses it, so the pre-salvage `mcp_tool_input` is populated.
+    fn run_mcp_call(tool: &str, tool_input: serde_json::Value) -> CheckResult {
+        let payload = serde_json::json!({ "tool_name": tool, "tool_input": tool_input });
+        let input = HookInput::from_json(&payload.to_string()).expect("payload parses");
+        RedactExternalContent.run(&input)
+    }
+
+    #[test]
+    fn mcp_post_is_refused_whatever_field_carries_the_term() {
+        // CAM-714: only `content`/`new_string`/`edits` were read, so a GitHub
+        // or Linear tool posting `body`/`title`/`description` went unscanned.
+        with_terms(FIXTURE, || {
+            let mut missed: Vec<String> = Vec::new();
+            for (tool, input) in [
+                (
+                    "mcp__github__create_issue",
+                    serde_json::json!({"owner": "o", "repo": "r", "title": "t", "body": "about acmecorp"}),
+                ),
+                (
+                    "mcp__github__create_pull_request",
+                    serde_json::json!({"owner": "o", "repo": "r", "title": "acmecorp rollout"}),
+                ),
+                (
+                    "mcp__plugin_linear_linear__save_issue",
+                    serde_json::json!({"team": "CAM", "title": "t", "description": "acmecorp notes"}),
+                ),
+                (
+                    "mcp__github__add_comment_to_pending_review",
+                    serde_json::json!({"comment": "see acmecorp"}),
+                ),
+                (
+                    "mcp__notion__update_page",
+                    serde_json::json!({"children": [{"type": "paragraph", "rich_text": [{"text": {"content": "acmecorp"}}]}]}),
+                ),
+                (
+                    "mcp__fs__write_file",
+                    serde_json::json!({"content": "about acmecorp"}),
+                ),
+                (
+                    // A `content` the typed parse cannot hold (an array of
+                    // blocks) is dropped by the salvage; the raw input keeps it.
+                    "mcp__slack__update_message",
+                    serde_json::json!({"content": [{"type": "text", "text": "acmecorp"}]}),
+                ),
+                (
+                    // An object `description` fails its typed `String` shape.
+                    "mcp__jira__create_issue",
+                    serde_json::json!({"description": {"type": "doc", "text": "acmecorp"}}),
+                ),
+            ] {
+                if run_mcp_call(tool, input.clone()).outcome != Outcome::Block {
+                    missed.push(format!("{tool} {input}"));
+                }
+            }
+            // Every row is judged before asserting, so one run names each
+            // field shape that slips through.
+            assert!(missed.is_empty(), "must block:\n{}", missed.join("\n"));
+        });
+    }
+
+    #[test]
+    fn clean_mcp_post_is_allowed() {
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__github__create_issue",
+                serde_json::json!({"owner": "o", "repo": "r", "title": "parser fix", "body": "nothing to see", "labels": ["bug"]}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow);
+            assert!(r.message.is_none(), "a clean MCP post is silent");
+        });
+    }
+
+    #[test]
+    fn mcp_edit_that_removes_a_term_stays_possible() {
+        // Old-side text is the baseline, not a post: an edit that takes the
+        // term out (or carries it through unchanged) must not block, while
+        // one that adds a second occurrence must.
+        with_terms(FIXTURE, || {
+            for edit in [
+                serde_json::json!({"oldText": "acmecorp here", "newText": "a client here"}),
+                serde_json::json!({"old_string": "acmecorp here", "new_string": "acmecorp there"}),
+            ] {
+                let r = run_mcp_call(
+                    "mcp__fs__edit_file",
+                    serde_json::json!({"path": "docs/x.md", "edits": [edit.clone()]}),
+                );
+                assert_eq!(r.outcome, Outcome::Allow, "must allow: {edit}");
+            }
+            let r = run_mcp_call(
+                "mcp__fs__edit_file",
+                serde_json::json!({"path": "docs/x.md", "edits": [{"oldText": "acmecorp", "newText": "acmecorp and acmecorp"}]}),
+            );
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "an added occurrence still blocks"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_old_side_text_excuses_only_its_new_side_pair() {
+        // A published sibling of an edit (a commit message, a comment) is
+        // scanned in full; only `new_string` is counted against `old_string`.
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__x__update_thing",
+                serde_json::json!({"old_string": "acmecorp", "new_string": "acmecorp", "comment": "acmecorp ships"}),
+            );
+            assert_eq!(r.outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn carried_through_term_in_another_case_is_not_introduced() {
+        // The term matcher is case-insensitive, so the old side is counted
+        // with it too: on the MCP surface and on Edit alike.
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__fs__edit_file",
+                serde_json::json!({"path": "docs/x.md", "edits": [{"oldText": "AcmeCorp here", "newText": "acmecorp there"}]}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "MCP edit");
+            let edit = cadence_hooks_core::test_builders::make_edit(
+                "/Users/x/repo/notes.md",
+                "AcmeCorp here",
+                "acmecorp there",
+            );
+            assert_eq!(
+                RedactExternalContent.run(&edit).outcome,
+                Outcome::Allow,
+                "Edit"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_target_path_is_not_scanned_as_published_text() {
+        // The same write through `Write` is allowed; a term in a work repo's
+        // directory name must not refuse every clean MCP write there.
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__fs__write_file",
+                serde_json::json!({"path": "/Users/x/Projects/acmecorp-platform/README.md", "content": "hello"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn mcp_object_keys_are_scanned() {
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__x__update_labels",
+                serde_json::json!({"labels": {"acmecorp": true}}),
+            );
+            assert_eq!(r.outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn mcp_term_source_exemption_covers_only_the_file_content() {
+        with_terms(FIXTURE, || {
+            let terms = std::env::var("CADENCE_REDACTION_TERMS").unwrap();
+            let r = run_mcp_call(
+                "mcp__fs__write_file",
+                serde_json::json!({"path": terms, "content": "[[terms]]\nterm = \"acmecorp\"\n"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "editing the term source");
+            let r = run_mcp_call(
+                "mcp__fs__write_file",
+                serde_json::json!({"path": terms, "content": "x", "message": "acmecorp"}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "a field beside the content");
+        });
+    }
+
+    #[test]
+    fn mcp_local_file_exemption_covers_only_the_file_content() {
+        let root = tempfile::tempdir().unwrap();
+        if !context::scratch_counts_as_system_temp(root.path()) {
+            eprintln!("skipped: TMPDIR is not a system temp dir, so nothing in it is exempt");
+            return;
+        }
+        let local = root.path().join("data.json");
+        let local = local.to_str().unwrap();
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__fs__write_file",
+                serde_json::json!({"path": local, "content": "{\"k\": \"acmecorp\"}"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "local config content");
+            let r = run_mcp_call(
+                "mcp__slack__create_upload",
+                serde_json::json!({"path": local, "initial_comment": "acmecorp roadmap"}),
+            );
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a comment beside a local attachment"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_command_gets_the_bash_surface() {
+        // An MCP terminal tool's `command` is judged the way Bash's is: what
+        // it posts is read (a `--body-file`), and a word outside a post is not.
+        let dir = post_fixture_dir();
+        let body = dir.path().join("b.md");
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__iterm__write_to_terminal",
+                serde_json::json!({"command": format!("gh issue create --body-file {}", body.display())}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "a posted body file");
+            let r = run_mcp_call(
+                "mcp__iterm__write_to_terminal",
+                serde_json::json!({"command": "cd ~/acmecorp && ls"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "a command that posts nothing");
+        });
+    }
+
+    #[test]
+    fn mcp_post_with_no_term_source_fails_open() {
+        // ADR-0001: a machine with no term source has nothing to block on.
+        with_terms_cleared(|| {
+            let r = run_mcp_call(
+                "mcp__github__create_issue",
+                serde_json::json!({"body": "acmecorp"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow);
         });
     }
 

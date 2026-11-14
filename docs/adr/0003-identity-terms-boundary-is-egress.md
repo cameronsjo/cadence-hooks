@@ -38,7 +38,10 @@ The identity scan runs at each egress point the binary can see:
 - the body of an external post (`gh pr`/`issue`/`release`/`gist`/`discussion`,
   `tea`) and a `git commit` message;
 - the content a `Write`/`Edit` introduces, which covers a derived artifact the
-  agent itself writes into a repository.
+  agent itself writes into a repository;
+- every string in an `mcp__*` call's input (added 2026-11-14, Linear CAM-714),
+  so an issue, comment or document an MCP tool publishes is scanned whatever
+  its server names the field.
 
 A derived artifact that is later published goes through one of those points at
 publication time. That is the check that matters, and it runs whichever tool

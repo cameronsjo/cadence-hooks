@@ -52,7 +52,8 @@ pub(crate) enum Mode {
 /// One allow entry — a context in which a term is benign.
 ///
 /// `path` matches when the scanned content's file path contains it (a Write/Edit
-/// surface only — a commit message has no path). `pattern` matches against the
+/// or MCP surface only, read from the call's `file_path` or `path` — a commit
+/// message has no path). `pattern` matches against the
 /// surrounding text. Either alone is sufficient; both empty is inert — unless
 /// `destinations` is set (below).
 ///
@@ -63,7 +64,7 @@ pub(crate) enum Mode {
 /// entry applies only to a post whose target resolves and matches, and it is
 /// ANDed with `path`/`pattern` when those are also set. With `destinations` as
 /// the only clause, the destination match alone excuses the term. A surface
-/// with no resolvable destination (a Write/Edit, a commit whose origin cannot
+/// with no resolvable destination (a Write/Edit, an MCP call, a commit whose origin cannot
 /// be read, a command posting to several repos) never satisfies a
 /// destination-scoped entry: unknown means the term stays blocked.
 #[derive(Debug, Clone, Default, Deserialize)]
