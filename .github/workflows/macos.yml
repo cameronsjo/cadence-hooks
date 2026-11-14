@@ -1,0 +1,44 @@
+name: macOS tests
+
+# Advisory macOS coverage, kept out of the release ship-gate on purpose.
+#
+# .github/scripts/ship-gate.sh reads every check run, check suite, and commit
+# status on the release PR's head SHA, so a separate workflow alone is not
+# ignored: a red or still-running macOS job on that SHA reads as `ci-red`.
+# The narrowest mechanism the gate already supports is a check run that
+# concludes `skipped` (the gate accepts success, skipped, neutral). The job
+# below skips itself on the release branch, so the gate sees a finished,
+# skipped run there and never waits on a macOS build. Every other branch runs
+# the tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (macos-latest)
+    # Skip on the release PR head (prepare-release/main), whichever event
+    # carries it: head_ref is set on pull_request, ref_name on push/dispatch.
+    if: github.head_ref != 'prepare-release/main' && github.ref_name != 'prepare-release/main'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # Same command as the Linux/Windows `check` job in ci.yml.
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
