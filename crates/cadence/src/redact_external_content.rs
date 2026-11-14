@@ -6359,7 +6359,13 @@ destinations = ["me/*", "them/exact"]
         let msg = r.message.unwrap_or_default();
         assert!(msg.contains("could not be"), "{msg}");
         assert!(msg.contains("Fix:"), "{msg}");
-        let source = unreadable.path().join(".config/cadence/redaction.toml");
+        // Join per component: a "/"-joined fixture mixes separators on Windows
+        // and never matches the native path the message prints.
+        let source = unreadable
+            .path()
+            .join(".config")
+            .join("cadence")
+            .join("redaction.toml");
         assert!(msg.contains(&source.display().to_string()), "{msg}");
         // A commit message is a post to this tier.
         let r = with_account_home(unreadable.path(), || post("git commit -m 'wip'"));
