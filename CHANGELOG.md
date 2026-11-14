@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pulldown-cmark` is bumped from 0.13.5 to 0.13.6 for RUSTSEC-2026-0433** (quadratic parsing of nested image wikilinks), which failed the RustSec advisory audit on `main` and on every open PR (cameronsjo/cadence-hooks#1611). The skill-frontmatter validator parses with default options and never turns on `ENABLE_WIKILINKS`, so the slow path was never reachable; the bump clears the audit.
+
 ## [0.133.0] - 2026-11-01
 
 ### Added
