@@ -29,6 +29,10 @@ flate2 = "1"
 # stable Rust. Already in the lock file as a transitive dependency, so this
 # adds no new code to the build.
 libc = "0.2"
+# The Windows profile known folder for `paths::account_home` (cadence-hooks#1617):
+# a home a repo env block cannot redirect. Already in the lock file as a
+# transitive dependency (0.61.2).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 
 cadence-hooks-core = { path = "crates/core" }
 cadence-hooks-cadence = { path = "crates/cadence" }

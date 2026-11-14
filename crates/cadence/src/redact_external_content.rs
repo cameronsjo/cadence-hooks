@@ -1324,7 +1324,8 @@ fn unreadable_source_message() -> String {
          Found: {path} (permissions on it or its directory, a dangling link, not a regular \
          file, or over the size cap)\n\
          Fix: make it a readable regular file (`chmod 600 '{path}'`), then retry. To run this \
-         machine without the identity tier on purpose, remove the file instead.\n\
+         machine without the identity tier on purpose, remove the file instead. \
+         `CADENCE_ALLOW_SENSITIVE_TERMS` does not release this block.\n\
          Check: cadence-hooks cadence redact-scan --status"
     )
 }
@@ -2401,11 +2402,19 @@ pub fn run_scan_to(
     // early), which is the fail-open posture ADR-0001 requires and matches the
     // hook, equally inert in that state.
     let (identity_list, status) = identity::load();
-    // An unarmed tier is otherwise indistinguishable from a clean scan: exit 0,
-    // no output. One stderr line says the identity check did not run. The exit
-    // code is unchanged, and the posting guard deliberately does not repeat
-    // this per call — `doctor` reports the state once (#1067).
-    if status.needs_notice() {
+    // A term source that is there but cannot be read blocks, as the hook's
+    // Bash arm does (#1617): exit 1 with the hook's own message, so a caller
+    // that gates a post on this exit code stops where the hook would. The
+    // shaped scan still runs below, as it does after an identity hit.
+    let source_unreadable = status.blocks_posts();
+    if source_unreadable {
+        eprintln!("{}", unreadable_source_message());
+    } else if status.needs_notice() {
+        // An unarmed tier is otherwise indistinguishable from a clean scan:
+        // exit 0, no output. One stderr line says the identity check did not
+        // run. The exit code is unchanged, and the posting guard deliberately
+        // does not repeat this per call — `doctor` reports the state once
+        // (#1067).
         eprintln!(
             "redact-scan: identity tier not armed — no term source loaded, so work-identifiable \
              terms were NOT checked (see `cadence-hooks cadence redact-scan --status`)"
@@ -2418,9 +2427,10 @@ pub fn run_scan_to(
     let identity_hits =
         identity::scan_identity(&input, &identity_list, None, destination.as_deref());
     let bypass = sensitive_terms_bypass();
-    // The EXIT MAPPING mirrors `combine` arm for arm: only Enforce blocks, and
-    // only with no bypass armed. Warn mode and a bypassed block both fall
-    // through to the shaped result.
+    // The EXIT MAPPING mirrors the hook arm for arm: an unreadable source
+    // blocks (above); otherwise only Enforce blocks, and only with no bypass
+    // armed. Warn mode and a bypassed block both fall through to the shaped
+    // result.
     //
     // One property deliberately does NOT mirror: the hook writes a
     // `BypassProvenance` row when the bypass suppresses a block, and this does
@@ -2468,7 +2478,11 @@ pub fn run_scan_to(
     {
         eprintln!("redact-scan: {}", foreign_destination_note(dest));
     }
-    if identity_blocks || any { 1 } else { 0 }
+    if source_unreadable || identity_blocks || any {
+        1
+    } else {
+        0
+    }
 }
 
 /// Port of the script's `--init`: scaffold the `redaction` section of
@@ -6376,5 +6390,32 @@ destinations = ["me/*", "them/exact"]
         // A command that posts nothing is untouched by an unreadable source.
         let r = with_account_home(unreadable.path(), || post("ls -la"));
         assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn redact_scan_exits_nonzero_on_an_unreadable_term_source() {
+        // The CLI is the only gate for surfaces the hook's command shape does
+        // not cover, so it must refuse where the hook refuses (#1617).
+        let body_dir = tempfile::tempdir().unwrap();
+        let body = body_dir.path().join("body.md");
+        std::fs::write(&body, "a plain sentence\n").unwrap();
+        let scan = || {
+            run_scan(
+                Some(body.display().to_string()),
+                Some("owned-internal".into()),
+                false,
+            )
+        };
+
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unreadable.path().join(".config/cadence/redaction.toml")).unwrap();
+        assert_eq!(with_account_home(unreadable.path(), scan), 1, "unreadable");
+
+        // Same body, no term source: inert, exit 0.
+        let absent = tempfile::tempdir().unwrap();
+        assert_eq!(with_account_home(absent.path(), scan), 0, "absent");
+        // Same body, a readable source without a match: exit 0.
+        let armed = account_with_terms(FIXTURE);
+        assert_eq!(with_account_home(armed.path(), scan), 0, "armed, clean");
     }
 }

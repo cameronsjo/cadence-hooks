@@ -1,10 +1,10 @@
 //! The identity term source is found through the account database, not `HOME`
-//! (cameronsjo/cadence-hooks#1617).
+//! or `USERPROFILE` (cameronsjo/cadence-hooks#1617).
 //!
-//! A repo's settings `env` block reaches every hook process and can set
-//! `HOME`. These run the real binary with `HOME` pointed at an empty directory,
+//! A repo's settings `env` block reaches every hook process and can set either
+//! variable. These run the real binary with both pointed at an empty directory,
 //! set on the child only, and assert the tier still looks in the account's own
-//! home.
+//! home: the passwd entry on unix, the profile known folder on Windows.
 
 mod support;
 
@@ -14,21 +14,23 @@ fn status_with_home(home: &std::path::Path) -> Output {
     support::cadence_hooks()
         .args(["cadence", "redact-scan", "--status"])
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .output()
         .expect("run cadence-hooks")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn an_empty_home_does_not_move_the_term_source() {
-    let Some(account) = cadence_hooks_core::paths::account_home() else {
-        eprintln!("skipped: no account home directory");
-        return;
-    };
+    let account = cadence_hooks_core::paths::account_home()
+        .expect("the account database names a home directory on this platform");
     let empty = tempfile::tempdir().expect("temp HOME");
     let out = status_with_home(empty.path());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let expected = account.join(".config/cadence/redaction.toml");
+    let expected = account
+        .join(".config")
+        .join("cadence")
+        .join("redaction.toml");
     assert!(
         stdout.contains(&expected.display().to_string()),
         "the report must name the account home's term source {}: {stdout}",

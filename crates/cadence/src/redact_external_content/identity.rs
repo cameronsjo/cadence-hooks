@@ -259,10 +259,9 @@ pub(crate) enum Status {
     Absent,
     /// File exists but could not be read — permissions, a directory, a special
     /// file, or over the bounded-read cap. The posting hook blocks on it
-    /// ([`Status::blocks_posts`], #1617). **Notified exactly like `Absent`**:
-    /// silent-inert on a permissions error is the same silent-disarm class the
-    /// lenient-config work closed, and the operator cannot tell the difference
-    /// from the outcome alone.
+    /// ([`Status::blocks_posts`], #1617). It is not inert:
+    /// an unreadable file means the machine expects the tier and nothing can
+    /// be checked, the silent-disarm class the lenient-config work closed.
     Unreadable,
     /// Read, but did not parse as the expected schema.
     Malformed(String),
@@ -393,8 +392,8 @@ pub(crate) mod test_seam {
 /// positive here would exempt an arbitrary file from the identity scan, which
 /// is the far worse error — so an unresolvable path is scanned, not skipped.
 /// Both the literal and canonicalized comparisons are tried, because the file
-/// may not exist yet (the first write that creates it) and because `HOME` is
-/// often a symlink.
+/// may not exist yet (the first write that creates it) and because the home
+/// directory is often reached through a symlink.
 pub(crate) fn is_term_source(file_path: Option<&str>) -> bool {
     let Some(fp) = file_path.filter(|p| !p.is_empty()) else {
         return false;

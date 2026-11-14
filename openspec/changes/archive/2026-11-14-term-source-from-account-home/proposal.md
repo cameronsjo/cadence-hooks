@@ -7,7 +7,8 @@
 - The term source is `<account home>/.config/cadence/redaction.toml`, where the account home comes from the user database (`getpwuid_r`), never from `HOME`. A failed lookup reads as an absent file.
 - A term source that exists but cannot be read (permissions on it or its directory, a dangling link, not a regular file, over the size cap) now blocks a post or commit message, with a message naming the path, how to fix it, and that removing the file runs the machine without the tier on purpose. The file being there means the machine is set up to scan, so an unreadable one is a disarm.
 - Kept: an absent file, a malformed one, and one with zero terms leave the tier inert, as before, so a machine with no term source is not blocked. Write/Edit scanning is unchanged on an unreadable source: the egress boundary is the post (ADR-0003).
-- `redact-scan --status` and `--validate-config` name the account-home path.
+- `redact-scan` exits 1 with the same message on an unreadable term source, so a caller gating a post on its exit code stops where the hook does. `--status` and `--validate-config` name the account-home path.
+- On Windows the account home is the profile known folder (`SHGetKnownFolderPath(FOLDERID_Profile)`), which does not follow `USERPROFILE`; before, Windows used `HOME` when a shell set it.
 
 Surfaces: `redact-external-content` (PreToolUse, Bash) exit code 0 → 2 for a post when the term source is unreadable; new block text. No hooks.json change in cameronsjo/cadence.
 
