@@ -2,7 +2,9 @@
 //!
 //! Fires on commit/push/PR/issue Bash commands and on Write/Edit to
 //! `docs/field-reports/` paths. The hook does the path triage; the model
-//! does the content judgment from the nudge text.
+//! does the content judgment from the nudge text. It nudges at most once per
+//! session per repo (a session marker keyed on the git root), since the text
+//! is the same every time (cadence-hooks#1443).
 //!
 //! Skips:
 //! - `CADENCE_SKIP_OVERSHARE_AUDIT=1` — session-scoped bypass for repos
@@ -40,8 +42,37 @@ impl Check for WarnOvershare {
     fn run(&self, input: &HookInput) -> CheckResult {
         let bypass = std::env::var(BYPASS_ENV).ok();
         let vault = std::env::var("OBSIDIAN_VAULT").ok();
-        run_with_env(input, bypass.as_deref(), vault.as_deref())
+        let result = run_with_env(input, bypass.as_deref(), vault.as_deref());
+        if result.outcome != Outcome::Nudge {
+            return result;
+        }
+        once_per_session(result, &marker_path(input))
     }
+}
+
+/// The session marker for the repo this input touches: the git root above
+/// the edited file's directory, or above `cwd` for Bash, else that directory
+/// itself. Read from disk only; no `git` process (cadence-hooks#1443).
+fn marker_path(input: &HookInput) -> std::path::PathBuf {
+    let dir = cadence_hooks_core::worktree::git_dir_for_input(input);
+    let dir = dir.to_string_lossy();
+    let root = cadence_hooks_core::paths::find_git_root(&dir)
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.into_owned());
+    cadence_hooks_core::markers::session_marker(input, "overshare-warned", Some(&root))
+}
+
+/// Let `nudge` through only the first time `marker` is seen this session,
+/// and record it. The audit text is the same on every firing, so one reminder
+/// per session per repo carries all of it (cadence-hooks#1443). A marker that
+/// cannot be written lets the next firing nudge again: fail open toward the
+/// reminder, never away from it.
+fn once_per_session(nudge: CheckResult, marker: &std::path::Path) -> CheckResult {
+    if marker.exists() {
+        return CheckResult::allow();
+    }
+    let _ = cadence_hooks_core::markers::write_marker(marker, "");
+    nudge
 }
 
 /// Core decision logic with env values passed in.
@@ -558,5 +589,51 @@ mod tests {
         // `cd foo && git commit ...` should still trigger.
         let result = run(&make_bash("cd foo && git commit -m bar"));
         assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    // --- Once per session per repo (cadence-hooks#1443) ---
+
+    #[test]
+    fn nudge_fires_once_per_marker_then_allows() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let marker = dir.path().join("overshare-warned-x");
+        let nudge = || CheckResult::nudge(nudge_text());
+        let first = once_per_session(nudge(), &marker);
+        assert_eq!(first.outcome, Outcome::Nudge);
+        assert!(marker.exists(), "the first firing records the marker");
+        let second = once_per_session(nudge(), &marker);
+        assert_eq!(second.outcome, Outcome::Allow);
+        assert!(second.message.is_none());
+    }
+
+    #[test]
+    fn marker_is_keyed_per_repo_and_per_session() {
+        let a = tempfile::tempdir().expect("repo a");
+        let b = tempfile::tempdir().expect("repo b");
+        std::fs::create_dir(a.path().join(".git")).unwrap();
+        std::fs::create_dir(b.path().join(".git")).unwrap();
+        std::fs::create_dir(a.path().join("sub")).unwrap();
+        let at = |cwd: &std::path::Path, sid: &str| HookInput {
+            tool_name: Some("Bash".into()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            session_id: Some(sid.into()),
+            ..make_bash("git push")
+        };
+        let root = marker_path(&at(a.path(), "s1"));
+        assert_eq!(
+            root,
+            marker_path(&at(&a.path().join("sub"), "s1")),
+            "same repo, same marker"
+        );
+        assert_ne!(
+            root,
+            marker_path(&at(b.path(), "s1")),
+            "another repo nudges again"
+        );
+        assert_ne!(
+            root,
+            marker_path(&at(a.path(), "s2")),
+            "another session nudges again"
+        );
     }
 }
