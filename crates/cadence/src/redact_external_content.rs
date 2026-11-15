@@ -1153,20 +1153,17 @@ impl Check for RedactExternalContent {
         // `run_mcp`). Routed before the command and edit-text checks below,
         // which read only the fields Claude Code's own tools use.
         //
-        // A server on the local-server list publishes nothing, so its calls
-        // are not scanned; one that carries a shell `command` still gets the
-        // Bash surface, which judges what that command posts.
-        if input.is_mcp() && is_local_mcp_server(input.tool_name.as_deref()) {
-            if input.command().is_none() {
-                return CheckResult::allow();
-            }
-        } else if input.is_mcp() {
-            let (identity_list, _status) = identity::load();
-            let verdict = run_mcp(input, &identity_list);
-            // An MCP tool that carries a shell `command` also gets the Bash
-            // surface below, which reads what that command posts (its
-            // `--body-file`, its credential tier); `run_mcp` leaves the
-            // command string to it.
+        // The credential tier runs on every MCP call. A tool on the local-tool
+        // table skips the identity tier only, so the term source is not even
+        // loaded for it.
+        if input.is_mcp() {
+            let identity =
+                (!is_identity_exempt_mcp_tool(input.tool_name.as_deref())).then(identity::load);
+            let verdict = run_mcp(input, identity.as_ref());
+            // A call that carries a shell `command` also gets the Bash surface
+            // below, which reads what that command posts (a `--body-file`
+            // included). `run_mcp` has already scanned the command string,
+            // except on a local shell tool.
             if input.command().is_none() || verdict.outcome == Outcome::Block {
                 return verdict;
             }
@@ -1643,35 +1640,70 @@ const FILE_CONTENT_KEYS: &[&str] = &["edits"];
 /// term, which the same write through `Write` is allowed.
 const TARGET_PATH_KEYS: &[&str] = &["file_path", "path"];
 
-/// Top-level keys the Bash surface reads instead, when the call carries a
-/// shell command: it judges what the command posts, not every word of it.
+/// The keys a shell command sits under, in the order `HookInput::command`
+/// reads them: `command`, else `cmd`.
 const COMMAND_KEYS: &[&str] = &["command", "cmd"];
+
+/// MCP tools that type their `command` into a terminal on this machine, by
+/// full tool name. The command runs here, so it is judged as a Bash command
+/// is (what it posts), not scanned word by word. On every other tool a
+/// `command` or `cmd` is a string sent to the server like any other.
+const LOCAL_SHELL_MCP_TOOLS: &[&str] = &["mcp__iterm__write_to_terminal"];
+
+/// Local MCP tools that skip the identity tier, by server segment and exact
+/// tool name. They act on this machine (the session, a chart, a pane read)
+/// and send their text to no tracker, chat, mail or repo, so a term in them
+/// is not a leak. The credential tier still runs on them, as on every MCP
+/// call. `herdr-bridge` `send` and `start` are left out on purpose: they type
+/// a prompt into another agent, whose model provider reads it.
+///
+/// Keyed on names, not on where the server came from: a project's MCP config
+/// that names a remote server `c3` gets the same exemption. That is outside
+/// the accident threat model (ADR-0003).
+const IDENTITY_EXEMPT_MCP_TOOLS: &[(&str, &[&str])] = &[
+    ("c3", &["compact", "model", "rename"]),
+    ("easel", &["chart"]),
+    ("herdr-bridge", &["panes", "read"]),
+];
+
+/// The rea reverse-engineering server: its tools analyse local artifacts, so
+/// they skip the identity tier, except a tool whose name marks it as loading
+/// a page or driving a browser (its URL goes out).
+// debt: name markers, not an exact tool list; switch to one if rea adds a URL-taking tool the markers miss.
+const REA_SERVER: &str = "rea";
+const REA_REMOTE_PREFIXES: &[&str] = &["capture_", "observe_"];
+const REA_REMOTE_MARKERS: &[&str] = &["web", "browser"];
+
+/// The server and tool segments of an MCP tool name: (`herdr-bridge`, `send`)
+/// for `mcp__herdr-bridge__send`. Split at the first `__` after the prefix;
+/// `None` for a non-MCP name or one with no tool segment.
+fn mcp_server_and_tool(tool_name: &str) -> Option<(&str, &str)> {
+    tool_name.strip_prefix("mcp__")?.split_once("__")
+}
+
+/// Whether `tool_name` skips the identity tier: a tool on
+/// [`IDENTITY_EXEMPT_MCP_TOOLS`], or a rea tool without a remote marker. A
+/// tool segment holding another `__` is never exempt: the split is then
+/// ambiguous (a server could be named `rea__cloud`), so the call is scanned.
+fn is_identity_exempt_mcp_tool(tool_name: Option<&str>) -> bool {
+    let Some((server, tool)) = tool_name.and_then(mcp_server_and_tool) else {
+        return false;
+    };
+    if tool.contains("__") {
+        return false;
+    }
+    if server == REA_SERVER {
+        let remote = REA_REMOTE_PREFIXES.iter().any(|p| tool.starts_with(p))
+            || REA_REMOTE_MARKERS.iter().any(|m| tool.contains(m));
+        return !remote;
+    }
+    IDENTITY_EXEMPT_MCP_TOOLS
+        .iter()
+        .any(|(s, tools)| *s == server && tools.contains(&tool))
+}
 
 /// One string an MCP call carries and the old-side text it replaces (empty
 /// when none).
-/// MCP servers that run on this machine and publish nothing to a tracker,
-/// chat, mail or repo: the c3 session tools, easel's charts, the herdr pane
-/// bridge and the rea reverse-engineering tools. Their calls are not scanned.
-/// Accepted: `herdr-bridge` `send` prompts another local agent, whose model
-/// provider reads that text. An explicit list,
-/// matched exactly on the server segment ([`mcp_server`]), so a server
-/// nobody listed (the next tracker, mailer or chat tool) is scanned.
-const LOCAL_MCP_SERVERS: &[&str] = &["c3", "easel", "herdr-bridge", "rea"];
-
-/// The server segment of an MCP tool name: `herdr-bridge` in
-/// `mcp__herdr-bridge__send`, `plugin_linear_linear` in
-/// `mcp__plugin_linear_linear__save_issue`. `None` for a non-MCP name.
-fn mcp_server(tool_name: &str) -> Option<&str> {
-    tool_name.strip_prefix("mcp__")?.split("__").next()
-}
-
-/// Whether `tool_name` is a call to a server on [`LOCAL_MCP_SERVERS`].
-fn is_local_mcp_server(tool_name: Option<&str>) -> bool {
-    tool_name
-        .and_then(mcp_server)
-        .is_some_and(|server| LOCAL_MCP_SERVERS.contains(&server))
-}
-
 type McpText<'a> = (&'a str, Cow<'a, str>);
 
 /// Every string in `value` at any depth, object keys included, each paired
@@ -1694,7 +1726,13 @@ fn mcp_object_texts<'a>(
     skip: &[&str],
     out: &mut Vec<McpText<'a>>,
 ) {
-    let is_prior = |k: &str, v: &serde_json::Value| PRIOR_TEXT_KEYS.contains(&k) && v.is_string();
+    // Old-side text is excused only beside the new-side value it pairs with:
+    // a lone `oldText` is no edit, just a field the server receives.
+    let has_new = map
+        .iter()
+        .any(|(k, v)| NEW_TEXT_KEYS.contains(&k.as_str()) && v.is_string());
+    let is_prior =
+        |k: &str, v: &serde_json::Value| has_new && PRIOR_TEXT_KEYS.contains(&k) && v.is_string();
     let priors: Vec<&str> = map
         .iter()
         .filter(|(k, v)| is_prior(k, v))
@@ -1731,20 +1769,30 @@ fn mcp_object_texts<'a>(
 /// a label id) can carry a term and block. A term in those is a leak too
 /// (the owner and repo name a GitHub URL shows), so that is accepted.
 ///
-/// - **The credential tier runs**, as on a Bash post (#1022): a token in any
-///   string blocks, armed term source or not, in any identity mode.
+/// - **The credential tier runs on every call**, as on a Bash post (#1022):
+///   a token in any string blocks, armed term source or not, in any identity
+///   mode, local tools included.
+/// - **The identity tier** runs unless `identity` is `None`, which `run`
+///   passes for a tool on the local-tool table
+///   ([`is_identity_exempt_mcp_tool`]).
+/// - **An unreadable term source** (#1617) blocks a call that carries text,
+///   as it blocks a Bash post: the machine expects the tier and nothing can
+///   be checked against it. An MCP call's text goes to its server, reads
+///   included (ADR-0003). An absent source stays inert.
+/// - **A `command` or `cmd` is scanned** like any other string, except the
+///   one key `HookInput::command` reads on a [`LOCAL_SHELL_MCP_TOOLS`] tool:
+///   that command runs here, and the Bash surface `run` also applies judges
+///   what it posts.
 ///
 /// What stays as on the Write/Edit surface ([`run_edit`]):
 ///
 /// - **No shaped tier.** The shaped tier does not run: its audience
 ///   algebra resolves the destination from a shell command's target repo,
 ///   which an MCP call does not have, so it would fall back to public and
-///   nudge on every local path in tools that never leave the machine. A shell
-///   `command` the call carries is left to the Bash surface, which `run`
-///   also applies, credential tier included.
-/// - **Removal edits stay possible.** Old-side text ([`PRIOR_TEXT_KEYS`]) is
-///   not scanned by either tier, and is counted against its paired new-side
-///   value only.
+///   nudge on every local path in tools that never leave the machine.
+/// - **Removal edits stay possible.** Old-side text ([`PRIOR_TEXT_KEYS`])
+///   beside a new-side value is not scanned by either tier, and is counted
+///   against that value only. Without a new-side sibling it is scanned.
 /// - **The term source and provably-local files** are exempt, read from the
 ///   call's `file_path`/`path`. The exemption covers the file's content (the
 ///   top-level [`NEW_TEXT_KEYS`] and `edits`) and nothing else: a `title` or
@@ -1754,10 +1802,13 @@ fn mcp_object_texts<'a>(
 ///
 /// The input read is the payload's own `tool_input`, before the typed parse
 /// dropped any field that failed its shape ([`HookInput::mcp_tool_input`]),
-/// so a `content` array or an object `description` is still read. Unarmed or
-/// absent term source: the identity tier allows (fail-open, ADR-0001), as on
+/// so a `content` array or an object `description` is still read. Absent or
+/// empty term source: the identity tier allows (fail-open, ADR-0001), as on
 /// every surface; the credential tier needs no term source and still runs.
-fn run_mcp(input: &HookInput, identity_list: &identity::IdentityList) -> CheckResult {
+fn run_mcp(
+    input: &HookInput,
+    identity: Option<&(identity::IdentityList, identity::Status)>,
+) -> CheckResult {
     let raw: Cow<serde_json::Value> = match &input.mcp_tool_input {
         Some(v) => Cow::Borrowed(v),
         None => match input
@@ -1777,8 +1828,17 @@ fn run_mcp(input: &HookInput, identity_list: &identity::IdentityList) -> CheckRe
         || (!context::is_prose_draft(file_path) && context::is_provably_local(file_path));
 
     let mut skip: Vec<&str> = TARGET_PATH_KEYS.to_vec();
-    if input.command().is_some() {
-        skip.extend(COMMAND_KEYS);
+    // Only the key the Bash surface reads: a `cmd` beside a `command` is read
+    // by nothing else, so it is scanned.
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| LOCAL_SHELL_MCP_TOOLS.contains(&name))
+        && let Some(key) = COMMAND_KEYS
+            .iter()
+            .find(|key| raw.get(**key).is_some_and(serde_json::Value::is_string))
+    {
+        skip.push(*key);
     }
     if local_file {
         skip.extend(NEW_TEXT_KEYS);
@@ -1807,6 +1867,15 @@ fn run_mcp(input: &HookInput, identity_list: &identity::IdentityList) -> CheckRe
         .filter(|(text, _)| scanned.insert(text))
         .flat_map(|(text, _)| credential_scan::scan(text))
         .collect();
+    let Some((identity_list, status)) = identity else {
+        return with_credential_block(&cred_hits, CheckResult::allow());
+    };
+    // A local file's content is not a post, as on `Write`, and a call with no
+    // string at all has nothing to check.
+    if status.blocks_posts() && !local_file && !unique.is_empty() {
+        let unreadable = CheckResult::block(unreadable_source_message());
+        return with_credential_block(&cred_hits, unreadable);
+    }
     let folded = if identity_list.is_armed() {
         let identity_hits = introduced_identity_hits(unique, identity_list, file_path);
         combine(&identity_hits, &[], &[], &[], identity_list.mode)
@@ -4900,48 +4969,181 @@ term = "acmecorp"
     }
 
     #[test]
-    fn local_mcp_servers_are_not_scanned_and_others_are() {
+    fn local_mcp_tools_skip_the_identity_tier_only() {
         let t = fake_ghp();
-        let input = serde_json::json!({"text": format!("acmecorp {t}")});
+        let term = serde_json::json!({"text": "acmecorp notes"});
+        let token = serde_json::json!({"text": format!("use {t}")});
         with_terms(FIXTURE, || {
+            // On the local-tool table: a term is not a leak there.
             for tool in [
                 "mcp__c3__compact",
+                "mcp__c3__rename",
                 "mcp__easel__chart",
-                "mcp__herdr-bridge__send",
+                "mcp__herdr-bridge__panes",
+                "mcp__herdr-bridge__read",
                 "mcp__rea__set_comment",
+                "mcp__rea__inspect_macho",
             ] {
-                let r = run_mcp_call(tool, input.clone());
-                assert_eq!(r.outcome, Outcome::Allow, "listed local server: {tool}");
+                let r = run_mcp_call(tool, term.clone());
+                assert_eq!(r.outcome, Outcome::Allow, "local tool, term: {tool}");
+                // The credential tier runs on every MCP call.
+                let r = run_mcp_call(tool, token.clone());
+                assert_eq!(r.outcome, Outcome::Block, "local tool, token: {tool}");
             }
-            // Matched exactly on the server segment: a name that merely
-            // starts or ends like a listed one is scanned.
+            // Off the table: a prompt typed into another agent, a URL a
+            // browser loads, a name that only starts or ends like a listed
+            // one, a tool segment the split cannot place, an unlisted tool.
             for tool in [
-                "mcp__c3x__post",
-                "mcp__rea-cloud__share",
+                "mcp__herdr-bridge__send",
+                "mcp__herdr-bridge__start",
+                "mcp__rea__capture_browser_scenario",
+                "mcp__rea__observe_native_calls",
+                "mcp__rea__inspect_web_page",
+                "mcp__rea__list_browser_targets",
+                "mcp__rea__cloud__post",
+                "mcp__c3__post",
+                "mcp__c3x__compact",
+                "mcp__rea-cloud__set_comment",
                 "mcp__plugin_c3_c3__compact",
                 "mcp__slack__c3",
             ] {
-                let r = run_mcp_call(tool, input.clone());
-                assert_eq!(r.outcome, Outcome::Block, "unlisted server: {tool}");
+                let r = run_mcp_call(tool, term.clone());
+                assert_eq!(r.outcome, Outcome::Block, "scanned tool, term: {tool}");
             }
-            // A listed server's shell command still gets the Bash surface.
-            let r = run_mcp_call(
-                "mcp__herdr-bridge__run",
-                serde_json::json!({"command": format!("gh issue create --title t --body \"{t}\"")}),
-            );
-            assert_eq!(r.outcome, Outcome::Block, "listed server, posting command");
         });
     }
 
     #[test]
-    fn mcp_server_is_the_segment_after_the_prefix() {
-        assert_eq!(mcp_server("mcp__herdr-bridge__send"), Some("herdr-bridge"));
+    fn a_token_in_a_herdr_bridge_send_is_refused() {
+        // `send` types its text into another agent, and that agent's model
+        // provider reads it; the credential tier has no local exemption.
+        let t = fake_ghp();
+        with_terms_cleared(|| {
+            let r = run_mcp_call(
+                "mcp__herdr-bridge__send",
+                serde_json::json!({"text": format!("use {t}")}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+            let msg = r.message.unwrap_or_default();
+            assert!(msg.contains("GitHub token"), "{msg}");
+            assert!(!msg.contains(&t), "the token is not echoed: {msg}");
+        });
+    }
+
+    #[test]
+    fn mcp_server_and_tool_split_at_the_first_separator() {
         assert_eq!(
-            mcp_server("mcp__plugin_linear_linear__save_issue"),
-            Some("plugin_linear_linear")
+            mcp_server_and_tool("mcp__herdr-bridge__send"),
+            Some(("herdr-bridge", "send"))
         );
-        assert_eq!(mcp_server("mcp__c3"), Some("c3"));
-        assert_eq!(mcp_server("Write"), None);
+        assert_eq!(
+            mcp_server_and_tool("mcp__plugin_linear_linear__save_issue"),
+            Some(("plugin_linear_linear", "save_issue"))
+        );
+        assert_eq!(
+            mcp_server_and_tool("mcp__rea__cloud__post"),
+            Some(("rea", "cloud__post"))
+        );
+        assert_eq!(mcp_server_and_tool("mcp__c3"), None);
+        assert_eq!(mcp_server_and_tool("Write"), None);
+        assert!(!is_identity_exempt_mcp_tool(Some("mcp__rea__cloud__post")));
+        assert!(!is_identity_exempt_mcp_tool(Some("mcp__c3")));
+        assert!(!is_identity_exempt_mcp_tool(None));
+    }
+
+    #[test]
+    fn mcp_post_with_an_unreadable_term_source_is_refused() {
+        // #1617 on the MCP surface: the same post `gh issue create` refuses.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unreadable.path().join(".config/cadence/redaction.toml")).unwrap();
+        let t = fake_ghp();
+        with_account_home(unreadable.path(), || {
+            assert_eq!(identity::load().1, identity::Status::Unreadable);
+            let r = run_mcp_call(
+                "mcp__github__create_issue",
+                serde_json::json!({"title": "t", "body": "hello"}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+            assert!(r.message.unwrap_or_default().contains("could not be"));
+            // A token is named ahead of the unreadable-source message.
+            let r = run_mcp_call(
+                "mcp__github__create_issue",
+                serde_json::json!({"body": format!("see {t}")}),
+            );
+            let msg = r.message.unwrap_or_default();
+            assert!(
+                msg.contains("GitHub token") && msg.contains("could not be"),
+                "{msg}"
+            );
+            // A local tool skips the identity tier, so the term source's
+            // state does not reach it; an empty input has nothing to check.
+            let r = run_mcp_call("mcp__c3__compact", serde_json::json!({"focus": "x"}));
+            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+            let r = run_mcp_call("mcp__github__get_me", serde_json::json!({}));
+            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+        });
+        // No file at all: inert, as on the Bash surface.
+        let absent = tempfile::tempdir().unwrap();
+        with_account_home(absent.path(), || {
+            let r = run_mcp_call(
+                "mcp__github__create_issue",
+                serde_json::json!({"body": "hello"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+        });
+    }
+
+    #[test]
+    fn an_mcp_command_is_scanned_unless_a_local_shell_runs_it() {
+        let t = fake_ghp();
+        with_terms(FIXTURE, || {
+            // Sent to a server, a command is a string like any other.
+            let r = run_mcp_call(
+                "mcp__slack__run_command",
+                serde_json::json!({"command": "/remind me about acmecorp"}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "slash command with a term");
+            let r = run_mcp_call(
+                "mcp__sandbox__run",
+                serde_json::json!({"command": format!("echo {t}")}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "remote run with a token");
+            // A token beside a command blocks on `run_mcp`'s verdict, before
+            // the Bash surface (which posts nothing for `ls`) could allow.
+            let r = run_mcp_call(
+                "mcp__sandbox__run",
+                serde_json::json!({"command": "ls", "body": format!("see {t}")}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "token beside a command");
+            // `command()` reads `command`, so a `cmd` beside it is read by
+            // nothing but this scan, on a shell tool too.
+            for tool in ["mcp__sandbox__run", "mcp__iterm__write_to_terminal"] {
+                let r = run_mcp_call(
+                    tool,
+                    serde_json::json!({"command": "ls", "cmd": format!("see {t}")}),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "token in cmd: {tool}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_lone_old_side_value_is_scanned() {
+        // An old-side key with no new-side sibling is no edit: the server
+        // just receives it.
+        let t = fake_ghp();
+        with_terms(FIXTURE, || {
+            let r = run_mcp_call(
+                "mcp__x__post_message",
+                serde_json::json!({"meta": {"oldText": "acmecorp"}}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "lone old-side term");
+            let r = run_mcp_call(
+                "mcp__x__post_message",
+                serde_json::json!({"meta": {"old_string": format!("see {t}")}}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "lone old-side token");
+        });
     }
 
     /// Run `cmd` from `dir`, so relative `@file`/`--input`/`--file` paths

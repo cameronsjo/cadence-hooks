@@ -61,10 +61,14 @@ When the term source is absent, malformed, or carries zero terms, the identity t
 - **THEN** the identity tier contributes nothing and the hook does not block on it
 
 ### Requirement: Unreadable term source blocks posts
-When the term source exists but cannot be read, `redact-external-content` MUST block (exit 2) every post and commit message, naming the path and the fix, and `redact-scan` MUST exit 1 with the same message. An absent file MUST NOT trigger either.
+When the term source exists but cannot be read, `redact-external-content` MUST block (exit 2) every post and commit message, and every `mcp__*` call that carries a string, except a call to a local tool or one whose content is a local file's, naming the path and the fix, and `redact-scan` MUST exit 1 with the same message. An absent file MUST NOT trigger either.
 
 #### Scenario: Term source that cannot be read
 - **WHEN** `redaction.toml` exists but is not a readable regular file (permissions on it or its directory, a dangling link, a directory) and a Bash call posts any text or runs `git commit` with a message
+- **THEN** the hook exits 2 and stderr names the path and a `Fix:` line
+
+#### Scenario: MCP post with a term source that cannot be read
+- **WHEN** `redaction.toml` exists but is not a readable regular file and an `mcp__github__create_issue` call carries a clean `body`
 - **THEN** the hook exits 2 and stderr names the path and a `Fix:` line
 
 #### Scenario: redact-scan on a term source that cannot be read
@@ -160,7 +164,7 @@ The `redaction` section of `.claude/cadence.json` SHALL tune the shaped tier onl
 - **THEN** the hook exits 0 and records no bypass row
 
 ### Requirement: Identity scan of MCP calls
-On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over every string value in the call's input at any depth, object keys included, read from the payload as sent so a field that fails the typed parse is still read. The top-level `file_path`/`path` MUST NOT be scanned. A shell `command` the call carries SHALL get the Bash-surface checks instead. The shaped tier MUST NOT run on MCP calls.
+On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over every string value in the call's input at any depth, object keys included, read from the payload as sent so a field that fails the typed parse is still read. The top-level `file_path`/`path` MUST NOT be scanned. The shaped tier MUST NOT run on MCP calls.
 
 #### Scenario: Issue body through an MCP tool
 - **WHEN** an `mcp__github__create_issue` call carries an identity term only in `body`
@@ -174,8 +178,19 @@ On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over 
 - **WHEN** an MCP write's `path` names a directory holding an identity term and its `content` is clean
 - **THEN** the hook exits 0
 
+### Requirement: MCP command strings are scanned
+On an `mcp__*` call, a `command` or `cmd` string SHALL be scanned like any other string, except the key the Bash surface reads (`command`, else `cmd`) on a local shell tool (`mcp__iterm__write_to_terminal`). A shell `command` SHALL also get the Bash-surface checks.
+
+#### Scenario: Command sent to a server
+- **WHEN** an `mcp__slack__run_command` call's `command` holds an identity term
+- **THEN** the hook exits 2
+
+#### Scenario: Command a local terminal runs
+- **WHEN** an `mcp__iterm__write_to_terminal` call's `command` is `cd ~/<term-dir> && ls`
+- **THEN** the hook exits 0
+
 ### Requirement: Credential scan of MCP calls
-On an `mcp__*` call, `redact-external-content` SHALL run the credential tier over the strings the identity tier reads, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
+On every `mcp__*` call, local tools included, `redact-external-content` SHALL run the credential tier over the strings the identity scan reads, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
 
 #### Scenario: Token in an MCP issue body
 - **WHEN** an `mcp__github__create_issue` call carries a GitHub token only in `body` and no term source exists
@@ -185,12 +200,20 @@ On an `mcp__*` call, `redact-external-content` SHALL run the credential tier ove
 - **WHEN** an MCP edit's `old_string` holds a token and its `new_string` does not
 - **THEN** the hook exits 0
 
-### Requirement: Local MCP servers are not scanned
-An `mcp__*` call whose server segment (the text after `mcp__` up to the next `__`) is exactly `c3`, `easel`, `herdr-bridge` or `rea` MUST NOT be scanned, except that a shell `command` it carries SHALL get the Bash-surface checks. A call to any other server SHALL be scanned.
+#### Scenario: Token typed into another agent
+- **WHEN** an `mcp__herdr-bridge__send` call's `text` holds a token
+- **THEN** the hook exits 2
 
-#### Scenario: Local server call
-- **WHEN** an `mcp__herdr-bridge__send` call carries an identity term and a token
+### Requirement: Local MCP tools skip the identity tier
+The identity tier MUST NOT run on a call to a local tool: `c3` `compact`, `model` or `rename`, `easel` `chart`, `herdr-bridge` `panes` or `read`, or a `rea` tool whose name neither starts with `capture_` or `observe_` nor contains `web` or `browser`. Server and tool are the text after `mcp__` split at the next `__`, matched exactly; a tool segment holding another `__` is not a local tool. Every other call SHALL get the identity tier, and every call SHALL get the credential tier.
+
+#### Scenario: Local tool call
+- **WHEN** an `mcp__herdr-bridge__read` call carries an identity term
 - **THEN** the hook exits 0
+
+#### Scenario: Prompt typed into another agent
+- **WHEN** an `mcp__herdr-bridge__send` call carries an identity term
+- **THEN** the hook exits 2
 
 #### Scenario: Server that only resembles a listed one
 - **WHEN** an `mcp__c3x__post` call carries an identity term
@@ -204,7 +227,7 @@ When an MCP call's `file_path` or `path` is the term source or a code or config 
 - **THEN** the hook exits 2
 
 ### Requirement: MCP edits count against their old-side text
-In an MCP call, a string under an old-side key (`old_string`, `oldString`, `old_str`, `old_text`, `oldText`) MUST NOT be scanned. A new-side string beside it (`new_string`, `newString`, `new_str`, `new_text`, `newText`, `content`) MUST block only on each term's occurrences beyond that term's occurrences in the old-side text; any other string beside it MUST be scanned in full.
+In an MCP call, a string under an old-side key (`old_string`, `oldString`, `old_str`, `old_text`, `oldText`) beside a new-side string MUST NOT be scanned; with no new-side sibling it SHALL be scanned like any other string. A new-side string beside it (`new_string`, `newString`, `new_str`, `new_text`, `newText`, `content`) MUST block only on each term's occurrences beyond that term's occurrences in the old-side text; any other string beside it MUST be scanned in full.
 
 #### Scenario: MCP edit removes a term
 - **WHEN** an MCP edit's `oldText` holds an identity term and its `newText` does not
