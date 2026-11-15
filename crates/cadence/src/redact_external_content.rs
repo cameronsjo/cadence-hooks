@@ -1579,9 +1579,9 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
 
     // The term source is exempt from its own scan. Without this, adding a term
     // to the deny-list is "introducing" it and blocks — the file becomes
-    // unmaintainable through the harness, and the block message's own advice
-    // ("add an `allow` entry in the term source") names an edit the guard just
-    // refused. See `identity::is_term_source` for the fail direction.
+    // unmaintainable through the harness: the operator's own edits, adding a
+    // term or the narrow allow entry the block message asks them for, would
+    // be refused. See `identity::is_term_source` for the fail direction.
     if identity::is_term_source(file_path) {
         return CheckResult::allow();
     }
@@ -2246,9 +2246,10 @@ fn build_identity_message(
         }
     }
     out.push_str(
-        "Remove the term, or — if this context is genuinely benign — add an `allow` entry \
-         beside it in the term source (see `cadence-hooks cadence redact-scan --help`). \
-         Per-repo config cannot excuse these.",
+        "Remove the term. If this context is genuinely benign, ask the operator to add a \
+         narrow `pattern` allow entry for it in the term source; do not edit the term source \
+         yourself (see `cadence-hooks cadence redact-scan --help`). Per-repo config cannot \
+         excuse these.",
     );
     out
 }
@@ -2544,8 +2545,8 @@ fn identity_scan_lines(
     // identity term has no replacement, only removal.
     //
     // These three arms are the SAME three `build_identity_message` branches on,
-    // deliberately with different text: the hook's message tells the operator to
-    // add an `allow` entry, and this one tells them the opposite, because a scan
+    // deliberately with different text: the hook's message asks for the
+    // operator to add an `allow` entry, and this one tells them the opposite, because a scan
     // is not a posting attempt and the CLI's caller is a pre-post gate. The
     // wording diverges; the enforce/warn/bypassed *semantics* must not. Any new
     // arm added to one belongs in the other.
@@ -6362,12 +6363,37 @@ term = "acmecorp"
     }
 
     #[test]
+    fn the_block_message_sends_an_allow_entry_to_the_operator() {
+        // An edit to the term source is not scanned, so an agent told to add
+        // an allow entry could excuse its own hit. The message asks for the
+        // operator instead, on every surface that renders it.
+        with_terms(FIXTURE, || {
+            for r in [
+                post("gh issue comment 1 -R them/x --body 'ships acmecorp tooling'"),
+                run_mcp_call(
+                    "mcp__github__create_issue",
+                    serde_json::json!({"body": "acmecorp"}),
+                ),
+            ] {
+                assert_eq!(r.outcome, Outcome::Block);
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("ask the operator"), "{msg}");
+                assert!(
+                    msg.contains("do not edit the term source yourself"),
+                    "{msg}"
+                );
+                assert!(!msg.contains("add an `allow` entry beside it"), "{msg}");
+            }
+        });
+    }
+
+    #[test]
     fn the_term_source_is_editable_ie_the_deny_list_stays_maintainable() {
         // The self-lock this exemption exists to prevent: adding a term to the
         // deny-list is "introducing" it under the introduced-only rule, so
         // without the exemption the file cannot be maintained through the
-        // harness at all — and the block message's own advice ("add an allow
-        // entry in the term source") names the edit it just refused.
+        // harness at all — and the block message asks the operator for an
+        // allow entry in the term source, the edit it would just have refused.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, FIXTURE).unwrap();

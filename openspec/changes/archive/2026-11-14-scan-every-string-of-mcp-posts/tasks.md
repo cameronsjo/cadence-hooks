@@ -51,3 +51,10 @@
 - [x] 7.2 `scripts/generate-rea-local-tools.py` fails on any effects form it cannot read; tests cover a spread and a shorthand flag
 - [x] 7.3 The unreadable-source message names what it stopped (a post, an MCP call, a scanned text)
 - [x] 7.4 The credential tier reads old-side text on MCP calls (the server receives it); the identity tier still skips it beside a new-side value
+
+## 8. Review round 7
+
+- [x] 8.1 `scripts/generate-rea-local-tools.py` refuses a flag `ToolEffects` does not declare and a judged flag with no declaration or default; tests for a renamed and a missing flag
+- [x] 8.2 CI runs `scripts/test_generate_rea_local_tools.py`
+- [x] 8.3 The CHANGELOG and proposal say the routing lands with cameronsjo/cadence#2149
+- [x] 8.4 The identity block message asks for the operator to add an allow entry and tells the agent not to edit the term source

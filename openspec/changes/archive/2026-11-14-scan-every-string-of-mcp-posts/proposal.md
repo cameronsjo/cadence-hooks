@@ -16,4 +16,4 @@ A security review of cameronsjo/cadence#2131 found that `redact-external-content
 ## Impact
 
 - Code: `crates/cadence/src/redact_external_content.rs`, `crates/core/src/lib.rs` (`HookInput::mcp_tool_input`).
-- Which MCP tools reach the check is the cadence plugin's hook matcher, not this binary. It matched only names containing a write-shaped verb, so Linear's `save_*` and GitHub's `add_*` comment tools never reached it. cameronsjo/cadence#2149 routes every `mcp__*` call to the hook, and `tests/fixtures/registration-audit/` carries that wiring.
+- Which MCP tools reach the check is the cadence plugin's hook matcher, not this binary. It matched only names containing a write-shaped verb, so Linear's `save_*` and GitHub's `add_*` comment tools never reached it. Routing every `mcp__*` call to the hook lands with cameronsjo/cadence#2149; `tests/fixtures/registration-audit/` carries that wiring already. Until an installed cadence plugin carries it, the binary judges only the MCP calls that plugin routes to it.

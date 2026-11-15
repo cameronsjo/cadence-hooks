@@ -379,9 +379,9 @@ pub(crate) mod test_seam {
 /// The term source contains every term, so writing a term into it is, by the
 /// introduced-only rule, "introducing" one — and the tier blocks. That makes
 /// the deny-list **unmaintainable through the harness**: adding a term is
-/// exactly the edit the guard refuses. Worse, the block message tells the
-/// operator to add an `allow` entry *in the term source*, which is the edit it
-/// just blocked. A perfectly circular instruction.
+/// exactly the edit the guard refuses. Worse, the block message asks the
+/// operator for an `allow` entry *in the term source*, which is the edit it
+/// would just have blocked. A perfectly circular instruction.
 ///
 /// Writing terms into the deny-list is definitionally legitimate — it is what
 /// the file is for. Same reasoning that makes the removal edit possible: a

@@ -114,6 +114,12 @@ jobs:
           node --version
           scripts/openspec.sh validate --all --strict --no-interactive
 
+      - name: Test the rea local-tool generator
+        # Stdlib-only and fast, so it rides this job instead of paying for its
+        # own. The generator decides which rea tools skip the identity tier;
+        # it must fail on any effects form it cannot vouch for.
+        run: python3 -I scripts/test_generate_rea_local_tools.py
+
       - name: Generated skills use the pinned CLI
         # `openspec update` resets the generated skills to a bare, unpinned
         # `openspec` grant that covers every subcommand. Rerunning the
