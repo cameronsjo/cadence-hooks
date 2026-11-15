@@ -92,7 +92,7 @@ code directly, bypassing `run-cadence-hooks.sh`:
 
 ```bash
 echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' \
-  | cadence-hooks guardrails guard-push-remote; echo "exit: $?"
+  | cadence-hooks cadence git-safety; echo "exit: $?"
 ```
 
 **Pin `PATH` on the child when you are comparing block TEXT rather than exit

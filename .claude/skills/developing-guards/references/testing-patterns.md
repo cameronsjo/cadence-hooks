@@ -170,12 +170,12 @@ fn main_branch_warns() {
 }
 
 #[test]
-fn chained_pushes_different_remotes_blocked() {
+fn push_to_unowned_url_nudges() {
     let result = PushRemoteGuard.run(
-        &make_bash("git push origin main && git push upstream main")
+        &make_bash("git push https://github.com/other/repo.git main")
     );
-    assert_eq!(result.outcome, Outcome::Block);
-    assert!(result.message.unwrap().contains("different remotes"));
+    assert_eq!(result.outcome, Outcome::Nudge);
+    assert!(result.message.unwrap().contains("not on your allowlist"));
 }
 ```
 
@@ -320,10 +320,10 @@ fn owner_check_passes() {
 
 // GOOD: test the guard's run() for scenarios that DON'T need env vars
 #[test]
-fn loop_missing_targets_blocked() {
-    // Loops block BEFORE the env var check
-    let result = PushRemoteGuard.run(&make_bash("for b in a b; do git push; done"));
-    assert_eq!(result.outcome, Outcome::Block);
+fn non_push_command_allowed() {
+    // No push: the guard returns before it reads the allowlist
+    let result = PushRemoteGuard.run(&make_bash("git status"));
+    assert_eq!(result.outcome, Outcome::Allow);
 }
 
 // AVOID: setting env vars in tests

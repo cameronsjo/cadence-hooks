@@ -133,7 +133,7 @@ When `CADENCE_BYPASS` is exactly `1`, every hook subcommand SHALL exit 0 before 
 - **THEN** it exits 0 without reading stdin and `bypasses.jsonl` gains a `global_disable` row
 
 #### Scenario: The protected set
-- **WHEN** `CADENCE_DISABLE` names `prevent-secret-leaks`, `prevent-secret-writes`, `prevent-secret-push`, `redact-external-content`, `git-safety`, `guard-push-remote`, `guard-gh-dangerous`, `guard-gh-write`, `guard-op-vault-scan`, `guard-sops-decrypt`, `guard-runbook-scrub`, `guard-browser-device`, `guard-dotfiles`, `guard-read-model`, `trash-guard` or `enforcement-status`
+- **WHEN** `CADENCE_DISABLE` names `prevent-secret-leaks`, `prevent-secret-writes`, `prevent-secret-push`, `redact-external-content`, `git-safety`, `guard-gh-dangerous`, `guard-gh-write`, `guard-op-vault-scan`, `guard-sops-decrypt`, `guard-runbook-scrub`, `guard-browser-device`, `guard-dotfiles`, `guard-read-model`, `trash-guard` or `enforcement-status`
 - **THEN** that hook still runs
 
 ### Requirement: Session-start enforcement report

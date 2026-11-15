@@ -115,7 +115,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 
 | Hook | Event | What it does | Remote |
 |------|-------|--------------|--------|
-| `guard-push-remote` | PreToolUse (Bash) | Block git push to repos you don't own | run |
+| `guard-push-remote` | PreToolUse (Bash) | Nudge when a `git push` goes to a repo you don't own; never blocks, and stays silent when it cannot read the remote exactly | run |
 | `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos | run |
 | `guard-forge-write` | PreToolUse (Bash) | Block `tea`/`glab` write operations to non-owned repos (unwired until the plugin entry lands) | run |
 | `guard-critical-grade` | PreToolUse (Bash) | Block applying `impact:critical` / `likelihood:critical` without a human ruling (unwired until the plugin entry lands) | run |

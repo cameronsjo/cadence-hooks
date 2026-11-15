@@ -83,13 +83,12 @@ Allowed: <if config-driven, show what IS allowed>
 **Config-driven guard (push-remote):**
 
 ```text
-BLOCKED: git-guardrails: Push target is not yours
+NUDGE: git-guardrails: Push target is not on your allowlist
    Would push to: https://github.com/other/repo.git
    Directory:     /home/user/project
    Allowed:       cameronsjo gitea.internal/cameron
 
-   Fix tracking:  git branch -u origin/main
-   Push explicit: git push origin main
+   Confirm this is the remote you mean, or push to your fork instead: git push <fork-remote> <branch>
 ```
 
 **Content-scanning guard (terminology):**
