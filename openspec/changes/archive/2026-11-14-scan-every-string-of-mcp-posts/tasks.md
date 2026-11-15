@@ -35,3 +35,12 @@
 - [x] 5.4 Unreadable term source blocks only calls whose input holds a string value
 - [x] 5.5 rea exemption from rea's effect audit (exact, case-sensitive list), pinned by a test
 - [x] 5.6 Tests for each, each staged off once and seen red
+
+## 6. Review round 5
+
+- [x] 6.1 No path exemption on MCP calls: both tiers read every path and the content beside it
+- [x] 6.2 Unreadable term source blocks any MCP call that carries a string, object keys included
+- [x] 6.3 Keep a bypass record when the MCP verdict is merged with the Bash surface's
+- [x] 6.4 Leave rea's file-writing tools off `REA_LOCAL_TOOLS`; `scripts/generate-rea-local-tools.py` derives the list
+- [x] 6.5 `Write` and `Edit` probes in the exactly-once wiring test; cite cameronsjo/cadence-hooks#1624 at the parse fail-open
+- [x] 6.6 Tests for each, each staged off once and seen red

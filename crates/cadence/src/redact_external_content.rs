@@ -1338,7 +1338,9 @@ fn run_command_or_edit(input: &HookInput) -> CheckResult {
 }
 
 /// `shell`, with the MCP string scan's `mcp` verdict kept: a block from
-/// `shell` stands, and otherwise a nudge from either is shown, joined.
+/// `shell` stands, and otherwise a nudge from either is shown, joined. A
+/// bypass record from either is kept, so a call allowed under
+/// `CADENCE_ALLOW_SENSITIVE_TERMS` still writes its ledger row.
 fn with_mcp_verdict(mcp: CheckResult, shell: CheckResult) -> CheckResult {
     if mcp.outcome != Outcome::Nudge {
         return shell;
@@ -1346,14 +1348,17 @@ fn with_mcp_verdict(mcp: CheckResult, shell: CheckResult) -> CheckResult {
     let Some(found) = mcp.message else {
         return shell;
     };
-    match shell.outcome {
-        Outcome::Nudge => {
-            let said = shell.message.unwrap_or_default();
+    if !matches!(shell.outcome, Outcome::Nudge | Outcome::Allow) {
+        return shell;
+    }
+    let mut merged = match shell.message {
+        Some(said) if shell.outcome == Outcome::Nudge => {
             CheckResult::nudge(format!("{found}\n{said}"))
         }
-        Outcome::Allow => CheckResult::nudge(found),
-        _ => shell,
-    }
+        _ => CheckResult::nudge(found),
+    };
+    merged.bypass = mcp.bypass.or(shell.bypass);
+    merged
 }
 
 /// The block for a term source that exists but cannot be read (#1617).
@@ -1522,6 +1527,17 @@ fn reconcile_findings(
     merged
 }
 
+/// Code or config proven local: a file the identity tier skips on `Write`
+/// and `Edit`. A prose draft is not code or config, so it
+/// keeps the scan even in a local location. `~/.ssh/config` has no
+/// extension, so its name reads as a draft; it is the one such file taken as
+/// config, on its exact resolved path (cameronsjo/cadence-hooks#1619).
+fn is_local_code_or_config(file_path: Option<&str>) -> bool {
+    let code_or_config =
+        !context::is_prose_draft(file_path) || context::is_ssh_client_config(file_path);
+    code_or_config && context::is_provably_local(file_path)
+}
+
 /// The Write/Edit surface: the identity pass **only**, over introduced
 /// fragments.
 ///
@@ -1576,12 +1592,9 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
     // there: it is the file a later `--body "$(cat F)"` or `cat F |` posts,
     // and the post-time scan does not read through either. A file inside a
     // work tree keeps the scan, because the post-time scan never sees a
-    // commit's file content. MCP calls never reach here (`run_mcp`).
-    // `~/.ssh/config` has no extension, so the name reads as a draft; it is
-    // the one such file taken as config, on its exact resolved path.
-    let code_or_config =
-        !context::is_prose_draft(file_path) || context::is_ssh_client_config(file_path);
-    if code_or_config && context::is_provably_local(file_path) {
+    // commit's file content. MCP calls never reach here: `run_mcp` exempts
+    // no path, since the server that receives the call may not be local.
+    if is_local_code_or_config(file_path) {
         return CheckResult::allow();
     }
 
@@ -1662,17 +1675,6 @@ const NEW_TEXT_KEYS: &[&str] = &[
     "content",
 ];
 
-/// Top-level keys that carry a file's content: what the path exemptions cover.
-const FILE_CONTENT_KEYS: &[&str] = &["edits"];
-
-/// Top-level keys naming the call's target (`file_path`, `path`). They decide
-/// the file-content exemptions. The credential tier always reads them. The
-/// identity tier skips them only when the path is absolute and proven local
-/// (a local filesystem server's target, where a term in a directory name is
-/// no leak, as for `Write`); a relative or remote path, such as a file in a
-/// GitHub repo, is published and is scanned.
-const TARGET_PATH_KEYS: &[&str] = &["file_path", "path"];
-
 /// The keys a shell command sits under, in the order `HookInput::command`
 /// reads them: `command`, else `cmd`.
 const COMMAND_KEYS: &[&str] = &["command", "cmd"];
@@ -1706,10 +1708,20 @@ const REA_SERVER: &str = "rea";
 
 /// rea tools that skip the identity tier: exactly those whose effect audit
 /// (rea `src/contracts/toolEffects.ts`, at rea `8413ec0`) neither launches a
-/// process nor reaches the network, that is whose MCP `openWorldHint` is
-/// false. They read and annotate local artifacts. Every other rea tool, and
+/// process, reaches the network, nor writes files (`openWorldHint` false and
+/// `writesFilesystem` false). They read and annotate local artifacts. A tool
+/// that writes a file to a path the caller picks (an evidence export, a
+/// snapshot) is left out: that file can land in a work tree and be
+/// committed. Every other rea tool, and
 /// any tool rea adds later, gets both tiers until it is listed here. Matched
 /// exactly and case-sensitively, so a case variant is scanned too.
+///
+/// Refresh against a newer rea: run
+/// `scripts/generate-rea-local-tools.py <rea>/src/contracts/toolEffects.ts`
+/// and paste its output here (it prints the list sorted), or pass
+/// `--check crates/cadence/src/redact_external_content.rs` to see the
+/// difference. Update the rea commit above, and move any tool that left the
+/// list into the open-world rows of `rea_local_tools_are_its_closed_world_tools`.
 const REA_LOCAL_TOOLS: &[&str] = &[
     "address_name",
     "address_to_file_offset",
@@ -1719,7 +1731,6 @@ const REA_LOCAL_TOOLS: &[&str] = &[
     "binary_overview",
     "build_call_path",
     "build_reconstruction_obligation_ledger",
-    "close_binary",
     "comment",
     "compare_application_versions",
     "compare_artifacts",
@@ -1738,8 +1749,6 @@ const REA_LOCAL_TOOLS: &[&str] = &[
     "current_procedure",
     "decode_interface_builder",
     "evaluate_reconstruction_coverage",
-    "export_evidence_bundle",
-    "export_web_scripts",
     "find_changed_behavior",
     "find_xrefs_to_name",
     "frida_session_status",
@@ -1750,13 +1759,11 @@ const REA_LOCAL_TOOLS: &[&str] = &[
     "get_objc_classes",
     "get_objc_protocols",
     "goto_address",
-    "identify_flutter_build",
     "import_evidence_bundle",
     "import_managed_reconstruction",
     "inline_comment",
     "inspect_address_context",
     "inspect_analysis_view",
-    "inspect_dart_aot",
     "inspect_desktop_application",
     "inspect_electron_fuses",
     "inspect_go_binary",
@@ -1925,18 +1932,22 @@ fn mcp_object_texts<'a>(
 /// - **The identity tier** runs unless `identity` is `None`, which `run`
 ///   passes for a tool on the local-tool table
 ///   ([`is_identity_exempt_mcp_tool`]).
-/// - **An unreadable term source** (#1617) blocks a call whose input holds a
-///   string value, as it blocks a Bash post: the machine expects the tier
-///   and nothing can be checked against it. An MCP call's text goes to its
-///   server, reads included (ADR-0003). A call with only keys, numbers and
-///   booleans sends no text and is let through. An absent source stays inert.
+/// - **An unreadable term source** (#1617) blocks a call that carries any
+///   string the identity tier would read, object keys included, as it blocks
+///   a Bash post: the machine expects the tier and nothing can be checked
+///   against it. An MCP call's text goes to its server, reads included
+///   (ADR-0003). Only a call with nothing to read (`{}`) is let through. An
+///   absent source stays inert.
 /// - **A `command` or `cmd` is scanned** like any other string. On a
 ///   [`LOCAL_SHELL_MCP_TOOLS`] tool the one key `HookInput::command` reads
 ///   skips the identity tier only: that command runs here, and the Bash
 ///   surface `run` also applies judges what it posts.
-/// - **The top-level `file_path`/`path`** ([`TARGET_PATH_KEYS`]) gets the
-///   credential tier always and the identity tier unless the path is
-///   absolute and proven local.
+/// - **No path exempts anything.** The `file_path`/`path` and the content
+///   beside it get both tiers, whatever the path says: whether a path is
+///   local is known only for this machine, and the server that receives the
+///   call may be a remote sandbox or container. An exemption for a local
+///   filesystem server would need an exact table of such servers; none is
+///   installed, so there is none, and `Write`/`Edit` cover local files.
 ///
 /// What stays as on the Write/Edit surface ([`run_edit`]):
 ///
@@ -1947,13 +1958,6 @@ fn mcp_object_texts<'a>(
 /// - **Removal edits stay possible.** Old-side text ([`PRIOR_TEXT_KEYS`])
 ///   beside a new-side value is not scanned by either tier, and is counted
 ///   against that value only. Without a new-side sibling it is scanned.
-/// - **The term source and provably-local files** are exempt, read from the
-///   call's `file_path`/`path`. The exemption covers the file's content (the
-///   top-level [`NEW_TEXT_KEYS`] and `edits`) and nothing else: a `title` or
-///   `initial_comment` beside a local attachment's path is still published,
-///   and still scanned. Both tiers skip that content: a local file is not a
-///   post. The test reads the path string, not the server, so a remote
-///   tool given a local-looking absolute path gets the same exemption.
 ///
 /// The input read is the payload's own `tool_input`, before the typed parse
 /// dropped any field that failed its shape ([`HookInput::mcp_tool_input`]),
@@ -1979,29 +1983,15 @@ fn run_mcp(
         .tool_input
         .as_ref()
         .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
-    let local_file = identity::is_term_source(file_path)
-        || (!context::is_prose_draft(file_path) && context::is_provably_local(file_path));
-    // The call's own path, when it is an absolute path on this machine that
-    // goes nowhere: a local filesystem server's target. A relative path (a
-    // file in a GitHub repo) or a remote one is published like any string.
-    let local_target = file_path.is_some_and(|p| std::path::Path::new(p).is_absolute())
-        && (identity::is_term_source(file_path) || context::is_provably_local(file_path));
-
-    // Keys neither tier reads: a local file's content, which is not a post.
-    let mut both_skip: Vec<&str> = Vec::new();
-    if local_file {
-        both_skip.extend(NEW_TEXT_KEYS);
-        both_skip.extend(PRIOR_TEXT_KEYS);
-        both_skip.extend(FILE_CONTENT_KEYS);
-    }
-    // Keys only the identity tier leaves alone; the credential tier reads
-    // them. A local target path (a term in a local directory name is no
-    // leak), and on a local shell tool the one key the Bash surface reads (a
-    // `cmd` beside a `command` is read by nothing else, so it is scanned).
-    let mut identity_skip: Vec<&str> = both_skip.clone();
-    if local_target {
-        identity_skip.extend(TARGET_PATH_KEYS);
-    }
+    // No path exempts anything here: whether `/tmp/notes.json` is local is
+    // known only for this machine, and the server that receives the call may
+    // be a remote sandbox or container. No local filesystem MCP server is
+    // installed, so none is exempt; `Write` and `Edit` cover local files.
+    //
+    // Keys only the identity tier leaves alone: on a local shell tool, the one
+    // key the Bash surface reads (a `cmd` beside a `command` is read by
+    // nothing else, so it is scanned).
+    let mut identity_skip: Vec<&str> = Vec::new();
     if input
         .tool_name
         .as_deref()
@@ -2020,11 +2010,11 @@ fn run_mcp(
         }
         texts
     };
-    // Credential tier (#1022): every string but a local file's content, armed
-    // term source or not, and no identity setting reaches it. Old-side text
-    // beside a new-side value is not scanned, so an edit that removes a token
-    // stays possible.
-    let credential_texts = walk(&both_skip);
+    // Credential tier (#1022): every string, whatever the path or the server,
+    // armed term source or not, and no identity setting reaches it. Old-side
+    // text beside a new-side value is not scanned, so an edit that removes a
+    // token stays possible.
+    let credential_texts = walk(&[]);
     let mut scanned: HashSet<&str> = HashSet::new();
     let cred_hits: Vec<credential_scan::CredHit> = credential_texts
         .iter()
@@ -2034,12 +2024,6 @@ fn run_mcp(
     let Some((identity_list, status)) = identity else {
         return with_credential_block(&cred_hits, CheckResult::allow());
     };
-    // A local file's content is not a post, as on `Write`. A call whose input
-    // holds no string value (`{}`, `{"page": 2}`) sends no text to check.
-    if status.blocks_posts() && !local_file && has_string_value(&raw) {
-        let unreadable = CheckResult::block(unreadable_source_message());
-        return with_credential_block(&cred_hits, unreadable);
-    }
     let identity_texts = walk(&identity_skip);
     // A repeated (text, prior) pair adds nothing to an identity report, which
     // dedups by (id, snippet).
@@ -2049,6 +2033,13 @@ fn run_mcp(
         .map(|(text, prior)| (*text, prior.as_ref()))
         .filter(|pair| seen.insert(*pair))
         .collect();
+    // Any string the identity tier would read counts, object keys included:
+    // a key goes to the server and is scanned when the source is readable.
+    // Only a call with nothing to read (`{}`) goes through.
+    if status.blocks_posts() && unique.iter().any(|(text, _)| !text.is_empty()) {
+        let unreadable = CheckResult::block(unreadable_source_message());
+        return with_credential_block(&cred_hits, unreadable);
+    }
     let folded = if identity_list.is_armed() {
         let identity_hits = introduced_identity_hits(unique, identity_list, file_path);
         combine(&identity_hits, &[], &[], &[], identity_list.mode)
@@ -2056,16 +2047,6 @@ fn run_mcp(
         CheckResult::allow()
     };
     with_credential_block(&cred_hits, folded)
-}
-
-/// Whether `value` holds a string anywhere: a value, not an object key.
-fn has_string_value(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(_) => true,
-        serde_json::Value::Array(items) => items.iter().any(has_string_value),
-        serde_json::Value::Object(map) => map.values().any(has_string_value),
-        _ => false,
-    }
 }
 
 /// `folded`, unless `cred_hits` holds a token: then a block naming the tokens
@@ -5013,35 +4994,23 @@ term = "acmecorp"
     }
 
     #[test]
-    fn mcp_target_path_is_scanned_unless_it_is_local() {
-        // A file path on a remote host is published: a repo file's name is as
-        // public as an issue body.
+    fn mcp_target_path_is_scanned_wherever_it_points() {
+        // A file path is sent to the server; whether it is local is known only
+        // for this machine, so no path is exempt.
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("acmecorp-notes").join("data.json");
         with_terms(FIXTURE, || {
             for path in [
                 "docs/acmecorp-notes.md",
                 "/Users/x/Projects/acmecorp-platform/README.md",
+                local.to_str().unwrap(),
             ] {
                 let r = run_mcp_call(
-                    "mcp__github__create_or_update_file",
+                    "mcp__fs__write_file",
                     serde_json::json!({"path": path, "content": "hello"}),
                 );
-                assert_eq!(r.outcome, Outcome::Block, "not proven local: {path}");
+                assert_eq!(r.outcome, Outcome::Block, "{path}");
             }
-        });
-        // An absolute path proven local names a directory on this machine.
-        let root = tempfile::tempdir().unwrap();
-        if !context::scratch_counts_as_system_temp(root.path()) {
-            eprintln!("skipped: TMPDIR is not a system temp dir, so nothing in it is exempt");
-            return;
-        }
-        let local = root.path().join("acmecorp-notes").join("data.json");
-        let local = local.to_str().unwrap();
-        with_terms(FIXTURE, || {
-            let r = run_mcp_call(
-                "mcp__fs__write_file",
-                serde_json::json!({"path": local, "content": "hello"}),
-            );
-            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
         });
     }
 
@@ -5098,16 +5067,75 @@ term = "acmecorp"
     }
 
     #[test]
+    fn an_mcp_bypass_beside_a_command_keeps_its_ledger_record() {
+        // A term downgraded by CADENCE_ALLOW_SENSITIVE_TERMS carries a bypass
+        // record; merging it with the Bash surface's verdict must keep it, or
+        // no ledger row is written.
+        with_env(FIXTURE, &[("CADENCE_ALLOW_SENSITIVE_TERMS", "1")], || {
+            let plain = run_mcp_call("mcp__x__run", serde_json::json!({"body": "acmecorp"}));
+            assert!(plain.bypass.is_some(), "control: {:?}", plain.message);
+            let r = run_mcp_call(
+                "mcp__x__run",
+                serde_json::json!({"command": "ls", "body": "acmecorp"}),
+            );
+            assert_ne!(r.outcome, Outcome::Block, "{:?}", r.message);
+            assert!(r.bypass.is_some(), "bypass record kept: {:?}", r.message);
+        });
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_mcp_write_to_ssh_config_is_scanned() {
+        // #1619 exempts `~/.ssh/config` on `Write` and `Edit`. An MCP call
+        // gets no path exemption (the server may not be local), so the same
+        // content through an MCP tool is scanned.
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/config"), "Host x\n").unwrap();
+        context::test_seam::with_home(&home, || {
+            with_env(FIXTURE, &[], || {
+                let ssh = home.join(".ssh/config");
+                let r = run_mcp_call(
+                    "mcp__fs__write_file",
+                    serde_json::json!({"path": ssh.to_str().unwrap(), "content": "Host acmecorp-bastion\n"}),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+            });
+        });
+    }
+
+    #[test]
+    fn an_unreadable_source_blocks_beside_a_local_path() {
+        // No path exempts the call from the #1617 block: the content and a
+        // `title` beside a local path both go to the server.
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("data.json");
+        let local = local.to_str().unwrap();
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unreadable.path().join(".config/cadence/redaction.toml")).unwrap();
+        with_account_home(unreadable.path(), || {
+            for input in [
+                serde_json::json!({"path": local, "content": "{}"}),
+                serde_json::json!({"path": local, "content": "{}", "title": "roadmap"}),
+            ] {
+                let r = run_mcp_call("mcp__slack__create_upload", input.clone());
+                assert_eq!(r.outcome, Outcome::Block, "{input}: {:?}", r.message);
+            }
+        });
+    }
+
+    #[test]
     fn rea_local_tools_are_its_closed_world_tools() {
-        // Pinned against rea's effect audit (`toolEffects.ts` at `8413ec0`):
-        // the exempt list is sorted and unique, and none of the tools that
-        // launch a process or reach the network is on it.
+        // Pinned against rea's effect audit (`toolEffects.ts` at `8413ec0`;
+        // refresh with `scripts/generate-rea-local-tools.py`): the exempt
+        // list is sorted and unique, and none of the tools that launch a
+        // process, reach the network or write files is on it.
         let mut sorted = REA_LOCAL_TOOLS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, REA_LOCAL_TOOLS, "sorted, no duplicates");
-        assert_eq!(REA_LOCAL_TOOLS.len(), 113);
-        let open_world = [
+        let scanned = [
             "analyze_javascript_application",
             "analyze_web_bundle",
             "annotate_native_function",
@@ -5118,6 +5146,7 @@ term = "acmecorp"
             "capture_native_ui_scenario",
             "capture_process_scenario",
             "capture_web_screenshot",
+            "close_binary",
             "close_frida_session",
             "close_gdb_session",
             "close_rizin_debug_session",
@@ -5129,9 +5158,12 @@ term = "acmecorp"
             "demangle_swift",
             "discover_webmcp_tools",
             "execute_rizin_command",
+            "export_evidence_bundle",
+            "export_web_scripts",
             "extract_artifact",
             "extract_firmware",
             "gdb_console",
+            "identify_flutter_build",
             "inspect_adb_client",
             "inspect_adb_device",
             "inspect_adb_display",
@@ -5144,6 +5176,7 @@ term = "acmecorp"
             "inspect_artifact",
             "inspect_asset_catalog",
             "inspect_binary_layout",
+            "inspect_dart_aot",
             "inspect_electron_page",
             "inspect_evm_interface",
             "inspect_firmware_regions",
@@ -5209,13 +5242,9 @@ term = "acmecorp"
             "uninstall_adb_package",
             "unload_frida_script",
         ];
-        assert_eq!(open_world.len(), 100);
-        for tool in open_world {
+        for tool in scanned {
             let name = format!("mcp__rea__{tool}");
-            assert!(
-                !is_identity_exempt_mcp_tool(Some(&name)),
-                "open-world: {name}"
-            );
+            assert!(!is_identity_exempt_mcp_tool(Some(&name)), "scanned: {name}");
         }
         assert!(is_identity_exempt_mcp_tool(Some("mcp__rea__set_comment")));
         // Exact and case-sensitive: a variant is scanned, as is an unknown.
@@ -5235,46 +5264,56 @@ term = "acmecorp"
     }
 
     #[test]
-    fn mcp_term_source_exemption_covers_only_the_file_content() {
+    fn an_mcp_write_to_the_term_source_is_scanned() {
+        // The term source is edited with `Write`/`Edit`, which exempt it. An
+        // MCP call naming that path, absolute or relative, gets no exemption.
         with_terms(FIXTURE, || {
             let terms = std::env::var("CADENCE_REDACTION_TERMS").unwrap();
             let r = run_mcp_call(
                 "mcp__fs__write_file",
                 serde_json::json!({"path": terms, "content": "[[terms]]\nterm = \"acmecorp\"\n"}),
             );
-            assert_eq!(r.outcome, Outcome::Allow, "editing the term source");
-            let r = run_mcp_call(
-                "mcp__fs__write_file",
-                serde_json::json!({"path": terms, "content": "x", "message": "acmecorp"}),
-            );
-            assert_eq!(r.outcome, Outcome::Block, "a field beside the content");
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
         });
     }
 
     #[test]
-    fn mcp_local_file_exemption_covers_only_the_file_content() {
+    fn a_local_looking_path_exempts_no_content() {
+        // A remote sandbox takes `/tmp/...` paths too: a path local on this
+        // machine says nothing about where the call's content goes.
+        let t = fake_ghp();
         let root = tempfile::tempdir().unwrap();
-        if !context::scratch_counts_as_system_temp(root.path()) {
-            eprintln!("skipped: TMPDIR is not a system temp dir, so nothing in it is exempt");
-            return;
-        }
-        let local = root.path().join("data.json");
+        let local = root.path().join("notes.json");
         let local = local.to_str().unwrap();
+        with_terms_cleared(|| {
+            for path in ["/tmp/notes.json", local] {
+                let r = run_mcp_call(
+                    "mcp__sandbox__write_file",
+                    serde_json::json!({"path": path, "content": format!("key {t}")}),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "token beside {path}");
+            }
+        });
         with_terms(FIXTURE, || {
             let r = run_mcp_call(
-                "mcp__fs__write_file",
+                "mcp__sandbox__write_file",
                 serde_json::json!({"path": local, "content": "{\"k\": \"acmecorp\"}"}),
             );
-            assert_eq!(r.outcome, Outcome::Allow, "local config content");
+            assert_eq!(r.outcome, Outcome::Block, "term beside a local path");
+            // Each path key is judged on its own: a local `file_path` does
+            // not excuse a remote `path` or the content.
             let r = run_mcp_call(
-                "mcp__slack__create_upload",
-                serde_json::json!({"path": local, "initial_comment": "acmecorp roadmap"}),
+                "mcp__github__push_file",
+                serde_json::json!({"file_path": local, "path": "docs/acmecorp.md", "content": "hello"}),
             );
-            assert_eq!(
-                r.outcome,
-                Outcome::Block,
-                "a comment beside a local attachment"
+            assert_eq!(r.outcome, Outcome::Block, "term in the remote path");
+        });
+        with_terms_cleared(|| {
+            let r = run_mcp_call(
+                "mcp__github__push_file",
+                serde_json::json!({"file_path": local, "path": "docs/x.md", "content": format!("key {t}")}),
             );
+            assert_eq!(r.outcome, Outcome::Block, "token beside two path keys");
         });
     }
 
@@ -5464,21 +5503,19 @@ term = "acmecorp"
             // state does not reach it; an empty input has nothing to check.
             let r = run_mcp_call("mcp__c3__compact", serde_json::json!({"focus": "x"}));
             assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
-            // A call with no string value (keys and numbers only) sends no
-            // text; one string value is enough to block.
+            // Only a call with nothing to read goes through. Object keys count:
+            // a key goes to the server and is scanned when the source is
+            // readable.
+            let r = run_mcp_call("mcp__github__list_issues", serde_json::json!({}));
+            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
             for input in [
-                serde_json::json!({}),
                 serde_json::json!({"page": 2}),
-                serde_json::json!({"limit": 5, "draft": false}),
+                serde_json::json!({"some words here": true}),
+                serde_json::json!({"page": 2, "query": "x"}),
             ] {
                 let r = run_mcp_call("mcp__github__list_issues", input.clone());
-                assert_eq!(r.outcome, Outcome::Allow, "{input}: {:?}", r.message);
+                assert_eq!(r.outcome, Outcome::Block, "{input}: {:?}", r.message);
             }
-            let r = run_mcp_call(
-                "mcp__github__list_issues",
-                serde_json::json!({"page": 2, "query": "x"}),
-            );
-            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
         });
         // No file at all: inert, as on the Bash surface.
         let absent = tempfile::tempdir().unwrap();

@@ -3404,7 +3404,14 @@ fn every_mcp_call_reaches_redact_external_content_once() {
             .map(|r| r.matcher.as_str())
             .collect();
         let mut wrong = Vec::new();
-        for probe in MCP_POSTING_PROBES.iter().chain(MCP_LOCAL_PROBES) {
+        // `Write` and `Edit` share the entry, so a matcher edit that drops
+        // them is caught here too.
+        let file_tools = ["Write", "Edit"];
+        for probe in MCP_POSTING_PROBES
+            .iter()
+            .chain(MCP_LOCAL_PROBES)
+            .chain(file_tools.iter())
+        {
             let runs = matchers.iter().filter(|m| matcher_fires(m, probe)).count();
             if runs != 1 {
                 wrong.push(format!("{probe}: {runs} runs"));
@@ -3412,7 +3419,7 @@ fn every_mcp_call_reaches_redact_external_content_once() {
         }
         assert!(
             wrong.is_empty(),
-            "[{label}] redact-external-content must run exactly once on every MCP call:\n  {}\n{hint}",
+            "[{label}] redact-external-content must run exactly once on every MCP call, Write and Edit:\n  {}\n{hint}",
             wrong.join("\n  ")
         );
     }

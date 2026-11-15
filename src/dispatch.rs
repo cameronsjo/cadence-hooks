@@ -254,7 +254,9 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
             // harness-gated and was not: `tool_name: "apply_patch"` armed the
             // harness sniff on the raw value before the patch rewrite errored,
             // so it blocked with no env var set. Ordinary malformed JSON still
-            // fails open (ADR-0001), exactly as before.
+            // fails open (ADR-0001), exactly as before. So does a payload
+            // nested past serde_json's recursion limit, for every guard and an
+            // MCP call's fields included: cameronsjo/cadence-hooks#1624.
             //
             // Verified against a binary built from the pre-change `main`:
             //   conflicting apply_patch bodies, no env -> exit 2
