@@ -516,3 +516,34 @@ fn piped_stdin_logger_does_not_trigger_interactive_guard() {
         "guard must not fire on piped stdin: {stderr}"
     );
 }
+
+/// The retired alias hooks still dispatch through `check_plan`: old plugin
+/// wiring that calls them gets exit 0 and no output (cadence-hooks#1443).
+#[test]
+fn retired_alias_hooks_exit_silently() {
+    for (hook, command) in [
+        ("warn-alias-parsing", "ls -1 | grep config"),
+        (
+            "warn-curl-alias",
+            "curl -H 'Accept: application/json' https://x",
+        ),
+    ] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+        .to_string();
+        let mut cmd = cadence_hooks();
+        cmd.env("CADENCE_METRICS_DIR", scratch_config_dir());
+        cmd.args(["guardrails", hook]);
+        let output = run_with_stdin(cmd, &payload);
+        assert_eq!(output.status.code(), Some(0), "{hook}");
+        assert!(output.stdout.is_empty(), "{hook}: {:?}", output.stdout);
+        assert!(
+            output.stderr.is_empty(),
+            "{hook}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

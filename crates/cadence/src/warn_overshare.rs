@@ -3,8 +3,9 @@
 //! Fires on commit/push/PR/issue Bash commands and on Write/Edit to
 //! `docs/field-reports/` paths. The hook does the path triage; the model
 //! does the content judgment from the nudge text. It nudges at most once per
-//! session per agent per target (a session marker keyed on the target repo and
-//! the `agent_id`), since the text is the same every time (cadence-hooks#1443).
+//! session per agent per target for an allowlisted commit, push or `gh` post
+//! (a session marker keyed on the target and the `agent_id`), and every time
+//! for anything else, since the text is the same every time (cadence-hooks#1443).
 //!
 //! Skips:
 //! - `CADENCE_SKIP_OVERSHARE_AUDIT=1` — session-scoped bypass for repos
@@ -60,24 +61,16 @@ const BASH_MARKER_KIND: &str = "overshare-warned-bash";
 const WRITE_MARKER_KIND: &str = "overshare-warned-write";
 
 /// The session markers that stand for "this agent was already reminded about
-/// this target" (cadence-hooks#1443), or `None` when the input names a target
-/// the existing readers do not resolve exactly, so it nudges every time.
+/// this target" (cadence-hooks#1443), or `None` to nudge every time.
 ///
 /// Each key is one target plus the payload's `agent_id`: a subagent carries
 /// its parent's `session_id`, and the reminder has to reach the context that
 /// writes the outgoing text, so each agent gets its own first nudge.
 ///
-/// Targets, read from disk and existing argv readers only (no `git` process,
-/// no new parsing):
-/// - Write/Edit: the git root above the edited file's directory.
-/// - Bash with no target named: the git root above `cwd`.
-/// - `gh` with a literal `-R`/`--repo` that [`gh_repo_flags`] resolves: that
-///   slug.
-/// - Ungated: a leading `cd` that moves the work dir, `git` with any global
-///   option (`-C`, `--git-dir`, `-c`, ...), a `gh` repo flag that is not one
-///   literal slug, and every `tea` post.
-///
-/// [`gh_repo_flags`]: cadence_hooks_core::shell::gh_repo_flags
+/// A Write or Edit is keyed on the git root above the edited file. A Bash
+/// command is gated only when every posting segment is on the short allowlist
+/// in [`allowlisted_target`]; anything else nudges every time, so a post to a
+/// repo other than the one keyed can never be silenced by that repo's marker.
 fn marker_paths(input: &HookInput) -> Option<Vec<std::path::PathBuf>> {
     let agent = input.agent_id.as_deref().unwrap_or_default();
     let key = |kind: &str, target: &str| {
@@ -91,11 +84,11 @@ fn marker_paths(input: &HookInput) -> Option<Vec<std::path::PathBuf>> {
     let dir = dir.to_string_lossy().into_owned();
     let root = cadence_hooks_core::paths::find_git_root(&dir)
         .map(|root| root.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.clone());
+        .unwrap_or(dir);
     let Some(command) = input.command() else {
         return Some(vec![key(WRITE_MARKER_KIND, &root)]);
     };
-    bash_targets(command, &dir).map(|targets| {
+    bash_targets(command).map(|targets| {
         targets
             .iter()
             .map(|target| match target {
@@ -106,50 +99,117 @@ fn marker_paths(input: &HookInput) -> Option<Vec<std::path::PathBuf>> {
     })
 }
 
-/// Where a Bash post goes, as far as the existing readers say exactly.
+/// Where an allowlisted Bash post goes.
 #[derive(Debug, PartialEq, Eq)]
 enum Target {
     /// The repo `cwd` is in.
     Cwd,
-    /// A literal `gh -R owner/repo` (lowercased).
+    /// A literal `gh -R owner/repo` / `--repo owner/repo` (lowercased).
     GhRepo(String),
 }
 
-/// The targets of `command`'s posting segments, or `None` when one names a
-/// target not resolved exactly. See [`marker_paths`].
-fn bash_targets(command: &str, cwd: &str) -> Option<Vec<Target>> {
-    use cadence_hooks_core::shell::{
-        GhRepoFlag, command_segments, command_word, executable_tokens, gh_repo_flags,
-        parse_work_dir, peel_command_runners, skip_git_global_options,
-    };
-    if parse_work_dir(command, cwd) != cwd {
+/// The targets of `command`'s posting segments when every one is on the
+/// allowlist, else `None`. A command that mentions `cd ` or `pushd ` anywhere
+/// is never gated, since either may move where a later segment runs.
+fn bash_targets(command: &str) -> Option<Vec<Target>> {
+    use cadence_hooks_core::shell::{command_segments, executable_tokens};
+    if command.contains("cd ") || command.contains("pushd ") {
         return None;
     }
     let mut targets = Vec::new();
     for segment in command_segments(command) {
-        let tokens = executable_tokens(&segment);
-        let argv = peel_command_runners(&tokens);
-        let Some(head) = argv.first() else { continue };
-        let target = match command_word(head).as_ref() {
-            "git" if skip_git_global_options(&argv[1..]).len() + 1 == argv.len() => Target::Cwd,
-            "git" | "tea" => return None,
-            "gh" => match gh_repo_flags(argv).resolve() {
-                GhRepoFlag::Absent => Target::Cwd,
-                GhRepoFlag::Target(slug) if !slug.contains(['$', '`']) => {
-                    Target::GhRepo(slug.to_ascii_lowercase())
-                }
-                _ => return None,
-            },
-            _ => continue,
-        };
+        let argv = executable_tokens(&segment);
+        let posts = segment_posts(&segment, &argv);
+        if !posts {
+            continue;
+        }
+        let target = allowlisted_target(&argv)?;
         if !targets.contains(&target) {
             targets.push(target);
         }
     }
-    if targets.is_empty() {
-        targets.push(Target::Cwd);
+    // A trigger no segment accounts for is not on the allowlist.
+    (!targets.is_empty()).then_some(targets)
+}
+
+/// Does this segment carry a trigger (a posting verb, or `git push`)?
+fn segment_posts(segment: &str, argv: &[String]) -> bool {
+    let push = argv.windows(2).any(|w| w[0] == "git" && w[1] == "push");
+    push || (crate::redact_external_content::is_external_post(segment)
+        && !crate::redact_external_content::api_posts_no_prose(segment))
+}
+
+/// The allowlist, by plain token tests on the segment's argv (no runner
+/// peeling, so `env`, `sudo` or a `VAR=` prefix is never on it):
+/// - `git commit …` with no global option before `commit`: the cwd repo.
+/// - `git push …` with no global option and no argument that looks like a URL
+///   or path: the cwd repo.
+/// - `gh <group> <verb> …` (not `api`, not `gist`) with no argument containing
+///   `://` or `github.com/`: a literal `-R`/`--repo owner/repo` slug, or the
+///   cwd repo when there is no repo flag.
+fn allowlisted_target(argv: &[String]) -> Option<Target> {
+    let looks_like_location = |arg: &String| {
+        arg.contains("://")
+            || ["git@", "/", "./", "../", "~"]
+                .iter()
+                .any(|prefix| arg.starts_with(prefix))
+    };
+    match argv.first().map(String::as_str)? {
+        "git" => match argv.get(1).map(String::as_str)? {
+            "commit" => Some(Target::Cwd),
+            "push" if !argv[2..].iter().any(looks_like_location) => Some(Target::Cwd),
+            _ => None,
+        },
+        "gh" => {
+            if argv
+                .iter()
+                .any(|arg| arg.contains("://") || arg.contains("github.com/"))
+            {
+                return None;
+            }
+            let mut slugs = Vec::new();
+            let mut words = Vec::new();
+            let mut i = 1;
+            while let Some(arg) = argv.get(i) {
+                let value = match arg.as_str() {
+                    "-R" | "--repo" => {
+                        i += 1;
+                        Some(argv.get(i)?.clone())
+                    }
+                    a if a.starts_with("--repo=") => Some(a["--repo=".len()..].to_string()),
+                    a if a.starts_with("-R") => Some(a[2..].to_string()),
+                    _ => None,
+                };
+                match value {
+                    Some(v) => slugs.push(v),
+                    None if !arg.starts_with('-') && words.len() < 2 => words.push(arg.as_str()),
+                    None => {}
+                }
+                i += 1;
+            }
+            if matches!(words.first(), None | Some(&"api") | Some(&"gist")) {
+                return None;
+            }
+            match slugs.as_slice() {
+                [] => Some(Target::Cwd),
+                [slug] if is_literal_slug(slug) => Some(Target::GhRepo(slug.to_ascii_lowercase())),
+                _ => None,
+            }
+        }
+        _ => None,
     }
-    Some(targets)
+}
+
+/// `owner/repo`: exactly one `/`, both halves non-empty and made of the
+/// characters GitHub allows.
+fn is_literal_slug(slug: &str) -> bool {
+    let ok = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    matches!(slug.split_once('/'), Some((owner, repo)) if ok(owner) && ok(repo))
 }
 
 /// Let `nudge` through unless every marker in `markers` is already recorded
@@ -765,35 +825,68 @@ mod tests {
         );
     }
 
+    /// Each allowlisted form, through the real check: the first call nudges,
+    /// the same form again for the same agent and target is silent.
     #[test]
-    fn a_named_target_keys_on_the_target_or_skips_the_gate() {
+    fn allowlisted_forms_nudge_once() {
         let dir = two_repos();
         let a = dir.path().join("a");
-        let key = |command: &str| marker_paths(&bash_at(command, &a, "s1", None));
-        let cwd_key = key("gh issue create --title x --body-file b.md").expect("gated");
-        let public = key("gh issue create -R owner/public --title x --body-file b.md")
-            .expect("a literal -R slug is read exactly");
-        assert_ne!(cwd_key, public, "-R names another repo's key");
-        assert_eq!(
-            public,
-            key("gh -R Owner/Public issue create --title x").expect("gated")
-        );
-        for command in [
-            "git -C ../b push",
-            "git -C ../b commit -m x",
-            "cd ../b && git push",
-            "gh issue create -R \"$REPO\" --title x",
-            "tea pr create --title x",
+        for (sid, command) in [
+            ("c1", "git commit -m 'fix: thing'"),
+            ("c2", "git add -A && git commit -m x"),
+            ("p1", "git push origin feature"),
+            ("p2", "git push -u origin HEAD:refs/heads/x"),
+            ("g1", "gh pr create --draft --title t --body-file b.md"),
+            ("g2", "gh issue comment 5 --body-file c.md"),
+            (
+                "r1",
+                "gh issue create -R owner/public --title t --body-file b.md",
+            ),
+            ("r2", "gh --repo owner/public pr comment 5 --body-file c.md"),
         ] {
-            assert!(
-                key(command).is_none(),
-                "{command}: an unresolved target nudges every time"
-            );
+            let markers = tempfile::tempdir().expect("marker dir");
+            cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+                let run = || WarnOvershare.run(&bash_at(command, &a, sid, None)).outcome;
+                assert_eq!(run(), Outcome::Nudge, "{command}: first call");
+                assert_eq!(run(), Outcome::Allow, "{command}: second call");
+            });
         }
     }
 
-    /// The real check, end to end: nudge, then silence for the same agent and
-    /// target, then a nudge for another target or agent.
+    /// Every form off the allowlist nudges every time, even after a nudge in
+    /// the same session and cwd repo (security review on PR 1629).
+    #[test]
+    fn forms_off_the_allowlist_nudge_every_time() {
+        let dir = two_repos();
+        let a = dir.path().join("a");
+        let markers = tempfile::tempdir().expect("marker dir");
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let run = |command: &str| WarnOvershare.run(&bash_at(command, &a, "s1", None)).outcome;
+            assert_eq!(run("git commit -m first"), Outcome::Nudge);
+            assert_eq!(run("gh pr create --title t"), Outcome::Allow);
+            for command in [
+                "gh api repos/owner/other/issues/5/comments -f body=hello",
+                "gh pr comment https://github.com/owner/other2/pull/5 --body hi",
+                "GH_REPO=owner/other3 gh issue create --title t --body b",
+                "gh gist create --public notes.md --desc d",
+                "pushd ../b && git push",
+                "cd ../b && git push",
+                "git push https://github.com/owner/other4.git HEAD",
+                "git push git@github.com:owner/other5.git HEAD",
+                "git push ../b main",
+                "git -C ../b commit -m x",
+                "gh issue create -R \"$REPO\" --title x",
+                "tea pr create --title x",
+                "env git commit -m x",
+            ] {
+                assert_eq!(run(command), Outcome::Nudge, "{command}: first");
+                assert_eq!(run(command), Outcome::Nudge, "{command}: second");
+            }
+        });
+    }
+
+    /// Keys differ per agent and per `-R` slug, and a call that does not
+    /// nudge spends no reminder.
     #[test]
     fn run_nudges_once_per_agent_and_target() {
         let dir = two_repos();
@@ -816,10 +909,7 @@ mod tests {
                 run("gh pr comment 5 -R owner/public --body b", None),
                 Outcome::Allow
             );
-            assert_eq!(run("git -C ../b commit -m x", None), Outcome::Nudge);
-            assert_eq!(run("git -C ../b commit -m x", None), Outcome::Nudge);
             assert_eq!(run("git status", None), Outcome::Allow);
-            // A call that does not nudge spends no reminder.
             assert_eq!(run("git status", Some("ag2")), Outcome::Allow);
             assert_eq!(run("git push origin q", Some("ag2")), Outcome::Nudge);
         });

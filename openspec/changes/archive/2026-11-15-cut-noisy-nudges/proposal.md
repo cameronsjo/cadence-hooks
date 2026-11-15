@@ -10,7 +10,7 @@ Three nudges fired thousands of times in two weeks and added text to the model's
 
 - `warn-alias-parsing` and `warn-curl-alias` are retired. Their subcommands stay and exit 0 with no output, because plugin `hooks.json` files still call them until cameronsjo/cadence removes that wiring. An unknown subcommand would print a version notice and exit 1 on every matching call.
 - `git-safety` allows a command it cannot read without a note. Every block and every history-rewrite nudge is unchanged.
-- `warn-overshare` nudges at most once per session, per agent, per trigger and per target, through the shared session marker. A command that names a target the existing readers do not resolve exactly nudges every time. What it matches is unchanged.
+- `warn-overshare` nudges at most once per session, per agent, per trigger and per target, but only for a short allowlist of forms (a plain `git commit`, a plain `git push`, a `gh` post with no URL or with a literal `-R` slug). Every other trigger nudges every time. What it matches is unchanged.
 
 ## Capabilities
 
@@ -22,7 +22,7 @@ None.
 
 - `tool-nudges`: the two alias requirements are removed; "Retired alias hooks exit silently" is added; "Advisory tool nudges are suppressible per repo" is replaced by "Advisory tool nudges can be silenced per repo", which no longer names the retired hooks.
 - `git-safety`: "Unseen execution nudges" is removed; "Commands the guard cannot read are allowed silently" replaces it.
-- `external-content`: "Overshare audit fires once per agent per target" is added.
+- `external-content`: "Overshare audit fires once per agent per target" and "Overshare audit nudges every time off the allowlist" are added.
 
 ## Impact
 
