@@ -2,19 +2,19 @@
 //!
 //! Detects `gh` sub-commands that mutate GitHub state (create, merge, close,
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
-//! an allowed owner list. Also blocks looped writes and cross-repo mutations.
+//! an allowed owner list. Only a target the guard read exactly is judged; a
+//! target it cannot read is allowed (cadence-ecosystem ADR-0046 rule 3).
 
 use cadence_hooks_core::config::{
     self, AllowEntry, default_host, env_allow_entries, env_extra_hosts,
 };
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
-use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
+use cadence_hooks_core::loop_analysis;
 use cadence_hooks_core::shell::{
-    COMMAND_RUNNERS, CommandWordVariables, ExpansionWork, GhRepoFlag, LOOP_PATTERN, TRANSPARENT,
-    UnreadEval, brace_expansion_overflows, carries_substitution, command_segments,
-    command_segments_with_dirs_reading, command_word, contains_ignoring_ascii_case,
-    gh_canonical_verb, gh_command_path, gh_repo_flags, host_and_repo_from_url, may_spell_word,
-    parse_gh_repo_value, parse_work_dir, requote_words, split_segments_with_ops, strip_quotes,
+    COMMAND_RUNNERS, CommandWordVariables, ExpansionWork, GhRepoFlag, TRANSPARENT, UnreadEval,
+    carries_substitution, command_segments, command_segments_with_dirs_reading, command_word,
+    contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
+    host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
     tokenize,
 };
 use cadence_hooks_core::shell::{
@@ -129,27 +129,6 @@ const NAME_KEEPING_VERBS: &[&str] = &["create"];
 /// decoy stand in for the real target (see [`api_repos_target`]).
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
-
-/// Word-boundary match for the lowercase GraphQL `mutation` operation keyword —
-/// the signal that a `gh api graphql` query writes rather than reads. Matched
-/// case-SENSITIVELY: the operation keyword is lowercase, whereas the *type* name
-/// `Mutation` (e.g. an introspection read `__type(name: "Mutation")`) is
-/// capitalized and must not be mistaken for a write (#263).
-static MUTATION_KEYWORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bmutation\b").expect("pattern should compile"));
-
-/// GraphQL mutation root fields safe to auto-allow: pure boolean thread metadata
-/// on a PR review that carries no attacker-controllable payload.
-/// `resolveReviewThread`/`unresolveReviewThread` only toggle a review thread's
-/// resolved flag, so they're allowed like reads (#262, #300, #317).
-///
-/// Deliberately EXCLUDED: `addPullRequestReviewThreadReply` posts
-/// attacker-controllable text as the user (its REST equivalent goes through
-/// owner-verified `repos/<owner>/<repo>` paths, so it stays checkable there).
-/// It's a future maintainer's-call candidate, not an oversight. `addComment` and
-/// `addPullRequestReview` are likewise out — any field that writes content stays
-/// blocked.
-static SAFE_GRAPHQL_MUTATIONS: [&str; 2] = ["resolveReviewThread", "unresolveReviewThread"];
 
 /// True when `command` names a `gh` sub-command that mutates GitHub state.
 ///
@@ -276,7 +255,8 @@ pub(crate) enum RepoFlag {
     /// override at all. Both the value and the fallback are judged.
     TargetOrAbsent(String),
     /// Two or more readings disagree, so which one gh obeys depends on a flag
-    /// table this guard does not have. Fails closed — see [`repo_flag`].
+    /// table this guard does not have. The target is unread, so the write is
+    /// allowed (cadence-ecosystem ADR-0046 rule 3) — see [`repo_flag`].
     Ambiguous,
 }
 
@@ -294,13 +274,12 @@ pub(crate) enum RepoFlag {
 /// `eval "gh … -R evil/target"` wrapper is peeled like every other arm already
 /// peels it (#463).
 ///
-/// **Certain readings resolve last-wins, as pflag does; uncertain ones fail
-/// closed.** A token that merely looks like a repo flag may be another flag's
-/// value — `--body -Rcameronsjo/allowed` is a body, not a target — and
-/// telling them apart needs gh's per-subcommand flag table, with both wrong
-/// guesses resolving toward ALLOW. So an uncertain reading after the last
-/// certain one that names another repo is [`RepoFlag::Ambiguous`] (the caller
-/// blocks), and a lone reading that may be a value is
+/// **Certain readings resolve last-wins, as pflag does.** A token that merely
+/// looks like a repo flag may be another flag's value — `--body
+/// -Rcameronsjo/allowed` is a body, not a target — and telling them apart
+/// needs gh's per-subcommand flag table. So an uncertain reading after the
+/// last certain one that names another repo is [`RepoFlag::Ambiguous`] (the
+/// caller allows: the target is unread), and a lone reading that may be a value is
 /// [`RepoFlag::TargetOrAbsent`], which judges the cwd fallback too — without
 /// that, `--body -Rcameronsjo/x` from an unowned checkout was judged as the
 /// owned decoy while gh wrote to the checkout's own repo (cadence-hooks#1069).
@@ -629,22 +608,10 @@ enum RepoResolution {
         upstream_host: String,
         upstream: String,
     },
-    /// Cannot determine target
+    /// Cannot determine target: allowed (cadence-ecosystem ADR-0046 rule 3).
     Unresolvable,
-    /// Repo flags disagree, so the target depends on gh's flag table rather
-    /// than on anything readable here ([`RepoFlag::Ambiguous`]). Distinct from
-    /// `Unresolvable` only in the message — a target WAS spelled out, so "add
-    /// `-R`" would be useless advice — and blocks under the same rule id.
-    AmbiguousFlags,
-    /// A `-R`/`--repo`/`GH_REPO` value gh would not read as a URL or
-    /// `[HOST/]OWNER/REPO` — or that this guard cannot promise to split the
-    /// way gh does ([`parse_gh_repo_value`]). Blocks: a target that cannot be
-    /// read cannot be judged owned (cadence-hooks#937).
-    UnreadableFlag(String),
-    /// Resolution abandoned at the #271 subprocess deadline. Distinct from
-    /// `Unresolvable` (git answered; genuinely ambiguous — fail-closed block
-    /// stands): a timeout is the guard's own infrastructure failing, which
-    /// degrades to a loud fail-open, never a false block (ADR-0001).
+    /// Resolution abandoned at the #271 subprocess deadline: the guard's own
+    /// infrastructure failing, which degrades to a loud fail-open (ADR-0001).
     TimedOut,
 }
 
@@ -692,764 +659,6 @@ fn gh_api_subcommand_index(argv: &[String]) -> Option<usize> {
     (argv.get(index).map(String::as_str) == Some("api")).then_some(index)
 }
 
-/// Stand-in host for a `GH_HOST` this guard could not resolve (#548). It matches
-/// no allowlist entry — bare entries match only the default host and
-/// `CADENCE_EXTRA_HOSTS`, and no hostname contains a space — so a write judged
-/// against it always blocks.
-const UNRESOLVED_GH_HOST: &str = "<unresolved $GH_HOST>";
-
-/// Shell keywords [`command_segments`] can leave in front of a segment's
-/// command word (`then export GH_HOST=…`).
-const SEGMENT_KEYWORDS: &[&str] = &[
-    "then", "do", "else", "elif", "if", "while", "until", "!", "{", "time",
-];
-
-/// Commands that can set or export a shell variable in the CURRENT shell other
-/// than through a plain `export NAME=value`. A `GH_HOST` mention under any of
-/// them is not modeled, so it resolves to [`UNRESOLVED_GH_HOST`].
-const VAR_SETTING_BUILTINS: &[&str] = &[
-    "read",
-    "printf",
-    "source",
-    ".",
-    "set",
-    "mapfile",
-    "readarray",
-    "let",
-    "getopts",
-    ":",
-    "exec",
-];
-
-/// Builtins that write a variable named by an operand rather than by a
-/// `NAME=value` word — see [`indirect_name_operands`].
-const NAME_OPERAND_BUILTINS: &[&str] = &["read", "printf", "mapfile", "readarray", "getopts"];
-
-/// The operands of a [`NAME_OPERAND_BUILTINS`] invocation that name the
-/// variable it writes. Values of value-taking options are stepped over so a
-/// `read -p "Host: "` prompt is not mistaken for a name.
-fn indirect_name_operands(builtin: &str, args: &[String]) -> Vec<String> {
-    // Redirections are not operands: drop `<<<word`, `2>/dev/null`, and a bare
-    // operator together with its target.
-    let mut kept = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        let body = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-        if body.starts_with(['<', '>']) {
-            let operator_only = body.chars().all(|c| matches!(c, '<' | '>' | '&' | '|'));
-            i += if operator_only { 2 } else { 1 };
-            continue;
-        }
-        kept.push(arg.clone());
-        i += 1;
-    }
-    let args = &kept[..];
-    let mut names = Vec::new();
-    match builtin {
-        "printf" => {
-            let mut i = 0;
-            while i < args.len() {
-                if args[i] == "-v" {
-                    if let Some(name) = args.get(i + 1) {
-                        names.push(name.clone());
-                    }
-                    i += 2;
-                } else if let Some(name) = args[i].strip_prefix("-v") {
-                    names.push(name.to_string());
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-        }
-        "getopts" => {
-            if let Some(name) = args.iter().filter(|a| !a.starts_with('-')).nth(1) {
-                names.push(name.clone());
-            }
-        }
-        _ => {
-            // read / mapfile / readarray: options, then name operands.
-            let (value_opts, name_opts) = if builtin == "read" {
-                ("dinNptu", "a")
-            } else {
-                ("dnOsuCc", "")
-            };
-            let mut i = 0;
-            while i < args.len() {
-                let arg = &args[i];
-                if arg == "--" {
-                    names.extend(args[i + 1..].iter().cloned());
-                    break;
-                }
-                if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
-                    let last = cluster.chars().last().unwrap_or(' ');
-                    if value_opts.contains(last) || name_opts.contains(last) {
-                        if name_opts.contains(last)
-                            && let Some(name) = args.get(i + 1)
-                        {
-                            names.push(name.clone());
-                        }
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                    continue;
-                }
-                names.push(arg.clone());
-                i += 1;
-            }
-        }
-    }
-    names
-}
-
-/// Builtins that declare a variable from `NAME[=value]` arguments. Each argument
-/// is judged by its NAME, not by whether the text mentions `GH_HOST`: the shell
-/// expands the word before the builtin reads it, so `export GH_HOS${X}T=evil`
-/// sets `GH_HOST` while never spelling it (#548 review).
-const DECLARING_BUILTINS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
-
-/// An assignment to `GH_HOST` inside a parameter or arithmetic expansion —
-/// `${GH_HOST=…}`, `${GH_HOST:=…}`, `$(( GH_HOST = … ))`, `(( GH_HOST += … ))`.
-/// The only way a command that is not a declaring builtin can leave `GH_HOST`
-/// changed behind it; a mere mention (`rg GH_HOST`, a commit message) cannot.
-static GH_HOST_EXPANSION_ASSIGNMENT: LazyLock<Regex> =
-    LazyLock::new(|| expansion_assignment_pattern("GH_HOST"));
-
-/// [`GH_HOST_EXPANSION_ASSIGNMENT`] for `GH_REPO` (cadence-hooks#1129).
-static GH_REPO_EXPANSION_ASSIGNMENT: LazyLock<Regex> =
-    LazyLock::new(|| expansion_assignment_pattern("GH_REPO"));
-
-fn expansion_assignment_pattern(name: &str) -> Regex {
-    Regex::new(&format!(
-        r"\$\{{{name}:?=|\(\([^)]*\b{name}\s*(?:<<|>>|[-+*/%&|^])?=(?:[^=]|$)"
-    ))
-    .expect("pattern should compile")
-}
-
-/// Stand-in `GH_REPO` for one this guard could not resolve (cadence-hooks#1129).
-/// It carries a `$`, so a write judged against it is the unexpanded-expansion
-/// block — never owned.
-const UNRESOLVED_GH_REPO: &str = "$GH_REPO";
-
-/// The `GH_HOST` values a gh process may inherit at a point in one command,
-/// tracked across its segments (#548).
-///
-/// An inline `GH_HOST=h gh …` was already read by [`gh_command_host`], but an
-/// `export GH_HOST=h` in an EARLIER segment reaches the child just the same,
-/// and the guard used to judge that write against the hook's own host.
-///
-/// Transitions ADD a candidate rather than replace one. The walk runs over the
-/// flattened [`command_segments`] list, which drops the operators between
-/// segments, so it cannot tell whether an `export` or `unset` actually ran:
-/// `export GH_HOST=evil; false && unset GH_HOST; gh …` still reaches `evil`.
-/// A write is judged against every candidate and must be owned on each — the
-/// set only ever grows, so every imprecision here costs a false block, never a
-/// wrong-host allow.
-///
-/// What is modeled precisely: `export GH_HOST=<literal>`, `unset [-v]
-/// GH_HOST` (when the hook process had no `GH_HOST` to fall back to), and a
-/// bare `GH_HOST=<literal>` — which reaches gh only once the variable is
-/// exported (an earlier `export`, `set -a`, or a `GH_HOST` the shell already
-/// inherited), so `GH_HOST=x; gh …` alone stays exactly as before. Anything
-/// else that can set it adds [`UNRESOLVED_GH_HOST`]: a declaring builtin
-/// (`declare -x`, `readonly`, …) naming it, or naming ANY variable whose name
-/// is not a plain literal (`export GH_HOS${X}T=…`, `GH_HOS{T,}`); an expansion
-/// in the value; `export -n`; a `GH_HOST` mention under `eval`, `read`,
-/// `printf` and the like; and an assignment inside `${…}` or `$((…))`.
-///
-/// A segment that invokes gh is never observed — a child process cannot change
-/// the parent shell's environment, and its arguments are prose as often as not
-/// (`--title "fix GH_HOST export"`). A plain mention by any other command
-/// (`rg GH_HOST`, `git commit -m "…GH_HOST…"`) changes nothing either.
-///
-/// Not modeled, and so unchanged: a file that is `source`d, whose contents
-/// this guard never sees.
-///
-/// **The same walk tracks `GH_REPO`** (cadence-hooks#1129): an
-/// `export GH_REPO=evil/x` earlier in the command retargets every later
-/// un-flagged gh write exactly as the inline `GH_REPO=evil/x gh …` does. Built
-/// with [`Self::for_repo`], a candidate is a repo value, and the empty string
-/// stands for "no `GH_REPO`" — gh then resolves the target itself.
-#[derive(Debug)]
-struct GhHostEnv {
-    /// The variable tracked: `GH_HOST` or `GH_REPO`.
-    var: &'static str,
-    candidates: Vec<String>,
-    /// `GH_HOST` carries the export attribute, so a bare assignment reaches gh.
-    exported: bool,
-    /// `set -a` was seen: every bare assignment is exported.
-    allexport: bool,
-    /// The hook process (and so the shell) inherited a `GH_HOST`.
-    inherited: bool,
-    /// The whole command, raw — heredoc bodies included, which the segment
-    /// list strips. Read only for a `source`/`.` fed by a heredoc.
-    raw_command: String,
-}
-
-impl GhHostEnv {
-    fn from_process() -> Self {
-        Self::tracking("GH_HOST")
-    }
-
-    fn tracking(var: &'static str) -> Self {
-        let inherited = std::env::var_os(var).is_some();
-        let initial = if var == "GH_HOST" {
-            default_host()
-        } else {
-            // gh reads an inherited GH_REPO too; an empty one is unset.
-            std::env::var(var).unwrap_or_default()
-        };
-        Self {
-            var,
-            candidates: vec![initial],
-            exported: inherited,
-            allexport: false,
-            inherited,
-            raw_command: String::new(),
-        }
-    }
-
-    /// [`Self::from_process`] for judging `command`, whose raw text a heredoc
-    /// fed to `source` is read from.
-    fn for_command(command: &str) -> Self {
-        Self {
-            raw_command: command.to_string(),
-            ..Self::from_process()
-        }
-    }
-
-    /// The `GH_REPO` form of [`Self::for_command`].
-    fn for_repo(command: &str) -> Self {
-        Self {
-            raw_command: command.to_string(),
-            ..Self::tracking("GH_REPO")
-        }
-    }
-
-    fn is_host(&self) -> bool {
-        self.var == "GH_HOST"
-    }
-
-    /// Does `word` name the tracked variable other than by a plain read?
-    fn mentions(&self, word: &str) -> bool {
-        mentions_var(word, self.var)
-    }
-
-    /// The candidate after `unset`: the process default host, or no repo.
-    fn unset_value(&self) -> String {
-        if self.is_host() {
-            default_host()
-        } else {
-            String::new()
-        }
-    }
-
-    fn candidates(&self) -> &[String] {
-        &self.candidates
-    }
-
-    fn add(&mut self, host: String) {
-        if !self.candidates.contains(&host) {
-            self.candidates.push(host);
-        }
-    }
-
-    fn add_unresolved(&mut self) {
-        let marker = if self.is_host() {
-            UNRESOLVED_GH_HOST
-        } else {
-            UNRESOLVED_GH_REPO
-        };
-        self.add(marker.to_string());
-    }
-
-    /// Add the host a `GH_HOST=<value>` assignment names — or the unresolved
-    /// stand-in for an empty value or one still carrying an expansion.
-    fn add_assigned(&mut self, value: &str) {
-        if value.is_empty() || value.contains('$') || value.contains('`') {
-            self.add_unresolved();
-        } else if self.is_host() {
-            self.add(value.to_ascii_lowercase());
-        } else {
-            self.add(value.to_string());
-        }
-    }
-
-    fn observe(&mut self, segment: &str) {
-        self.observe_depth(segment, 0);
-    }
-
-    /// A `GH_HOST` assigned in front of a command that runs gh one level
-    /// down — `GH_HOST=h bash -c "gh …"`, `env GH_HOST=h sh -c '…'`. The
-    /// segment list hands the inner gh over as its own segment, without the
-    /// prefix, so the host the child inherits has to be recorded here
-    /// (cadence-hooks#1077). Only the leading words are read — assignments,
-    /// command runners and their options — up to the command they run, so a
-    /// `GH_HOST=…` that is merely an argument (`echo GH_HOST=x`) counts for
-    /// nothing. A name that is not a plain literal may expand to `GH_HOST`,
-    /// so it is unresolved, as [`gh_command_host`] treats it.
-    ///
-    /// Recorded for every later gh segment of the command, not just the
-    /// wrapper's own: over-inclusive, which can only add a host to judge.
-    fn observe_wrapper_prefix(&mut self, segment: &str) {
-        if !contains_ignoring_ascii_case(segment, "gh") {
-            return;
-        }
-        let tokens = tokenize(segment);
-        let mut hosts: Vec<Option<&str>> = Vec::new();
-        let mut command_at = tokens.len();
-        for (at, token) in tokens.iter().enumerate() {
-            let is_runner = COMMAND_RUNNERS.contains(&command_word(token).as_ref());
-            if is_runner || token.starts_with('-') || SEGMENT_KEYWORDS.contains(&token.as_str()) {
-                continue;
-            }
-            match token.split_once('=') {
-                Some((name, value)) if name == self.var => hosts.push(Some(value)),
-                Some((name, _)) if !is_literal_identifier(name) => hosts.push(None),
-                Some(_) => {}
-                None => {
-                    command_at = at;
-                    break;
-                }
-            }
-        }
-        // Only a command that goes on to run gh: `GH_HOST=h make docs` sets
-        // the host for `make` alone.
-        if !tokens[command_at..]
-            .iter()
-            .any(|token| contains_ignoring_ascii_case(token, "gh"))
-        {
-            return;
-        }
-        for host in hosts {
-            match host {
-                Some(value) => self.add_assigned(value),
-                None => self.add_unresolved(),
-            }
-        }
-    }
-
-    fn observe_depth(&mut self, segment: &str, depth: usize) {
-        if observes_nothing(segment, self.var) {
-            return;
-        }
-        let tokens = tokenize(segment);
-        let normalized = strip_compound_openers(&tokens);
-        let mut words: &[String] = &normalized;
-        while words
-            .first()
-            .is_some_and(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
-        {
-            words = &words[1..];
-        }
-        let assignments = words.iter().take_while(|w| is_shell_assignment(w)).count();
-        let (prefix, mut rest) = words.split_at(assignments);
-        // `builtin export …` / `command export …` run the same builtin, as do
-        // `command -p …` and either with `--`. `command -v`/`-V` only look a
-        // name up and run nothing, so such a segment changes nothing.
-        while let Some(wrapper) = rest.first().map(|w| w.replace('\\', ""))
-            && matches!(wrapper.as_str(), "builtin" | "command")
-        {
-            let mut next = 1;
-            while let Some(option) = rest.get(next) {
-                if option == "--" {
-                    next += 1;
-                    break;
-                }
-                let Some(flags) = option.strip_prefix('-').filter(|f| !f.is_empty()) else {
-                    break;
-                };
-                if wrapper != "command" {
-                    break;
-                }
-                if flags.contains(['v', 'V']) {
-                    return;
-                }
-                if !flags.chars().all(|c| c == 'p') {
-                    break;
-                }
-                next += 1;
-            }
-            match rest.get(next) {
-                Some(word) if !word.starts_with('-') => rest = &rest[next..],
-                _ => break,
-            }
-        }
-        // Backslashes in a command word only suppress alias expansion: `\trap`
-        // and `t\rap` are both `trap`.
-        let command_word = rest
-            .first()
-            .map(|w| w.rsplit('/').next().unwrap_or(w).replace('\\', ""));
-        let command = command_word.as_deref();
-
-        // FAIL CLOSED where the command position was not understood: a
-        // subshell, function body or case arm this normalization missed still
-        // runs its builtin in some shell, so a declaring or name-writing
-        // builtin ANYWHERE in the segment, next to a `GH_HOST` mention or a
-        // non-literal `NAME=`, is unresolved (#1073 live review).
-        let understood = command.is_some_and(|c| {
-            DECLARING_BUILTINS.contains(&c)
-                || NAME_OPERAND_BUILTINS.contains(&c)
-                || c == "unset"
-                || c == "eval"
-                || c == "trap"
-        });
-        if !understood
-            && tokens.iter().any(|t| {
-                let word = t.trim_start_matches(['(', '{']);
-                DECLARING_BUILTINS.contains(&word)
-                    || NAME_OPERAND_BUILTINS.contains(&word)
-                    || word == "unset"
-            })
-            && tokens.iter().any(|t| {
-                self.mentions(t)
-                    || (!t.starts_with('-')
-                        && t.split_once('=').is_some_and(|(name, _)| {
-                            // `[ "$m" = export ]`: a bare `=` names nothing.
-                            !name.is_empty() && !is_literal_identifier(name)
-                        }))
-            })
-        {
-            self.add_unresolved();
-        }
-
-        // `source`/`.` fed by a heredoc or stdin runs text the segment list
-        // never shows (#1073 live review).
-        if matches!(command, Some("source" | "."))
-            && sources_inline_text(segment)
-            && (self.raw_command.contains(self.var)
-                || RAW_NONLITERAL_DECLARATION.is_match(&self.raw_command))
-        {
-            self.add_unresolved();
-        }
-
-        if command == Some("set")
-            && rest[1..].iter().any(|w| {
-                w == "allexport" || (w.starts_with('-') && !w.starts_with("--") && w.contains('a'))
-            })
-        {
-            self.allexport = true;
-        }
-
-        if let Some(name) = command.filter(|c| DECLARING_BUILTINS.contains(c)) {
-            if prefix.iter().any(|w| self.mentions(w)) {
-                self.add_unresolved();
-            }
-            self.observe_declaration(name, &rest[1..]);
-            return;
-        }
-        // `eval` runs its words in THIS shell, so an export inside it counts.
-        // Past the nesting cap its words go unread, so the host is unknown
-        // (#1073 review I-d).
-        if command == Some("eval") {
-            self.observe_nested(&rest[1..].join(" "), depth);
-        }
-        // A `trap` action runs later in this shell, so it is read like an
-        // `eval` string (#1073 review). `trap -p`, `trap -l` and `trap - SIG`
-        // run nothing.
-        if command == Some("trap") {
-            // After `--` a leading dash is part of the action, and only an
-            // action of exactly `-` (reset) runs nothing. Without `--`, a
-            // leading dash is an option (`-p`, `-l`) or that same reset.
-            let action = match rest[1..].split_first() {
-                Some((first, tail)) if first == "--" => tail.first().filter(|a| *a != "-"),
-                Some((first, _)) => Some(first).filter(|a| !a.starts_with('-')),
-                None => None,
-            };
-            if let Some(action) = action {
-                self.observe_nested(action, depth);
-            }
-        }
-        if let Some(name) = command.filter(|c| NAME_OPERAND_BUILTINS.contains(c))
-            && indirect_name_operands(name, &rest[1..])
-                .iter()
-                .any(|operand| !is_literal_identifier(operand) || operand == self.var)
-        {
-            // `printf -v GH_HOS${X}T …`, `read GH_HOS${X}T` (#1073 review I-c).
-            self.add_unresolved();
-        }
-
-        match command {
-            // Assignments only: shell variables, which reach gh only once
-            // exported.
-            None => {
-                if !(self.exported || self.allexport) {
-                    return;
-                }
-                for word in prefix {
-                    if let Some(value) = word
-                        .strip_prefix(self.var)
-                        .and_then(|rest| rest.strip_prefix('='))
-                    {
-                        self.add_assigned(value);
-                    } else if mentions_gh_host(word) {
-                        self.add_unresolved();
-                    }
-                }
-            }
-            Some("unset") => {
-                let args = &rest[1..];
-                if !tokens.iter().any(|t| self.mentions(t)) {
-                    return;
-                }
-                let unsets = args.iter().any(|w| w == self.var);
-                if prefix.iter().any(|w| self.mentions(w))
-                    || args.iter().any(|w| w.starts_with('-') && w != "-v")
-                    || args.iter().any(|w| w != self.var && self.mentions(w))
-                {
-                    self.add_unresolved();
-                } else if unsets {
-                    // gh then falls back to its own configured default, which
-                    // is the process default only when there was no inherited
-                    // `GH_HOST` for the hook to have read instead.
-                    if self.inherited {
-                        self.add_unresolved();
-                    } else {
-                        self.add(self.unset_value());
-                    }
-                }
-            }
-            Some(name) if name == "eval" || VAR_SETTING_BUILTINS.contains(&name) => {
-                if tokens.iter().any(|t| self.mentions(t)) {
-                    self.add_unresolved();
-                }
-            }
-            // Any other command: a prefix assignment lives only for that
-            // command, and a mention is only a mention — just an assignment
-            // inside an expansion can leave something behind.
-            Some(_) => {
-                let expansion_assignment = if self.is_host() {
-                    &GH_HOST_EXPANSION_ASSIGNMENT
-                } else {
-                    &GH_REPO_EXPANSION_ASSIGNMENT
-                };
-                if expansion_assignment.is_match(segment) {
-                    self.add_unresolved();
-                }
-            }
-        }
-    }
-
-    /// Observe a script this shell will run from a string (`eval`, a `trap`
-    /// action). Past [`MAX_EVAL_DEPTH`] its words go unread, so the value is
-    /// unresolved. A command word built by an expansion (`eval "$(…)"`,
-    /// `eval "$X"`) is text this walk never sees, so it is skipped: the guard
-    /// judges the hosts it did read (cadence-ecosystem ADR-0046 rule 3).
-    fn observe_nested(&mut self, script: &str, depth: usize) {
-        if depth >= MAX_EVAL_DEPTH {
-            self.add_unresolved();
-            return;
-        }
-        for inner in command_segments(script) {
-            if segment_invokes_gh(&inner) || command_word_is_dynamic(&inner) {
-                continue;
-            }
-            self.observe_depth(&inner, depth + 1);
-        }
-    }
-
-    /// One `export`/`declare`/`typeset`/`readonly`/`local` invocation's
-    /// arguments. See [`DECLARING_BUILTINS`].
-    fn observe_declaration(&mut self, builtin: &str, args: &[String]) {
-        let unexport = builtin == "export" && args.iter().any(|w| w == "-n");
-        // A nameref (`declare -n r=GH_HOST`) makes every later write to `r` a
-        // write to its target, which no later segment spells. Any nameref, or
-        // any value naming GH_HOST, is unresolved (#1073 review I-c).
-        let nameref = builtin != "export"
-            && args
-                .iter()
-                .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('n'));
-        if nameref
-            || (builtin != "export"
-                && args
-                    .iter()
-                    .any(|w| w.split_once('=').is_some_and(|(_, v)| v.contains(self.var))))
-        {
-            self.add_unresolved();
-        }
-        for word in args {
-            if word.starts_with('-') || word.starts_with('+') {
-                continue;
-            }
-            let name = word.split_once('=').map_or(word.as_str(), |(n, _)| n);
-            if !is_literal_identifier(name) {
-                // `GH_HOS${X}T`, `GH_HOS{T,}`, a backtick, a stray quote: the
-                // name is only known once the shell expands it.
-                self.add_unresolved();
-                continue;
-            }
-            if name.strip_suffix('+').unwrap_or(name) != self.var {
-                continue;
-            }
-            if builtin != "export" || unexport {
-                // Not modeled: declare/typeset/readonly/local attributes and
-                // `export -n` un-exporting.
-                self.add_unresolved();
-                continue;
-            }
-            self.exported = true;
-            match word
-                .strip_prefix(self.var)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
-                Some(value) => self.add_assigned(value),
-                // `export GH_HOST` exports whatever the shell variable holds;
-                // `GH_HOST+=…` appends to it.
-                None => self.add_unresolved(),
-            }
-        }
-    }
-}
-
-/// A plain shell identifier (`[A-Za-z_][A-Za-z0-9_]*`), optionally with the
-/// trailing `+` of a `NAME+=` append. Anything else — `$`, a backslash, `{`, a
-/// backtick, a quote — means the shell decides the name, not the text.
-fn is_literal_identifier(name: &str) -> bool {
-    let name = name.strip_suffix('+').unwrap_or(name);
-    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Tokens with the openers of a compound command removed, so the builtin
-/// inside is found at command position: a leading `(` (`(export …`), a
-/// function definition head (`name()`, `name(){`, `name ( ) {`,
-/// `function name {`), and a case arm's pattern (`case x in x)`, `y)`).
-fn strip_compound_openers(tokens: &[String]) -> Vec<String> {
-    // A cursor rather than removing from the front: a segment of thousands of
-    // `case x in x)` openers shifted the whole vector once per opener, and a
-    // 200 KB flood spent half a second here.
-    let mut words: Vec<String> = tokens.to_vec();
-    let mut at = 0;
-    loop {
-        let Some(first) = words.get(at).cloned() else {
-            return words.split_off(at.min(words.len()));
-        };
-        let rest = &words[at..];
-        if first == "(" || first == "{" || first == "()" {
-            at += 1;
-        } else if let Some(tail) = first.strip_prefix('(').filter(|r| !r.starts_with('(')) {
-            words[at] = tail.to_string();
-        } else if first == "function" && rest.len() > 1 {
-            at += 2;
-        } else if let Some((name, _)) = first.split_once("()")
-            && is_literal_identifier(&name.replace('-', "_"))
-        {
-            let tail = first[name.len() + 2..].trim_start_matches('{').to_string();
-            if tail.is_empty() {
-                at += 1;
-            } else {
-                words[at] = tail;
-            }
-        } else if rest.get(1).is_some_and(|w| w == "()" || w == "(){")
-            && is_literal_identifier(&first.replace('-', "_"))
-        {
-            at += 2;
-        } else if first == "case" {
-            match rest.iter().position(|w| w.ends_with(')')) {
-                Some(end) => at += end + 1,
-                None => return words.split_off(at),
-            }
-        } else if first.len() > 1 && first.ends_with(')') && !first.contains("$(") {
-            // A later case arm: `y) export …`.
-            at += 1;
-        } else {
-            return words.split_off(at);
-        }
-    }
-}
-
-/// True when a segment's command word is produced by an expansion (`$X`,
-/// `$(…)`, a backtick), after compound openers, keywords and assignments.
-fn command_word_is_dynamic(segment: &str) -> bool {
-    let normalized = strip_compound_openers(&tokenize(segment));
-    normalized
-        .iter()
-        .skip_while(|w| SEGMENT_KEYWORDS.contains(&w.as_str()))
-        .find(|w| !is_shell_assignment(w))
-        .is_some_and(|w| w.contains('$') || w.contains('`'))
-}
-
-/// True when a `source`/`.` segment reads its script from text in the command
-/// itself: a heredoc or here-string, stdin, or a process substitution.
-fn sources_inline_text(segment: &str) -> bool {
-    segment.contains("<<") || segment.contains("/dev/stdin") || segment.contains("<(")
-}
-
-/// A declaring builtin naming a variable the shell builds at expansion time,
-/// anywhere in raw text (a heredoc body): `export GH_HOS''T=…`,
-/// `declare -x GH_HOS${X}T=…`.
-static RAW_NONLITERAL_DECLARATION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"\b(?:export|declare|typeset|readonly|local)\s+(?:[-+]\S*\s+)*[^\s=]*[$`{'"\\][^\s=]*="#,
-    )
-    .expect("pattern should compile")
-});
-
-/// `NAME=value` / `NAME+=value` in command-word position.
-fn is_shell_assignment(word: &str) -> bool {
-    word.split_once('=')
-        .is_some_and(|(name, _)| is_literal_identifier(name))
-}
-
-/// True when `word` names the `GH_HOST` variable in any way other than a plain
-/// read (`$GH_HOST`, `${GH_HOST}`). Longer names that merely contain it
-/// (`MY_GH_HOST`, `GH_HOSTNAME`) do not count.
-fn mentions_gh_host(word: &str) -> bool {
-    mentions_var(word, "GH_HOST")
-}
-
-/// [`mentions_gh_host`] for any variable name.
-/// Can [`GhHostEnv::observe_depth`] skip `segment` outright? Only when it is
-/// plain words — no quoting, escape, expansion, `=` or brace expansion that
-/// could spell something else once tokenized — none of which mentions `var`
-/// or names a builtin the observation reads. Every arm of the observation
-/// needs one of those, so such a segment leaves the state as it was; skipping
-/// its tokenization keeps a flood of plain commands cheap.
-fn observes_nothing(segment: &str, var: &str) -> bool {
-    if segment.contains(var)
-        || !segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b" \t\n_./:@%+-;|&(){}".contains(&b))
-    {
-        return false;
-    }
-    !segment
-        .split(|c: char| !(c.is_ascii_alphanumeric() || "_.-".contains(c)))
-        .any(|word| {
-            DECLARING_BUILTINS.contains(&word)
-                || NAME_OPERAND_BUILTINS.contains(&word)
-                || VAR_SETTING_BUILTINS.contains(&word)
-                || matches!(
-                    word,
-                    "unset" | "set" | "source" | "." | "eval" | "trap" | "builtin" | "command"
-                )
-        })
-}
-
-fn mentions_var(word: &str, name: &str) -> bool {
-    let bytes = word.as_bytes();
-    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut from = 0;
-    while let Some(offset) = word[from..].find(name) {
-        let start = from + offset;
-        let end = start + name.len();
-        from = end;
-        if (start > 0 && ident(bytes[start - 1])) || bytes.get(end).is_some_and(|&b| ident(b)) {
-            continue;
-        }
-        if start >= 1 && bytes[start - 1] == b'$' {
-            continue;
-        }
-        if start >= 2 && &bytes[start - 2..start] == b"${" && bytes.get(end) == Some(&b'}') {
-            continue;
-        }
-        return true;
-    }
-    false
-}
-
 /// Resolve the host selected for one `gh` invocation.
 ///
 /// `default_host()` sees the hook process environment, not an assignment that
@@ -1461,63 +670,24 @@ fn mentions_var(word: &str, name: &str) -> bool {
 /// Which tokens are stepped over as some other flag's value is decided by
 /// [`host_scan_flags`], per subcommand — never by `gh api`'s grammar wholesale.
 ///
-/// `env_host` is the `GH_HOST` the gh process inherits — the hook's own
-/// default, or what an `export` earlier in the same command left behind (#548,
-/// see [`GhHostEnv`]). Inline and `--hostname` selections outrank it.
+/// `env_host` is the `GH_HOST` the gh process inherits from the hook's own
+/// environment. Inline and `--hostname` selections outrank it.
 fn gh_command_host(command: &str, env_host: &str) -> String {
-    selected_gh_host(command, str::to_ascii_lowercase).unwrap_or_else(|| env_host.to_string())
+    selected_gh_host(command).unwrap_or_else(|| env_host.to_string())
 }
 
 /// The host one `gh` invocation selects itself, `--hostname` over an inline
-/// `GH_HOST=`, or `None` when it selects none; see [`gh_command_host`].
-/// `fold` is applied to the host as typed: [`gh_command_host`] folds its case
-/// to compare it, and a message shows it as typed ([`host_as_typed`]). The
-/// [`UNRESOLVED_GH_HOST`] stand-in is never folded.
-fn selected_gh_host(command: &str, fold: fn(&str) -> String) -> Option<String> {
-    selected_gh_host_by(command, fold).map(|(host, _)| host)
-}
-
-/// Which part of a `gh` invocation selected its host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostSelector {
-    /// `--hostname`, which only `gh api` takes.
-    HostnameFlag,
-    /// `GH_HOST`, inline on the command.
-    InlineGhHost,
-}
-
-/// [`selected_gh_host`], with the part of the command that selected it.
-fn selected_gh_host_by(command: &str, fold: fn(&str) -> String) -> Option<(String, HostSelector)> {
+/// `GH_HOST=`, case-folded, or `None` when it selects none; see
+/// [`gh_command_host`].
+fn selected_gh_host(command: &str) -> Option<String> {
     let (tokens, gh_index) = gh_command_tokens(command)?;
     let table = host_scan_flags(&tokens[gh_index..]);
 
-    // A prefix word whose NAME is not a plain literal (`env GH_HOS${X}T=h gh`)
-    // may expand to `GH_HOST=h`, so it resolves to no known host (#548).
-    // `env -S`/`--split-string` re-splits one string into assignments and a
-    // command, so its host is not readable from these tokens either.
-    let prefix_words = &tokens[..gh_index];
-    let split_string = prefix_words
+    let inline_host = tokens[..gh_index]
         .iter()
-        .any(|t| t.rsplit('/').next() == Some("env"))
-        && prefix_words.iter().any(|t| {
-            t.starts_with("--split-string")
-                || (t.starts_with('-') && !t.starts_with("--") && t.contains('S'))
-        });
-    let obfuscated_prefix = split_string
-        || prefix_words.iter().any(|token| {
-            token
-                .split_once('=')
-                .is_some_and(|(name, _)| !name.starts_with('-') && !is_literal_identifier(name))
-        });
-    let inline_host = if obfuscated_prefix {
-        Some(UNRESOLVED_GH_HOST.to_string())
-    } else {
-        tokens[..gh_index]
-            .iter()
-            .filter_map(|token| token.strip_prefix("GH_HOST="))
-            .rfind(|host| !host.is_empty())
-            .map(fold)
-    };
+        .filter_map(|token| token.strip_prefix("GH_HOST="))
+        .rfind(|host| !host.is_empty())
+        .map(str::to_ascii_lowercase);
 
     let mut flag_host = None;
     let mut index = gh_index + 1;
@@ -1528,7 +698,7 @@ fn selected_gh_host_by(command: &str, fold: fn(&str) -> String) -> Option<(Strin
         }
         if token == "--hostname" {
             if let Some(host) = tokens.get(index + 1).filter(|host| !host.is_empty()) {
-                flag_host = Some(fold(host));
+                flag_host = Some(host.to_ascii_lowercase());
                 index += 2;
                 continue;
             }
@@ -1536,7 +706,7 @@ fn selected_gh_host_by(command: &str, fold: fn(&str) -> String) -> Option<(Strin
             .strip_prefix("--hostname=")
             .filter(|host| !host.is_empty())
         {
-            flag_host = Some(fold(host));
+            flag_host = Some(host.to_ascii_lowercase());
         } else if token.starts_with("--") {
             // Any other long flag. A value-taking one owns the following token
             // even when that value is the literal `--hostname`; a boolean long
@@ -1553,9 +723,7 @@ fn selected_gh_host_by(command: &str, fold: fn(&str) -> String) -> Option<(Strin
         index += 1;
     }
 
-    flag_host
-        .map(|host| (host, HostSelector::HostnameFlag))
-        .or(inline_host.map(|host| (host, HostSelector::InlineGhHost)))
+    flag_host.or(inline_host)
 }
 
 #[cfg(test)]
@@ -1592,9 +760,8 @@ fn resolve_target_repo_on(
 ///   without it (cadence-hooks#1069).
 /// - An inline `GH_REPO=` adds its value: gh reads it wherever `-R` is absent
 ///   or empty, and this guard cannot tell which subcommands honor it.
-/// - Without one, an `env_repo` the gh process inherits — exported earlier in
-///   the command, see [`GhHostEnv::for_repo`] — adds its value the same way
-///   (cadence-hooks#1129). Empty means none.
+/// - Without one, an `env_repo` the gh process inherits from the hook's
+///   environment adds its value the same way. Empty means none.
 ///
 /// A PR or issue URL argument comes before all of these: gh takes the repo
 /// and host from it and never reads `-R`, `GH_REPO` or the checkout
@@ -1627,20 +794,19 @@ fn resolve_target_repos_on(
     };
     match flag {
         RepoFlag::Target(repo) => {
-            resolutions.push(flag_value_resolution(&repo, &dh));
+            resolutions.extend(flag_value_resolution(&repo, &dh));
             return resolutions;
         }
-        RepoFlag::Ambiguous => {
-            resolutions.push(RepoResolution::AmbiguousFlags);
-            return resolutions;
-        }
-        RepoFlag::TargetOrAbsent(repo) => resolutions.push(flag_value_resolution(&repo, &dh)),
+        // Readings disagree, so which repo gh takes is not readable here
+        // (ADR-0046 rule 3).
+        RepoFlag::Ambiguous => return resolutions,
+        RepoFlag::TargetOrAbsent(repo) => resolutions.extend(flag_value_resolution(&repo, &dh)),
         RepoFlag::Absent => {}
     }
     if let Some(repo) = inline_gh_repo(command) {
-        resolutions.push(flag_value_resolution(&repo, &dh));
+        resolutions.extend(flag_value_resolution(&repo, &dh));
     } else if !env_repo.is_empty() {
-        resolutions.push(flag_value_resolution(env_repo, &dh));
+        resolutions.extend(flag_value_resolution(env_repo, &dh));
     }
     resolutions.push(resolve_unflagged_target(
         command,
@@ -1658,205 +824,29 @@ fn resolve_target_repos_on(
 /// repo owned by `github.com` (cadence-hooks#1077), and
 /// `-R https://evil.example/cameronsjo/x` is judged on `evil.example`.
 ///
-/// A value carrying a shell expansion keeps its raw text, so the
-/// unexpanded-expansion block names it (#757); any other value gh would not
-/// split is [`RepoResolution::UnreadableFlag`].
-fn flag_value_resolution(value: &str, dh: &str) -> RepoResolution {
+/// A value carrying a shell expansion keeps its raw text, so a literal owner
+/// in front of it is still judged (#1491); any other value gh would not split
+/// names no repo this guard can read, and is `None` (ADR-0046 rule 3).
+fn flag_value_resolution(value: &str, dh: &str) -> Option<RepoResolution> {
     match parse_gh_repo_value(value) {
-        Some(spec) => RepoResolution::Resolved {
+        Some(spec) => Some(RepoResolution::Resolved {
             host: spec.host.unwrap_or_else(|| dh.to_string()),
             repo: format!("{}/{}", spec.owner, spec.name),
-        },
-        None if repo_has_unexpanded_expansion(value) => RepoResolution::Resolved {
+        }),
+        None if repo_has_unexpanded_expansion(value) => Some(RepoResolution::Resolved {
             host: dh.to_string(),
             repo: value.to_string(),
-        },
-        None => RepoResolution::UnreadableFlag(value.to_string()),
+        }),
+        None => None,
     }
-}
-
-/// True when an explicit `-R` value names a repo owned on the host it lands
-/// on — the loop gate's form of [`flag_value_resolution`]. An unreadable
-/// value is not owned.
-fn flag_value_is_owned(
-    value: &str,
-    dh: &str,
-    allowed_owners: &[AllowEntry],
-    allowed_repos: &[AllowEntry],
-) -> bool {
-    match flag_value_resolution(value, dh) {
-        RepoResolution::Resolved { host, repo } => {
-            is_allowed(&host, &repo, allowed_owners, allowed_repos)
-        }
-        _ => false,
-    }
-}
-
-/// The words the loop's raw `-R` word becomes once the shell has removed its
-/// quotes and expanded its braces, as it hands them to gh. The loop parser
-/// keeps the word's text as typed, so `-R "cameronsjo/tool"` arrives with
-/// both quotes on, and the owner it reads is `"cameronsjo` (#1504). The
-/// single-command arm never sees them: [`tokenize`] has removed them by then.
-///
-/// An expansion stays in the text (`"cameronsjo/$r"` reads `cameronsjo/$r`),
-/// and the ownership check judges it as it judges an unquoted `-R` value: a
-/// literal allowed owner is owned, and `$o/$r` or `$h/cameronsjo/x` is not.
-/// A brace expansion is several words, quoted or not (`"cameronsjo"/{a,b}`,
-/// `{cameronsjo,mona_acme}/tool`).
-///
-/// A word that names no repo ([`names_no_repo`]) is left out while another
-/// word is left. An empty brace alternative makes one: bash turns
-/// `--repo=cameronsjo/{,x}` into `--repo=cameronsjo/ --repo=cameronsjo/x`,
-/// and gh takes the last, while `-R cameronsjo/{x,}` hands gh `cameronsjo/`
-/// as an extra argument, which it refuses. The per-segment pass judges the
-/// argv gh gets either way. A word [`tokenize`] reads no word in (`{,}`) is
-/// returned as typed.
-///
-/// Quote removal is the tokenizer's, not a second copy of its rules, so a
-/// backslash, a quote inside the other kind, `$'…'` or a brace reads as it
-/// does for a single command. The verdict ([`loop_flag_value_is_owned`])
-/// and the message ([`loop_target_is_unresolvable`]) both read the word
-/// through here.
-fn unquoted_loop_repo_words(word: &str) -> Vec<String> {
-    let mut words = tokenize(word);
-    if words.is_empty() {
-        return vec![word.to_string()];
-    }
-    if words.iter().any(|w| !names_no_repo(w)) {
-        words.retain(|w| !names_no_repo(w));
-    }
-    words
-}
-
-/// True when no reading of gh's takes `word` for a repo: it has no
-/// expansion, [`parse_gh_repo_value`] reads none in it (`cameronsjo/`,
-/// `-R`, `--`), and no URL in it names an owner and a repo past its host.
-/// gh takes the repo of a pull request or issue URL given as an argument,
-/// whatever `-R` says (#1529), so a word such as
-/// `https://github.com/work-org/y/issues/1` is kept and judged.
-fn names_no_repo(word: &str) -> bool {
-    let url_names_repo = word.split_once("://").is_some_and(|(_, rest)| {
-        rest.split('/')
-            .skip(1)
-            .filter(|part| !part.is_empty())
-            .count()
-            >= 2
-    });
-    !repo_has_unexpanded_expansion(word) && parse_gh_repo_value(word).is_none() && !url_names_repo
-}
-
-/// [`flag_value_is_owned`] for a loop's raw `-R` word: the word is judged
-/// as the shell hands it to gh, so `-R "cameronsjo/tool"` and
-/// `-R "cameronsjo/$r"` are as owned as their unquoted forms (#1504). A word
-/// the shell expands to several words, quoted or not, is owned only when each
-/// of them is, whichever one gh takes as the repo, leaving out a word that
-/// names no repo while another is left.
-///
-/// This gate can only add a block. Once it passes, the per-segment pass
-/// judges every looped write again, as a single command, so reading the word
-/// as the shell does cannot allow what a single command blocks.
-fn loop_flag_value_is_owned(
-    word: &str,
-    dh: &str,
-    allowed_owners: &[AllowEntry],
-    allowed_repos: &[AllowEntry],
-) -> bool {
-    unquoted_loop_repo_words(word)
-        .iter()
-        .all(|w| flag_value_is_owned(w, dh, allowed_owners, allowed_repos))
 }
 
 /// True when a target's host is one this guard can judge: no expansion in it
 /// (no `$` or backtick), and no `*`, which stands for a command substitution
 /// in the globbed reading (`GH_HOST=$(cat h)` and `-R "$(cat h)/o/r"` read as
-/// the host `*`). The [`UNRESOLVED_GH_HOST`] stand-in counts as read, though
-/// its text holds a `$`: its block names the host fix (#548).
+/// the host `*`).
 fn host_is_read(host: &str) -> bool {
-    host == UNRESOLVED_GH_HOST || !(repo_has_unexpanded_expansion(host) || host.contains('*'))
-}
-
-/// `host` as `segment` typed it. The guard folds a host's case before it
-/// compares it, but `$H` and `$h` are different shell variables, so a message
-/// that names an expanded host shows the text the command spelled (#1503).
-///
-/// The host is looked for in the target's own `HOST/` part, then in the host
-/// the command selects ([`selected_gh_host`]). The target is the `-R` or
-/// `--repo` value, and an inline `GH_REPO` only where
-/// [`resolve_target_repos_on`] reads one: with no `-R`, or beside a `-R` gh
-/// may ignore. A `-R` that decides the target leaves `GH_REPO` unread, as gh
-/// does. A `gh repo` argument is not read: its host is shown as given, unless
-/// the command selects the same host in another case, which is then shown
-/// (`GH_HOST=$h gh repo archive "$H/evil/x"` shows `$h`, though gh takes
-/// `$H`). A host the segment does not spell, such as the hook's own
-/// `GH_HOST`, is shown as given. Message only: no verdict reads it.
-fn host_as_typed(segment: &str, host: &str) -> String {
-    target_host_as_typed(segment, host)
-        .or_else(|| {
-            selected_gh_host(segment, str::to_owned)
-                .filter(|typed| typed.eq_ignore_ascii_case(host))
-        })
-        .unwrap_or_else(|| host.to_string())
-}
-
-/// `host` as the target's own `HOST/` part types it: the first half of
-/// [`host_as_typed`], and `None` when the target does not spell it.
-fn target_host_as_typed(segment: &str, host: &str) -> Option<String> {
-    let typed_in = |text: &str| {
-        let at = text.to_ascii_lowercase().find(host)?;
-        text.get(at..at + host.len()).map(str::to_string)
-    };
-    // `gh api` takes no `-R`, so it never names the host there.
-    let flag = if gh_api_endpoint(segment).is_some() {
-        RepoFlag::Absent
-    } else {
-        repo_flag(segment)
-    };
-    let (flag_value, gh_repo) = match flag {
-        RepoFlag::Target(value) => (Some(value), None),
-        RepoFlag::TargetOrAbsent(value) => (Some(value), inline_gh_repo(segment)),
-        RepoFlag::Absent => (None, inline_gh_repo(segment)),
-        RepoFlag::Ambiguous => (None, None),
-    };
-    flag_value
-        .into_iter()
-        .chain(gh_repo)
-        .filter(|value| {
-            parse_gh_repo_value(value)
-                .and_then(|spec| spec.host)
-                .is_some_and(|value_host| value_host == host)
-        })
-        .find_map(|value| typed_in(&value))
-}
-
-/// The fix for a target whose host [`host_is_read`] cannot judge, when the
-/// target does not spell that host itself. `--hostname` or `GH_HOST` chose
-/// it, so a literal `-R` or endpoint path would leave the command blocked:
-/// the fix names the host instead. `--hostname` when the command passes one
-/// (gh takes it over `GH_HOST`), else `GH_HOST`, inline or exported earlier.
-/// `None` when the target spells the host (`-R "$h/o/r"`, or a `gh repo`
-/// argument such as `"$h/o/r"`), whose fix is a literal target (#1507).
-///
-/// Returns the `Fix:` line's text and the block metadata's plain form.
-fn unread_host_fix(segment: &str, host: &str) -> Option<(&'static str, &'static str)> {
-    let argument_spells_host = gh_repo_positional_target(segment)
-        .and_then(|(_, argument_host, _)| argument_host)
-        .is_some_and(|argument_host| argument_host.eq_ignore_ascii_case(host));
-    if host_is_read(host) || argument_spells_host || target_host_as_typed(segment, host).is_some() {
-        return None;
-    }
-    let by_flag = selected_gh_host_by(segment, str::to_owned)
-        .is_some_and(|(_, by)| by == HostSelector::HostnameFlag);
-    Some(if by_flag {
-        (
-            "give `--hostname` a literal host (`--hostname <host>`), or drop it",
-            "give --hostname a literal host, or drop it",
-        )
-    } else {
-        (
-            "set `GH_HOST` to a literal host (`GH_HOST=<host>`), or drop it",
-            "set GH_HOST to a literal host, or drop it",
-        )
-    })
+    !(repo_has_unexpanded_expansion(host) || host.contains('*'))
 }
 
 /// For a blocked target that carries a shell expansion: true when it still
@@ -1895,40 +885,6 @@ fn names_literal_unowned_owner(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         && !is_allowed(host, repo, allowed_owners, allowed_repos)
-}
-
-/// True when a looped `-R` value the ownership check rejected is
-/// unresolvable rather than unowned, so the loop gate says "cannot resolve"
-/// and not "targets repo you don't own".
-///
-/// The value is the raw `-R` text, read as the words
-/// [`unquoted_loop_repo_words`] returns, the same words the ownership check
-/// judged, so `$'work-org/tool'` reads `work-org/tool`, as for a single
-/// command. Only a word with an expansion in it can be unresolvable; one
-/// without keeps the unowned message (#1337). With one, the word is
-/// unresolvable unless [`names_literal_unowned_owner`] reads a literal owner
-/// the allowlist rejects. A value that is several words is unresolvable when
-/// every word the allowlist rejects is, as the loop block says "cannot
-/// resolve" only when every blocked target is; callers pass only a value
-/// the ownership check rejected.
-fn loop_target_is_unresolvable(
-    value: &str,
-    dh: &str,
-    allowed_owners: &[AllowEntry],
-    allowed_repos: &[AllowEntry],
-) -> bool {
-    unquoted_loop_repo_words(value).iter().all(|word| {
-        flag_value_is_owned(word, dh, allowed_owners, allowed_repos)
-            || match flag_value_resolution(word, dh) {
-                RepoResolution::Resolved { host, repo } => {
-                    repo_has_unexpanded_expansion(word)
-                        && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos)
-                }
-                // A word with a `$` or backtick always resolves, so this one
-                // has no expansion to be unresolvable.
-                _ => false,
-            }
-    })
 }
 
 /// The last non-empty `GH_REPO=` in the assignment prefix of the segment's gh
@@ -2077,7 +1033,9 @@ fn is_allowed_with_extras(
 }
 
 /// Judge a fork (origin + upstream remotes) for write access: allowed iff
-/// **both** remotes belong to allowed owners, each checked against its own host.
+/// every remote this guard could parse belongs to an allowed owner, each
+/// checked against its own host. An unparseable remote names no repo to judge
+/// (cadence-ecosystem ADR-0046 rule 3).
 fn fork_allowed(
     origin_host: &str,
     origin: &str,
@@ -2087,99 +1045,11 @@ fn fork_allowed(
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
 ) -> bool {
-    // Fail closed on unparseable remotes: an empty repo string means we could
-    // not extract owner/repo from the remote URL.
-    !origin.is_empty()
-        && !upstream.is_empty()
-        && is_allowed_with_extras(
-            origin_host,
-            origin,
-            allowed_owners,
-            allowed_repos,
-            extra_hosts,
-        )
-        && is_allowed_with_extras(
-            upstream_host,
-            upstream,
-            allowed_owners,
-            allowed_repos,
-            extra_hosts,
-        )
-}
-
-/// Policy decision for a gh write inside a loop without an explicit `-R` flag.
-#[derive(Debug, PartialEq)]
-enum LoopWriteDecision {
-    /// Deterministic loop in an owned repo — allow.
-    Allow,
-    /// Block, optionally suggesting the resolved `-R owner/repo` fix.
-    Block { suggestion: Option<String> },
-}
-
-/// Judge a looped gh write that lacks an explicit `-R` target.
-///
-/// Relaxed policy (default): allow iff the loop body provably never changes
-/// directory AND the cwd resolves to a single owned, non-fork repo. Under
-/// those conditions every iteration's gh resolves to the same repo the hook
-/// sees — identical trust to a single command.
-///
-/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block.
-///
-/// In either mode a block suggests the cwd's repo as the `-R` fix only when
-/// that repo is owned and the loop body provably stays in it; otherwise the
-/// fix gets a placeholder. The caller also drops the suggestion when gh may
-/// send a looped write elsewhere for a reason this judgment does not see
-/// ([`loop_fix_may_name_dir_repo`]).
-fn judge_loop_write(
-    strict: bool,
-    body_mutates_cwd: Option<bool>,
-    cwd_resolution: &RepoResolution,
-    allowed_owners: &[AllowEntry],
-    allowed_repos: &[AllowEntry],
-    extra_hosts: &[String],
-) -> LoopWriteDecision {
-    // A concrete -R suggestion exists exactly when the cwd resolves to a
-    // single owned, non-fork repo and the loop body provably stays in it. A
-    // body that may change directory writes to whatever repo it moves to, so
-    // the cwd's repo is not its target and the fix gets a placeholder (#1524).
-    // (Empty allowlists can never produce one — the unconfigured fail-safe
-    // holds for loops too.) The allow below needs a body that stays put as
-    // well, so this moves no verdict.
-    let suggestion = match cwd_resolution {
-        RepoResolution::Resolved { host, repo }
-            if body_mutates_cwd == Some(false)
-                && is_allowed_with_extras(
-                    host,
-                    repo,
-                    allowed_owners,
-                    allowed_repos,
-                    extra_hosts,
-                ) =>
-        {
-            Some(repo.clone())
-        }
-        _ => None,
+    let owned = |host: &str, repo: &str| {
+        repo.is_empty()
+            || is_allowed_with_extras(host, repo, allowed_owners, allowed_repos, extra_hosts)
     };
-
-    // Relaxed: the loop body provably never changes directory, so every
-    // iteration's gh resolves to the suggested repo — same trust as a
-    // single command. Anything else (strict mode, cd in body, parse
-    // failure, fork, unowned/unresolvable cwd) blocks.
-    if !strict && body_mutates_cwd == Some(false) {
-        if suggestion.is_some() {
-            return LoopWriteDecision::Allow;
-        }
-        // Resolution hit the #271 subprocess deadline — mirror the
-        // single-command TimedOut arm: infrastructure failure fails open
-        // (loudly), never a false block. Strict mode still blocks above
-        // regardless of resolution, so this converts no strict verdict.
-        if matches!(cwd_resolution, RepoResolution::TimedOut) {
-            cadence_hooks_core::deadline::note_suppressed_block();
-            return LoopWriteDecision::Allow;
-        }
-    }
-
-    LoopWriteDecision::Block { suggestion }
+    owned(origin_host, origin) && owned(upstream_host, upstream)
 }
 
 /// Render the configured allowlist as a flat Vec of display strings.
@@ -2192,274 +1062,6 @@ fn allowed_display_list(owners: &[AllowEntry], repos: &[AllowEntry]) -> Vec<Stri
         .chain(repos.iter())
         .map(|e| e.to_string())
         .collect()
-}
-
-/// True when every looped write the block names is a `gh api` call, so no
-/// `-R` advice applies.
-fn only_api_writes(writes: &[String], api_writes: &[String]) -> bool {
-    writes.is_empty() && !api_writes.is_empty()
-}
-
-/// True when every `gh api` write the block names already has a literal
-/// `repos/<owner>/<repo>` path, so it was refused for the loop's shape
-/// ([`loop_targets_are_literal`]), not its path.
-fn api_writes_are_literal(api_writes: &[String]) -> bool {
-    !api_writes.is_empty()
-        && api_writes
-            .iter()
-            .all(|w| api_literal_repo_target(w.trim_matches('`')).is_some())
-}
-
-/// The repo a looped `gh api` write's fix names: the cwd's `target` only when
-/// every such write is `repos/{owner}/{repo}/…`, the one path gh fills from
-/// the directory's remote. Any other path names its own owner or repo, or
-/// takes one from a variable, so the cwd's repo is not its target and the fix
-/// gets `placeholder` (#1524).
-fn looped_api_fix_target<'a>(
-    api_writes: &[String],
-    target: &'a str,
-    placeholder: &'a str,
-) -> &'a str {
-    let cwd_path = |w: &String| {
-        gh_api_endpoint(w.trim_matches('`'))
-            .and_then(|endpoint| api_repos_target(&endpoint))
-            .is_some_and(|repo| repo == "{owner}/{repo}")
-    };
-    if api_writes.iter().all(cwd_path) {
-        target
-    } else {
-        placeholder
-    }
-}
-
-/// Variables that send gh somewhere other than the directory's repo: gh reads
-/// `GH_REPO` in place of the directory (it also fills `{owner}/{repo}` in a
-/// `gh api` path), `GH_HOST` moves the host, and git, which gh asks for the
-/// remotes, reads them from `GIT_DIR`.
-const LOOP_FIX_RETARGETING_VARS: [&str; 3] = ["GH_REPO", "GH_HOST", "GIT_DIR"];
-
-/// Whether a loop block's fix may name `work_dir`'s repo, the suggestion
-/// [`judge_loop_write`] resolved there (#1524). That judgment sees only
-/// whether a loop body changes directory. Two things it cannot see send a
-/// looped write elsewhere, and either one gives the fix a placeholder:
-///
-/// - One of [`LOOP_FIX_RETARGETING_VARS`]: set non-empty where the hook runs,
-///   or named anywhere in the command (inline, exported, inside the body).
-/// - A directory change [`parse_work_dir`] does not read: a `cd` in a
-///   subshell, a `{ …; }` group or an `if`, a `pushd`, a `cd` on a later
-///   line, or a runner's `-C`/`-D`. The per-segment reading
-///   ([`command_segments_with_dirs_reading`], then [`dir_after_runners`]) follows
-///   those, so it must put every gh write in `work_dir` too. A read
-///   elsewhere does not matter.
-///
-/// It decides the fix's text only: the verdict is made before it runs.
-fn loop_fix_may_name_dir_repo(command: &str, cwd: &str, work_dir: &str) -> bool {
-    if LOOP_FIX_RETARGETING_VARS
-        .iter()
-        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()) || command.contains(var))
-    {
-        return false;
-    }
-    // The verdict reads an unread `eval` as staying put; the fix does not.
-    // It names the repo only when it is sure, so an `eval` may move here.
-    let segments = command_segments_with_dirs_reading(command, cwd, UnreadEval::MayMove);
-    // A reading cut short may have missed a gh write in another directory.
-    !ExpansionWork::spent()
-        && segments
-            .iter()
-            .filter(|(segment, _)| {
-                segment_invokes_gh(segment)
-                    && (is_write_command(segment) || is_write_command(&requote_words(segment)))
-            })
-            .all(|(segment, dir)| dir_after_runners(segment, dir) == work_dir)
-}
-
-/// What a plain loop is, for the fix of a literal-path write refused for the
-/// loop's shape.
-const PLAIN_LOOP_FIX: &str = "a literal `gh api` path counts as the target only in a plain loop: \
-     `for` headers with a lowercase name and plain values, `do`, `done`, and `gh api`, `pr`, \
-     `issue` or similar commands with plain arguments, joined by `;` or newlines only, with no \
-     redirect, `||`/`&&`, pipe, `&`, or other command; make the loop plain or run each call \
-     outside it";
-
-/// The fix for a loop in which every gh command names its target, but which
-/// mixes `-R` commands with literal-path `gh api` writes: the loop gate counts
-/// only `-R` as a target in that case, so the loop keeps the cwd-based policy.
-/// Two loops in one command are read together, so the split must be into
-/// separate commands.
-const MIXED_LOOP_FIX: &str = "every command names its target, but a loop that mixes `-R` \
-     commands with literal-path `gh api` writes is still judged by the working directory; run \
-     the `gh api` loop and the `-R` loop as separate commands";
-
-/// The structured `fix` for a looped-write block: `-R` for commands that take
-/// it, the endpoint path for `gh api`, both when the loop holds both.
-///
-/// `literal_api` says the loop also holds literal-path `gh api` writes that
-/// the `-R` advice must not reach, since `gh api` has no `-R`.
-fn looped_write_fix(
-    writes: &[String],
-    api_writes: &[String],
-    target: &str,
-    literal_api: bool,
-) -> String {
-    if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
-        return PLAIN_LOOP_FIX.to_string();
-    }
-    let api_target = looped_api_fix_target(api_writes, target, "<owner>/<repo>");
-    if only_api_writes(writes, api_writes) {
-        return format!("gh api repos/{api_target}/…");
-    }
-    // `gh repo archive` and the other argument verbs have no -R (#1491).
-    let repo_verb = writes
-        .iter()
-        .find_map(|w| repo_argument_verb(w.trim_matches('`')));
-    let flag_writes = writes
-        .iter()
-        .any(|w| repo_argument_verb(w.trim_matches('`')).is_none());
-    let mut parts = Vec::new();
-    if flag_writes || repo_verb.is_none() {
-        parts.push(if api_writes.is_empty() && literal_api {
-            format!("-R {target} on every command but the literal-path gh api writes")
-        } else {
-            format!("-R {target}")
-        });
-    }
-    if let Some(verb) = repo_verb {
-        let owner = target.split('/').next().unwrap_or("<owner>");
-        parts.push(format!("gh repo {verb} {owner}/<repo>"));
-    }
-    if !api_writes.is_empty() {
-        parts.push(format!("for gh api, gh api repos/{api_target}/…"));
-    }
-    parts.join("; ")
-}
-
-/// Build the block message for a looped gh write, with a concrete fix target
-/// when the cwd resolved to an owned repo.
-///
-/// `writes` are the commands that take `-R`; `api_writes` are `gh api` calls,
-/// which have no `-R` flag (gh rejects it), so their fix is to spell the repo
-/// literally in the endpoint path (cameronsjo/cadence-hooks#1344).
-/// `literal_api` is as for [`looped_write_fix`].
-fn looped_write_block_message(
-    writes: &[String],
-    api_writes: &[String],
-    suggestion: Option<&str>,
-    literal_api: bool,
-) -> String {
-    let fix_target = suggestion.unwrap_or("owner/repo");
-    let mut found: Vec<&str> = writes
-        .iter()
-        .chain(api_writes)
-        .map(String::as_str)
-        .collect();
-    if found.is_empty() {
-        found.push("gh write command(s) without a target");
-    }
-    // `gh repo archive` and the other argument verbs have no -R: their fix is
-    // the argument, with the owner spelled out (#1491).
-    let (repo_writes, flag_writes): (Vec<&String>, Vec<&String>) = writes
-        .iter()
-        .partition(|w| repo_argument_verb(w.trim_matches('`')).is_some());
-    let mut fixes = Vec::new();
-    if !flag_writes.is_empty() || (api_writes.is_empty() && repo_writes.is_empty()) {
-        fixes.push(if literal_api {
-            format!(
-                "add `-R {fix_target}` to each gh command except the literal-path `gh api` \
-                 writes, which have no -R flag"
-            )
-        } else {
-            format!("add `-R {fix_target}` to each command")
-        });
-    }
-    let mut verbs: Vec<String> = Vec::new();
-    for verb in repo_writes
-        .iter()
-        .filter_map(|w| repo_argument_verb(w.trim_matches('`')))
-    {
-        if !verbs.contains(&verb) {
-            verbs.push(verb);
-        }
-    }
-    if let Some(first) = verbs.first() {
-        let owner = fix_target.split('/').next().unwrap_or("owner");
-        let named: Vec<String> = verbs.iter().map(|v| format!("`gh repo {v}`")).collect();
-        fixes.push(format!(
-            "{} {} no -R flag: give it the repo as its argument with the owner spelled out \
-             (`gh repo {first} {owner}/<repo>`; the repo name may come from the loop variable)",
-            named.join(", "),
-            if verbs.len() == 1 { "has" } else { "have" },
-        ));
-    }
-    // A literal path counts as the target only in a plain loop
-    // ([`loop_targets_are_literal`]), so a write that already has one was
-    // refused for the loop's shape, not its path.
-    let (literal, unwritten): (Vec<&String>, Vec<&String>) = api_writes
-        .iter()
-        .partition(|w| api_literal_repo_target(w.trim_matches('`')).is_some());
-    if !unwritten.is_empty() {
-        let api_target = looped_api_fix_target(api_writes, fix_target, "owner/repo");
-        fixes.push(format!(
-            "`gh api` has no -R flag: write the repo literally in the path \
-             (`gh api repos/{api_target}/…`), with no variable or `{{owner}}`/`{{repo}}` \
-             placeholder in the owner or repo name"
-        ));
-    }
-    if !literal.is_empty() {
-        fixes.push(PLAIN_LOOP_FIX.to_string());
-    }
-    let header = if only_api_writes(writes, api_writes) && api_writes_are_literal(api_writes) {
-        "gh api write in a loop the guard cannot follow"
-    } else if only_api_writes(writes, api_writes) {
-        "gh api write in loop without a literal repos/<owner>/<repo> path"
-    } else if flag_writes.is_empty() && !repo_writes.is_empty() {
-        "gh write command in loop without an explicit target"
-    } else {
-        "gh write command in loop without explicit -R flag"
-    };
-    format!(
-        "🚫 git-guardrails: {header}\n   \
-         Found: {}\n   \
-         Fix: {}",
-        found.join(", "),
-        fixes.join("; "),
-    )
-}
-
-/// Build the block message for an unresolvable target, naming the directory
-/// that failed to resolve and a concrete target example — `fix`, spelled for
-/// the command by [`target_spelling`].
-///
-/// [`UNRESOLVABLE_DIR`] is a sentinel that starts with a NUL byte, so it is
-/// named in words rather than printed. Any other directory goes through
-/// [`sanitize_field`] first (cameronsjo/cadence-hooks#1509).
-fn unresolvable_message(work_dir: &str, fix: &str) -> String {
-    let work_dir = if work_dir == UNRESOLVABLE_DIR {
-        "unknown (an earlier part of the command may change directory in a way this guard \
-         cannot read, such as `eval`, `popd` or `pushd a b`)"
-            .to_string()
-    } else {
-        // A directory name may carry a line break, an escape or a bidi
-        // control that would read as text of the guard's own message.
-        sanitize_field(work_dir, MAX_PATH_DISPLAY)
-    };
-    format!(
-        "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
-         Directory: {work_dir}\n   \
-         Fix: {}",
-        fix_wording(fix)
-    )
-}
-
-/// The `Fix:` clause of [`unresolvable_message`]. A `gh repo` verb in
-/// [`REPO_ARGUMENT_VERBS`] takes the repo as its argument, so its fix says to
-/// name it there rather than to "add" a whole command (#1491).
-fn fix_wording(fix: &str) -> String {
-    if fix.starts_with("gh repo ") {
-        format!("name the repo as the argument: `{fix}`")
-    } else {
-        format!("add `{fix}` to target a repo explicitly")
-    }
 }
 
 /// Build the block message for a disallowed target, including a host-scoping
@@ -2482,13 +1084,7 @@ fn disallowed_message(
     // host checks below read the raw host; only the printed text is flattened.
     let shown_host = sanitize_field(host, MAX_PATH_DISPLAY);
     let repo = sanitize_field(repo, MAX_PATH_DISPLAY);
-    let host_hint = if host == UNRESOLVED_GH_HOST {
-        "\n   Host: this command may set `GH_HOST` to a value this guard cannot read (a \
-         declaring builtin such as `declare -x`, an expanded variable name or value, or an \
-         assignment inside `${…}`/`$((…))`) — name the host on the gh command itself \
-         (`--hostname <host>`)"
-            .to_string()
-    } else if host != default && !extra_hosts.iter().any(|e| e == host) {
+    let host_hint = if host != default && !extra_hosts.iter().any(|e| e == host) {
         format!(
             "\n   Host scope: {}",
             crate::messages::host_scope_advice(&default, host)
@@ -2740,48 +1336,6 @@ fn api_repos_target(endpoint: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// The organization a `gh api orgs/<org>[/…]` endpoint PATH addresses, so an
-/// organization-level write is judged against the owner allowlist like a
-/// `repos/<owner>/…` one (cameronsjo/cadence-hooks#1311).
-///
-/// Reads the path only, like [`api_repos_target`], and anchored to its start.
-/// Only a plain path is read: the org must be a literal GitHub login, and every
-/// later segment plain text with no `.`/`..` segment, percent-escape,
-/// placeholder or expansion. Any other shape returns `None` and keeps the
-/// unverifiable-write verdict it had.
-fn api_orgs_owner(endpoint: &str) -> Option<String> {
-    let path = endpoint.split(['?', '#']).next().unwrap_or("");
-    let path = path.strip_prefix('/').unwrap_or(path);
-    let path = path.strip_suffix('/').unwrap_or(path);
-    let mut segments = path.split('/');
-    if segments.next() != Some("orgs") {
-        return None;
-    }
-    let org = segments.next()?;
-    let is_login = !org.is_empty()
-        && !org.starts_with('-')
-        && org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    let rest: Vec<&str> = segments.collect();
-    // A later `repos/<owner>/…` names a repository too
-    // (`orgs/<org>/teams/<team>/repos/<owner>/<repo>`): one owned by
-    // another account is not this org's to grant, so it keeps the old verdict.
-    let names_another_owner = rest
-        .windows(2)
-        .any(|pair| pair[0] == "repos" && !pair[1].eq_ignore_ascii_case(org));
-    if names_another_owner {
-        return None;
-    }
-    let rest_is_plain = rest.iter().all(|segment| {
-        !segment.is_empty()
-            && *segment != "."
-            && *segment != ".."
-            && segment
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    });
-    (is_login && rest_is_plain).then(|| org.to_string())
-}
-
 /// Long flags of the `gh repo` verbs in [`REPO_TARGET_VERBS`] that consume a
 /// SEPARATE value token, which the positional scan must step over.
 ///
@@ -2946,35 +1500,6 @@ fn repo_argument_verb(segment: &str) -> Option<String> {
     REPO_ARGUMENT_VERBS
         .contains(&verb)
         .then(|| verb.to_string())
-}
-
-/// True when a looped `gh repo` write in [`REPO_ARGUMENT_VERBS`] names its
-/// repository as its argument with the owner (and any host) spelled out, as
-/// in `gh repo archive "cameronsjo/$r"` (cameronsjo/cadence-hooks#1491).
-///
-/// That names the target the way `-R cameronsjo/$r` does: the repo name may
-/// come from the loop variable, but every iteration writes under the same
-/// owner, which the per-segment pass judges against the allowlist. The
-/// directory the loop runs in does not matter. A variable owner (`"$o/$r"`),
-/// a bare name, a URL, or no argument gives `false`, and the loop keeps the
-/// directory-based policy.
-fn looped_repo_argument_is_literal(c: &loop_analysis::LoopedCommand) -> bool {
-    let Some((verb, host, target)) = gh_repo_positional_target(&format!("gh {}", c.args.join(" ")))
-    else {
-        return false;
-    };
-    let literal = |word: &str, punct: &[u8]| {
-        !word.is_empty()
-            && !word.starts_with('-')
-            && word
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || punct.contains(&b))
-    };
-    REPO_ARGUMENT_VERBS.contains(&verb.as_str())
-        && host.as_deref().is_none_or(|h| literal(h, b"-."))
-        && target
-            .split_once('/')
-            .is_some_and(|(owner, name)| literal(owner, b"-_") && !name.is_empty())
 }
 
 /// True when `segment`'s gh invocation targets the user's own account
@@ -3440,8 +1965,7 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// resolution, and must not silence the nudge either (#463).
 ///
 /// A PR or issue URL argument ([`selector_url_targets`]) does not count here
-/// yet, though resolution reads it first: the loop gates do not read it
-/// either, so such a write keeps the nudge and the strict-loop block.
+/// yet, though resolution reads it first, so such a write keeps the nudge.
 pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
     repo_flag(segment) == RepoFlag::Absent
         && gh_api_endpoint(segment).is_none_or(|endpoint| api_repos_target(&endpoint).is_none())
@@ -3509,705 +2033,6 @@ fn tokens_contain_gh(tokens: &[String]) -> bool {
     tokens.iter().any(|tok| token_is_gh(tok))
 }
 
-/// Extract the value of a `gh api graphql` `query=` field across the
-/// `-f`/`--field`/`-F`/`--raw-field` forms (separate-token, compact `-fquery=…`,
-/// and `=`-joined `--field=query=…`). Returns the substring after `query=`.
-fn graphql_query_value(tokens: &[String]) -> Option<String> {
-    let is_field_flag = |t: &str| matches!(t, "-f" | "--field" | "-F" | "--raw-field");
-    for (i, tok) in tokens.iter().enumerate() {
-        // Separate-token form: `-f query=…`.
-        if is_field_flag(tok)
-            && let Some(next) = tokens.get(i + 1)
-            && let Some(v) = next.strip_prefix("query=")
-        {
-            return Some(v.to_string());
-        }
-        // Compact / `=`-joined forms: `-fquery=…`, `-Fquery=…`,
-        // `--field=query=…`, `--raw-field=query=…`.
-        for prefix in ["-f", "-F", "--field=", "--raw-field="] {
-            if let Some(rest) = tok.strip_prefix(prefix)
-                && let Some(v) = rest.strip_prefix("query=")
-            {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Classify a `gh api graphql` segment by its `query=` field value:
-/// - `Some(true)`  — an inline query containing the word `mutation` (a write)
-/// - `Some(false)` — an inline query with no `mutation` keyword (a read)
-/// - `None`        — the query is non-inline (`-F query=@file`) or absent, so
-///   its kind can't be verified (treat as a write, and name it out)
-fn graphql_mutation_status(segment: &str) -> Option<bool> {
-    let tokens = tokenize(segment);
-    let query = graphql_query_value(&tokens)?;
-    // `@file` / `@-` (stdin) references aren't inline — undeterminable.
-    if query.starts_with('@') {
-        return None;
-    }
-    // Classify on the string-stripped body so a `mutation` keyword smuggled
-    // inside a string literal (or a `Mutation` type name in an introspection
-    // read) can't flip the verdict (#263).
-    let stripped = strip_graphql_literals(&query);
-    Some(MUTATION_KEYWORD.is_match(&stripped))
-}
-
-/// Replace GraphQL string literals — both `"…"` and block `"""…"""`, honoring
-/// `\"` escapes — and `#`-to-end-of-line comments with spaces. Neutralizes
-/// braces, identifiers, and keywords hiding inside string arguments so the
-/// mutation classifier and the root-field extractor see only real query
-/// structure (#263). Length is preserved (each consumed char becomes a space)
-/// so byte offsets stay aligned for the extractor.
-fn strip_graphql_literals(query: &str) -> String {
-    let chars: Vec<char> = query.chars().collect();
-    let mut out = String::with_capacity(query.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '#' {
-            // Comment: blank through end of line (the newline itself is kept).
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(' ');
-                i += 1;
-            }
-            continue;
-        }
-        if c == '"' {
-            let is_block = i + 2 < chars.len() && chars[i + 1] == '"' && chars[i + 2] == '"';
-            if is_block {
-                out.push_str("   ");
-                i += 3;
-                // Consume until the closing `"""` (or end — unterminated blanks
-                // the remainder, which fails the extractor closed).
-                while i < chars.len() {
-                    // GraphQL's ONLY block-string escape is `\"""` (a literal
-                    // triple-quote). It does NOT close the string — consume all
-                    // four chars and stay inside. Missing this let a smuggled
-                    // root field ride through: an early close turned the real
-                    // `}` chars living inside the string into structural braces,
-                    // so the extractor closed the selection set early and never
-                    // saw the trailing mutation field (#262).
-                    if chars[i] == '\\'
-                        && i + 3 < chars.len()
-                        && chars[i + 1] == '"'
-                        && chars[i + 2] == '"'
-                        && chars[i + 3] == '"'
-                    {
-                        out.push_str("    ");
-                        i += 4;
-                        continue;
-                    }
-                    if chars[i] == '"'
-                        && i + 2 < chars.len()
-                        && chars[i + 1] == '"'
-                        && chars[i + 2] == '"'
-                    {
-                        out.push_str("   ");
-                        i += 3;
-                        break;
-                    }
-                    out.push(' ');
-                    i += 1;
-                }
-                continue;
-            }
-            // Regular string, honoring `\"` (and `\\`) escapes.
-            out.push(' ');
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\\' {
-                    out.push(' ');
-                    i += 1;
-                    if i < chars.len() {
-                        out.push(' ');
-                        i += 1;
-                    }
-                    continue;
-                }
-                if chars[i] == '"' {
-                    out.push(' ');
-                    i += 1;
-                    break;
-                }
-                out.push(' ');
-                i += 1;
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-fn is_graphql_name_start(b: u8) -> bool {
-    b == b'_' || b.is_ascii_alphabetic()
-}
-
-fn is_graphql_name_cont(b: u8) -> bool {
-    b == b'_' || b.is_ascii_alphanumeric()
-}
-
-/// Extract the root (top-level) field names of a GraphQL mutation from an
-/// already string-stripped query. Returns `None` on ANY structural ambiguity so
-/// the caller fails closed:
-/// - not exactly one `mutation` operation keyword (a second op could hide a
-///   dangerous field),
-/// - no selection set, an unbalanced brace/paren, a truncated body, or
-/// - an unexpected token at field-head position (fragment `...`, directive `@`,
-///   variable `$`, …).
-///
-/// Aliases resolve to the underlying field (`x: deleteRepository` → `deleteRepository`).
-/// Only identifiers at brace-depth 1 / paren-depth 0 are field heads, so argument
-/// values and sub-selections never leak into the result.
-fn graphql_root_mutation_fields(stripped_query: &str) -> Option<Vec<String>> {
-    let mut kw_matches = MUTATION_KEYWORD.find_iter(stripped_query);
-    let kw = kw_matches.next()?;
-    if kw_matches.next().is_some() {
-        return None; // multiple operations — ambiguous, fail closed
-    }
-    let bytes = stripped_query.as_bytes();
-
-    // Locate the selection-set `{`: the first `{` at paren-depth 0 after the
-    // keyword, skipping an optional operation name and `(varDefs)`.
-    let mut i = kw.end();
-    let mut paren_depth: i32 = 0;
-    let mut brace_start: Option<usize> = None;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => paren_depth += 1,
-            b')' => {
-                paren_depth -= 1;
-                if paren_depth < 0 {
-                    return None;
-                }
-            }
-            b'{' if paren_depth == 0 => {
-                brace_start = Some(i);
-                break;
-            }
-            b'}' if paren_depth == 0 => return None,
-            _ => {}
-        }
-        i += 1;
-    }
-    let mut i = brace_start?;
-
-    // Walk the selection set, collecting field heads at brace-depth 1 / paren-depth 0.
-    let mut fields: Vec<String> = Vec::new();
-    let mut brace_depth: i32 = 0;
-    let mut paren_depth: i32 = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match c {
-            b'{' => {
-                brace_depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                brace_depth -= 1;
-                if brace_depth == 0 {
-                    return Some(fields); // closed the mutation selection set
-                }
-                if brace_depth < 0 {
-                    return None;
-                }
-                i += 1;
-            }
-            b'(' => {
-                paren_depth += 1;
-                i += 1;
-            }
-            b')' => {
-                paren_depth -= 1;
-                if paren_depth < 0 {
-                    return None;
-                }
-                i += 1;
-            }
-            _ if brace_depth != 1 || paren_depth != 0 => {
-                // Inside an argument list or a sub-selection — not a field head.
-                i += 1;
-            }
-            _ if c.is_ascii_whitespace() || c == b',' => {
-                i += 1;
-            }
-            b':' => {
-                // Alias separator; the real field name follows.
-                i += 1;
-            }
-            _ if is_graphql_name_start(c) => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && is_graphql_name_cont(bytes[i]) {
-                    i += 1;
-                }
-                let ident = &stripped_query[start..i];
-                // Look past whitespace/commas: a following `:` makes this an alias,
-                // so the true field name is the next identifier — skip it here.
-                let mut j = i;
-                while j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b',') {
-                    j += 1;
-                }
-                if j < bytes.len() && bytes[j] == b':' {
-                    continue;
-                }
-                fields.push(ident.to_string());
-            }
-            _ => return None, // fragment/directive/variable/etc. — ambiguous
-        }
-    }
-    None // ran off the end without closing the selection set
-}
-
-/// True when `segment` is a `gh api graphql` mutation whose root fields are ALL
-/// in [`SAFE_GRAPHQL_MUTATIONS`]. Inlines the query (a non-inline `@file` query
-/// is never safe), strips string/comment literals, requires the `mutation`
-/// keyword, and demands the extractor return a non-empty, fully-safe field set.
-/// The membership test is a subset check (`all`), never `contains`, so a single
-/// unsafe field in a composite mutation blocks the whole segment.
-fn graphql_is_safe_mutation(segment: &str) -> bool {
-    let tokens = tokenize(segment);
-    let Some(query) = graphql_query_value(&tokens) else {
-        return false;
-    };
-    if query.starts_with('@') {
-        return false;
-    }
-    let stripped = strip_graphql_literals(&query);
-    if !MUTATION_KEYWORD.is_match(&stripped) {
-        return false;
-    }
-    match graphql_root_mutation_fields(&stripped) {
-        Some(fields) => {
-            !fields.is_empty()
-                && fields
-                    .iter()
-                    .all(|f| SAFE_GRAPHQL_MUTATIONS.contains(&f.as_str()))
-        }
-        None => false,
-    }
-}
-
-/// Top-level REST endpoints that name no owner or repository at all, so no
-/// `repos/<owner>/<repo>` spelling of them exists. Used only to word the block:
-/// the guard still refuses the write, but the "use `repos/<owner>/<repo>/…`"
-/// fix is unsatisfiable for these and must not be offered (#971).
-const REPOLESS_API_ROOTS: &[&str] = &["markdown", "rate_limit", "meta", "emojis", "zen", "octocat"];
-
-/// The first path segment of a relative `gh api` endpoint when it is one of
-/// [`REPOLESS_API_ROOTS`]. Reads the path only, like [`api_repos_target`]; a
-/// URL-form endpoint returns `None` and keeps the generic wording.
-fn repoless_api_root(segment: &str) -> Option<&'static str> {
-    let endpoint = gh_api_endpoint(segment)?;
-    let path = endpoint.split(['?', '#']).next().unwrap_or("");
-    if path.contains("://") {
-        return None;
-    }
-    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
-    REPOLESS_API_ROOTS
-        .iter()
-        .copied()
-        .find(|root| *root == first)
-}
-
-/// The endpoint path of a `gh api` segment when it addresses the authenticated
-/// user's own account (`user/…`), with gh's first-class command for that
-/// resource when one exists. Relative endpoints only, like
-/// [`repoless_api_root`].
-///
-/// Account resources have no `repos/<owner>/<repo>` form, so the generic fix
-/// dead-ended there (#756). The block itself stands — no owner is in the path —
-/// but the hint names what does work. `gh ssh-key` and `gh gpg-key` are
-/// account-level and deliberately outside this guard's write patterns (see
-/// [`WRITE_ACTIONS_EXTRA`]); only the two resources whose commands are known to
-/// cover the same keys are mapped, and every other `user/…` path gets the plain
-/// "ask the user" branch.
-fn account_scoped_api(segment: &str) -> Option<Option<&'static str>> {
-    let endpoint = gh_api_endpoint(segment)?;
-    let path = endpoint.split(['?', '#']).next().unwrap_or("");
-    if path.contains("://") {
-        return None;
-    }
-    let mut parts = path.trim_start_matches('/').split('/');
-    if parts.next() != Some("user") {
-        return None;
-    }
-    Some(match parts.next() {
-        Some("keys") => Some("`gh ssh-key add` / `gh ssh-key delete <id>`"),
-        Some("gpg_keys") => Some("`gh gpg-key add` / `gh gpg-key delete <key-id>`"),
-        _ => None,
-    })
-}
-
-/// The fix line for an account-scoped `gh api` write — see [`account_scoped_api`].
-fn account_scoped_fix(alternative: Option<&str>) -> String {
-    match alternative {
-        Some(cmd) => format!(
-            "account resources have no repos/<owner>/<repo> form; use gh's own command for this \
-             resource ({cmd}), or ask the user"
-        ),
-        None => "account resources have no repos/<owner>/<repo> form; ask the user to run the \
-                 command themselves"
-            .to_string(),
-    }
-}
-
-/// Build the block message for a `gh api` write whose target owner can't be
-/// verified (graphql, `orgs/…`, `user/…`, anything that isn't
-/// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
-/// query was loaded from a file, so its mutation status couldn't be confirmed.
-fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String {
-    let is_graphql = segment_is_graphql(segment);
-    let note = if undeterminable_query {
-        "\n   Note: the GraphQL query is loaded from a file (`-F query=@…`), so its \
-         mutation status can't be verified — treated as a write."
-    } else {
-        ""
-    };
-    // graphql has no `-R`/`repos/<owner>/<repo>` form, so the generic
-    // "use gh api repos/…" fix is unsatisfiable there — state the reality (#317).
-    if let Some(root) = repoless_api_root(segment) {
-        return format!(
-            "🚫 git-guardrails: gh api write to `/{root}`, an endpoint with no owner or repo \
-             in its path — there is no ownership to check\n   \
-             Command: {segment}\n   \
-             Fix: `/{root}` has no `repos/<owner>/<repo>` form, so this guard cannot clear it. \
-             Do the work locally, or ask the user to run the command themselves.{note}"
-        );
-    }
-    if let Some(alternative) = account_scoped_api(segment) {
-        return format!(
-            "🚫 git-guardrails: gh api write to an account-scoped `user/…` endpoint — no owner in \
-             its path, so ownership can't be checked\n   \
-             Command: {segment}\n   \
-             Fix: {}{note}",
-            account_scoped_fix(alternative)
-        );
-    }
-    let fix = if is_graphql {
-        "Fix: `gh api graphql` has no `-R` or `repos/<owner>/<repo>` form to make ownership \
-         checkable. `resolveReviewThread`/`unresolveReviewThread` mutations are auto-allowed; \
-         any other mutation must be run by the user directly (a command they execute \
-         themselves), not by the agent."
-    } else {
-        "Fix: use `gh api repos/<owner>/<repo>/…` so ownership is checkable, or ask the user"
-    };
-    format!(
-        "🚫 git-guardrails: gh api write to an unverifiable target — ownership can't be checked\n   \
-         Command: {segment}\n   \
-         {fix}{note}"
-    )
-}
-
-/// Structured block for an unverifiable `gh api` write (#78). Carries the new
-/// `gh-write-api-unverifiable` rule_id and a path-shaped fix (graphql has no
-/// `-R`, so the fix steers toward `repos/<owner>/<repo>`).
-fn api_unverifiable_block(
-    segment: &str,
-    undeterminable_query: bool,
-    allowed_owners: &[AllowEntry],
-    allowed_repos: &[AllowEntry],
-) -> CheckResult {
-    // graphql has no -R/repos form, so its structured fix states the reality
-    // rather than the unsatisfiable "use gh api repos/…" (#317).
-    let fix = if let Some(root) = repoless_api_root(segment) {
-        format!(
-            "/{root} has no owner or repo in its path, so no repos/<owner>/<repo> form exists; do the work locally or ask the user to run it"
-        )
-    } else if let Some(alternative) = account_scoped_api(segment) {
-        account_scoped_fix(alternative)
-    } else if segment_is_graphql(segment) {
-        "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly".to_string()
-    } else {
-        "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user".to_string()
-    };
-    CheckResult::block_structured(
-        api_unverifiable_message(segment, undeterminable_query),
-        BlockMetadata {
-            rule_id: "gh-write-api-unverifiable".to_string(),
-            fix,
-            allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-            severity: "error",
-        },
-    )
-}
-
-/// [`looped_write_kind`] for one loop-analysis command.
-fn looped_command_kind(c: &loop_analysis::LoopedCommand) -> LoopedWriteKind {
-    looped_write_kind(&format!("gh {}", c.args.join(" ")))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LoopedWriteKind {
-    ReadOrAllowed,
-    RepoWrite,
-    /// A `gh api` write whose endpoint path names its repository literally
-    /// ([`api_literal_repo_target`]). The target is fixed by the text, the
-    /// same as an explicit `-R`, so the loop gate does not demand `-R` (which
-    /// `gh api` does not have, cameronsjo/cadence-hooks#1344). Ownership is
-    /// judged by the per-segment pass that runs after the loop gate, which
-    /// also reads `--hostname` and an inherited `GH_HOST`.
-    ApiPathWrite,
-    ApiUnverifiable {
-        undeterminable_query: bool,
-    },
-}
-
-/// True when `command` is plain enough that a literal `gh api` path is the
-/// only target its looped writes can reach, so [`LoopedWriteKind::ApiPathWrite`]
-/// may stand in for `-R` (cameronsjo/cadence-hooks#1344).
-///
-/// The per-segment pass that judges those writes reads the command once, in
-/// order, and does not know a loop variable's value. So anything that could
-/// change a later iteration's target is refused, as an allowlist rather than a
-/// list of dangers. Every segment must be one of:
-///
-/// - a `for NAME in <values>` header with at least one value: `NAME` is lowercase, starts with a
-///   letter (`$_` is reset after every command), and is not a name the
-///   shell or gh reads; each value is plain text that does not start with
-///   `-` or `=` and does not start or end with `.`;
-/// - a bare `do`/`done`;
-/// - a `gh` command whose subcommand is in a fixed list that cannot change
-///   gh's host, login, or config and writes no file to a path it is given
-///   (so not `auth`, `config`, `alias`, `release`, `run`, `repo`, `gist`, or
-///   an extension), that is not `pr checkout` or `issue develop` (a `pr` or
-///   `issue` command's verb, after an optional `-R`, is plain literal text,
-///   and no word is `checkout`, `co`, or `develop`), and whose arguments are plain words, optionally wrapped in
-///   one pair of double quotes, that may expand the loop's own variables in
-///   exactly two forms: `${NAME}`, or `$NAME` followed by the end of the
-///   word or one of `/ - , @ + =`.
-///
-/// Segments must be joined by `;` and newlines only: no pipe, `&&`/`||` or
-/// background `&` between commands. A comment is dropped as the shell drops
-/// it, so a `|` or `&` inside one does not count. One inside a word (a quote,
-/// `2>&1`, `>|`) fails the plain-word test.
-///
-/// Those two forms are the only ones neither bash nor zsh rewrites: the value
-/// is a plain header word, so the expansion is that word, cannot split into a
-/// new argument such as `--hostname`, and cannot join a neighbour into `..`.
-/// Everything else is refused, including zsh's `$NAME:s/a/b/` and every other
-/// `:` modifier after an unbraced name, `${NAME:…}` and any other operator,
-/// flag, or subscript inside braces, and a word starting with `=` (zsh
-/// rewrites `=ls` to a path). A refused command keeps the cwd-based loop
-/// policy this guard had before, as does any other shape (`export`, a
-/// function, `source`, `eval`, a `while` condition, a glob, `%`).
-fn loop_targets_are_literal(command: &str) -> bool {
-    /// gh subcommands a plain loop may run. None of them changes which host
-    /// or account a later iteration's `gh api` reaches, and none writes files
-    /// to a path it is given (`release download -D`, `run download`, `repo
-    /// clone` and `gist clone` could write into gh's config dir). Some change
-    /// local git state (`pr merge --delete-branch`), which a literal `gh api`
-    /// path does not read.
-    const LOOP_SUBCOMMANDS: &[&str] = &[
-        "api", "pr", "issue", "workflow", "label", "search", "browse", "status", "cache",
-        "variable", "secret", "ruleset", "project",
-    ];
-    /// Lowercase names the shell or gh reads, or that zsh rewrites: its
-    /// arrays tied to `PATH` and friends, `histchars` and `pipestatus`, and
-    /// the proxy variables Go's `ProxyFromEnvironment` reads.
-    const SETTING_NAMES: &[&str] = &[
-        "path",
-        "fpath",
-        "cdpath",
-        "manpath",
-        "module_path",
-        "mailpath",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-        // zsh keeps only the first three characters of `histchars` and
-        // resets `pipestatus`, so neither holds its header value.
-        "histchars",
-        "pipestatus",
-    ];
-    /// Letters, digits, a few punctuation bytes, and any byte outside ASCII
-    /// (`body=café`): no shell reads one of those as syntax.
-    fn plain(word: &str) -> bool {
-        !word.is_empty()
-            && !word.contains("..")
-            && !word.starts_with('=')
-            && word.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || !b.is_ascii()
-                    || matches!(
-                        b,
-                        b'_' | b'.' | b'/' | b':' | b'=' | b'@' | b',' | b'+' | b'-'
-                    )
-            })
-    }
-    fn name_byte(b: u8) -> bool {
-        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'
-    }
-    /// The word with each accepted loop-variable expansion replaced by a
-    /// plain placeholder, or `None` when it holds any other expansion.
-    fn expand(word: &str, loop_vars: &[String]) -> Option<String> {
-        let inner = word
-            .strip_prefix('"')
-            .and_then(|w| w.strip_suffix('"'))
-            .unwrap_or(word);
-        let bytes = inner.as_bytes();
-        let mut out = String::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] != b'$' {
-                out.push(char::from(bytes[i]));
-                i += 1;
-                continue;
-            }
-            let braced = bytes.get(i + 1) == Some(&b'{');
-            let start = i + 1 + usize::from(braced);
-            let end = start
-                + bytes[start..]
-                    .iter()
-                    .take_while(|b| name_byte(**b) || b.is_ascii_uppercase())
-                    .count();
-            let name = &inner[start..end];
-            if !loop_vars.iter().any(|v| v == name) {
-                return None;
-            }
-            i = if braced {
-                // `${NAME}` only: no operator, flag, or subscript.
-                (bytes.get(end) == Some(&b'}')).then_some(end + 1)?
-            } else {
-                // `$NAME` followed by a byte no shell reads as part of the
-                // expansion. zsh reads `:` as a modifier, and `.` is left out
-                // because ksh-style shells read `$a.b` as one compound name.
-                match bytes.get(end) {
-                    None | Some(b'/' | b'-' | b',' | b'@' | b'+' | b'=') => end,
-                    Some(_) => return None,
-                }
-            };
-            out.push('v');
-        }
-        Some(out)
-    }
-    // A plain loop is joined by `;` and newlines only, never a pipe,
-    // `&&`/`||`, or a background job. The operators are the splitter's, not
-    // the raw text's, so a `&` or `|` inside a comment does not count: the
-    // splitter drops a comment the way the shell does, ending a word only at
-    // a shell blank (#1390), so the command after it is still a segment
-    // here. A `|` or `&` the splitter keeps inside a word (a quote, `2>&1`,
-    // `>|`) fails `plain` below.
-    let segments = split_segments_with_ops(command);
-    if segments
-        .iter()
-        .any(|(_, op)| op.is_some_and(|op| !matches!(op, ";" | "\n")))
-    {
-        return false;
-    }
-    fn is_checkout_verb(word: &str) -> bool {
-        matches!(word, "checkout" | "co" | "develop")
-    }
-    /// The verb of `gh pr`/`gh issue`: the first word after an optional
-    /// `-R`/`--repo`, or `None` when another flag or nothing comes first.
-    fn pr_issue_verb<'a>(args: &[&'a str]) -> Option<&'a str> {
-        let rest = match args {
-            ["-R" | "--repo", _, rest @ ..] => rest,
-            [flag, rest @ ..] if flag.starts_with("--repo=") || flag.starts_with("-R") => rest,
-            _ => args,
-        };
-        rest.first().copied().filter(|v| !v.starts_with('-'))
-    }
-    let mut loop_vars: Vec<String> = Vec::new();
-    // The raw segments, not `command_segments`: that one expands parameters
-    // it can read statically and treats a loop variable as unset, so
-    // `${b:-x}` would reach this check as plain `x`.
-    for (segment, _) in &segments {
-        let segment = segment.trim();
-        let segment = segment.strip_prefix("do ").unwrap_or(segment).trim();
-        if matches!(segment, "do" | "done") {
-            continue;
-        }
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        match words.as_slice() {
-            ["for", name, "in", values @ ..] => {
-                // Lowercase only: a loop over `IFS`, `GH_HOST`, `HOME`, or any
-                // other setting the shell or gh reads changes how gh runs, and
-                // those are uppercase except the few in `SETTING_NAMES`. The
-                // name starts with a letter: bash and zsh reset `$_` to the
-                // previous command's last argument after every command, so it
-                // is not the header value.
-                let ident = !SETTING_NAMES.contains(name)
-                    && name.starts_with(|c: char| c.is_ascii_lowercase())
-                    && name.bytes().all(name_byte);
-                // A value that starts with `-` would arrive in gh's argv as a
-                // flag. One that starts or ends with `.` could meet a `.` or
-                // another value across an expansion and build `..`.
-                let value_ok = |v: &&str| {
-                    plain(v) && !v.starts_with('-') && !v.starts_with('.') && !v.ends_with('.')
-                };
-                // An empty list never assigns the name, so a later `$NAME`
-                // keeps whatever value the shell already had.
-                if !ident || values.is_empty() || !values.iter().all(value_ok) {
-                    return false;
-                }
-                loop_vars.push((*name).to_string());
-            }
-            ["gh", subcommand, args @ ..] => {
-                // `pr checkout` and `issue develop` rewrite the working tree
-                // and `branch.*` config. The verb is the first word after an
-                // optional `-R`/`--repo`; it must be plain literal text, so a
-                // quoted verb (`gh pr "checkout"`) or one built from a loop
-                // variable (`gh pr $b`, `gh pr c$b`) is refused, as is any
-                // other flag before it. No word anywhere may be a checkout
-                // verb either; that also refuses ordinary words such as
-                // `--search develop`, and a refusal only keeps the loop policy.
-                let checks_out = matches!(*subcommand, "pr" | "issue")
-                    && (!pr_issue_verb(args).is_some_and(|v| plain(v) && !is_checkout_verb(v))
-                        || args.iter().any(|a| is_checkout_verb(a.trim_matches('"'))));
-                if checks_out
-                    || !LOOP_SUBCOMMANDS.contains(subcommand)
-                    || !args.iter().all(|a| {
-                        plain(a)
-                            || (!a.trim_start_matches('"').starts_with('-')
-                                && expand(a, &loop_vars).is_some_and(|w| plain(&w)))
-                    })
-                {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// The `owner/repo` a `gh api` command names literally in its endpoint path,
-/// or `None` when it is not a `gh api` call, the endpoint is not
-/// `repos/<owner>/<repo>`, or either name is anything but plain text.
-///
-/// The character sets are GitHub's own (an owner is letters, digits, and `-`;
-/// a repository adds `_` and `.`), so the shapes whose target is decided at
-/// run time all fall out: a `$` or backtick expansion, gh's `{owner}`/`{repo}`
-/// placeholders (filled from the cwd remote, which a loop body can change),
-/// brace expansion, globs, and percent-escapes. Those stay
-/// [`LoopedWriteKind::RepoWrite`] and keep the cwd-based loop policy.
-fn api_literal_repo_target(command: &str) -> Option<String> {
-    let repo = api_repos_target(&gh_api_endpoint(command)?)?;
-    is_github_repo(&repo).then_some(repo)
-}
-
-/// True when `repo` is `owner/name` in GitHub's own character sets: an owner
-/// is letters, digits and `-`, with no leading `-`; a name is
-/// [`is_github_name`].
-///
-/// [`api_literal_repo_target`] judges with it, so its verdicts rest on it.
-fn is_github_repo(repo: &str) -> bool {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return false;
-    };
-    let owner_ok = !owner.is_empty()
-        && !owner.starts_with('-')
-        && owner
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    owner_ok && is_github_name(name)
-}
-
 /// True when `name` is a repository name in GitHub's character set: letters,
 /// digits, `-`, `_` and `.`, and not `.` or `..`.
 ///
@@ -4233,47 +2058,13 @@ const MAX_GITHUB_REPO_NAME: usize = 100;
 /// placeholder for any other repo.
 ///
 /// Only the name is checked. The unowned fix reuses the name alone, under an
-/// allowlist owner. The loop's `-R` and the fork block's `Use -R` print a repo
-/// the allowlist accepted, so its owner matched an allowlist entry, ignoring
+/// allowlist owner. The fork block's `Use -R` prints a repo the allowlist
+/// accepted, so its owner matched an allowlist entry, ignoring
 /// case. Checking the owner too dropped the fix for an owner with `_` or `.`,
 /// such as the managed-user login `mona_acme` (code review N1 on #1539).
 fn advice_may_reuse(repo: &str) -> bool {
     repo.split_once('/')
         .is_some_and(|(_, name)| name.len() <= MAX_GITHUB_REPO_NAME && is_github_name(name))
-}
-
-/// Classify the reconstructed argv retained by loop analysis.
-///
-/// API calls without a repository-shaped endpoint cannot use `-R`, so they
-/// must not fall into the generic missing-target block. In particular,
-/// GraphQL reads and the two safe thread-metadata mutations remain allowed,
-/// while other mutations use the same unverifiable-API verdict as the
-/// per-segment path.
-fn looped_write_kind(command: &str) -> LoopedWriteKind {
-    if !is_write_command(command) {
-        return LoopedWriteKind::ReadOrAllowed;
-    }
-    let Some(endpoint) = gh_api_endpoint(command) else {
-        return LoopedWriteKind::RepoWrite;
-    };
-    if is_graphql_endpoint(&endpoint) {
-        let status = graphql_mutation_status(command);
-        if status == Some(false) || graphql_is_safe_mutation(command) {
-            return LoopedWriteKind::ReadOrAllowed;
-        }
-        return LoopedWriteKind::ApiUnverifiable {
-            undeterminable_query: status.is_none(),
-        };
-    }
-    if api_repos_target(&endpoint).is_none() {
-        return LoopedWriteKind::ApiUnverifiable {
-            undeterminable_query: false,
-        };
-    }
-    if api_literal_repo_target(command).is_some() {
-        return LoopedWriteKind::ApiPathWrite;
-    }
-    LoopedWriteKind::RepoWrite
 }
 
 /// True when a resolved `owner/repo` still carries shell expansion syntax
@@ -4375,8 +2166,8 @@ fn fork_block_message(
 }
 
 /// Resolve and judge a single gh write segment's target. Returns `Some(block)`
-/// when the segment targets a repo outside the allowlist (or one that can't be
-/// resolved), `None` when it's allowed. Per-segment resolution is what stops a
+/// when the segment targets a repo outside the allowlist, `None` when it's
+/// allowed or its target cannot be read. Per-segment resolution is what stops a
 /// benign first `-R` from covering an unowned write later in the same chain.
 /// `whole` is every segment of the command it came from, which the fix reads
 /// ([`fix_keeps_repo_name`]).
@@ -4398,7 +2189,6 @@ fn judge_write_segment(
                 resolution,
                 segment,
                 whole,
-                work_dir,
                 allowed_owners,
                 allowed_repos,
                 extra_hosts,
@@ -4500,50 +2290,26 @@ fn write_keeps_repo_name([group, verb]: [&str; 2], argv: &[String]) -> bool {
     }
 }
 
-/// The verdict on one repo a write segment may land on.
+/// The verdict on one repo a write segment may land on. Only a target this
+/// guard read exactly and found unowned blocks (cadence-ecosystem ADR-0046
+/// rules 2 and 3).
 fn judge_resolution(
     resolution: RepoResolution,
     segment: &str,
     whole: &[String],
-    work_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
 ) -> Option<CheckResult> {
     match resolution {
-        RepoResolution::UnreadableFlag(value) => Some(CheckResult::block_structured(
-            format!(
-                "🚫 git-guardrails: gh write names a target repo this guard cannot read\n   \
-                 Command: {segment}\n   \
-                 Target:  {shown}\n   \
-                 gh reads a repo as a URL or `[HOST/]OWNER/REPO`; this value is neither, or \
-                 is spelled in a way this guard cannot split exactly as gh does, so it cannot \
-                 be checked for ownership.\n   \
-                 Fix: spell the target as `{}`",
-                target_spelling(segment, "owner/repo"),
-                // The value can be a `GH_REPO` inherited from the environment,
-                // and a URL's userinfo can hold a token
-                // (cameronsjo/cadence-hooks#1541).
-                shown = crate::messages::shown_url(&value),
-            ),
-            BlockMetadata {
-                rule_id: "gh-write-target-unresolvable".to_string(),
-                fix: format!(
-                    "spell the target as {}",
-                    target_spelling(segment, "owner/repo")
-                ),
-                allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-                severity: "error",
-            },
-        )),
         RepoResolution::Fork {
             origin_host,
             origin,
             upstream_host,
             upstream,
         } => {
-            // Both remotes owned (each judged against its own host) — the write
-            // lands somewhere you control either way.
+            // Every remote this guard could read is owned (each judged
+            // against its own host) — the write lands somewhere you control.
             if fork_allowed(
                 &origin_host,
                 &origin,
@@ -4575,49 +2341,14 @@ fn judge_resolution(
         }
         // The resolution probes hit the #271 subprocess deadline: the guard's
         // own infrastructure failed, which never blocks (ADR-0001). The
-        // suppressed fail-closed block is recorded so telemetry distinguishes
-        // "slow git" from "an ownership block was bypassed".
+        // suppressed block is recorded so telemetry distinguishes "slow git"
+        // from "an ownership block was bypassed".
         RepoResolution::TimedOut => {
             cadence_hooks_core::deadline::note_suppressed_block();
             None
         }
-        // Repo flags disagree. A target WAS spelled out, so the unresolvable
-        // arm's "add -R" advice would be wrong; say which readings conflict and
-        // let the operator pick. Same rule id — an ambiguous target IS an
-        // unresolvable one, and downstream consumers keyed on the id shouldn't
-        // have to learn a new one to keep blocking.
-        RepoResolution::AmbiguousFlags => Some(CheckResult::block_structured(
-            format!(
-                "🚫 git-guardrails: gh write names more than one target repo\n   \
-                 Command: {segment}\n   \
-                 Which one gh honors depends on whether a later `-R`-shaped token is a real \
-                 flag or another flag's value — this guard cannot tell, so it will not guess.\n   \
-                 Fix: leave exactly one `-R owner/repo`. Quoting the other argument will NOT \
-                 help — quotes are stripped before this check — so reword it, or put a space \
-                 after the dash prefix (`-R owner/repo` inside prose is ignored)."
-            ),
-            BlockMetadata {
-                rule_id: "gh-write-target-unresolvable".to_string(),
-                fix: "leave exactly one -R owner/repo".to_string(),
-                allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-                severity: "error",
-            },
-        )),
-        RepoResolution::Unresolvable => {
-            // Suggest the first allowed owner so the fix is concrete even when no
-            // repo can be inferred from the directory.
-            let owner_for_fix = allowed_owners.first().map_or("owner", |e| e.owner.as_str());
-            let fix = target_spelling(segment, &format!("{owner_for_fix}/<repo>"));
-            Some(CheckResult::block_structured(
-                unresolvable_message(work_dir, &fix),
-                BlockMetadata {
-                    rule_id: "gh-write-target-unresolvable".to_string(),
-                    fix,
-                    allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-                    severity: "error",
-                },
-            ))
-        }
+        // No `-R` and no readable remote: nothing to judge (ADR-0046 rule 3).
+        RepoResolution::Unresolvable => None,
         RepoResolution::SelectorUrl { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 return None;
@@ -4637,115 +2368,56 @@ fn judge_resolution(
         }
         RepoResolution::Resolved { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
-                None
-            } else if !host_is_read(&host)
+                return None;
+            }
+            // A host or name holding a shell expansion is a value only the
+            // running shell knows, so it is allowed (ADR-0046 rule 3, #1503).
+            // A literal owner with an expanded name (`evil/$r`) is still read
+            // exactly, by its owner, and blocks (#1491).
+            if !host_is_read(&host)
                 || (repo_has_unexpanded_expansion(&repo)
                     && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos))
             {
-                // The target holds a shell expansion this guard never sees the
-                // value of, and no literal owner can be read past it, so it is
-                // UNRESOLVABLE, not unowned — and the unowned template's
-                // `-R <owner>/<name>` fix would graft an owner the caller never
-                // chose onto `$1` (#757). A literal owner with an expanded
-                // name (`evil/$r`) is judged by its owner and gets the unowned
-                // message (#1491).
-                //
-                // An expansion in the host (`-R "$h/evil/x"`) is as unreadable
-                // as one in the name: the owner and name may be literal, but
-                // the guard cannot say where they live, and the unowned
-                // message's `-R cameronsjo/x` fix would drop the host. The
-                // loop's `-R` arm says the same of that value (#1507).
-                let literal = target_spelling(segment, "owner/repo");
-                let repo_expanded = repo_has_unexpanded_expansion(&repo);
-                // When `--hostname` or `GH_HOST` chose the unread host, a
-                // literal target alone leaves the command blocked, so the fix
-                // names the host as well, or alone when the target is literal.
-                let (fix_line, fix) = match unread_host_fix(segment, &host) {
-                    None => (
-                        format!("pass the target as a literal `{literal}`"),
-                        format!("pass the target as a literal {literal}"),
-                    ),
-                    Some((line, plain)) if repo_expanded => (
-                        format!("pass the target as a literal `{literal}`; also {line}"),
-                        format!("pass the target as a literal {literal}; also {plain}"),
-                    ),
-                    Some((line, plain)) => (line.to_string(), plain.to_string()),
-                };
-                // Name the part that expands: with only the host expanded,
-                // `Target:` shows the whole spec, host first, as typed.
-                let target = if repo_expanded {
-                    repo
-                } else {
-                    format!("{}/{repo}", host_as_typed(segment, &host))
-                };
-                Some(CheckResult::block_structured(
-                    format!(
-                        "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
-                         Target:  {shown} (an unexpanded shell expansion — its value is only known \
-                         when the shell runs)\n   \
-                         Fix: {fix_line}",
-                        shown = crate::messages::shown_url(&target),
-                    ),
-                    BlockMetadata {
-                        rule_id: "gh-write-target-unresolvable".to_string(),
-                        fix,
-                        allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-                        severity: "error",
-                    },
-                ))
-            } else {
-                let example_owner = allowed_owners
-                    .first()
-                    .map(|e| e.owner.as_str())
-                    .unwrap_or("owner");
-                // Reuse the repo *name* under an allowed owner so the fix lands
-                // on the same project — `evil/cool-tool` becomes
-                // `cameronsjo/cool-tool`, not a placeholder. Only when every
-                // write in the command creates something
-                // ([`fix_keeps_repo_name`]). A verb that changes or removes
-                // something, a `gh api` write, and a segment this guard cannot
-                // read a verb from name `<repo>`, wherever they sit in the
-                // command: rerun as written, a fix naming the repo would act
-                // on the operator's own repo of that name (#1506).
-                // An expanded name is never reused, whoever spelled it: the
-                // fix is a command the model runs, and a name with `$` or a
-                // backtick runs as shell. The command's own `-R "evil/$r"`
-                // and a name read from the checkout's remote both get
-                // `<repo>`. Testing whether the command's text holds the
-                // name cannot tell the target from a `--title`, a `--body`
-                // or a heredoc that merely repeats it.
-                let name = repo.split('/').next_back().unwrap_or(repo.as_str());
-                let repo_name = if fix_keeps_repo_name(segment, whole)
-                    && !repo_has_unexpanded_expansion(name)
-                {
-                    name
-                } else {
-                    "<repo>"
-                };
-                // An unresolved GH_HOST is not fixed by any `-R` (#548).
-                let fix = if host == UNRESOLVED_GH_HOST {
-                    "name the host on the gh command itself (--hostname <host>)".to_string()
-                } else {
-                    // The name may come from `origin`, and the fix is a
-                    // command the model may run, so only a GitHub name is
-                    // reused in it (#1526).
-                    let repo_name = if advice_may_reuse(&repo) {
-                        repo_name
-                    } else {
-                        "<repo>"
-                    };
-                    target_spelling(segment, &format!("{example_owner}/{repo_name}"))
-                };
-                Some(CheckResult::block_structured(
-                    disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
-                    BlockMetadata {
-                        rule_id: "gh-write-unauthorized-target".to_string(),
-                        fix,
-                        allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-                        severity: "error",
-                    },
-                ))
+                return None;
             }
+            let example_owner = allowed_owners
+                .first()
+                .map(|e| e.owner.as_str())
+                .unwrap_or("owner");
+            // Reuse the repo *name* under an allowed owner so the fix lands
+            // on the same project — `evil/cool-tool` becomes
+            // `cameronsjo/cool-tool`, not a placeholder. Only when every
+            // write in the command creates something
+            // ([`fix_keeps_repo_name`]). A verb that changes or removes
+            // something, a `gh api` write, and a segment this guard cannot
+            // read a verb from name `<repo>`, wherever they sit in the
+            // command: rerun as written, a fix naming the repo would act
+            // on the operator's own repo of that name (#1506).
+            // An expanded name is never reused, whoever spelled it: the
+            // fix is a command the model runs, and a name with `$` or a
+            // backtick runs as shell.
+            let name = repo.split('/').next_back().unwrap_or(repo.as_str());
+            let repo_name = if fix_keeps_repo_name(segment, whole)
+                && !repo_has_unexpanded_expansion(name)
+                // The name may come from `origin`, and the fix is a command
+                // the model may run, so only a GitHub name is reused in it
+                // (#1526).
+                && advice_may_reuse(&repo)
+            {
+                name
+            } else {
+                "<repo>"
+            };
+            let fix = target_spelling(segment, &format!("{example_owner}/{repo_name}"));
+            Some(CheckResult::block_structured(
+                disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
+                BlockMetadata {
+                    rule_id: "gh-write-unauthorized-target".to_string(),
+                    fix,
+                    allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                    severity: "error",
+                },
+            ))
         }
     }
 }
@@ -4775,352 +2447,33 @@ impl Check for GhWriteGuard {
             return CheckResult::allow();
         }
 
-        // Nesting past what the shell parser is fed is unreadable here, and
-        // at ~900 levels it used to overflow the stack and abort — a noisy
-        // fail-open (PR #1118 review). Fail closed instead.
+        // Nesting past what the shell parser is fed overflows the stack. A
+        // command this guard cannot read is allowed (cadence-ecosystem
+        // ADR-0046 rule 3).
         if loop_analysis::group_nesting_depth(command) > loop_analysis::MAX_PARSE_NESTING {
-            return CheckResult::block(format!(
-                "🚫 git-guardrails: command nests groups more than {} levels deep — \
-                 too deep to verify its gh targets\n   \
-                 Fix: flatten the command, or run each gh command on its own",
-                loop_analysis::MAX_PARSE_NESTING
-            ));
+            return CheckResult::allow();
         }
 
-        // A word whose brace expansion is past what the tokenizer models is
-        // left whole, so the gh invocation it spells (`gh {pr,}{…}… create`)
-        // is invisible to every reading below. Refuse rather than judge a
-        // command this guard cannot see (cadence-hooks#1115).
-        //
-        // The allowance is armed here for every reading below. `command_segments`
-        // re-splits the command and every script under it; a 200 KB flood of
-        // substitution heredocs cost seconds, and a hook past its deadline fails
-        // open, so a command this large to read is refused (cadence-hooks#1141).
+        // The allowance bounds how much script `command_segments` reads across
+        // every reading below (cadence-hooks#1141). Past it the rest goes
+        // unread, and the guard judges what it did read (ADR-0046 rule 3).
         let _work = ExpansionWork::arm(expansion_allowance(command.len()));
-        let readable = command_segments(command);
-        if ExpansionWork::spent() {
-            return too_large_to_read_block();
-        }
-        if let Some(segment) = readable.into_iter().find(|segment| {
-            segment.contains('{')
-                && contains_ignoring_ascii_case(segment, "gh")
-                && brace_expansion_overflows(segment)
-        }) {
-            let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
-            let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
-            return CheckResult::block_structured(
-                format!(
-                    "🚫 git-guardrails: gh command uses a brace expansion too large to read\n   \
-                     Command: {segment}\n   \
-                     Fix: spell the gh command out without the brace expansion"
-                ),
-                BlockMetadata {
-                    rule_id: "gh-write-target-unresolvable".to_string(),
-                    fix: "spell the gh command out without the brace expansion".to_string(),
-                    allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
-                    severity: "error",
-                },
-            );
-        }
 
         let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
         let extra_hosts = env_extra_hosts();
 
-        // AST-based loop detection with regex fallback. A loop needs one of
-        // its reserved words spelled out in the text — they cannot come from
-        // an expansion — and so does the fallback pattern, so a command with
-        // none of them skips the parse: every answer it could give is
-        // `NoLoops` or a fallback that does not match.
-        static LOOP_WORD: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?:^|[^A-Za-z0-9_])(?:for|while|until|select)(?:[^A-Za-z0-9_]|$)")
-                .expect("pattern should compile")
-        });
-        let may_loop = LOOP_WORD.is_match(command);
-        let mut unread_loop = false;
-        let analysis = if may_loop {
-            loop_analysis::analyze_gh_loops(command)
-        } else {
-            LoopAnalysis::NoLoops
-        };
-        // A literal api path stands in for -R only in a plain loop; see
-        // [`loop_targets_are_literal`]. Otherwise it is judged like any
-        // other looped write without a target.
-        let literal_paths = std::cell::OnceCell::new();
-        let kind = |c: &loop_analysis::LoopedCommand| match looped_command_kind(c) {
-            LoopedWriteKind::ApiPathWrite
-                if !*literal_paths.get_or_init(|| loop_targets_are_literal(command)) =>
-            {
-                LoopedWriteKind::RepoWrite
-            }
-            k => k,
-        };
-        match analysis {
-            LoopAnalysis::AllTargetsExplicit(cmds) => {
-                // Only writes are ownership-gated; reads (gh pr view, issue list) are
-                // owner-independent and safe against any repo — mirror the MissingTargets
-                // branch, which already gates on write kind (#158). -R targets are
-                // always on the default host (gh CLI convention).
-                for c in &cmds {
-                    if let LoopedWriteKind::ApiUnverifiable {
-                        undeterminable_query,
-                    } = kind(c)
-                    {
-                        return api_unverifiable_block(
-                            &format!("gh {}", c.args.join(" ")),
-                            undeterminable_query,
-                            &allowed_owners,
-                            &allowed_repos,
-                        );
-                    }
-                }
-                let dh = default_host();
-                let unowned_write_targets: Vec<&str> = cmds
-                    .iter()
-                    .filter(|c| kind(c) == LoopedWriteKind::RepoWrite)
-                    .filter(|c| {
-                        !c.explicit_repo.as_ref().is_some_and(|r| {
-                            loop_flag_value_is_owned(r, &dh, &allowed_owners, &allowed_repos)
-                        })
-                    })
-                    .filter_map(|c| c.explicit_repo.as_deref())
-                    .collect();
-                // #1337: a `-R "$r"` whose value is only known when the shell
-                // runs is unresolvable, not unowned. When every blocked target
-                // is such an expansion, say that and name it, as the
-                // single-command arm does (#757); the verdict is unchanged.
-                // As there, a literal owner the allowlist rejects is unowned
-                // (`evil/$r`, #1491); see [`names_literal_unowned_owner`].
-                if !unowned_write_targets.is_empty()
-                    && unowned_write_targets.iter().all(|t| {
-                        loop_target_is_unresolvable(t, &dh, &allowed_owners, &allowed_repos)
-                    })
-                {
-                    // Only a short value in the charset `prevent-secret-writes`
-                    // prints (`unresolved_parameter_cause`) is echoed: the
-                    // `-R` text is the command author's, and the message
-                    // reaches the model.
-                    let tokens: Vec<String> = unowned_write_targets
-                        .iter()
-                        .map(|t| {
-                            let value = t.trim_matches('"');
-                            let safe = value.len() <= 64
-                                && value.chars().all(|c| {
-                                    c.is_ascii_alphanumeric() || matches!(c, '$' | '_' | '{' | '}')
-                                });
-                            if safe {
-                                format!("\"{value}\"")
-                            } else {
-                                "a shell parameter".to_string()
-                            }
-                        })
-                        .collect();
-                    return CheckResult::block_structured(
-                        format!(
-                            "⚠️  git-guardrails: gh loop: cannot resolve {} in -R; use a literal \
-                             owner/repo\n   \
-                             The value is only known when the shell runs, so this guard cannot \
-                             check it for ownership.\n   \
-                             Fix: spell each target as a literal `-R owner/repo` (one gh command \
-                             per repo, or a loop over literal `-R` values)",
-                            tokens.join(", "),
-                        ),
-                        BlockMetadata {
-                            rule_id: "gh-write-target-unresolvable".to_string(),
-                            fix: "pass the target as a literal -R owner/repo".to_string(),
-                            allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
-                            severity: "error",
-                        },
-                    );
-                }
-                if !unowned_write_targets.is_empty() {
-                    let all_entries: Vec<String> = allowed_owners
-                        .iter()
-                        .chain(allowed_repos.iter())
-                        .map(|e| e.to_string())
-                        .collect();
-                    // Name only the targets judged unowned. An unresolvable
-                    // one beside them (`"$o/$r"`, the allowed
-                    // `"cameronsjo/$r"`) is no repo you don't own. At least
-                    // one is left: the arm above took the all-unresolvable
-                    // case.
-                    let found: Vec<&str> = unowned_write_targets
-                        .iter()
-                        .copied()
-                        .filter(|t| {
-                            !loop_target_is_unresolvable(t, &dh, &allowed_owners, &allowed_repos)
-                        })
-                        .collect();
-                    return CheckResult::block(format!(
-                        "🚫 git-guardrails: gh loop targets repo you don't own\n   \
-                         Found: {}\n   \
-                         Allowed: {}\n   \
-                         Fix: use `-R owner/repo` to target an owned repo (`gh api` has no -R: name \
-                         an owned repo in its literal `repos/<owner>/<repo>/…` path)",
-                        found.join(", "),
-                        all_entries.join(" "),
-                    ));
-                }
-                // All write targets owned (or the loop is read-only) — allow the loop
-            }
-            LoopAnalysis::MissingTargets(cmds) => {
-                // Only block if any looped gh command is a write — read-only
-                // commands (gh pr list, gh issue view) are safe without -R.
-                for c in &cmds {
-                    if let LoopedWriteKind::ApiUnverifiable {
-                        undeterminable_query,
-                    } = kind(c)
-                    {
-                        return api_unverifiable_block(
-                            &format!("gh {}", c.args.join(" ")),
-                            undeterminable_query,
-                            &allowed_owners,
-                            &allowed_repos,
-                        );
-                    }
-                }
-                // A `gh repo` write whose argument spells out its owner names
-                // its target as `-R` does (#1491), so the directory rule
-                // skips it and the per-segment pass below judges its owner,
-                // wherever the loop runs. A loop in which every command names
-                // its target, this way or with `-R`, skips the directory rule
-                // whole; that pass judges each of its targets.
-                let names_repo = |c: &loop_analysis::LoopedCommand| {
-                    c.explicit_repo.is_none() && looped_repo_argument_is_literal(c)
-                };
-                let all_named = cmds
-                    .iter()
-                    .all(|c| c.explicit_repo.is_some() || names_repo(c));
-                let has_write = !all_named
-                    && cmds
-                        .iter()
-                        .any(|c| kind(c) == LoopedWriteKind::RepoWrite && !names_repo(c));
-                if has_write {
-                    // Relaxed-when-deterministic policy (#44): a loop whose
-                    // body never changes directory, running in an owned
-                    // non-fork repo, targets that repo on every iteration —
-                    // the same trust extended to single commands. Set
-                    // CADENCE_GH_STRICT_LOOPS=1 to restore unconditional
-                    // blocking.
-                    let strict = std::env::var("CADENCE_GH_STRICT_LOOPS").is_ok_and(|v| v == "1");
-                    let cwd = input.cwd.as_deref().unwrap_or(".");
-                    let work_dir = parse_work_dir(command, cwd);
-                    let decision = judge_loop_write(
-                        strict,
-                        loop_analysis::loop_bodies_mutate_cwd(command),
-                        &resolve_from_git_remotes(&work_dir),
-                        &allowed_owners,
-                        &allowed_repos,
-                        &extra_hosts,
-                    );
-                    if let LoopWriteDecision::Block { suggestion } = decision {
-                        // The verdict is made. The fix names the directory's
-                        // repo only when gh sends every looped write there.
-                        let suggestion = suggestion
-                            .filter(|_| loop_fix_may_name_dir_repo(command, cwd, &work_dir));
-                        // The suggestion is the repo `origin` names, printed
-                        // as the `-R` to add, so only a GitHub name is reused
-                        // (#1526). The verdict above read it as is.
-                        let suggestion = suggestion.map(|s| {
-                            if advice_may_reuse(&s) {
-                                s
-                            } else {
-                                "<owner>/<repo>".to_string()
-                            }
-                        });
-                        let (api_writes, writes): (Vec<String>, Vec<String>) = cmds
-                            .iter()
-                            .filter(|c| {
-                                c.explicit_repo.is_none()
-                                    && kind(c) == LoopedWriteKind::RepoWrite
-                                    && !names_repo(c)
-                            })
-                            .map(|c| format!("gh {}", c.args.join(" ")))
-                            .partition(|c| gh_api_endpoint(c).is_some());
-                        let quote = |v: Vec<String>| -> Vec<String> {
-                            v.into_iter().map(|c| format!("`{c}`")).collect()
-                        };
-                        // Every command names its target (`-R` or a literal
-                        // api path) and only the mix is refused: say so,
-                        // since `-R` advice would not apply.
-                        // A loop here lacks a target somewhere, so if every
-                        // command is a literal api write or has `-R`, at
-                        // least one is the api write.
-                        let mixed = writes.is_empty()
-                            && api_writes.is_empty()
-                            && cmds.iter().all(|c| {
-                                kind(c) == LoopedWriteKind::ApiPathWrite
-                                    || c.explicit_repo.is_some()
-                            });
-                        if mixed {
-                            return CheckResult::block_structured(
-                                format!(
-                                    "🚫 git-guardrails: gh loop mixes -R commands with gh api writes\n   \
-                                     Fix: {MIXED_LOOP_FIX}"
-                                ),
-                                BlockMetadata {
-                                    rule_id: "gh-write-loop-missing-repo".to_string(),
-                                    fix: MIXED_LOOP_FIX.to_string(),
-                                    allowed_owners: allowed_display_list(
-                                        &allowed_owners,
-                                        &allowed_repos,
-                                    ),
-                                    severity: "error",
-                                },
-                            );
-                        }
-                        let (writes, api_writes) = (quote(writes), quote(api_writes));
-                        let target = suggestion.as_deref().unwrap_or("<owner>/<repo>");
-                        let literal_api = cmds
-                            .iter()
-                            .any(|c| kind(c) == LoopedWriteKind::ApiPathWrite);
-                        let fix = looped_write_fix(&writes, &api_writes, target, literal_api);
-                        return CheckResult::block_structured(
-                            looped_write_block_message(
-                                &writes,
-                                &api_writes,
-                                suggestion.as_deref(),
-                                literal_api,
-                            ),
-                            BlockMetadata {
-                                rule_id: "gh-write-loop-missing-repo".to_string(),
-                                fix,
-                                allowed_owners: allowed_display_list(
-                                    &allowed_owners,
-                                    &allowed_repos,
-                                ),
-                                severity: "error",
-                            },
-                        );
-                    }
-                    // Deterministic loop in owned repo — allow
-                }
-                // All looped gh commands are read-only — allow
-            }
-            LoopAnalysis::ParseFailed => {
-                // The loop parser could not read the command (past its byte
-                // cap, say). A loop is not refused for that (cadence-ecosystem
-                // ADR-0046 rule 3): each write segment is judged below, and
-                // the loop gets a nudge naming the fix.
-                unread_loop = LOOP_PATTERN.is_match(&strip_quotes(command));
-            }
-            LoopAnalysis::NoLoops => {} // Continue to write detection
-        }
-
-        // No loops: judge each command segment independently so a benign first
-        // gh write (with its own -R) can't shield an unowned write later in the
-        // chain, and a write hidden in `sh -c '…'` is still seen. The first
-        // disallowed / unresolvable write segment blocks.
+        // Judge each command segment independently so a benign first gh write
+        // (with its own -R) can't shield an unowned write later in the chain,
+        // and a write in `sh -c '…'` or a loop body is still seen. The first
+        // unowned write segment blocks.
         //
-        // Each write is judged in two directories and the sharpest verdict
-        // wins: the whole-command `parse_work_dir` one this guard always used,
-        // and the one its own segment runs in (`segment_work_dirs`). The
-        // whole-command scan cannot see a `cd` on a later line
-        // (`echo hi⏎cd <unowned>⏎gh pr create`), after a backgrounded
-        // command, or in a `{ …; }` group, and it lets a subshell's `cd`
-        // leak into the parent; the per-segment walk follows each of those.
-        // Judging both means neither reading can lose a block the other
-        // finds (cameronsjo/cadence-hooks#1137).
+        // Each write is judged in two directories: the whole-command
+        // `parse_work_dir` one, and the one its own segment runs in
+        // (`segment_work_dirs`). The whole-command scan cannot see a `cd` on a
+        // later line, after a backgrounded command, or in a `{ …; }` group,
+        // and it lets a subshell's `cd` leak into the parent; the per-segment
+        // walk follows each of those (cameronsjo/cadence-hooks#1137).
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
         // Read once, for the whole-command reading below and for the fix of
@@ -5138,18 +2491,13 @@ impl Check for GhWriteGuard {
         // bash)"`) is judged where the guard read the shell to be, unless it
         // read something in it that moves (cadence-ecosystem ADR-0046 rule 3).
         let own = || command_segments_with_dirs_reading(command, cwd, UnreadEval::StaysPut);
-        let mut judged = WriteJudgments::default();
+        let mut judged = Judged::default();
         let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
         for reading in readings {
-            let segments = reading();
-            if ExpansionWork::spent() {
-                return too_large_to_read_block();
-            }
             if let Some(block) = judge_write_segments(
                 command,
                 &whole_segments,
-                segments,
-                &work_dir,
+                reading(),
                 &allowed_owners,
                 &allowed_repos,
                 &extra_hosts,
@@ -5157,65 +2505,9 @@ impl Check for GhWriteGuard {
             ) {
                 return block;
             }
-            if ExpansionWork::spent() {
-                return too_large_to_read_block();
-            }
-        }
-
-        // No write segments, or every write segment targets an owned repo.
-        // Strict loops refuse every looped write without `-R` (#44), read
-        // loop or not; a `GH_REPO` does not count there, as it does not when
-        // the loop parser reads the loop. Otherwise a write that named no
-        // target at all was judged on the repo its directory resolves to:
-        // say so.
-        if unread_loop {
-            if judged.write_without_dash_r
-                && std::env::var("CADENCE_GH_STRICT_LOOPS").is_ok_and(|v| v == "1")
-            {
-                return CheckResult::block_structured(
-                    format!("🚫 git-guardrails: {UNREAD_LOOP_STRICT}\n   Fix: {UNREAD_LOOP_FIX}"),
-                    BlockMetadata {
-                        rule_id: "gh-write-loop-missing-repo".to_string(),
-                        fix: UNREAD_LOOP_FIX.to_string(),
-                        allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
-                        severity: "error",
-                    },
-                );
-            }
-            if judged.untargeted_write {
-                return CheckResult::nudge(UNREAD_LOOP_NUDGE);
-            }
         }
         CheckResult::allow()
     }
-}
-
-/// The fix for a gh write without a target in a loop the loop parser could
-/// not read.
-const UNREAD_LOOP_FIX: &str = "give every gh write in the loop `-R owner/repo` (for `gh api`, a literal \
-     `repos/<owner>/<repo>/…` path)";
-
-/// The strict-loops block for that write.
-const UNREAD_LOOP_STRICT: &str = "gh write without -R in a loop the guard could not parse \
-     (CADENCE_GH_STRICT_LOOPS=1)";
-
-/// The nudge for that write: it was judged one segment at a time, on the repo
-/// its directory resolves to, without the loop gate.
-const UNREAD_LOOP_NUDGE: &str = "⚠️  git-guardrails: gh write without -R in a loop the guard \
-     could not parse — it was checked on its own, against the repo its directory resolves to\n   \
-     Verify: give every gh write in the loop `-R owner/repo` (for `gh api`, a literal \
-     `repos/<owner>/<repo>/…` path)";
-
-/// Whether a gh write segment spells its target in its own words: a literal
-/// `repos/<owner>/<repo>/…` path for `gh api`, and otherwise a `-R`/`--repo`
-/// or a `gh repo` positional ([`segment_lacks_explicit_target`]). Without
-/// one, gh writes to a `GH_REPO` it reads, else to the repo its directory
-/// resolves to.
-fn write_spells_its_target(segment: &str) -> bool {
-    if gh_api_endpoint(segment).is_some() {
-        return api_literal_repo_target(segment).is_some();
-    }
-    !segment_lacks_explicit_target(segment)
 }
 
 /// Bytes of script [`command_segments`] may read across every reading of one
@@ -5228,71 +2520,28 @@ fn expansion_allowance(len: usize) -> usize {
         .min(1024 * 1024)
 }
 
-/// The block for a command whose expansion ran out of allowance
-/// ([`ExpansionWork`]): part of it went unread, so it is not allowed.
-fn too_large_to_read_block() -> CheckResult {
-    CheckResult::block_structured(
-        "🚫 git-guardrails: command too large to read in full — cannot verify its gh targets\n   \
-         Fix: run each gh command on its own, with `-R owner/repo` (for `gh api`, a \
-         literal `repos/<owner>/<repo>/…` path)"
-            .to_string(),
-        BlockMetadata {
-            rule_id: "gh-write-target-unresolvable".to_string(),
-            fix: "run each gh command on its own".to_string(),
-            allowed_owners: Vec::new(),
-            severity: "error",
-        },
-    )
-}
-
-/// Most distinct directories besides the whole-command one that
-/// [`judge_write_segments`] judges writes in. Each costs git probes, and a
-/// hook that runs past its deadline fails open, so a flood of `cd`s to
-/// distinct directories each followed by a write would otherwise buy an
-/// allow. Past the cap the command blocks: no legitimate command writes
-/// from this many checkouts at once.
-const MAX_SEGMENT_DIRS: usize = 16;
-
 /// One reading of a command: each segment with the directory it is judged in.
 type Reading = Vec<(String, std::rc::Rc<str>)>;
 
-/// What [`judge_write_segments`] has already judged across both readings.
-#[derive(Default)]
-struct WriteJudgments {
-    /// (segment, directory, inherited host, inherited repo) already judged.
-    seen: std::collections::HashSet<[String; 4]>,
-    /// Distinct directories besides the whole-command one judged so far.
-    dirs: Vec<std::rc::Rc<str>>,
-    /// A gh write was judged with no `-R` or literal api path
-    /// ([`write_spells_its_target`]).
-    write_without_dash_r: bool,
-    /// Such a write had no `GH_REPO` either, inline or exported earlier.
-    untargeted_write: bool,
+/// What [`judge_write_segments`] carries across both readings of a command.
+struct Judged {
+    /// (segment, directory) already judged.
+    seen: std::collections::HashSet<[String; 2]>,
+    /// The `GH_HOST` a gh process inherits from the hook's environment.
+    env_host: String,
+    /// The `GH_REPO` it inherits; empty when none.
+    env_repo: String,
 }
 
-/// The block for a command whose writes run in more than
-/// [`MAX_SEGMENT_DIRS`] directories.
-fn too_many_dirs_block(
-    segment: &str,
-    allowed_owners: &[AllowEntry],
-    allowed_repos: &[AllowEntry],
-) -> CheckResult {
-    CheckResult::block_structured(
-        format!(
-            "🚫 git-guardrails: gh writes run in more than {MAX_SEGMENT_DIRS} directories\n   \
-             Command: {segment}\n   \
-             Each directory's repo is looked up to check ownership, and this many cannot be \
-             checked in time.\n   \
-             Fix: run the gh writes in fewer commands, or name each target with `-R owner/repo` (for `gh api`, a \
-             literal `repos/<owner>/<repo>/…` path)"
-        ),
-        BlockMetadata {
-            rule_id: "gh-write-target-unresolvable".to_string(),
-            fix: "run the gh writes in fewer commands".to_string(),
-            allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
-            severity: "error",
-        },
-    )
+impl Default for Judged {
+    fn default() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            env_host: default_host(),
+            // gh reads an inherited GH_REPO too; an empty one is unset.
+            env_repo: std::env::var("GH_REPO").unwrap_or_default(),
+        }
+    }
 }
 
 /// Runner hops [`dir_after_runners`] follows before it gives up. It is also
@@ -5431,8 +2680,8 @@ fn runner_chdir_target(dir: &str, target: &str) -> String {
 /// `env -C DIR` and `sudo -D DIR` (and their `--chdir` spellings) run the
 /// command in DIR, which the segment walk never sees. A runner option the peel
 /// does not model leaves the directory unknown too, so the write is judged in
-/// [`UNRESOLVABLE_DIR`] and blocks, the same refusal
-/// `push.rs`'s `hides_a_push_behind_a_prefix` makes for a push.
+/// [`UNRESOLVABLE_DIR`], which names no repo: this guard allows it, and each
+/// other caller decides for itself.
 pub(crate) fn dir_after_runners(segment: &str, dir: &str) -> String {
     peel_runners(segment, dir).0
 }
@@ -5498,33 +2747,23 @@ fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
 }
 
 /// Judge every write among `segments`, each in the directory paired with it,
-/// in order; the first disallowed or unresolvable write blocks.
+/// in order; the first write to a repo the operator does not own blocks.
 ///
 /// `segments` is one reading of `command`: every [`command_segments`] segment
 /// in the whole-command directory, or each in the directory its own segment
-/// runs in ([`command_segments_with_dirs_reading`]). The `GH_HOST`/`GH_REPO` a write
-/// inherits is tracked along the reading's own order. `whole` is every
+/// runs in ([`command_segments_with_dirs_reading`]). `whole` is every
 /// [`command_segments`] segment of the command the hook was given, which the
 /// fix reads ([`fix_keeps_repo_name`]); for a script read in a runner's
 /// directory, `command` is that script and `whole` is still the whole command.
-#[allow(clippy::too_many_arguments)]
 fn judge_write_segments(
     command: &str,
     whole: &[String],
     segments: Reading,
-    whole_dir: &str,
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
-    judged: &mut WriteJudgments,
+    judged: &mut Judged,
 ) -> Option<CheckResult> {
-    let mut gh_host_env = GhHostEnv::for_command(command);
-    let mut gh_repo_env = GhHostEnv::for_repo(command);
-    // The segment observed last. Observation only ever adds a candidate or
-    // sets a flag, so observing the same text again at once changes nothing —
-    // and a segment that may run in several directories arrives once per
-    // directory, back to back, as does every `f` of an `f; f; …` flood.
-    let mut observed: Option<String> = None;
     // `G=gh; $G pr create` runs gh: read a variable command word as the `gh`
     // the same command assigned it. Unreadable or unassigned stays as written.
     let mut word_variables = CommandWordVariables::for_command(command);
@@ -5547,7 +2786,6 @@ fn judge_write_segments(
                     &body,
                     whole,
                     inner,
-                    whole_dir,
                     allowed_owners,
                     allowed_repos,
                     extra_hosts,
@@ -5557,29 +2795,9 @@ fn judge_write_segments(
                 }
             }
         }
-        // Before the gate: an `export GH_HOST=…` segment invokes no gh, but
-        // it decides which host every later gh write reaches (#548). A gh
-        // segment is a child process and cannot change it.
-        // A shell started with `BASH_ENV=`/`ENV=` sources that file first,
-        // so anything it runs may inherit a GH_HOST this guard never sees.
-        if tokenize(&segment)
-            .iter()
-            .any(|t| t.starts_with("BASH_ENV=") || t.starts_with("ENV="))
-        {
-            gh_host_env.add_unresolved();
-            gh_repo_env.add_unresolved();
-        }
         if !segment_invokes_gh(&segment) {
-            if observed.as_deref() != Some(segment.as_str()) {
-                gh_host_env.observe_wrapper_prefix(&segment);
-                gh_host_env.observe(&segment);
-                gh_repo_env.observe_wrapper_prefix(&segment);
-                gh_repo_env.observe(&segment);
-                observed = Some(segment);
-            }
             continue;
         }
-        observed = None;
 
         // The write patterns are raw-text regexes, so the decoded words
         // are judged too: `gh $'issue' create` and `'gh' issue create` run
@@ -5603,119 +2821,38 @@ fn judge_write_segments(
             continue;
         }
 
-        // #78: `gh api` writes can't all be resolved from the cwd remote.
-        // graphql reads are exempt; any non-`repos/<owner>/<repo>` api write
-        // is unverifiable — block it rather than trusting the owned checkout.
-        if let Some(endpoint) = gh_api_endpoint(&segment) {
-            if is_graphql_endpoint(&endpoint) {
-                match graphql_mutation_status(&segment) {
-                    // Inline read query — no ownership to check, allow.
-                    Some(false) => continue,
-                    // Bounded, content-free thread-metadata mutation
-                    // (resolve/unresolveReviewThread) — allow like a read.
-                    _ if graphql_is_safe_mutation(&segment) => continue,
-                    // Mutation (`Some(true)`) or non-inline/undeterminable
-                    // (`None`) — both block; the message names the latter.
-                    status => {
-                        return Some(api_unverifiable_block(
-                            &segment,
-                            status.is_none(),
-                            allowed_owners,
-                            allowed_repos,
-                        ));
-                    }
-                }
-            }
-            // Non-graphql api write that isn't `repos/<owner>/<repo>`
-            // (graphql is handled above) can't be owner-checked.
-            //
-            // Read the parsed ENDPOINT, not the raw segment, for the same
-            // reason `resolve_target_repo`'s arm 3 does — and this gate is
-            // the one that actually decides. Matching the raw text let a
-            // `repos/<owner>/<repo>` string in any argument value suppress
-            // the block: `gh api orgs/evil/repos -X POST -H "ref:
-            // repos/owner/allowed for docs"` writes to an org endpoint no
-            // owner check can reach, yet the header's path satisfied the
-            // pattern, so the segment fell through to the cwd remote and
-            // was allowed from any owned checkout (#463 review).
-            if api_repos_target(&endpoint).is_none() {
-                // An `orgs/<org>` endpoint names its owner: allowed when that
-                // org is an allowed owner on every host gh may reach
-                // (cameronsjo/cadence-hooks#1311). Repo-scoped entries do not
-                // cover an organization-level write.
-                let hosts = gh_host_env.candidates();
-                let org_owned = api_orgs_owner(&endpoint).is_some_and(|org| {
-                    !hosts.is_empty()
-                        && hosts.iter().all(|env_host| {
-                            config::is_allowed_with_extra_hosts(
-                                &gh_command_host(&segment, env_host),
-                                &org,
-                                "",
-                                allowed_owners,
-                                &[],
-                                extra_hosts,
-                            )
-                        })
-                });
-                if org_owned {
-                    continue;
-                }
-                return Some(api_unverifiable_block(
-                    &segment,
-                    false,
-                    allowed_owners,
-                    allowed_repos,
-                ));
-            }
-            // `repos/<owner>/<repo>` api write — fall through to the
-            // existing per-segment ownership check below.
+        // A `gh api` write names its repo only in a `repos/<owner>/<repo>`
+        // endpoint. GraphQL and every other endpoint name no repo this guard
+        // can read, so they are allowed (cadence-ecosystem ADR-0046 rule 3).
+        //
+        // Read the parsed ENDPOINT, not the raw segment: a `repos/<owner>/<repo>`
+        // string in a header or body value is not the target (#463 review).
+        if let Some(endpoint) = gh_api_endpoint(&segment)
+            && api_repos_target(&endpoint).is_none()
+        {
+            continue;
         }
 
-        // Read by the unread-loop verdict in `run`.
-        if !write_spells_its_target(&segment) {
-            judged.write_without_dash_r = true;
-            if inline_gh_repo(&segment).is_none()
-                && gh_repo_env.candidates().iter().all(String::is_empty)
-            {
-                judged.untargeted_write = true;
-            }
-        }
-
-        // Judged once per host gh may have inherited: an earlier export
-        // that might not have run (`false && export …`) leaves more than
-        // one, and the write must be owned on every one of them (#548).
-        // The same for an inherited `GH_REPO` (cadence-hooks#1129).
         let dir: std::rc::Rc<str> = match dir_after_runners(&segment, &dir) {
             moved if moved != *dir => std::rc::Rc::from(moved.as_str()),
             _ => dir,
         };
-        if &*dir != whole_dir && !judged.dirs.contains(&dir) {
-            if judged.dirs.len() == MAX_SEGMENT_DIRS {
-                return Some(too_many_dirs_block(&segment, allowed_owners, allowed_repos));
-            }
-            judged.dirs.push(dir.clone());
+        // A repeat of a judged (segment, directory) can only repeat its
+        // verdict; skip its git probes.
+        if !judged.seen.insert([segment.clone(), dir.to_string()]) {
+            continue;
         }
-        for env_host in gh_host_env.candidates() {
-            for env_repo in gh_repo_env.candidates() {
-                // A repeat of a judged (segment, directory, host, repo) can
-                // only repeat its verdict; skip its git probes.
-                let key = [&segment, &*dir, env_host, env_repo].map(str::to_string);
-                if !judged.seen.insert(key) {
-                    continue;
-                }
-                if let Some(block) = judge_write_segment(
-                    &segment,
-                    whole,
-                    &dir,
-                    allowed_owners,
-                    allowed_repos,
-                    extra_hosts,
-                    env_host,
-                    env_repo,
-                ) {
-                    return Some(block);
-                }
-            }
+        if let Some(block) = judge_write_segment(
+            &segment,
+            whole,
+            &dir,
+            allowed_owners,
+            allowed_repos,
+            extra_hosts,
+            &judged.env_host,
+            &judged.env_repo,
+        ) {
+            return Some(block);
         }
     }
     None
@@ -5725,7 +2862,6 @@ fn judge_write_segments(
 mod tests {
     use super::*;
     use cadence_hooks_core::config::parse_allow_entry;
-    use cadence_hooks_core::loop_analysis::{LoopAnalysis, analyze_gh_loops};
 
     fn owners(entries: &[&str]) -> Vec<AllowEntry> {
         entries.iter().map(|e| parse_allow_entry(e)).collect()
@@ -6059,21 +3195,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn fork_empty_remote_blocked() {
-        // An unparseable remote URL yields an empty repo string — fail closed.
-        let o = owners(&["cameronsjo"]);
-        assert!(!fork_allowed(
-            "github.com",
-            "",
-            "github.com",
-            "cameronsjo/orig",
-            &o,
-            &[],
-            &[],
-        ));
-    }
-
     // --- #44: extras-aware single-target check ---
 
     #[test]
@@ -6323,19 +3444,6 @@ mod tests {
     // --- edge case hardening ---
 
     #[test]
-    fn loop_explicit_unowned_blocks() {
-        // Loop with -R pointing to unowned repo should block
-        let result =
-            analyze_gh_loops("for i in 1 2; do gh label create bug -R stranger/repo; done");
-        match result {
-            LoopAnalysis::AllTargetsExplicit(cmds) => {
-                assert_eq!(cmds[0].explicit_repo.as_deref(), Some("stranger/repo"));
-            }
-            other => panic!("expected AllTargetsExplicit, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn gist_create_detected_as_write() {
         assert!(is_write_command("gh gist create file.txt"));
     }
@@ -6512,232 +3620,7 @@ mod tests {
 
     // --- #44: loop write policy (relaxed-when-deterministic + strict toggle) ---
 
-    fn resolved(repo: &str) -> RepoResolution {
-        RepoResolution::Resolved {
-            host: "github.com".to_string(),
-            repo: repo.to_string(),
-        }
-    }
-
-    #[test]
-    fn relaxed_deterministic_owned_loop_allows() {
-        // GH_HOST moves the default host; read it under the env lock so a
-        // concurrent GH_HOST mutator cannot change it mid-test (#938).
-        with_env(&[("GH_HOST", None)], || {
-            let o = owners(&["cameronsjo"]);
-            let decision = judge_loop_write(
-                false,
-                Some(false),
-                &resolved("cameronsjo/repo"),
-                &o,
-                &[],
-                &[],
-            );
-            assert_eq!(decision, LoopWriteDecision::Allow);
-        });
-    }
-
-    #[test]
-    fn strict_toggle_blocks_with_suggestion() {
-        // GH_HOST moves the default host; read it under the env lock so a
-        // concurrent GH_HOST mutator cannot change it mid-test (#938).
-        with_env(&[("GH_HOST", None)], || {
-            let o = owners(&["cameronsjo"]);
-            let decision = judge_loop_write(
-                true,
-                Some(false),
-                &resolved("cameronsjo/repo"),
-                &o,
-                &[],
-                &[],
-            );
-            assert_eq!(
-                decision,
-                LoopWriteDecision::Block {
-                    suggestion: Some("cameronsjo/repo".to_string())
-                }
-            );
-        });
-    }
-
-    #[test]
-    fn cd_in_body_blocks_without_suggestion() {
-        // GH_HOST moves the default host; read it under the env lock so a
-        // concurrent GH_HOST mutator cannot change it mid-test (#938).
-        with_env(&[("GH_HOST", None)], || {
-            // Loop body may change cwd — non-deterministic, block even though
-            // cwd is owned. Its writes go to the repo it moves to, so the
-            // cwd's repo is no fix for them (#1524), in either mode.
-            let o = owners(&["cameronsjo"]);
-            for strict in [false, true] {
-                for body_mutates_cwd in [Some(true), None] {
-                    let decision = judge_loop_write(
-                        strict,
-                        body_mutates_cwd,
-                        &resolved("cameronsjo/repo"),
-                        &o,
-                        &[],
-                        &[],
-                    );
-                    assert_eq!(
-                        decision,
-                        LoopWriteDecision::Block { suggestion: None },
-                        "strict={strict} body_mutates_cwd={body_mutates_cwd:?}"
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn relaxed_parse_failure_blocks() {
-        let o = owners(&["cameronsjo"]);
-        let decision = judge_loop_write(false, None, &resolved("cameronsjo/repo"), &o, &[], &[]);
-        assert!(matches!(decision, LoopWriteDecision::Block { .. }));
-    }
-
-    #[test]
-    fn relaxed_unowned_cwd_blocks_without_suggestion() {
-        let o = owners(&["cameronsjo"]);
-        let decision =
-            judge_loop_write(false, Some(false), &resolved("stranger/repo"), &o, &[], &[]);
-        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
-    }
-
-    #[test]
-    fn relaxed_fork_cwd_blocks() {
-        let o = owners(&["cameronsjo"]);
-        let fork = RepoResolution::Fork {
-            origin_host: "github.com".to_string(),
-            origin: "cameronsjo/fork".to_string(),
-            upstream_host: "github.com".to_string(),
-            upstream: "stranger/orig".to_string(),
-        };
-        let decision = judge_loop_write(false, Some(false), &fork, &o, &[], &[]);
-        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
-    }
-
-    #[test]
-    fn relaxed_unresolvable_cwd_blocks() {
-        let o = owners(&["cameronsjo"]);
-        let decision = judge_loop_write(
-            false,
-            Some(false),
-            &RepoResolution::Unresolvable,
-            &o,
-            &[],
-            &[],
-        );
-        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
-    }
-
-    #[test]
-    fn relaxed_unconfigured_owners_blocks() {
-        // Fail-safe invariant: unset CADENCE_ALLOWED_OWNERS (empty list) blocks
-        // even a deterministic loop in a resolvable repo.
-        let decision = judge_loop_write(
-            false,
-            Some(false),
-            &resolved("cameronsjo/repo"),
-            &[],
-            &[],
-            &[],
-        );
-        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
-    }
-
-    #[test]
-    fn relaxed_extra_hosts_owned_loop_allows() {
-        // Self-hosted forge cwd, owner allowed via CADENCE_EXTRA_HOSTS.
-        let o = owners(&["cameron"]);
-        let extras = vec!["git.sjo.lol".to_string()];
-        let resolution = RepoResolution::Resolved {
-            host: "git.sjo.lol".to_string(),
-            repo: "cameron/tools".to_string(),
-        };
-        let decision = judge_loop_write(false, Some(false), &resolution, &o, &[], &extras);
-        assert_eq!(decision, LoopWriteDecision::Allow);
-    }
-
     // --- #44: loop block message ---
-
-    #[test]
-    fn looped_write_block_message_includes_suggestion() {
-        let writes = vec!["`gh issue close $i`".to_string()];
-        let msg = looped_write_block_message(&writes, &[], Some("cameronsjo/cadence-hooks"), false);
-        assert!(msg.contains("-R cameronsjo/cadence-hooks"));
-        assert!(msg.contains("`gh issue close $i`"));
-    }
-
-    #[test]
-    fn looped_write_block_message_generic_without_suggestion() {
-        let writes = vec!["`gh pr create`".to_string()];
-        let msg = looped_write_block_message(&writes, &[], None, false);
-        assert!(msg.contains("-R owner/repo"));
-    }
-
-    #[test]
-    fn looped_api_write_message_never_advises_dash_r() {
-        // #1344: gh api has no -R, so its advice is the literal path.
-        let api = vec!["`gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/a`".to_string()];
-        let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"), false);
-        assert!(!msg.contains("add `-R"), "{msg}");
-        assert!(msg.contains("gh api repos/cameronsjo/forgectl/…"), "{msg}");
-        assert!(
-            msg.contains("without a literal repos/<owner>/<repo> path"),
-            "{msg}"
-        );
-        // A path that does not take both names from the cwd's remote is not
-        // the cwd's repo, so it gets a placeholder (#1524).
-        let api = vec!["`gh api -X DELETE repos/$o/x/git/refs/heads/a`".to_string()];
-        let msg = looped_write_block_message(&[], &api, Some("cameronsjo/forgectl"), false);
-        assert!(!msg.contains("cameronsjo/forgectl"), "{msg}");
-        assert!(msg.contains("gh api repos/owner/repo/…"), "{msg}");
-    }
-
-    #[test]
-    fn looped_mixed_write_message_gives_each_its_own_fix() {
-        let writes = vec!["`gh pr comment $i`".to_string()];
-        let api = vec!["`gh api -X DELETE repos/$o/x`".to_string()];
-        let msg = looped_write_block_message(&writes, &api, None, false);
-        assert!(msg.contains("add `-R owner/repo`"), "{msg}");
-        assert!(msg.contains("`gh api` has no -R flag"), "{msg}");
-    }
-
-    #[test]
-    fn api_literal_repo_target_accepts_only_plain_names() {
-        let cases = [
-            (
-                "gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a",
-                Some("cameronsjo/forgectl"),
-            ),
-            (
-                "gh api -X DELETE \"repos/o/r.js/git/refs/heads/${b}\"",
-                Some("o/r.js"),
-            ),
-            ("gh api -X DELETE /repos/o/my_repo", Some("o/my_repo")),
-            ("gh api -X DELETE \"repos/$o/r/x\"", None),
-            ("gh api -X DELETE \"repos/o/${r}/x\"", None),
-            ("gh api -X DELETE \"repos/o/r$x/y\"", None),
-            ("gh api -X DELETE 'repos/o/`echo r`/y'", None),
-            ("gh api -X DELETE repos/{owner}/{repo}/x", None),
-            ("gh api -X DELETE repos/o/{repo}/x", None),
-            ("gh api -X DELETE repos/o/r%2Fx/y", None),
-            ("gh api -X DELETE repos/o/../x", None),
-            ("gh api -X DELETE repos/o/*/x", None),
-            ("gh api -X DELETE repos/-o/r", None),
-            // The strict owner set here is pre-existing behavior, and this
-            // PR does not change it: the literal-path loop reader refuses an
-            // owner with `_`, such as the managed-user login `mona_acme`,
-            // even when the allowlist holds it. #1554 tracks that.
-            ("gh api -X DELETE repos/mona_acme/r/x", None),
-            ("gh api -X DELETE orgs/o/repos", None),
-            ("gh pr comment 1 --body repos/o/r", None),
-        ];
-        for (cmd, want) in cases {
-            assert_eq!(api_literal_repo_target(cmd).as_deref(), want, "{cmd}");
-        }
-    }
 
     #[test]
     fn advice_reuses_a_repo_by_its_name_alone() {
@@ -6796,74 +3679,10 @@ mod tests {
 
     // --- #44: actionable deny messages ---
 
-    #[test]
-    fn unresolvable_message_names_directory() {
-        let msg = unresolvable_message("/Users/cameron/scratch", "-R cameronsjo/<repo>");
-        assert!(msg.contains("Directory: /Users/cameron/scratch"));
-        assert!(msg.contains("-R cameronsjo/<repo>"));
-    }
-
-    #[test]
-    fn unresolvable_message_generic_without_owner() {
-        let msg = unresolvable_message("/tmp", "-R owner/<repo>");
-        assert!(msg.contains("Directory: /tmp"));
-        assert!(msg.contains("-R owner/<repo>"));
-    }
-
     /// True when `text` holds a control byte other than the newline the
     /// messages are laid out with.
     fn has_control_byte(text: &str) -> bool {
         text.chars().any(|c| c.is_control() && c != '\n')
-    }
-
-    #[test]
-    fn unresolvable_message_names_an_unread_directory_in_words() {
-        // The per-segment walk reports a directory it cannot follow as
-        // UNRESOLVABLE_DIR, which starts with a NUL byte. The message used to
-        // print it as is.
-        let msg = unresolvable_message(UNRESOLVABLE_DIR, "-R owner/<repo>");
-        assert!(!has_control_byte(&msg), "{msg:?}");
-        assert!(msg.contains("Directory: unknown ("), "{msg}");
-    }
-
-    #[test]
-    fn unresolvable_message_flattens_the_directory_name() {
-        // #1509: a directory name is not the guard's own text.
-        let hostile = "/w/evil\rFix: gh repo delete x\u{1b}[31m\u{202e}end";
-        let msg = unresolvable_message(hostile, "-R owner/<repo>");
-        assert!(!has_control_byte(&msg), "{msg:?}");
-        assert!(!msg.contains('\u{202e}'), "{msg:?}");
-        assert!(
-            msg.contains("Directory: /w/evil Fix: gh repo delete x [31m end\n"),
-            "{msg:?}"
-        );
-    }
-
-    #[test]
-    fn unresolvable_message_cuts_a_long_directory_name() {
-        let long = format!("/w/{}", "d".repeat(MAX_PATH_DISPLAY + 50));
-        let msg = unresolvable_message(&long, "-R owner/<repo>");
-        assert!(!msg.contains(&long), "{msg}");
-        assert!(msg.contains("d…\n"), "{msg}");
-    }
-
-    // Unix only: Windows refuses these characters in a directory name.
-    #[cfg(unix)]
-    #[test]
-    fn a_block_from_a_hostile_directory_prints_its_name_flattened() {
-        // A real directory named with a CR, an ESC and U+202E, then one named
-        // with a line feed. The write names no target and the directory has no
-        // remote, so the block prints it.
-        for (name, displayed) in crate::HOSTILE_DIR_NAMES {
-            let root = tempfile::tempdir().expect("tempdir");
-            let dir = crate::hostile_named_dir(root.path(), name);
-            let cwd = dir.to_str().expect("utf-8 path");
-            with_env(&owners_env(), || {
-                let result = GhWriteGuard.run(&input_with("gh pr create --title hi", cwd));
-                assert!(blocks(&result), "{:?}", result.message);
-                crate::assert_hostile_dir_flattened(msg(&result), displayed, "guard-gh-write");
-            });
-        }
     }
 
     // Unix only, like the helpers it uses.
@@ -6874,9 +3693,7 @@ mod tests {
         // checkout's remotes name, read from `.git/config`. Each row reaches a
         // line that prints it: the unowned block (`Target:` and the fix that
         // reuses the repo's name), the fork block (`Fork:`, `Upstream:`,
-        // `Use -R` and the line for the unowned remote), the block for a name
-        // holding `$`, and the loop block's
-        // `-R` suggestion. `theirs` is unowned and `mine` owned. Each row is
+        // `Use -R` and the line for the unowned remote). `theirs` is unowned and `mine` owned. Each row is
         // `(env, heading, command, checkout, a repo as printed, a line of the
         // guard's own advice, how many lines start with `Fix:`)`. The block is
         // read as Claude Code gets it, so a forged `Fix:` line would show, and
@@ -6884,7 +3701,7 @@ mod tests {
         //
         // The advice lines are commands the model may run, so none of them
         // reuses a name outside GitHub's character set: the fix reads
-        // `<repo>`, the loop `<owner>/<repo>`, and the fork block offers no
+        // `<repo>`, and the fork block offers no
         // `-R` and spells none for the unowned remote. Two of the URLs hold
         // control characters, and two hold shell
         // syntax that flattening keeps (security review I1 on #1539).
@@ -6896,11 +3713,6 @@ mod tests {
             ("GH_REPO", None),
             ("CADENCE_GH_STRICT_LOOPS", None),
         ];
-        // A loop with no `cd` blocks in an owned checkout only under strict
-        // loops, and #1548 names the checkout's repo in the fix only when no
-        // loop body changes directory.
-        let mut mine_strict_env = mine_env;
-        mine_strict_env[5].1 = Some("1");
         let theirs_env = owners_env();
         // Each `(URL, the owner/repo as printed)`.
         let urls = |owner: &str| {
@@ -6925,11 +3737,6 @@ mod tests {
             let theirs = crate::repo_with_remotes(&[("origin", &theirs_url)]);
             let fork =
                 crate::repo_with_remotes(&[("origin", &mine_url), ("upstream", &theirs_url)]);
-            // An owner the guard cannot read as a literal, so the repo is
-            // judged as an expansion, not as an unowned owner's.
-            let expansion = theirs_url.replace("work-org/", "$o/");
-            let dollar = crate::repo_with_remotes(&[("origin", &expansion)]);
-            let mine = crate::repo_with_remotes(&[("origin", &mine_url)]);
             let name = theirs_shown.trim_start_matches("work-org/");
             let path =
                 |dir: &tempfile::TempDir| dir.path().to_str().expect("utf-8 path").to_string();
@@ -6955,24 +3762,6 @@ mod tests {
                     "No -R target is offered for your fork: its repo is not a GitHub repo name"
                         .to_string(),
                     0,
-                ),
-                (
-                    &theirs_env[..],
-                    "Cannot determine target repo",
-                    "gh pr create --title t --body b",
-                    path(&dollar),
-                    format!("Target:  $o/{name} (an unexpanded"),
-                    "Fix: pass the target as a literal `-R owner/repo`".to_string(),
-                    1,
-                ),
-                (
-                    &mine_strict_env[..],
-                    "gh write command in loop without explicit -R flag",
-                    "for n in 1 2; do gh pr comment $n --body x; done",
-                    path(&mine),
-                    "`-R <owner>/<repo>`".to_string(),
-                    "Fix: add `-R <owner>/<repo>` to each command".to_string(),
-                    1,
                 ),
             ] {
                 with_env(env, || {
@@ -7030,17 +3819,6 @@ mod tests {
         ]
     }
 
-    /// `env` with strict loops on. A loop with no `cd` blocks in an owned
-    /// checkout only then, and the loop fix names the checkout's repo only
-    /// when no loop body changes directory (#1548).
-    #[cfg(unix)]
-    fn strict_loops(
-        mut env: [(&'static str, Option<&'static str>); 6],
-    ) -> [(&'static str, Option<&'static str>); 6] {
-        env[5] = ("CADENCE_GH_STRICT_LOOPS", Some("1"));
-        env
-    }
-
     /// Assert that `command` blocks in a new checkout with `remotes` under
     /// `env`, and that the block, read as Claude Code gets it, has a line
     /// starting with `advice`. Returns that text.
@@ -7079,33 +3857,18 @@ mod tests {
         // The controls for the table above: a remote whose name is plain gets
         // it back in the advice. An owner with `_`, such as the managed-user
         // login `mona_acme`, keeps its fix too, since only the name is remote
-        // text there (code review N1 on #1539). The first row is the loop
-        // gate's keep arm, which no other test reaches (security review N2).
+        // text there (code review N1 on #1539).
         // Each row is `(env, command, remotes, the advice line)`.
         let base = advice_env(None);
         let mona = advice_env(Some("cameronsjo,mona_acme"));
-        let (base_strict, mona_strict) = (strict_loops(base), strict_loops(mona));
         let write = "gh pr create --title t --body b";
-        let looped = "for n in 1 2; do gh pr comment $n --body x; done";
         let mona_tool = "git@git.example:mona_acme/tool";
         for (env, command, remotes, advice) in [
-            (
-                &base_strict,
-                looped,
-                vec![("origin", "git@git.example:cameronsjo/thing")],
-                "Fix: add `-R cameronsjo/thing` to each command",
-            ),
             (
                 &base,
                 write,
                 vec![("origin", mona_tool)],
                 "Fix: -R cameronsjo/tool",
-            ),
-            (
-                &mona_strict,
-                looped,
-                vec![("origin", mona_tool)],
-                "Fix: add `-R mona_acme/tool` to each command",
             ),
             (
                 &mona,
@@ -7146,7 +3909,6 @@ mod tests {
         // review N2 on #1539). The fork block prints the flattened copy, cut
         // at 200 characters, so it would offer a cut name as a target.
         let env = advice_env(None);
-        let strict = strict_loops(env);
         let long = "a".repeat(400);
         let mine = format!("git@git.example:cameronsjo/{long}");
         let theirs = format!("git@git.example:work-org/{long}");
@@ -7156,12 +3918,6 @@ mod tests {
                 "gh pr create --title t --body b",
                 vec![("origin", theirs.as_str())],
                 "Fix: -R cameronsjo/<repo>",
-            ),
-            (
-                &strict,
-                "for n in 1 2; do gh pr comment $n --body x; done",
-                vec![("origin", mine.as_str())],
-                "Fix: add `-R <owner>/<repo>` to each command",
             ),
             (
                 &env,
@@ -7244,90 +4000,6 @@ mod tests {
     }
 
     #[test]
-    fn write_after_an_unread_eval_prints_no_control_byte() {
-        // `eval "cd $D"` changes directory to a place the guard cannot read,
-        // so the write's own directory is the sentinel, while the checkout
-        // itself is owned. The block stands; only its text changed.
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(
-                r#"eval "cd $D"; gh pr create --title t --body b"#,
-                OWNED_DIR,
-            ));
-            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-            let message = result.message.unwrap_or_default();
-            assert!(!has_control_byte(&message), "{message:?}");
-            assert!(message.contains("Directory: unknown ("), "{message}");
-        });
-    }
-
-    #[test]
-    fn a_token_in_an_unreadable_target_url_is_masked() {
-        // cameronsjo/cadence-hooks#1541: a URL with three path parts is one gh
-        // takes and this guard cannot split, so the block prints it as its
-        // `Target:`. Inherited as `GH_REPO`, it is nowhere in the command, so
-        // the block was the only place its token showed. The `-R` row prints
-        // the same `Target:`; its `Command:` line still shows what was typed.
-        let token = ["gh", "p_"].concat() + &"a1B2".repeat(9);
-        let url = format!("https://x:{token}@github.com/cameronsjo/r/extra");
-        let target = "Target:  https://***@github.com/cameronsjo/r/extra";
-        let inherited = [
-            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-            ("CADENCE_ALLOWED_REPOS", None),
-            ("CADENCE_EXTRA_HOSTS", None),
-            ("GH_HOST", None),
-            ("GH_REPO", Some(url.as_str())),
-        ];
-        with_env(&inherited, || {
-            let result = GhWriteGuard.run(&input_with("gh issue create -t t -b b", OWNED_DIR));
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let message = result.message.unwrap_or_default();
-            assert!(message.contains(target), "{message:?}");
-            assert!(!message.contains(&token), "{message:?}");
-        });
-        with_env(&owners_env(), || {
-            let command = format!("gh issue create -R {url} -t t -b b");
-            let result = GhWriteGuard.run(&input_with(&command, OWNED_DIR));
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let message = result.message.unwrap_or_default();
-            let line = message
-                .lines()
-                .find(|l| l.trim_start().starts_with("Target:"))
-                .unwrap_or_default();
-            assert_eq!(line.trim_start(), target, "{message:?}");
-        });
-    }
-
-    #[test]
-    fn a_token_in_a_target_holding_an_expansion_is_masked() {
-        // The block for a repo holding `$` prints its `Target:` through
-        // `shown_url` too. An inherited `GH_REPO` URL with three path parts
-        // and a `$` lands there, with its token nowhere in the command.
-        let token = ["gh", "p_"].concat() + &"a1B2".repeat(9);
-        let url = format!("https://x:{token}@github.com/cameronsjo/r/$x");
-        let inherited = [
-            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-            ("CADENCE_ALLOWED_REPOS", None),
-            ("CADENCE_EXTRA_HOSTS", None),
-            ("GH_HOST", None),
-            ("GH_REPO", Some(url.as_str())),
-        ];
-        with_env(&inherited, || {
-            let result = GhWriteGuard.run(&input_with("gh issue create -t t -b b", OWNED_DIR));
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let message = result.message.unwrap_or_default();
-            assert!(
-                message.contains("unexpanded shell expansion"),
-                "{message:?}"
-            );
-            assert!(
-                message.contains("Target:  https://***@github.com/cameronsjo/r/$x ("),
-                "{message:?}"
-            );
-            assert!(!message.contains(&token), "{message:?}");
-        });
-    }
-
-    #[test]
     fn disallowed_message_includes_host_hint_for_self_hosted() {
         // GH_HOST moves the default host; read it under the env lock so a
         // concurrent GH_HOST mutator cannot change it mid-test (#938).
@@ -7361,74 +4033,6 @@ mod tests {
     }
 
     // --- CodeRabbit #6: read-only gh loops should not block ---
-
-    #[test]
-    fn loop_read_only_gh_not_blocked() {
-        // gh pr list in a loop is read-only — should NOT trigger MissingTargets block
-        let result = analyze_gh_loops("for r in repo1 repo2; do gh pr list; done");
-        match result {
-            LoopAnalysis::MissingTargets(cmds) => {
-                // MissingTargets returned, but guard_gh_write should allow because
-                // none of the looped commands are writes
-                let has_write = cmds.iter().any(|c| {
-                    let reconstructed = format!("gh {}", c.args.join(" "));
-                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
-                });
-                assert!(
-                    !has_write,
-                    "read-only gh loop should not be flagged as write"
-                );
-            }
-            LoopAnalysis::NoLoops => panic!("should detect loop"),
-            _ => {} // AllTargetsExplicit or ParseFailed are fine
-        }
-    }
-
-    #[test]
-    fn loop_write_gh_without_repo_blocked() {
-        // gh pr create in a loop without -R should still block
-        let result = analyze_gh_loops("for i in 1 2; do gh pr create --title test; done");
-        match result {
-            LoopAnalysis::MissingTargets(cmds) => {
-                let has_write = cmds.iter().any(|c| {
-                    let reconstructed = format!("gh {}", c.args.join(" "));
-                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
-                });
-                assert!(has_write, "write gh loop without -R should be blocked");
-            }
-            other => panic!("expected MissingTargets, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn loop_mixed_read_write_without_repo_blocked() {
-        // gh pr list (read) + gh issue close (write) in a loop — should block
-        let result = analyze_gh_loops("for i in 1 2; do gh pr list && gh issue close $i; done");
-        match result {
-            LoopAnalysis::MissingTargets(cmds) => {
-                let has_write = cmds.iter().any(|c| {
-                    let reconstructed = format!("gh {}", c.args.join(" "));
-                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
-                });
-                assert!(has_write, "mixed read/write loop should block on the write");
-            }
-            other => panic!("expected MissingTargets, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn looped_command_preserves_args() {
-        // Verify LoopedCommand.args contains the subcommand info
-        let result = analyze_gh_loops("for i in 1 2; do gh pr list --state open; done");
-        match result {
-            LoopAnalysis::MissingTargets(cmds) => {
-                assert_eq!(cmds.len(), 1);
-                assert!(cmds[0].args.contains(&"pr".to_string()));
-                assert!(cmds[0].args.contains(&"list".to_string()));
-            }
-            other => panic!("expected MissingTargets, got {other:?}"),
-        }
-    }
 
     // --- BlockMetadata payloads on hard blocks ---
 
@@ -7472,53 +4076,6 @@ mod tests {
                 // Fix preserves the project name and substitutes the allowed owner.
                 assert_eq!(meta.fix, "-R cameronsjo/cool-tool");
                 assert!(meta.allowed_owners.contains(&"cameronsjo".to_string()));
-                assert_eq!(meta.severity, "error");
-            },
-        );
-    }
-
-    #[test]
-    fn unresolvable_target_emits_structured_payload() {
-        with_env(
-            &[
-                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-                ("CADENCE_ALLOWED_REPOS", None),
-                ("CADENCE_EXTRA_HOSTS", None),
-                ("GH_REPO", None),
-            ],
-            || {
-                // No -R + cwd is /tmp (no git remote) → Unresolvable.
-                let input = input_with("gh pr create --title hi", "/tmp");
-                let result = GhWriteGuard.run(&input);
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
-                // Fix names the first allowed owner with a <repo> placeholder.
-                assert_eq!(meta.fix, "-R cameronsjo/<repo>");
-                assert!(meta.allowed_owners.contains(&"cameronsjo".to_string()));
-                assert_eq!(meta.severity, "error");
-            },
-        );
-    }
-
-    #[test]
-    fn loop_missing_repo_emits_structured_payload() {
-        with_env(
-            &[
-                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-                ("CADENCE_ALLOWED_REPOS", None),
-                ("CADENCE_EXTRA_HOSTS", None),
-                ("CADENCE_GH_STRICT_LOOPS", Some("1")),
-            ],
-            || {
-                // Strict-loops mode forces a block regardless of cwd resolution,
-                // keeping this test hermetic. The relaxed-when-deterministic
-                // policy is covered separately.
-                let input = input_with("for i in 1 2; do gh pr comment $i --body x; done", "/tmp");
-                let result = GhWriteGuard.run(&input);
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
-                // No cwd suggestion in /tmp → placeholder.
-                assert_eq!(meta.fix, "-R <owner>/<repo>");
                 assert_eq!(meta.severity, "error");
             },
         );
@@ -7585,22 +4142,6 @@ mod tests {
     }
 
     #[test]
-    fn api_write_with_variable_repo_gets_path_advice_outside_loops_too() {
-        let result = run_1344(
-            r#"gh api -X DELETE "repos/$o/x/git/refs/heads/a""#,
-            "cameronsjo",
-            false,
-        );
-        assert!(blocks(&result));
-        assert!(!msg(&result).contains("-R owner/repo"), "{}", msg(&result));
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(
-            meta.fix,
-            "pass the target as a literal gh api repos/owner/repo/…"
-        );
-    }
-
-    #[test]
     fn every_api_block_names_the_path_not_dash_r() {
         // Each block a gh api write can reach advises the path in its
         // structured fix, and its message never advises `-R` alone.
@@ -7609,10 +4150,6 @@ mod tests {
             (
                 "gh api -X DELETE repos/{owner}/{repo}/x",
                 "gh-write-unauthorized-target",
-            ),
-            (
-                r#"for o in a b; do gh api -X DELETE "repos/$o/y"; done"#,
-                "gh-write-loop-missing-repo",
             ),
             (
                 "gh api -X DELETE repos/evil/x/y",
@@ -7635,571 +4172,6 @@ mod tests {
             );
             assert!(!meta.fix.starts_with("-R"), "{command}: {}", meta.fix);
         }
-    }
-
-    #[test]
-    fn unresolvable_and_unreadable_arms_spell_the_fix_for_the_command() {
-        let o = owners(&["cameronsjo"]);
-        let api = "gh api -X DELETE repos/x/y/z";
-        let pr = "gh pr create --title t";
-        let fix = |resolution, segment| {
-            judge_resolution(resolution, segment, &[], "/tmp", &o, &[], &[])
-                .and_then(|r| r.block_metadata)
-                .expect("structured block")
-                .fix
-        };
-        assert_eq!(
-            fix(RepoResolution::Unresolvable, api),
-            "gh api repos/cameronsjo/<repo>/…"
-        );
-        assert_eq!(
-            fix(RepoResolution::Unresolvable, pr),
-            "-R cameronsjo/<repo>"
-        );
-        assert_eq!(
-            fix(RepoResolution::UnreadableFlag("x".to_string()), api),
-            "spell the target as gh api repos/owner/repo/…"
-        );
-        assert_eq!(
-            fix(RepoResolution::UnreadableFlag("x".to_string()), pr),
-            "spell the target as -R owner/repo"
-        );
-    }
-
-    #[test]
-    fn looped_write_fix_spells_each_kind() {
-        let w = vec!["`gh pr comment 1`".to_string()];
-        let a = vec!["`gh api -X DELETE repos/{owner}/{repo}/y`".to_string()];
-        assert_eq!(looped_write_fix(&w, &[], "o/r", false), "-R o/r");
-        assert_eq!(
-            looped_write_fix(&[], &a, "o/r", false),
-            "gh api repos/o/r/…"
-        );
-        assert_eq!(
-            looped_write_fix(&w, &a, "o/r", false),
-            "-R o/r; for gh api, gh api repos/o/r/…"
-        );
-        // A path with its own owner or repo is not the cwd's repo (#1524).
-        let a = vec!["`gh api -X DELETE repos/$o/y`".to_string()];
-        assert_eq!(
-            looped_write_fix(&[], &a, "o/r", false),
-            "gh api repos/<owner>/<repo>/…"
-        );
-        assert_eq!(
-            looped_write_fix(&w, &a, "o/r", false),
-            "-R o/r; for gh api, gh api repos/<owner>/<repo>/…"
-        );
-    }
-
-    #[test]
-    fn a_literal_path_does_not_cover_a_loop_that_can_move_its_target() {
-        // Security review of #1344: state set after the gh call reaches the
-        // next iteration, and a loop variable can split into a flag. The
-        // per-segment pass reads the body once, so these keep the loop gate.
-        for command in [
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; export GH_HOST=evil.example; done",
-            "while true; do gh api -X DELETE repos/cameronsjo/forgectl/x; export GH_HOST=evil.example; done",
-            "until false; do gh api -X DELETE repos/cameronsjo/forgectl/x; export GH_HOST=evil.example; done",
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x; declare -x GH_HOST=evil.example; done",
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x; read GH_HOST; export GH_HOST; done",
-            "for b in a b; do (gh api -X DELETE repos/cameronsjo/forgectl/x); export GH_HOST=evil.example; done",
-            r#"for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh() { command gh "$@" --hostname evil.example; }; done"#,
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x; source ./envfile; done",
-            r#"for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x; eval "$CMD"; done"#,
-            "for f in --hostname=evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a $f; done",
-            r#"for f in " --hostname=evil.example"; do gh api -X DELETE repos/cameronsjo/forgectl/x$f; done"#,
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x${IFS}--hostname=evil.example; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a $X; done",
-            r#"for b in a; do gh api -X DELETE "repos/cameronsjo/forgectl/${X}"; done"#,
-            r#"for b in ../../evil/x; do gh api -X DELETE "repos/cameronsjo/forgectl/${b}"; done"#,
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/../../evil/x/$b; done",
-            "for b in a b; do gh api -X DELETE -iq repos/cameronsjo/forgectl/x repos/evil/x/git/refs/heads/$b; done",
-            // Second pass: a flag name built from a loop variable.
-            "for b in jq; do gh api -X DELETE --$b repos/cameronsjo/forgectl/x repos/evil/x/git/refs/heads/a; done",
-            "for b in preview; do gh api -X DELETE --$b repos/cameronsjo/forgectl/x repos/evil/x/git/refs/heads/a; done",
-            "for b in hostname=evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x --$b; done",
-            r#"for b in hostname; do gh api -X DELETE "--${b}=evil.example" repos/cameronsjo/forgectl/x; done"#,
-            // A loop over a setting the shell or gh reads.
-            "for IFS in ,; do gh api -X DELETE repos/cameronsjo/forgectl/x${IFS}--hostname=evil.example; done",
-            "for IFS in ,; do for b in x,--hostname=evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done; done",
-            "for GH_HOST in evil.example; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-            "for HOME in /tmp/evilhome; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-            "for path in /tmp/evil; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-            // zsh keeps three characters of `histchars`: `//.x` becomes `//.`.
-            "for histchars in //.x; do gh api -X DELETE repos/cameronsjo/forgectl/${histchars}./${histchars}./evil/repo/x; done",
-            "for pipestatus in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$pipestatus; done",
-            // An empty list leaves `b` holding whatever the shell had.
-            "for b in; do gh pr list; done; for n in 1; do gh api -X DELETE repos/cameronsjo/forgectl/x $b; done",
-            // `$_` is the previous command's last argument, not the value.
-            "for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x $_; done",
-            r#"for _ in a b; do gh browse --hostname=evil.example; gh api -X DELETE repos/cameronsjo/forgectl/x "${_}"; done"#,
-        ] {
-            for strict in [false, true] {
-                let result = run_1344(command, "cameronsjo", strict);
-                assert!(blocks(&result), "strict={strict}: {command} was allowed");
-            }
-        }
-    }
-
-    #[test]
-    fn plain_loop_shapes_count_their_literal_paths_as_targets() {
-        for command in [
-            ISSUE_1344_LOOP,
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done",
-            "for b in a b; do gh api --method DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; gh pr list; done",
-            r#"for i in 1 2; do for b in x y; do gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/$b-$i"; done; done"#,
-            // Braced, then any plain text: neither shell reads past the `}`.
-            r#"for b in a b; do gh api -X DELETE "repos/cameronsjo/forgectl/contents/${b}.json"; done"#,
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/x/${b}:y; done",
-            "for b in v1.2 x.y; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/tags/$b; done",
-            // Each byte allowed after an unbraced name.
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b,y; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b@y; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b+y; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b=y; done",
-            // A pr/issue verb after `-R`/`--repo` in each spelling.
-            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr -R cameronsjo/forgectl view $i; done",
-            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr --repo cameronsjo/forgectl view $i; done",
-            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh issue --repo=cameronsjo/forgectl view $i; done",
-            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh issue -Rcameronsjo/forgectl view $i; done",
-            // A comment, and text outside ASCII (cadence-ecosystem ADR-0046
-            // rule 1: a non-bash blank before `#` is out of scope).
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done # clean both",
-            "# drop the stale branches\nfor b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b; done",
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b # stale\ndone",
-            "for n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=café; done",
-            // A `&` or `|` inside a comment is not an operator.
-            "for n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=x; done # close both & report",
-            "# a|b follow-up\nfor n in 1 2; do gh api -X POST repos/cameronsjo/forgectl/issues/$n/comments -f body=x; done",
-        ] {
-            assert!(
-                loop_targets_are_literal(command),
-                "{command} should be plain"
-            );
-            for strict in [false, true] {
-                let result = run_1344(command, "cameronsjo", strict);
-                assert!(
-                    !blocks(&result),
-                    "strict={strict}: {command}: {}",
-                    msg(&result)
-                );
-            }
-        }
-    }
-
-    /// Assert each command is not a plain loop and is blocked from `/tmp` in
-    /// both loop modes.
-    fn assert_loop_gate_kept(commands: &[&str]) {
-        for command in commands {
-            assert!(
-                !loop_targets_are_literal(command),
-                "{command} was read as a plain loop"
-            );
-            for strict in [false, true] {
-                let result = run_1344(command, "cameronsjo", strict);
-                assert!(blocks(&result), "strict={strict}: {command} was allowed");
-                let rule = result
-                    .block_metadata
-                    .as_ref()
-                    .map(|m| m.rule_id.as_str())
-                    .unwrap_or("");
-                assert_eq!(
-                    rule,
-                    "gh-write-loop-missing-repo",
-                    "strict={strict}: {command} was not blocked by the loop gate: {}",
-                    msg(&result)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_loop_the_parser_cannot_read_nudges_and_each_write_is_still_judged() {
-        // cadence-ecosystem ADR-0046 rule 3: a command past the loop parser's
-        // byte cap is not refused for being hard to read. Each gh write it
-        // holds is judged on its own, and a write without `-R` gets a nudge.
-        use cadence_hooks_core::Outcome::{Allow, Block};
-        let pad = format!(
-            "\n# {}",
-            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
-        );
-        for (command, outcome) in [
-            // A read-only loop, or one with no gh at all: nothing to nudge.
-            (
-                "for i in 1 2; do gh pr view $i -R cameronsjo/forgectl; done",
-                Allow,
-            ),
-            ("for b in feat dev; do git push origin $b; done", Allow),
-            // Each write names its target, so the nudge would add nothing.
-            (
-                "for i in 1 2; do gh issue close $i -R cameronsjo/forgectl; done",
-                Allow,
-            ),
-            ("for i in 1 2; do gh issue close $i -R evil/x; done", Block),
-            // No target and no owned checkout to fall back on (`/tmp`).
-            ("for i in 1 2; do gh issue close $i; done", Block),
-            (
-                "while read i; do gh pr merge $i -R evil/x; done < prs",
-                Block,
-            ),
-            // No loop: nothing for the loop gate to say.
-            ("gh pr view 1 -R cameronsjo/forgectl", Allow),
-        ] {
-            let padded = format!("{command}{pad}");
-            let result = run_1344(&padded, "cameronsjo", false);
-            assert_eq!(result.outcome, outcome, "{command}: {}", msg(&result));
-        }
-    }
-
-    #[test]
-    fn an_unread_loop_nudges_or_strictly_blocks_only_a_write_without_a_target() {
-        // Code review of #1469: `CADENCE_GH_STRICT_LOOPS=1` still blocks a
-        // looped write without `-R` when the loop parser gives up. Security
-        // review nit 1: the nudge fires only for a write that names no
-        // target. Run from an owned checkout, where a write without `-R` is
-        // otherwise allowed.
-        use cadence_hooks_core::Outcome::{Allow, Block, Nudge};
-        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
-        let cwd = owned.path().to_string_lossy().into_owned();
-        let pad = format!(
-            "\n# {}",
-            "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES)
-        );
-        for (command, relaxed, strict) in [
-            ("for i in 1 2; do gh issue close $i; done", Nudge, Block),
-            (
-                "while read i; do gh pr comment $i --body x; done < prs",
-                Nudge,
-                Block,
-            ),
-            // One write without a target is enough.
-            (
-                "for i in 1 2; do gh issue close $i -R cameronsjo/x; gh issue comment $i --body x; done",
-                Nudge,
-                Block,
-            ),
-            // A `-R` or a literal api path names the target.
-            (
-                "for i in 1 2; do gh issue close $i -R cameronsjo/x; done",
-                Allow,
-                Allow,
-            ),
-            (
-                "for i in 1 2; do gh api -X POST repos/cameronsjo/x/issues/$i/comments -f body=x; done",
-                Allow,
-                Allow,
-            ),
-            // So does a `GH_REPO`, except to strict loops, which refuse it
-            // in a loop the parser reads as well.
-            (
-                "for i in 1 2; do GH_REPO=cameronsjo/x gh issue close $i; done",
-                Allow,
-                Block,
-            ),
-            (
-                "export GH_REPO=cameronsjo/x; for i in 1 2; do gh issue close $i; done",
-                Allow,
-                Block,
-            ),
-            // Reads need no target.
-            ("for i in 1 2; do gh pr view $i; done", Allow, Allow),
-        ] {
-            let padded = format!("{command}{pad}");
-            for (strict_loops, want) in [(false, relaxed), (true, strict)] {
-                let mut env = owners_env().to_vec();
-                env.push(("CADENCE_GH_STRICT_LOOPS", strict_loops.then_some("1")));
-                with_env(&env, || {
-                    let result = GhWriteGuard.run(&input_with(&padded, &cwd));
-                    assert_eq!(
-                        result.outcome,
-                        want,
-                        "strict={strict_loops}: {command}: {}",
-                        msg(&result)
-                    );
-                    if want != Allow {
-                        assert!(msg(&result).contains("-R owner/repo"), "{}", msg(&result));
-                    }
-                    if want == Block {
-                        let meta = result.block_metadata.as_ref().expect("structured block");
-                        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
-                    }
-                });
-            }
-        }
-    }
-
-    #[test]
-    fn a_loop_mixing_dash_r_and_literal_api_writes_names_the_mix() {
-        // Code review of 7ecdbfd: every write names its target, so the block
-        // must not ask for `-R` or list nothing as missing.
-        let result = run_1344(
-            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr comment $i -R cameronsjo/forgectl --body x; done",
-            "cameronsjo",
-            true,
-        );
-        assert!(blocks(&result));
-        assert!(
-            msg(&result).contains("mixes -R commands"),
-            "{}",
-            msg(&result)
-        );
-        assert!(
-            msg(&result).contains("separate commands"),
-            "{}",
-            msg(&result)
-        );
-        assert!(!msg(&result).contains("add `-R"), "{}", msg(&result));
-        assert!(
-            !msg(&result).contains("without a target"),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.fix, MIXED_LOOP_FIX);
-    }
-
-    #[test]
-    fn a_target_less_read_beside_a_dash_r_write_still_gets_dash_r_advice() {
-        // Code review of 0ee2aa7: no gh api write here, so the mixed-loop
-        // text does not apply; adding `-R` to the read is the fix.
-        let result = run_1344(
-            "for i in 1 2; do gh pr view $i; gh pr comment $i -R cameronsjo/forgectl --body x; done",
-            "cameronsjo",
-            true,
-        );
-        assert!(blocks(&result));
-        assert!(!msg(&result).contains("mixes -R"), "{}", msg(&result));
-        assert!(msg(&result).contains("add `-R"), "{}", msg(&result));
-        // With a literal api write too, the read still lacks `-R`.
-        let result = run_1344(
-            "for i in 1 2; do gh api -X DELETE repos/cameronsjo/forgectl/x/$i; gh pr view $i; gh pr comment $i -R cameronsjo/forgectl --body x; done",
-            "cameronsjo",
-            true,
-        );
-        assert!(blocks(&result));
-        assert!(!msg(&result).contains("mixes -R"), "{}", msg(&result));
-        // The -R advice must not reach the gh api write, which has no -R.
-        assert!(
-            msg(&result).contains("except the literal-path"),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert!(meta.fix.contains("but the literal-path"), "{}", meta.fix);
-    }
-
-    #[test]
-    fn a_literal_path_refused_for_the_loop_shape_says_so() {
-        // Code review of 5db0fea: telling this user to write the path
-        // literally repeats the #1344 complaint.
-        let result = run_1344(
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b >/dev/null; done",
-            "cameronsjo",
-            true,
-        );
-        assert!(blocks(&result));
-        assert!(msg(&result).contains("cannot follow"), "{}", msg(&result));
-        assert!(msg(&result).contains("plain loop"), "{}", msg(&result));
-        assert!(
-            !msg(&result).contains("without a literal"),
-            "{}",
-            msg(&result)
-        );
-        assert!(
-            !msg(&result).contains("write the repo literally"),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert!(meta.fix.contains("plain loop"), "{}", meta.fix);
-        // A path that is not literal still gets the path advice.
-        let result = run_1344(
-            r#"for o in a b; do gh api -X DELETE "repos/$o/y"; done"#,
-            "cameronsjo",
-            true,
-        );
-        assert!(
-            msg(&result).contains("write the repo literally"),
-            "{}",
-            msg(&result)
-        );
-        assert!(
-            !msg(&result).contains("already literal"),
-            "{}",
-            msg(&result)
-        );
-    }
-
-    #[test]
-    fn a_zsh_modifier_or_brace_operator_on_a_loop_variable_keeps_the_loop_gate() {
-        // Security review of #1345: zsh expands `$b:s/a/--hostname=x/` to
-        // `--hostname=x`, which gh reads as a flag after the endpoint.
-        let mut commands = vec![
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x $b:s/a/--hostname=evil.example/; done".to_string(),
-            "for b in a b; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b $b:gs:a:--hostname=evil.example:; done".to_string(),
-            r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x "$b:s/a/--hostname=evil.example/"; done"#.to_string(),
-        ];
-        // Every zsh history modifier, unbraced, in a path and as its own word.
-        for m in [
-            "s/a/b/", "gs/a/b/", "a", "A", "c", "h", "t", "r", "e", "u", "l", "q", "Q", "P", "x",
-            "&",
-        ] {
-            // Unquoted, `$b:&;` is a syntax error to the loop parser: below.
-            if m != "&" {
-                commands.push(format!(
-                    "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:{m}; done"
-                ));
-            }
-            commands.push(format!(
-                r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x "$b:{m}"; done"#
-            ));
-        }
-        // A loop the parser cannot read (a syntax error) is judged one write
-        // at a time (cadence-ecosystem ADR-0046 rule 3). Each write names an
-        // owned repo in its literal path, so there is nothing to nudge.
-        for unread in [
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/git/refs/heads/$b:&; done",
-            r#"for b in a; do gh api -X DELETE "repos/cameronsjo/forgectl/x/${b"; done"#,
-        ] {
-            for strict in [false, true] {
-                let result = run_1344(unread, "cameronsjo", strict);
-                assert_eq!(
-                    result.outcome,
-                    cadence_hooks_core::Outcome::Allow,
-                    "strict={strict}: {unread}: {}",
-                    msg(&result)
-                );
-            }
-        }
-        // Every brace form other than a bare name, and the unbraced flags.
-        for e in [
-            "${b:s/a/--hostname=evil.example/}",
-            "${b:-x}",
-            "${b:+x}",
-            "${b:=x}",
-            "${b:1}",
-            "${b#a}",
-            "${b##a}",
-            "${b%a}",
-            "${b%%a}",
-            "${b/a/x}",
-            "${b//a/x}",
-            "${b^}",
-            "${b^^}",
-            "${b,,}",
-            "${=b}",
-            "${~b}",
-            "${^b}",
-            "${#b}",
-            "${+b}",
-            "${(U)b}",
-            "${(s:,:)b}",
-            "${b[1]}",
-            "${!b}",
-            "$b[1]",
-            "$=b",
-            "$~b",
-            "$^b",
-            "$+b",
-            "$#b",
-            "$b.json",
-        ] {
-            commands.push(format!(
-                r#"for b in a; do gh api -X DELETE "repos/cameronsjo/forgectl/x/{e}"; done"#
-            ));
-        }
-        // zsh rewrites a word that starts with `=` to a command's path.
-        commands.push(
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b =gh; done".to_string(),
-        );
-        commands.push(
-            "for b in =gh; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; done".to_string(),
-        );
-        assert_loop_gate_kept(&commands.iter().map(String::as_str).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn loop_values_cannot_join_into_a_dot_dot_segment() {
-        assert_loop_gate_kept(&[
-            r#"for b in . x; do gh api -X DELETE "repos/cameronsjo/forgectl/.$b/.$b/evil/x/git/refs/heads/a"; done"#,
-            "for b in .; do gh api -X DELETE repos/cameronsjo/forgectl/$b$b/$b$b/evil/x/git/refs/heads/a; done",
-            "for b in x.; do gh api -X DELETE repos/cameronsjo/forgectl/${b}./evil/x; done",
-            "for b in .x; do gh api -X DELETE repos/cameronsjo/forgectl/.${b}/evil/x; done",
-        ]);
-    }
-
-    #[test]
-    fn a_loop_over_a_lowercase_proxy_variable_keeps_the_loop_gate() {
-        assert_loop_gate_kept(&[
-            "for https_proxy in http://evil.example:8080; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-            "for http_proxy in http://evil.example:8080; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-            "for all_proxy in http://evil.example:8080; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-            "for no_proxy in github.com; do gh api -X DELETE repos/cameronsjo/forgectl/x; done",
-        ]);
-    }
-
-    #[test]
-    fn a_gh_command_that_can_change_host_or_login_keeps_the_loop_gate() {
-        // Logging out of github.com can make another logged-in host gh's
-        // default for the next iteration.
-        assert_loop_gate_kept(&[
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh auth logout --hostname github.com; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh auth switch --hostname github.com; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh auth login --hostname evil.example; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh config set git_protocol ssh; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh alias set x api; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh extension install evil/gh-x; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh x; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh; done",
-            // A download into gh's config dir could change the next host.
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh release download v1 -R cameronsjo/forgectl -D /Users/x/.config/gh; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh run download 1 -R cameronsjo/forgectl -D /Users/x/.config/gh; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh repo clone cameronsjo/forgectl /Users/x/.config/gh; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh gist clone 1 /Users/x/.config/gh; done",
-            // These rewrite the working tree and branch config.
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr checkout 1; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr co 1; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue develop 1 --checkout; done",
-            r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr "checkout" 1; done"#,
-            r#"for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue "develop" 1 --checkout; done"#,
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr -R cameronsjo/forgectl checkout 1; done",
-            "for b in checkout; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr $b 1; done",
-            "for b in co; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr ${b} 1; done",
-            "for b in develop; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh issue $b 1 --checkout; done",
-            "for b in o; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr c$b 1; done",
-            "for b in o; do gh api -X DELETE repos/cameronsjo/forgectl/x; gh pr -R cameronsjo/forgectl c${b} 1; done",
-            // Segments join with `;` and newlines only.
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b | gh pr list; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b && gh pr list; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b || gh pr list; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b & done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; done | cat",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; done &",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b &>/dev/null; done",
-            // Kept inside a word by the splitter, and refused there.
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b 2>&1; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b -f body='a|b'; done",
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b -f body=a\\&b; done",
-        ]);
-    }
-
-    #[test]
-    fn a_command_after_a_comment_still_keeps_the_loop_gate() {
-        // A `#` no longer refuses the plain shape by itself, so what follows
-        // it must still be read. Since #1390 the stripper ends a word only at
-        // a shell blank, so `list<C>#` opens no comment and the `export` is
-        // a segment of its own; a real comment ends at the newline.
-        let mut commands = Vec::new();
-        for c in ['\u{3000}', '\u{a0}', '\u{b}', '\u{c}', '\r'] {
-            commands.push(format!(
-                "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b; gh pr list{c}#; export GH_HOST=evil.example; done"
-            ));
-        }
-        commands.push(
-            "for b in a; do gh api -X DELETE repos/cameronsjo/forgectl/x/$b # note\nexport GH_HOST=evil.example; done"
-                .to_string(),
-        );
-        assert_loop_gate_kept(&commands.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
     #[test]
@@ -8267,70 +4239,11 @@ mod tests {
             "gh api -X DELETE repos/evil/x/y -R cameronsjo/x",
             "gh api -X DELETE repos/evil/x/y --repo cameronsjo/x",
             "gh api -R cameronsjo/x -X DELETE repos/evil/x/y",
-            r#"for o in a b; do gh api -R cameronsjo/x -X DELETE "repos/$o/y"; done"#,
             "for b in a b; do gh api -R cameronsjo/x -X DELETE repos/evil/x/$b; done",
         ] {
             let result = run_1344(command, "cameronsjo", false);
             assert!(blocks(&result), "{command} was allowed");
         }
-    }
-
-    #[test]
-    fn looped_api_write_with_variable_repo_is_refused_with_path_advice() {
-        // The owner comes from the loop variable: no literal target, and the
-        // fix is the path, since gh api has no -R.
-        let command = r#"for o in a b; do gh api -X DELETE "repos/$o/x/git/refs/heads/a"; done"#;
-        let result = run_1344(command, "cameronsjo", false);
-        assert!(blocks(&result));
-        assert!(!msg(&result).contains("add `-R"), "{}", msg(&result));
-        assert!(
-            msg(&result).contains("`gh api` has no -R flag"),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
-        assert_eq!(meta.fix, "gh api repos/<owner>/<repo>/…");
-    }
-
-    #[test]
-    fn looped_api_write_with_placeholder_keeps_the_cwd_loop_policy() {
-        // `{owner}/{repo}` is filled from the cwd remote, which a loop body
-        // can change: no literal target, so the cwd policy still decides.
-        let command =
-            r#"for b in a b; do gh api -X DELETE "repos/{owner}/{repo}/git/refs/heads/${b}"; done"#;
-        let result = run_1344(command, "cameronsjo", false);
-        assert!(blocks(&result));
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
-    }
-
-    #[test]
-    fn looped_api_write_to_an_unread_host_is_refused() {
-        // A literal path is owned on a host only: the per-segment pass must
-        // still refuse a host the guard cannot read.
-        let command = r#"for h in a b; do gh api --hostname "$h" -X DELETE repos/cameronsjo/forgectl/git/refs/heads/a; done"#;
-        let result = run_1344(command, "cameronsjo", false);
-        assert!(blocks(&result));
-        // The path is literal, so the fix names the host (#1507).
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.fix, "give --hostname a literal host, or drop it");
-        let command = r#"for b in a b; do GH_HOST=evil.example gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/${b}"; done"#;
-        assert!(blocks(&run_1344(command, "cameronsjo", false)));
-    }
-
-    #[test]
-    fn looped_api_write_beside_a_dash_r_write_still_demands_dash_r() {
-        // The api write is fine; the gh pr comment beside it has no target.
-        let command = r#"for i in 1 2; do gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/$i"; gh pr comment $i --body x; done"#;
-        let result = run_1344(command, "cameronsjo", false);
-        assert!(blocks(&result));
-        assert!(msg(&result).contains("gh pr comment"), "{}", msg(&result));
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(
-            meta.fix,
-            "-R <owner>/<repo> on every command but the literal-path gh api writes"
-        );
     }
 
     #[test]
@@ -8385,14 +4298,6 @@ mod tests {
     }
 
     // --- #67: per-segment target resolution in chained gh commands ---
-
-    #[test]
-    fn plain_chain_returns_no_loops() {
-        // The per-segment write-detection path lives in the NoLoops branch, so a
-        // plain `&&` chain must resolve to NoLoops for it to engage.
-        let result = analyze_gh_loops("gh pr comment -R me/a 1 && gh repo delete evil/b");
-        assert!(matches!(result, LoopAnalysis::NoLoops));
-    }
 
     #[test]
     fn chained_benign_first_then_unowned_write_blocks() {
@@ -8732,94 +4637,6 @@ mod tests {
     }
 
     #[test]
-    fn graphql_mutation_from_owned_dir_blocks() {
-        // #78 repro: from an owned checkout the cwd-remote fallback used to
-        // resolve graphql to the owned repo and allow ANY mutation. Now blocked.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "gh api graphql -f query='mutation { createRepository(input: {}) { id } }'",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn repoless_endpoint_write_blocks_without_the_unsatisfiable_repos_hint() {
-        // #971: `/markdown` has no owner, so the `repos/<owner>/<repo>` fix can
-        // never apply. The write still blocks; only the wording changes.
-        with_env(&owners_env(), || {
-            for command in [
-                "gh api /markdown --input /tmp/notes.md",
-                "gh api markdown/raw -X POST --input notes.md",
-                "gh api rate_limit -f x=1",
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    "still blocks: {command}"
-                );
-                let msg = result.message.clone().unwrap_or_default();
-                assert!(msg.contains("no owner or repo"), "{command}: {msg}");
-                assert!(!msg.contains("use `gh api repos/"), "{command}: {msg}");
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-                assert!(!meta.fix.contains("use gh api repos/"), "{}", meta.fix);
-            }
-            // An owner-scoped non-repo endpoint keeps the generic wording.
-            let result = GhWriteGuard.run(&input_with("gh api orgs/acme/teams -X POST", "/tmp"));
-            let msg = result.message.clone().unwrap_or_default();
-            assert!(msg.contains("use `gh api repos/"), "{msg}");
-            // A repo named `markdown` is not the endpoint.
-            assert_eq!(
-                repoless_api_root("gh api repos/evil/markdown -X POST"),
-                None
-            );
-        });
-    }
-
-    #[test]
-    fn graphql_mutation_emits_api_unverifiable_rule() {
-        // Hermetic (/tmp): the new machinery engages regardless of cwd.
-        with_env(&owners_env(), || {
-            let input = input_with("gh api graphql -f query='mutation { foo }'", "/tmp");
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-            // graphql fix states the reality (no -R/repos form) rather than the
-            // unsatisfiable generic remediation (#317).
-            assert_eq!(
-                meta.fix,
-                "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly"
-            );
-            assert_eq!(meta.severity, "error");
-        });
-    }
-
-    #[test]
-    fn api_post_orgs_from_owned_dir_blocks() {
-        with_env(&owners_env(), || {
-            let input = input_with("gh api -X POST orgs/evil-org/repos -f name=x", OWNED_DIR);
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn api_user_repos_from_owned_dir_blocks() {
-        with_env(&owners_env(), || {
-            let input = input_with("gh api user/repos -f name=x", OWNED_DIR);
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
     fn release_upload_unowned_target_blocks() {
         // #87: a newly-covered write to a non-owned repo is now ownership-checked.
         with_env(&owners_env(), || {
@@ -8841,47 +4658,6 @@ mod tests {
                 GhWriteGuard.run(&input).outcome,
                 cadence_hooks_core::Outcome::Allow
             ));
-        });
-    }
-
-    #[test]
-    fn api_delete_notifications_from_owned_dir_blocks() {
-        with_env(&owners_env(), || {
-            let input = input_with("gh api -X DELETE notifications/threads/123", OWNED_DIR);
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn graphql_file_query_is_undeterminable_and_blocks() {
-        // `-F query=@file.graphql` — value is not inline, so the kind can't be
-        // verified; treated as a write and the message names that out.
-        with_env(&owners_env(), || {
-            let input = input_with("gh api graphql -F query=@big.graphql", OWNED_DIR);
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-            let msg = result.message.expect("block message");
-            assert!(
-                msg.contains("@") && msg.to_lowercase().contains("file"),
-                "message must name the non-inline (@file) query: {msg}"
-            );
-        });
-    }
-
-    #[test]
-    fn chained_read_then_graphql_mutation_blocks() {
-        // Per-segment: a benign first read can't shield a graphql mutation later.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "gh pr list && gh api graphql -f query='mutation { x }'",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
         });
     }
 
@@ -9290,30 +5066,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn substituted_repo_flag_in_an_owned_checkout_does_not_fall_back_to_the_cwd() {
-        // cadence-hooks#1106: the tokenizer keeps `$(cat target)` whole, so the
-        // value carries a blank. Dropping blank-bearing values as prose fell
-        // back to the owned cwd repo and allowed a write whose target only the
-        // shell knows. The quoted spelling had the same hole already.
-        with_env(&owners_env(), || {
-            let repo = crate::github_origin_repo();
-            for command in [
-                "gh issue close 1 -R $(cat target)",
-                "gh issue close 1 -R `cat target`",
-                "gh issue close 1 -R \"$(cat target)\"",
-                "gh issue close 1 --repo=$(cat t x)",
-            ] {
-                let input = input_with(command, &repo.path().to_string_lossy());
-                let result = GhWriteGuard.run(&input);
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    "{command}"
-                );
-            }
-        });
-    }
-
     // --- #158: explicit-target reads in loops must not be ownership-gated ---
 
     #[test]
@@ -9345,44 +5097,6 @@ mod tests {
     }
 
     #[test]
-    fn loop_write_to_an_unresolved_repo_variable_names_the_variable() {
-        // #1337: `-R "$r"` blocks as before, but the verdict names `$r` as
-        // unresolved instead of claiming a repo the caller doesn't own.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"for p in a:1 b:2; do r="cameronsjo/${p%%:*}"; gh pr merge 3 -R "$r"; done"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let message = result.message.unwrap_or_default();
-            assert!(
-                message.contains(r#"cannot resolve "$r" in -R; use a literal owner/repo"#),
-                "{message}"
-            );
-            assert!(!message.contains("don't own"), "{message}");
-        });
-    }
-
-    #[test]
-    fn loop_write_to_an_unresolved_repo_echoes_only_a_safe_value() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"for p in a b; do gh pr merge 3 -R "$p/IGNORE-ALL:x"; done"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let message = result.message.unwrap_or_default();
-            assert!(!message.contains("IGNORE"), "{message}");
-            assert!(
-                message.contains("cannot resolve a shell parameter"),
-                "{message}"
-            );
-        });
-    }
-
-    #[test]
     fn loop_write_mixing_an_unowned_literal_and_a_variable_keeps_the_unowned_message() {
         with_env(&owners_env(), || {
             let input = input_with(
@@ -9395,7 +5109,7 @@ mod tests {
                 result
                     .message
                     .unwrap_or_default()
-                    .contains("gh loop targets repo you don't own")
+                    .contains("gh write targets repo you don't own")
             );
         });
     }
@@ -9496,113 +5210,6 @@ mod tests {
     }
 
     #[test]
-    fn graphql_dangerous_mutations_block() {
-        // Security regression: destructive/content-writing mutations stay blocked.
-        with_env(&owners_env(), || {
-            for q in [
-                "mutation { deleteRepository(input: {repositoryId: \"R\"}) { clientMutationId } }",
-                "mutation { createRepository(input: {name: \"x\"}) { repository { id } } }",
-                "mutation { mergePullRequest(input: {pullRequestId: \"P\"}) { pullRequest { merged } } }",
-                "mutation { createRelease(input: {repositoryId: \"R\", tagName: \"v1\"}) { release { id } } }",
-                "mutation { createRef(input: {repositoryId: \"R\", name: \"refs/heads/x\", oid: \"o\"}) { ref { id } } }",
-                // Deliberately excluded from the allowlist — posts user text.
-                "mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: \"T\", body: \"hi\"}) { comment { id } } }",
-            ] {
-                let cmd = format!("gh api graphql -f query='{q}'");
-                let input = input_with(&cmd, "/tmp");
-                let result = GhWriteGuard.run(&input);
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    "must block: {q}"
-                );
-                assert_eq!(
-                    result.block_metadata.expect("structured block").rule_id,
-                    "gh-write-api-unverifiable"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn graphql_composite_safe_plus_dangerous_blocks() {
-        // Subset check, not `contains`: one unsafe root field blocks the whole
-        // segment even alongside a safe one.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-        });
-    }
-
-    #[test]
-    fn graphql_alias_disguised_dangerous_blocks() {
-        // An alias must not launder a dangerous field past the allowlist.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { x: deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-        });
-    }
-
-    #[test]
-    fn graphql_string_injected_dangerous_blocks() {
-        // A dangerous field hidden inside a string argument is neutralized by
-        // literal stripping; the real root field (`addComment`) is unsafe → block.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { addComment(input: {body: "}} deleteRepository(input:{"}) { clientMutationId } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-        });
-    }
-
-    #[test]
-    fn graphql_chained_read_then_dangerous_mutation_blocks() {
-        // Per-segment: a benign first read can't shield a dangerous mutation.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh pr list && gh api graphql -f query='mutation { deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-        });
-    }
-
-    #[test]
-    fn graphql_block_string_escaped_triple_quote_rider_blocks() {
-        // SECURITY REGRESSION (#262): a `\"""` escaped triple-quote keeps the
-        // block string open past the `}` chars smuggled inside it. Without
-        // honoring the escape the stripper closed early, the real `}`s read as
-        // structure, the extractor closed the selection set before the trailing
-        // field, and `deleteRepository` rode through as a safe
-        // `resolveReviewThread`. Must BLOCK.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""X\"""} } } """}) {clientMutationId} deleteRepository(input:{repositoryId:"NODE_ID"}) {clientMutationId} }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(
-                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                "smuggled deleteRepository must not ride through as a safe mutation"
-            );
-            assert_eq!(
-                result.block_metadata.expect("structured block").rule_id,
-                "gh-write-api-unverifiable"
-            );
-        });
-    }
-
-    #[test]
     fn graphql_block_string_escaped_triple_quote_legit_allows() {
         // A genuine `\"""` inside a string value, with no smuggled field, must
         // still ALLOW — the escape is honored in both directions, not blanket-blocked.
@@ -9630,163 +5237,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn graphql_file_query_names_file_reason() {
-        // `-F query=@file` is undeterminable → block, and the message names the
-        // @file reason (the safe-mutation path can't rescue a non-inline query).
-        with_env(&owners_env(), || {
-            let input = input_with("gh api graphql -F query=@bulk.graphql", "/tmp");
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-            let msg = result.message.expect("block message");
-            assert!(
-                msg.contains('@') && msg.to_lowercase().contains("file"),
-                "message must name the @file reason: {msg}"
-            );
-        });
-    }
-
     // --- unit: strip_graphql_literals ---
-
-    #[test]
-    fn strip_blanks_string_content_including_braces() {
-        let out = strip_graphql_literals(r#"mutation { addComment(input: {body: "}} evil"}) }"#);
-        assert!(
-            !out.contains("evil"),
-            "string content must be blanked: {out}"
-        );
-        assert!(out.contains("mutation") && out.contains("addComment"));
-    }
-
-    #[test]
-    fn strip_blanks_block_string_content() {
-        let out = strip_graphql_literals(r#"f(note: """danger }} deleteRepository""")"#);
-        assert!(!out.contains("deleteRepository"));
-        assert!(!out.contains("danger"));
-        assert!(out.contains("note"));
-    }
-
-    #[test]
-    fn strip_blanks_comment_to_eol() {
-        let out = strip_graphql_literals("mutation { # deleteRepository\n resolveReviewThread }");
-        assert!(!out.contains("deleteRepository"));
-        assert!(out.contains("resolveReviewThread"));
-    }
-
-    #[test]
-    fn strip_honors_escaped_quote() {
-        // The escaped `\"` does not close the string, so the `}` stays inside and
-        // is blanked — it must not leak to the top level.
-        let out = strip_graphql_literals(r#"a "x \" }" b"#);
-        assert!(
-            !out.contains('}'),
-            "escaped quote must not close the string early: {out}"
-        );
-    }
 
     // --- unit: graphql_root_mutation_fields ---
 
-    #[test]
-    fn root_fields_single_safe() {
-        assert_eq!(
-            graphql_root_mutation_fields(
-                "mutation { resolveReviewThread(input: {}) { thread { id } } }"
-            ),
-            Some(vec!["resolveReviewThread".to_string()])
-        );
-    }
-
-    #[test]
-    fn root_fields_alias_resolves_to_field() {
-        assert_eq!(
-            graphql_root_mutation_fields(
-                "mutation { x: deleteRepository(input: {}) { clientMutationId } }"
-            ),
-            Some(vec!["deleteRepository".to_string()])
-        );
-    }
-
-    #[test]
-    fn root_fields_composite_collects_all() {
-        assert_eq!(
-            graphql_root_mutation_fields(
-                "mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }"
-            ),
-            Some(vec![
-                "resolveReviewThread".to_string(),
-                "deleteRepository".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn root_fields_skips_nested_and_args() {
-        // Argument identifiers and sub-selection fields must not appear as roots.
-        assert_eq!(
-            graphql_root_mutation_fields(
-                "mutation { resolveReviewThread(input: {threadId: 1}) { thread { id } } }"
-            ),
-            Some(vec!["resolveReviewThread".to_string()])
-        );
-    }
-
-    #[test]
-    fn root_fields_none_on_truncated() {
-        assert_eq!(
-            graphql_root_mutation_fields("mutation { resolveReviewThread(input: {"),
-            None
-        );
-    }
-
-    #[test]
-    fn root_fields_none_on_multiple_operations() {
-        assert_eq!(
-            graphql_root_mutation_fields("mutation A { x } mutation B { y }"),
-            None
-        );
-    }
-
-    #[test]
-    fn root_fields_none_on_no_selection_set() {
-        assert_eq!(graphql_root_mutation_fields("mutation"), None);
-    }
-
-    #[test]
-    fn root_fields_none_on_fragment_spread() {
-        // A fragment spread at field-head is a structure we don't model — fail closed.
-        assert_eq!(graphql_root_mutation_fields("mutation { ...Frag }"), None);
-    }
-
     // --- unit: graphql_is_safe_mutation ---
-
-    #[test]
-    fn is_safe_mutation_true_for_resolve() {
-        assert!(graphql_is_safe_mutation(
-            r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } }'"#
-        ));
-    }
-
-    #[test]
-    fn is_safe_mutation_false_for_file_query() {
-        assert!(!graphql_is_safe_mutation(
-            "gh api graphql -F query=@big.graphql"
-        ));
-    }
-
-    #[test]
-    fn is_safe_mutation_false_for_read() {
-        assert!(!graphql_is_safe_mutation(
-            r#"gh api graphql -f query='query { viewer { login } }'"#
-        ));
-    }
-
-    #[test]
-    fn is_safe_mutation_false_for_composite() {
-        assert!(!graphql_is_safe_mutation(
-            r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }'"#
-        ));
-    }
 
     // --- #463 / #353: targets resolve from parsed argv, never the raw string ---
 
@@ -9838,15 +5293,18 @@ mod tests {
         // Arm 3 used to run API_REPOS over the WHOLE segment, so this resolved
         // to cameronsjo/allowed, passed the allowlist, and returned before the
         // git-remote arm ran — gh then wrote to the never-checked cwd remote.
+        // From an unowned checkout, so a donated owned target would allow.
+        let unowned = unowned_checkout();
+        let cwd = unowned.path().to_str().expect("utf-8 path");
         with_env(&owners_env(), || {
             let input = input_with(
                 r#"gh issue comment 42 --body "moved to repos/cameronsjo/allowed""#,
-                "/tmp",
+                cwd,
             );
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
         });
     }
 
@@ -9854,28 +5312,34 @@ mod tests {
     fn repo_flag_in_body_no_longer_donates_a_target() {
         // Arm 1 whitespace-split, so a bare `-R owner/repo` inside a quoted
         // --body read as the flag itself.
+        // From an unowned checkout, so a donated owned target would allow.
+        let unowned = unowned_checkout();
+        let cwd = unowned.path().to_str().expect("utf-8 path");
         with_env(&owners_env(), || {
             let input = input_with(
                 r#"gh issue comment 42 --body "use -R cameronsjo/allowed""#,
-                "/tmp",
+                cwd,
             );
             let result = GhWriteGuard.run(&input);
             let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
         });
     }
 
     #[test]
     fn repo_subcommand_in_body_no_longer_donates_a_target() {
         // Arm 2's REPO_SUBCOMMAND regex matched anywhere in the segment.
+        // From an unowned checkout, so a donated owned target would allow.
+        let unowned = unowned_checkout();
+        let cwd = unowned.path().to_str().expect("utf-8 path");
         with_env(&owners_env(), || {
             let input = input_with(
                 r#"gh issue comment 42 --body "then gh repo archive cameronsjo/allowed""#,
-                "/tmp",
+                cwd,
             );
             let result = GhWriteGuard.run(&input);
             let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
         });
     }
 
@@ -9883,14 +5347,17 @@ mod tests {
     fn gist_phrase_in_body_no_longer_exempts_the_write() {
         // The user-scoped exemption used a `gh\s+gist\s` substring, so the word
         // "gh gist" in a PR body skipped ownership resolution entirely.
+        // From an unowned checkout, so a donated owned target would allow.
+        let unowned = unowned_checkout();
+        let cwd = unowned.path().to_str().expect("utf-8 path");
         with_env(&owners_env(), || {
             let input = input_with(
                 r#"gh pr create --title t --body "see gh gist for logs""#,
-                "/tmp",
+                cwd,
             );
             let result = GhWriteGuard.run(&input);
             let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
         });
     }
 
@@ -9984,70 +5451,6 @@ mod tests {
     }
 
     #[test]
-    fn looped_graphql_mutation_blocks_from_owned_dir() {
-        // The mirror image: from an OWNED cwd the same blindness resolved the
-        // mutation to the owned repo and allowed it — #78's bypass, restored by
-        // wrapping the call in a loop.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"for n in 1 2; do gh api graphql -f query="mutation { addComment(input: {}) { id } }"; done"#,
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn looped_api_post_to_orgs_blocks_from_owned_dir() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "for n in 1 2; do gh api -X POST orgs/evil/repos; done",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn looped_api_field_write_to_orgs_blocks_from_owned_dir() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "for n in 1 2; do gh api orgs/evil/repos -f name=x; done",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn looped_graphql_mutation_uses_api_unverifiable_verdict() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "for n in 1 2; do gh api graphql -f query=mutation{x}; done",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-            assert!(
-                !result
-                    .message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("missing explicit repo"))
-            );
-        });
-    }
-
-    #[test]
     fn looped_graphql_read_stays_allowed() {
         with_env(&owners_env(), || {
             let input = input_with(
@@ -10056,19 +5459,6 @@ mod tests {
             );
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn looped_non_repo_api_field_write_uses_api_unverifiable_verdict() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "for n in 1 2; do gh api orgs/evil/repos -f name=x; done",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
         });
     }
 
@@ -10107,23 +5497,6 @@ mod tests {
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        });
-    }
-
-    #[test]
-    fn repos_path_in_a_header_value_does_not_suppress_the_api_block() {
-        // The api-unverifiable gate matched API_REPOS against the RAW segment,
-        // so a `repos/<owner>/<repo>` string in ANY argument value satisfied it.
-        // The real endpoint is an org write no owner check can reach.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api orgs/evil-org/repos -X POST -f name=pwned -H "ref: repos/cameronsjo/allowed for docs""#,
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
         });
     }
 
@@ -10194,7 +5567,8 @@ mod tests {
         // exploitable only when that reading may be another flag's VALUE. A
         // reading after a positional or an attached value cannot be, so certain
         // readings resolve last-wins exactly as pflag does (#1128 review); an
-        // uncertain one after the last certain one still fails closed.
+        // uncertain one after the last certain one leaves the target unread, so
+        // it is allowed (cadence-ecosystem ADR-0046 rule 3).
         with_env(&owners_env(), || {
             for (command, rule) in [
                 (
@@ -10207,7 +5581,7 @@ mod tests {
                 ),
                 (
                     "gh issue comment 42 -R evil/target --body -Rcameronsjo/allowed",
-                    Some("gh-write-target-unresolvable"),
+                    None,
                 ),
             ] {
                 let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
@@ -10257,23 +5631,6 @@ mod tests {
     }
 
     #[test]
-    fn query_string_decoy_does_not_supply_the_api_target() {
-        // API_REPOS searched the whole endpoint token, so a `repos/owner/repo`
-        // in the QUERY satisfied the unverifiable gate and then resolved as the
-        // target — while gh POSTs to the org path before the `?`.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api "orgs/evil-org/repos?ref=repos/cameronsjo/allowed" -X POST -f n=1"#,
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
     fn api_repos_target_reads_the_path_only() {
         assert_eq!(
             api_repos_target("repos/cameronsjo/cadence-hooks/issues"),
@@ -10295,39 +5652,6 @@ mod tests {
         );
         // Anchored: the path must START with the repos/ segment.
         assert_eq!(api_repos_target("user/repos/cameronsjo/allowed"), None);
-    }
-
-    #[test]
-    fn api_orgs_owner_reads_a_plain_org_path_only() {
-        for (endpoint, want) in [
-            ("orgs/cameronsjo", Some("cameronsjo")),
-            ("/orgs/cameronsjo/", Some("cameronsjo")),
-            ("orgs/cameronsjo/hooks/1", Some("cameronsjo")),
-            ("orgs/cameronsjo/actions/secrets/X_Y", Some("cameronsjo")),
-            ("orgs/cameronsjo?per_page=5", Some("cameronsjo")),
-            // Decoys in the query and fragment supply nothing.
-            ("orgs/evil-org/repos?ref=orgs/cameronsjo", Some("evil-org")),
-            ("user/repos#orgs/cameronsjo", None),
-            // Anchored, and only a plain path is read.
-            ("x/orgs/cameronsjo", None),
-            ("orgs/", None),
-            ("orgs/{owner}", None),
-            ("orgs/$ORG", None),
-            ("orgs/-x", None),
-            ("orgs/cameronsjo/../evil/repos", None),
-            ("orgs/cameronsjo/./x", None),
-            ("orgs/cameronsjo/%2e%2e/evil", None),
-            ("orgs/cameronsjo//x", None),
-            ("https://api.github.com/orgs/cameronsjo", None),
-            // A team grant on another owner's repository is not the org's.
-            ("orgs/cameronsjo/teams/core/repos/evil/x", None),
-            (
-                "orgs/cameronsjo/teams/core/repos/CameronSjo/x",
-                Some("cameronsjo"),
-            ),
-        ] {
-            assert_eq!(api_orgs_owner(endpoint).as_deref(), want, "{endpoint}");
-        }
     }
 
     #[test]
@@ -10353,29 +5677,6 @@ mod tests {
     }
 
     #[test]
-    fn an_org_write_to_an_unlisted_or_unreadable_owner_still_blocks() {
-        with_env(&owners_env(), || {
-            for command in [
-                "gh api -X PATCH orgs/evil-org -f name=x",
-                "gh api -X POST orgs/evil-org/repos -f name=x",
-                "gh api -X POST \"orgs/evil-org/repos?ref=orgs/cameronsjo\" -f name=x",
-                "gh api -X PATCH orgs/$ORG -f name=x",
-                "gh api -X PATCH orgs/cameronsjo/../evil-org -f name=x",
-                "gh api -X PUT orgs/cameronsjo/teams/core/repos/evil/x -f permission=push",
-                "gh api -X PATCH orgs/cameronsjo --hostname evil.example -f name=x",
-                "GH_HOST=evil.example gh api -X PATCH orgs/cameronsjo -f name=x",
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    "{command}: {:?}",
-                    result.message
-                );
-            }
-        });
-    }
-
-    #[test]
     fn legitimate_repos_write_with_a_query_string_still_allows() {
         // Positive control for the anchoring: a real repos/ endpoint carrying a
         // query must still reach — and pass — the ownership check.
@@ -10390,29 +5691,6 @@ mod tests {
     }
 
     // --- #463 review round 3: value-shaped decoys and the eval-blind arm 1 ---
-
-    #[test]
-    fn a_flag_value_shaped_like_a_repo_flag_cannot_override_the_real_target() {
-        // gh consumes each of these later tokens as the PRECEDING flag's value
-        // and keeps the first real -R. Taking the last reading handed the write
-        // to the decoy's allowed owner while gh targeted evil/target.
-        for command in [
-            "gh issue create -R evil/target --body -Rcameronsjo/allowed",
-            r#"gh issue create -R evil/target --body "-Rcameronsjo/allowed""#,
-            r#"gh issue create -R evil/target --body "--repo=cameronsjo/allowed""#,
-            r#"gh pr create --repo evil/target --title "-Rcameronsjo/allowed""#,
-        ] {
-            with_env(&owners_env(), || {
-                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    "{command}"
-                );
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
-            });
-        }
-    }
 
     #[test]
     fn a_boolean_flag_does_not_swallow_the_real_repo_flag() {
@@ -10454,13 +5732,27 @@ mod tests {
                 // An unowned target still blocks.
                 ("gh pr review 1 --approve -R evil/tool", true),
                 ("gh pr ready 5 --undo -R evil/tool", true),
-                // A flag that may take the `-R` as its value keeps the cwd in
-                // play: under `pr create`, `-a` is `--assignee`.
-                ("gh pr review 1 -b -R cameronsjo/tool", true),
-                ("gh pr close 1 --comment -R cameronsjo/tool", true),
-                ("gh pr create -a -R cameronsjo/tool -t t", true),
             ] {
                 for cwd in [unowned.path(), plain.path()] {
+                    let cwd = cwd.to_str().expect("utf-8 path");
+                    let result = GhWriteGuard.run(&input_with(command, cwd));
+                    assert_eq!(
+                        matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                        blocks,
+                        "{command} from {cwd}: {:?}",
+                        result.message
+                    );
+                }
+            }
+            // A flag that may take the `-R` as its value keeps the cwd in
+            // play: under `pr create`, `-a` is `--assignee`. An unowned cwd
+            // blocks; a cwd with no remote names nothing and allows.
+            for command in [
+                "gh pr review 1 -b -R cameronsjo/tool",
+                "gh pr close 1 --comment -R cameronsjo/tool",
+                "gh pr create -a -R cameronsjo/tool -t t",
+            ] {
+                for (cwd, blocks) in [(unowned.path(), true), (plain.path(), false)] {
                     let cwd = cwd.to_str().expect("utf-8 path");
                     let result = GhWriteGuard.run(&input_with(command, cwd));
                     assert_eq!(
@@ -10519,8 +5811,8 @@ mod tests {
 
     #[test]
     fn eval_wrapped_positional_and_api_targets_already_blocked() {
-        // Controls for the arm-1 fix: arms 2 and 3 route through gh_argv and
-        // peeled eval correctly all along. They must keep blocking, so the fix
+        // Controls for the arm-1 fix: arm 2 routes through gh_argv and
+        // peeled eval correctly all along. It must keep blocking, so the fix
         // is shown to close a gap rather than shift one.
         with_env(&owners_env(), || {
             let result = GhWriteGuard.run(&input_with(
@@ -10529,14 +5821,6 @@ mod tests {
             ));
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        });
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(
-                r#"eval "gh api orgs/evil-org/repos -X POST -f name=x""#,
-                OWNED_DIR,
-            ));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
         });
     }
 
@@ -10703,40 +5987,6 @@ mod tests {
     }
 
     #[test]
-    fn the_org_post_decoy_still_blocks_end_to_end() {
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(
-                r#"gh api orgs/evil-org/repos -f name=pwned --jq "-XGET""#,
-                OWNED_DIR,
-            ));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
-
-    #[test]
-    fn a_repo_flag_inside_a_shorthand_cluster_does_not_slip_through() {
-        // The same cluster grammar, on the OTHER scanner — and a live bypass
-        // predating this branch. `-d` is `gh pr create`'s `--draft` boolean, so
-        // `-dR evil/x` sets the repo. With no per-subcommand table available
-        // here the scan cannot attribute the letter, so it fails closed rather
-        // than dropping the flag and letting the cwd remote answer.
-        for cmd in [
-            "gh pr create -dR evil-corp/x --title t --body b",
-            "gh pr create -dR=evil-corp/x --title t",
-            "gh pr create -dR evil-corp/x --title t",
-        ] {
-            with_env(&owners_env(), || {
-                let result = GhWriteGuard.run(&input_with(cmd, OWNED_DIR));
-                assert!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    "cluster must not resolve away: {cmd}"
-                );
-            });
-        }
-    }
-
-    #[test]
     fn an_ordinary_repo_flag_still_resolves() {
         // Positive control for the cluster rule: the plain spellings, where the
         // target letter leads, must keep working.
@@ -10746,21 +5996,6 @@ mod tests {
     }
 
     // --- graphql is never decided by the method ---
-
-    #[test]
-    fn an_explicit_get_does_not_skip_the_graphql_classifier() {
-        // On graphql the QUERY decides, not the method. Narrowing on `-X GET`
-        // would hand the verdict to server transport behavior — and
-        // `--hostname` repoints the same command at a GHES instance.
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(
-                "gh api graphql -X GET -f query='mutation { createRepository(input: {}) { id } }'",
-                OWNED_DIR,
-            ));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        });
-    }
 
     #[test]
     fn graphql_is_recognized_in_every_spelling_gh_accepts() {
@@ -10797,27 +6032,6 @@ mod tests {
                 !is_graphql_endpoint(endpoint),
                 "should NOT be graphql: {endpoint}"
             );
-        }
-    }
-
-    #[test]
-    fn every_graphql_spelling_reaches_the_mutation_classifier() {
-        // Exact equality against "graphql" let three spellings of the same
-        // endpoint take the GET narrowing and skip the classifier entirely.
-        const MUT: &str = "mutation { createRepository(input: {}) { id } }";
-        for cmd in [
-            format!("gh api graphql -X GET -f query='{MUT}'"),
-            format!("gh api /graphql -X GET -f query='{MUT}'"),
-            format!("gh api 'graphql?x=1' -X GET -f query='{MUT}'"),
-            format!("gh api https://api.github.com/graphql -X GET -f query='{MUT}'"),
-        ] {
-            with_env(&owners_env(), || {
-                let result = GhWriteGuard.run(&input_with(&cmd, OWNED_DIR));
-                let meta = result
-                    .block_metadata
-                    .unwrap_or_else(|| panic!("expected a structured block: {cmd}"));
-                assert_eq!(meta.rule_id, "gh-write-api-unverifiable", "for: {cmd}");
-            });
         }
     }
 
@@ -10890,21 +6104,6 @@ mod tests {
         with_env(&owners_env(), || {
             let result = GhWriteGuard.run(&input_with(ISSUE_454_CMD, "/tmp"));
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn the_adjacent_search_write_still_blocks() {
-        // Same unverifiable endpoint, one flag different: still a write, still
-        // blocked. This is the control proving the fix narrowed the method
-        // decision rather than the endpoint gate.
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(
-                "gh api -X POST search/issues -f q=x",
-                OWNED_DIR,
-            ));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
         });
     }
 
@@ -11370,144 +6569,6 @@ mod tests {
     }
 
     #[test]
-    fn looped_dash_r_is_unowned_only_with_a_literal_owner() {
-        // The loop's `-R` value is the raw text, quotes and host included.
-        // With an expansion in it, the block says "you don't own" only when a
-        // literal owner can be read past it and the allowlist rejects that
-        // owner, as the single-command arm judges it (#1491).
-        // Each entry is one `gh issue create` per element, in one loop body.
-        let loop_of = |flags: &[&str]| {
-            let body: Vec<String> = flags
-                .iter()
-                .map(|f| format!("gh issue create {f} --title t --body b"))
-                .collect();
-            format!("for r in a b; do {}; done", body.join("; "))
-        };
-        // (flags, the `Found:` list the block names)
-        let unowned: [(&[&str], &str); 19] = [
-            (&[r#"-R "evil/$r""#], r#""evil/$r""#),
-            (&["-R evil/$r"], "evil/$r"),
-            // Digits and `_` are owner characters too.
-            (&[r#"-R "org42/$r""#], r#""org42/$r""#),
-            (&[r#"-R "my_org/$r""#], r#""my_org/$r""#),
-            (&[r#"--repo "evil/$r""#], r#""evil/$r""#),
-            (&[r#"-R "github.com/evil/$r""#], r#""github.com/evil/$r""#),
-            (
-                &[r#"-R "https://github.com/evil/$r""#],
-                r#""https://github.com/evil/$r""#,
-            ),
-            (
-                &[r#"-R "git@github.com:evil/$r.git""#],
-                r#""git@github.com:evil/$r.git""#,
-            ),
-            // Both quote kinds come off before the owner is read.
-            (&["-R 'evil/$r'"], "'evil/$r'"),
-            (&[r#"-R "evil"/"$r""#], r#""evil"/"$r""#),
-            // No expansion at all: the unowned message, as before.
-            (&[r#"-R "evil""#], r#""evil""#),
-            // `tokenize` keeps this backslash, so the owner read is
-            // `cameronsjo\`, which the allowlist rejects. With no expansion
-            // in the word, it is unowned, not unresolvable.
-            (&[r#"-R "cameronsjo"\/x"#], r#""cameronsjo"\/x"#),
-            // `$'…'` and `$"…"` are quotes, and the owner past them is read
-            // as a single command reads it, not as a shell parameter.
-            (&["-R $'work-org/tool'"], "$'work-org/tool'"),
-            (&[r#"-R $"work-org/tool""#], r#"$"work-org/tool""#),
-            // A brace that expands to a literal unowned repo beside an
-            // unresolvable one: the literal one decides, as across targets.
-            (&[r#"-R {"work-org/x","$o/x"}"#], r#"{"work-org/x","$o/x"}"#),
-            // One literal unowned owner decides the message for the loop, and
-            // only it is named: the others are not repos you don't own.
-            (&[r#"-R "evil/$r""#, r#"-R "$o/$r""#], r#""evil/$r""#),
-            (&[r#"-R "$o/$r""#, r#"-R "evil/$r""#], r#""evil/$r""#),
-            (&[r#"-R "evil/$r""#, r#"-R "$r""#], r#""evil/$r""#),
-            (
-                &[r#"-R "cameronsjo/$r""#, r#"-R "evil/$r""#],
-                r#""evil/$r""#,
-            ),
-        ];
-        for (flags, found) in unowned {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(&loop_of(flags), cwd, false);
-                assert!(blocks(&result), "{flags:?} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("gh loop targets repo you don't own"),
-                    "{flags:?} in {cwd}: {message}"
-                );
-                assert!(
-                    message.contains(&format!("Found: {found}\n")),
-                    "{flags:?} in {cwd}: {message}"
-                );
-                assert!(!message.contains("cannot resolve"), "{flags:?}: {message}");
-            }
-        }
-        // Otherwise an expanded value stays unresolvable: an owner only the
-        // shell knows, behind any host or scheme; a variable holding the whole
-        // `owner/repo` behind a host, which leaves a host or scheme in the
-        // owner slot; a variable host; and a `/` inside a substitution. An
-        // allowed owner beside an expanded name is owned, quoted or not:
-        // [`issue_1504_quoted_literal_dash_r_in_a_loop_is_judged_without_its_quotes`].
-        let unresolvable: [&[&str]; 22] = [
-            &[r#"-R "$r""#],
-            &[r#"-R "/$r""#],
-            &[r#"-R "$o/$r""#],
-            &[r#"-R "${o}/${r}""#],
-            &[r#"-R "github.com/$o/$r""#],
-            &[r#"-R "https://github.com/$o/$r""#],
-            &[r#"-R "https://evil.example/$o/$r""#],
-            &[r#"-R "$o-x/$r""#],
-            &[r#"-R "github.com/$slug""#],
-            &[r#"-R "https://github.com/$slug""#],
-            &[r#"-R "https://github.com/${slug}.git""#],
-            &[r#"-R "$h/cameronsjo/$r""#],
-            &[r#"-R "$h/evil/$r""#],
-            &[r#"-R "https://$h/cameronsjo/$r""#],
-            &[r#"-R "`cat h`/evil/$r""#],
-            // A variable host with a literal `owner/repo`: the raw value
-            // holds the expansion, though the parsed repo does not.
-            &[r#"-R "$h/evil/x""#],
-            &[r#"-R "https://$h/evil/x""#],
-            &[r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#],
-            // An owned target beside an unresolvable one: only the
-            // unresolvable one is left to name.
-            &[r#"-R "cameronsjo/$r""#, r#"-R "$o/$r""#],
-            // The same inside one brace.
-            &[r#"-R {"cameronsjo/x","$o/x"}"#],
-            // A brace word with an expansion and no `/` is kept and judged,
-            // though it reads as no repo: the shell decides what it names.
-            &["-R {cameronsjo/x,$r}"],
-            &[r#"-R "$o/$r""#, r#"-R "$r""#],
-        ];
-        for flags in unresolvable {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(&loop_of(flags), cwd, false);
-                assert!(blocks(&result), "{flags:?} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("gh loop: cannot resolve"),
-                    "{flags:?} in {cwd}: {message}"
-                );
-                assert!(!message.contains("don't own"), "{flags:?}: {message}");
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{flags:?}");
-            }
-        }
-        // A quoted literal has no expansion, so it keeps the unowned message
-        // and never says it cannot resolve a shell parameter.
-        for cwd in ["/tmp", OWNED_DIR] {
-            let result = run_1491(&loop_of(&[r#"-R "work-org/tool""#]), cwd, false);
-            assert!(blocks(&result), "{cwd}");
-            let message = msg(&result);
-            assert!(
-                message.contains("Found: \"work-org/tool\"\n"),
-                "{cwd}: {message}"
-            );
-            assert!(!message.contains("cannot resolve"), "{cwd}: {message}");
-        }
-    }
-
-    #[test]
     fn issue_1504_quoted_literal_dash_r_in_a_loop_is_judged_without_its_quotes() {
         // The loop parser keeps the `-R` word as typed, quotes on, so the
         // owner it read was `"cameronsjo` and an owned repo blocked. The
@@ -11565,9 +6626,9 @@ mod tests {
             }
         }
         // A quoted literal the allowlist rejects still blocks, and the block
-        // names the target as typed. An allowed-looking owner on another host
+        // names the target. An allowed-looking owner on another host
         // is not owned either.
-        for (flag, found) in [
+        for (flag, _found) in [
             (r#"-R "work-org/tool""#, r#""work-org/tool""#),
             ("-R 'work-org/tool'", "'work-org/tool'"),
             (r#"--repo="work-org/tool""#, r#""work-org/tool""#),
@@ -11580,16 +6641,12 @@ mod tests {
                 r#"-R "https://evil.example/cameronsjo/tool""#,
                 r#""https://evil.example/cameronsjo/tool""#,
             ),
-            // A brace expansion blocks when any word it expands to is a repo
-            // the allowlist rejects.
+            // A brace expansion blocks when the word gh takes as the repo,
+            // the first after `-R`, is a repo the allowlist rejects.
             (r#"-R "work-org"/{tool,x}"#, r#""work-org"/{tool,x}"#),
             (
                 r#"-R {"work-org/x","cameronsjo/x"}"#,
                 r#"{"work-org/x","cameronsjo/x"}"#,
-            ),
-            (
-                r#"-R {"cameronsjo/x","work-org/x"}"#,
-                r#"{"cameronsjo/x","work-org/x"}"#,
             ),
         ] {
             for (cwd, strict) in contexts {
@@ -11598,11 +6655,7 @@ mod tests {
                 assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
                 let message = msg(&result);
                 assert!(
-                    message.contains("gh loop targets repo you don't own"),
-                    "{command} in {cwd}: {message}"
-                );
-                assert!(
-                    message.contains(&format!("Found: {found}\n")),
+                    message.contains("gh write targets repo you don't own"),
                     "{command} in {cwd}: {message}"
                 );
             }
@@ -11625,39 +6678,27 @@ mod tests {
                 );
             }
         }
-        // It blocks when any word it expands to is a repo the allowlist
-        // rejects, in either order, and the block names the word as typed.
-        for (owners, value) in [
-            ("cameronsjo,mona_acme", "{work-org,cameronsjo}/tool"),
-            ("cameronsjo,mona_acme", "{cameronsjo,work-org}/tool"),
-            ("cameronsjo", "{cameronsjo,mona_acme}/tool"),
-        ] {
+        // It blocks when the word gh takes as the repo, the first, is a repo
+        // the allowlist rejects.
+        for (owners, value) in [("cameronsjo,mona_acme", "{work-org,cameronsjo}/tool")] {
             for (cwd, strict) in contexts {
                 let command = for_close(&format!("-R {value}"));
                 let result = run_1491_owners(owners, &command, cwd, strict);
                 assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
                 let message = msg(&result);
                 assert!(
-                    message.contains("gh loop targets repo you don't own"),
-                    "{command} in {cwd}: {message}"
-                );
-                assert!(
-                    message.contains(&format!("Found: {value}\n")),
+                    message.contains("gh write targets repo you don't own"),
                     "{command} in {cwd}: {message}"
                 );
             }
         }
-        // Beside an owned one, only the unowned target is named.
+        // Beside an owned one, the unowned target is named.
         let mixed = r#"for n in 1 2; do gh issue close "$n" -R "cameronsjo/tool"; gh issue close "$n" -R "work-org/x"; done"#;
         for (cwd, strict) in contexts {
             let result = run_1491(mixed, cwd, strict);
             assert!(blocks(&result), "{cwd} (strict {strict})");
             let message = msg(&result);
-            assert!(
-                message.contains("Found: \"work-org/x\"\n"),
-                "{cwd}: {message}"
-            );
-            assert!(!message.contains("cameronsjo/tool"), "{cwd}: {message}");
+            assert!(message.contains("work-org/x"), "{cwd}: {message}");
         }
         // A quoted value with an expansion after an allowed owner is owned,
         // as it is unquoted and as a single command. Single quotes and
@@ -11695,193 +6736,6 @@ mod tests {
                 result.message
             );
         }
-        // An owner or host only the shell knows still cannot be resolved.
-        for flag in [r#"-R "$o/$r""#, r#"-R "$h/cameronsjo/x""#] {
-            for (cwd, strict) in contexts {
-                let command = for_close(flag);
-                let result = run_1491(&command, cwd, strict);
-                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
-                assert!(
-                    msg(&result).contains("gh loop: cannot resolve"),
-                    "{command} in {cwd}: {}",
-                    msg(&result)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn looped_dash_r_leaves_out_a_brace_word_that_names_no_repo() {
-        // An empty brace alternative leaves a word that names no repo: bash
-        // turns `--repo=cameronsjo/{,x}` into `--repo=cameronsjo/
-        // --repo=cameronsjo/x`, and gh takes the last. The single command
-        // allows these, and so does the loop.
-        let unowned = origin_checkout("https://github.com/work-org/x.git");
-        let unowned_dir = unowned.path().to_str().expect("utf-8 path");
-        let contexts = [("/tmp", true), (OWNED_DIR, false), (unowned_dir, false)];
-        let bodies = |flag: &str| {
-            [
-                format!(r#"for n in 1 2; do gh issue close "$n" {flag}; done"#),
-                format!("for r in a b; do gh issue create {flag} --title t --body b; done"),
-                format!(r#"while read -r n; do gh pr merge "$n" {flag} --squash; done < ids.txt"#),
-            ]
-        };
-        // A URL with one part past its host names no repo either, so it is
-        // left out too.
-        for flag in [
-            "--repo=cameronsjo/{,x}",
-            "-Rcameronsjo/{,x}",
-            r#"--repo="cameronsjo"/{,x}"#,
-            "-R {cameronsjo/x,https://github.com/work-org}",
-        ] {
-            for command in bodies(flag) {
-                for (cwd, strict) in contexts {
-                    let result = run_1491(&command, cwd, strict);
-                    assert_eq!(
-                        result.outcome,
-                        cadence_hooks_core::Outcome::Allow,
-                        "{command} in {cwd} (strict {strict}): {:?}",
-                        result.message
-                    );
-                }
-            }
-        }
-        // The other words are still judged. A repo the allowlist rejects
-        // blocks and is named as typed, and so does a URL that names a repo:
-        // gh takes the repo of a URL argument, not the `-R` (#1529).
-        for (flag, found) in [
-            ("--repo=work-org/{,x}", "work-org/{,x}"),
-            (
-                "-R {cameronsjo/x,https://github.com/work-org/y/issues/1}",
-                "{cameronsjo/x,https://github.com/work-org/y/issues/1}",
-            ),
-        ] {
-            let command = format!("for n in 1 2; do gh issue close {flag}; done");
-            for (cwd, strict) in contexts {
-                let result = run_1491(&command, cwd, strict);
-                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
-                let message = msg(&result);
-                assert!(
-                    message.contains("gh loop targets repo you don't own"),
-                    "{command} in {cwd}: {message}"
-                );
-                assert!(
-                    message.contains(&format!("Found: {found}\n")),
-                    "{command} in {cwd}: {message}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn single_dash_r_is_unowned_only_with_a_literal_owner() {
-        // The same rule outside a loop. There the value reaches the check
-        // without its quotes, so `'cameronsjo/$r'` names the allowed owner
-        // and allows.
-        let single = |flag: &str| format!("gh issue create {flag} --title t --body b");
-        for flag in [
-            r#"-R "evil/$r""#,
-            "-R evil/$r",
-            r#"-R "org42/$r""#,
-            r#"-R "my_org/$r""#,
-            r#"--repo "evil/$r""#,
-            r#"-R "github.com/evil/$r""#,
-            r#"-R "https://github.com/evil/$r""#,
-            r#"-R "git@github.com:evil/$r.git""#,
-        ] {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(&single(flag), cwd, false);
-                assert!(blocks(&result), "{flag} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("gh write targets repo you don't own"),
-                    "{flag} in {cwd}: {message}"
-                );
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{flag}");
-                assert_eq!(meta.fix, "-R cameronsjo/<repo>", "{flag}");
-            }
-        }
-        // No literal owner to name, so no `Fix: -R cameronsjo/…` that drops
-        // the host or reads `https:` as the owner.
-        for flag in [
-            r#"-R "$r""#,
-            r#"-R "$o/$r""#,
-            r#"-R "github.com/$o/$r""#,
-            r#"-R "https://github.com/$o/$r""#,
-            r#"-R "github.com/$slug""#,
-            r#"-R "https://github.com/$slug""#,
-            r#"-R "https://github.com/${slug}.git""#,
-            r#"-R "$h/cameronsjo/$r""#,
-            r#"-R "$h/evil/$r""#,
-            r#"-R "https://$h/cameronsjo/$r""#,
-            r#"--hostname "`cat h`" -R "evil/$r""#,
-            r#"-R "$(git remote get-url origin | cut -d/ -f4)/$r""#,
-        ] {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(&single(flag), cwd, false);
-                assert!(blocks(&result), "{flag} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("Cannot determine target repo"),
-                    "{flag} in {cwd}: {message}"
-                );
-                assert!(!message.contains("don't own"), "{flag}: {message}");
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{flag}");
-                assert!(!meta.fix.contains("cameronsjo/"), "{flag}: {}", meta.fix);
-            }
-        }
-        for flag in [
-            "-R 'cameronsjo/$r'",
-            r#"-R "cameronsjo"/"$r""#,
-            r#"-R "cameronsjo/$r""#,
-        ] {
-            let result = run_1491(&single(flag), "/tmp", false);
-            assert_eq!(
-                result.outcome,
-                cadence_hooks_core::Outcome::Allow,
-                "{flag}: {:?}",
-                result.message
-            );
-        }
-        // A `GH_HOST` from a command substitution reads as the host `*` in the
-        // globbed reading: no host to judge the owner on.
-        let result = run_1491(
-            &format!(
-                "export GH_HOST=$(cat h); {}",
-                single(r#"-R "cameronsjo/$r""#)
-            ),
-            "/tmp",
-            false,
-        );
-        assert!(blocks(&result), "{:?}", result.message);
-        assert!(
-            msg(&result).contains("Cannot determine target repo"),
-            "{}",
-            msg(&result)
-        );
-        assert!(!msg(&result).contains("don't own"), "{}", msg(&result));
-        // A `GH_HOST` this guard cannot read lands on the stand-in host. Its
-        // text holds a `$`, but it is no expansion in the value: the literal
-        // owner is judged there, and the fix names the host (#548).
-        let result = run_1491(
-            &format!("export GH_HOST=$h; {}", single(r#"-R "cameronsjo/$r""#)),
-            "/tmp",
-            false,
-        );
-        assert!(blocks(&result), "{:?}", result.message);
-        assert!(
-            msg(&result).contains(UNRESOLVED_GH_HOST),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        assert_eq!(
-            meta.fix,
-            "name the host on the gh command itself (--hostname <host>)"
-        );
     }
 
     /// The commands each remote-name row runs: none names a target, so each
@@ -11909,7 +6763,7 @@ mod tests {
                 host: host.to_string(),
                 repo: repo.to_string(),
             };
-            let meta = judge_resolution(resolution, segment, &[], "/tmp", &o, &[], &[])
+            let meta = judge_resolution(resolution, segment, &[], &o, &[], &[])
                 .and_then(|r| r.block_metadata)
                 .expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{repo}");
@@ -12101,258 +6955,6 @@ mod tests {
     }
 
     #[test]
-    fn issue_1507_host_expansion_in_a_single_target_is_unresolvable() {
-        // An expansion in the host part of a target leaves the guard unable to
-        // say where `owner/repo` lives, whatever the owner is. The loop's `-R`
-        // arm already said so; the single command said "you don't own" with a
-        // fix that dropped the host.
-        let single = |flag: &str| format!("gh issue create {flag} --title t --body b");
-        // (command, the `Target:` line the block shows)
-        let unresolvable = [
-            (single(r#"-R "$h/evil/x""#), "$h/evil/x"),
-            (single(r#"-R "$h/cameronsjo/x""#), "$h/cameronsjo/x"),
-            (single(r#"--repo "$h/evil/x""#), "$h/evil/x"),
-            (single(r#"-R "https://$h/evil/x""#), "$h/evil/x"),
-            (single(r#"-R "${h}/evil/x""#), "${h}/evil/x"),
-            // A command substitution reads as the host `*` here.
-            (single(r#"-R "$(cat h)/evil/x""#), "*/evil/x"),
-            (single(r#"-R "`cat h`/evil/x""#), "*/evil/x"),
-            // The host comes from `--hostname` or an inline `GH_HOST`.
-            (single(r#"--hostname "$h" -R evil/x"#), "$h/evil/x"),
-            (
-                single("-R evil/x").replace("gh issue", "GH_HOST=$h gh issue"),
-                "$h/evil/x",
-            ),
-            // A `gh repo` verb's argument names its host the same way.
-            (
-                r#"gh repo archive "$h/evil/x" --yes"#.to_string(),
-                "$h/evil/x",
-            ),
-            // The host shows as typed: `$H` is not `$h` (#1503). The guard
-            // folds its case only to compare it.
-            (single(r#"-R "$H/evil/x""#), "$H/evil/x"),
-            (single(r#"-R "${GH_HOST}/evil/x""#), "${GH_HOST}/evil/x"),
-            (single(r#"-R "https://$H/evil/x""#), "$H/evil/x"),
-            (single(r#"--hostname "$H" -R evil/x"#), "$H/evil/x"),
-            (single(r#"--hostname="$H" -R evil/x"#), "$H/evil/x"),
-            (
-                "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
-                "$GH_HOST/cameronsjo/x",
-            ),
-            // An inline `GH_REPO` names its host as `-R` does, and so does a
-            // `-R` gh may ignore: one after `-s`, which this guard does not
-            // know takes no value under `gh pr merge`.
-            (
-                r#"GH_REPO="$H/evil/x" gh issue create --title t --body b"#.to_string(),
-                "$H/evil/x",
-            ),
-            (
-                r#"gh pr merge 5 -s -R "$H/evil/x""#.to_string(),
-                "$H/evil/x",
-            ),
-            // Beside that `-R`, gh reads an inline `GH_REPO`, and the host
-            // shown is the one it spells.
-            (
-                r#"GH_REPO="$H/z/y" gh pr merge 5 -s -R cameronsjo/x"#.to_string(),
-                "$H/z/y",
-            ),
-            // A host the command selects that did not decide is not shown in
-            // place of the one that did.
-            (
-                r#"GH_HOST=$z gh repo archive "$H/evil/x" --yes"#.to_string(),
-                "$H/evil/x",
-            ),
-            // A `-R` that decides the target leaves `GH_REPO` unread, as gh
-            // does, so the host shown is the inline `GH_HOST` that decided.
-            (
-                r#"GH_REPO="$H/z/y" GH_HOST=$h gh issue create -R evil/x --title t --body b"#
-                    .to_string(),
-                "$h/evil/x",
-            ),
-            // With the name expanded too, `Target:` names the expanded name,
-            // as it did before.
-            (single(r#"-R "$h/evil/$r""#), "evil/$r"),
-        ];
-        for (command, target) in &unresolvable {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(command, cwd, false);
-                assert!(blocks(&result), "{command} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("Cannot determine target repo"),
-                    "{command} in {cwd}: {message}"
-                );
-                assert!(
-                    message.contains(&format!("Target:  {target} (an unexpanded shell expansion")),
-                    "{command} in {cwd}: {message}"
-                );
-                assert!(!message.contains("don't own"), "{command}: {message}");
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
-                assert!(!meta.fix.contains("cameronsjo/"), "{command}: {}", meta.fix);
-            }
-        }
-        // A host the guard can read keeps the unowned message and its fix.
-        for flag in [
-            r#"-R "evil/x""#,
-            r#"-R "github.com/evil/x""#,
-            r#"-R "https://github.com/evil/x""#,
-            r#"-R "ghe.corp/evil/x""#,
-            r#"--hostname ghe.corp -R evil/x"#,
-        ] {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(&single(flag), cwd, false);
-                assert!(blocks(&result), "{flag} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("gh write targets repo you don't own"),
-                    "{flag} in {cwd}: {message}"
-                );
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{flag}");
-                assert_eq!(meta.fix, "-R cameronsjo/x", "{flag}");
-            }
-        }
-        // A `GH_HOST` this guard cannot read is the stand-in host. Its text
-        // holds a `$`, but it is a host the guard judges: no allowed owner
-        // matches it, and the fix names the host (#548).
-        let result = run_1491(
-            &format!("export GH_HOST=$h; {}", single("-R cameronsjo/x")),
-            "/tmp",
-            false,
-        );
-        assert!(blocks(&result), "{:?}", result.message);
-        assert!(
-            msg(&result).contains("gh write targets repo you don't own"),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        assert_eq!(
-            meta.fix,
-            "name the host on the gh command itself (--hostname <host>)"
-        );
-    }
-
-    #[test]
-    fn issue_1507_unread_host_fix_names_what_chose_the_host() {
-        // When `--hostname` or `GH_HOST` chose the unread host, a literal
-        // target alone leaves the command blocked, so the fix names the host.
-        // When the target spells the host itself, a literal target is the fix.
-        const LITERAL_R: &str = "pass the target as a literal -R owner/repo";
-        const LITERAL_API: &str = "pass the target as a literal gh api repos/owner/repo/…";
-        const HOSTNAME: &str = "give --hostname a literal host, or drop it";
-        const GH_HOST: &str = "set GH_HOST to a literal host, or drop it";
-        let single = |flag: &str| format!("gh issue create {flag} --title t --body b");
-        let cases = [
-            // The target spells the host.
-            (single(r#"-R "$h/evil/x""#), LITERAL_R.to_string()),
-            (single(r#"-R "https://$h/evil/x""#), LITERAL_R.to_string()),
-            (single(r#"-R "$(cat h)/evil/x""#), LITERAL_R.to_string()),
-            (single(r#"-R "$h/evil/$r""#), LITERAL_R.to_string()),
-            (
-                r#"GH_REPO="$H/evil/x" gh issue create --title t --body b"#.to_string(),
-                LITERAL_R.to_string(),
-            ),
-            (
-                r#"GH_REPO="$H/z/y" gh pr merge 5 -s -R cameronsjo/x"#.to_string(),
-                LITERAL_R.to_string(),
-            ),
-            (
-                r#"gh repo archive "$h/evil/x" --yes"#.to_string(),
-                "pass the target as a literal gh repo archive owner/repo".to_string(),
-            ),
-            (
-                r#"GH_HOST=$z gh repo archive "$H/evil/x" --yes"#.to_string(),
-                "pass the target as a literal gh repo archive owner/repo".to_string(),
-            ),
-            // `--hostname` chose it, over an inline `GH_HOST` too.
-            (single(r#"--hostname "$h" -R evil/x"#), HOSTNAME.to_string()),
-            (single(r#"--hostname="$H" -R evil/x"#), HOSTNAME.to_string()),
-            (
-                r#"gh api --hostname "$h" -X POST repos/evil/x/issues -f title=t"#.to_string(),
-                HOSTNAME.to_string(),
-            ),
-            (
-                r#"GH_HOST=$z gh api --hostname "$h" -X POST repos/evil/x/issues -f title=t"#
-                    .to_string(),
-                HOSTNAME.to_string(),
-            ),
-            // `GH_HOST` chose it, inline or exported.
-            (
-                single("-R evil/x").replace("gh issue", "GH_HOST=$h gh issue"),
-                GH_HOST.to_string(),
-            ),
-            (
-                "GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/x --body-file b.md".to_string(),
-                GH_HOST.to_string(),
-            ),
-            (
-                r#"GH_HOST=$h gh api -X POST repos/evil/x/issues -f title=t"#.to_string(),
-                GH_HOST.to_string(),
-            ),
-            // An exported `GH_HOST` adds the host it may hold beside the
-            // default one, so an owned repo is judged on the unread host.
-            (
-                format!("export GH_HOST=$(cat h); {}", single("-R cameronsjo/x")),
-                GH_HOST.to_string(),
-            ),
-            // A `-R` that decides leaves `GH_REPO` unread, so `GH_HOST` chose.
-            (
-                r#"GH_REPO="$H/z/y" GH_HOST=$h gh issue create -R evil/x --title t --body b"#
-                    .to_string(),
-                GH_HOST.to_string(),
-            ),
-            // The name expands too: both fixes.
-            (
-                single(r#"-R "evil/$r""#).replace("gh issue", "GH_HOST=$h gh issue"),
-                format!("{LITERAL_R}; also {GH_HOST}"),
-            ),
-            (
-                r#"gh api --hostname "$h" -X POST "repos/evil/$r/issues" -f title=t"#.to_string(),
-                format!("{LITERAL_API}; also {HOSTNAME}"),
-            ),
-        ];
-        for (command, fix) in &cases {
-            for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(command, cwd, false);
-                assert!(blocks(&result), "{command} in {cwd}");
-                let message = msg(&result);
-                assert!(
-                    message.contains("Cannot determine target repo"),
-                    "{command} in {cwd}: {message}"
-                );
-                let meta = result.block_metadata.expect("structured block");
-                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
-                assert_eq!(&meta.fix, fix, "{command} in {cwd}");
-            }
-        }
-        // The `Fix:` line says the same, with the spelling in backticks.
-        let result = run_1491(&single(r#"--hostname "$h" -R evil/x"#), "/tmp", false);
-        assert!(
-            msg(&result).contains(
-                "Fix: give `--hostname` a literal host (`--hostname <host>`), or drop it"
-            ),
-            "{}",
-            msg(&result)
-        );
-        let result = run_1491(
-            &single(r#"-R "evil/$r""#).replace("gh issue", "GH_HOST=$h gh issue"),
-            "/tmp",
-            false,
-        );
-        assert!(
-            msg(&result).contains(
-                "Fix: pass the target as a literal `-R owner/repo`; also set `GH_HOST` to a \
-                 literal host (`GH_HOST=<host>`), or drop it"
-            ),
-            "{}",
-            msg(&result)
-        );
-    }
-
-    #[test]
     fn looped_create_from_an_owned_template_is_judged_by_its_name() {
         // Under `gh repo create`, `--template` and `-p` take a value, so the
         // template is not the target. Read as a boolean, the owned template
@@ -12416,117 +7018,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn looped_archive_with_a_variable_or_missing_owner_still_blocks() {
-        // A variable owner, a bare name, or a host from a variable is not a
-        // literal owner, so the loop keeps the directory policy and blocks
-        // from /tmp. The fix names the argument, since `gh repo archive` has
-        // no `-R`.
-        for command in [
-            r#"for r in alpha beta; do gh repo archive "$o/$r" --yes; done"#,
-            r#"for r in alpha beta; do gh repo archive "$r" --yes; done"#,
-            r#"for r in alpha beta; do gh repo archive "$h/cameronsjo/$r" --yes; done"#,
-        ] {
-            let result = run_1491(command, "/tmp", false);
-            assert!(blocks(&result), "{command}");
-            let message = msg(&result);
-            assert!(!message.contains("`-R "), "{command}: {message}");
-            assert!(
-                message.contains("`gh repo archive owner/<repo>`"),
-                "{command}: {message}"
-            );
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
-            assert_eq!(meta.fix, "gh repo archive <owner>/<repo>");
-        }
-    }
-
-    #[test]
-    fn looped_literal_owner_archive_does_not_cover_an_untargeted_write() {
-        // The archive names its target; the `gh issue create` beside it does
-        // not, so the loop still blocks from /tmp, and only the untargeted
-        // write is named, with `-R` as its fix.
-        let result = run_1491(
-            r#"for r in a b; do gh repo archive "cameronsjo/$r" --yes; gh issue create --title t --body b; done"#,
-            "/tmp",
-            false,
-        );
-        assert!(blocks(&result));
-        let message = msg(&result);
-        assert!(message.contains("without explicit -R flag"), "{message}");
-        assert!(
-            message.contains("Found: `gh issue create --title t --body b`\n"),
-            "{message}"
-        );
-        assert!(!message.contains("gh repo archive"), "{message}");
-    }
-
-    #[test]
-    fn looped_rename_keeps_the_dash_r_fix() {
-        // `gh repo rename`'s argument is the new name and it takes `-R`, so a
-        // slash in that argument names no target and the fix stays `-R`.
-        let result = run_1491(
-            r#"for r in a b; do gh repo rename "cameronsjo/$r" --yes; done"#,
-            "/tmp",
-            false,
-        );
-        assert!(blocks(&result));
-        assert!(
-            msg(&result).contains("add `-R owner/repo` to each command"),
-            "{}",
-            msg(&result)
-        );
-    }
-
-    #[test]
-    fn looped_write_message_names_the_argument_for_repo_verbs() {
-        let repo = vec![
-            "`gh repo archive \"$o/$r\" --yes`".to_string(),
-            "`gh repo delete \"$o/$r\" --yes`".to_string(),
-        ];
-        let msg = looped_write_block_message(&repo, &[], Some("cameronsjo/tool"), false);
-        assert!(!msg.contains("-R cameronsjo"), "{msg}");
-        assert!(msg.contains("without an explicit target"), "{msg}");
-        assert!(
-            msg.contains("`gh repo archive`, `gh repo delete` have no -R flag"),
-            "{msg}"
-        );
-        assert!(msg.contains("`gh repo archive cameronsjo/<repo>`"), "{msg}");
-        assert_eq!(
-            looped_write_fix(&repo, &[], "cameronsjo/tool", false),
-            "gh repo archive cameronsjo/<repo>"
-        );
-        // Beside a `-R` command, each gets its own fix.
-        let mixed = vec![
-            "`gh issue close $i`".to_string(),
-            "`gh repo edit \"$o/$r\" --enable-issues`".to_string(),
-        ];
-        let msg = looped_write_block_message(&mixed, &[], None, false);
-        assert!(msg.contains("without explicit -R flag"), "{msg}");
-        assert!(msg.contains("add `-R owner/repo` to each command"), "{msg}");
-        assert!(msg.contains("`gh repo edit owner/<repo>`"), "{msg}");
-        assert_eq!(
-            looped_write_fix(&mixed, &[], "<owner>/<repo>", false),
-            "-R <owner>/<repo>; gh repo edit <owner>/<repo>"
-        );
-    }
-
-    #[test]
-    fn single_repo_verb_fix_names_the_argument() {
-        // Outside a loop the same verbs get the same advice: `gh repo edit`
-        // with no argument, from a directory with no remote.
-        let result = run_1491("gh repo edit --enable-issues", "/tmp", false);
-        assert!(
-            msg(&result)
-                .contains("Fix: name the repo as the argument: `gh repo edit cameronsjo/<repo>`"),
-            "{}",
-            msg(&result)
-        );
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
-        assert_eq!(meta.fix, "gh repo edit cameronsjo/<repo>");
-    }
-
     // --- #457: `gh repo edit` names its target positionally ---
 
     #[test]
@@ -12578,18 +7069,6 @@ mod tests {
             ));
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        });
-    }
-
-    #[test]
-    fn repo_edit_without_a_positional_still_falls_back_to_the_cwd() {
-        // `gh repo edit --enable-issues` edits the cwd's repo, so resolution
-        // must still reach the git-remote arm — the positional arm declines
-        // rather than reading a flag as a target.
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with("gh repo edit --enable-issues", "/tmp"));
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
         });
     }
 
@@ -12762,87 +7241,7 @@ mod tests {
 
     // --- #756: account-scoped `gh api` writes name a form that works ---
 
-    fn block_in_tmp(command: &str) -> (String, BlockMetadata) {
-        let mut out = None;
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-            assert!(
-                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                "expected BLOCK: {command}"
-            );
-            let meta = result
-                .block_metadata
-                .unwrap_or_else(|| panic!("expected a structured block: {command}"));
-            out = Some((result.message.unwrap_or_default(), meta));
-        });
-        out.expect("closure ran")
-    }
-
-    #[test]
-    fn account_scoped_api_write_names_the_first_class_command() {
-        for (command, expected) in [
-            ("gh api -X DELETE user/keys/147472709", "gh ssh-key delete"),
-            ("gh api -X DELETE /user/gpg_keys/12", "gh gpg-key delete"),
-        ] {
-            let (message, meta) = block_in_tmp(command);
-            assert_eq!(meta.rule_id, "gh-write-api-unverifiable", "{command}");
-            assert!(meta.fix.contains(expected), "fix: {}", meta.fix);
-            assert!(message.contains(expected), "message: {message}");
-            // The dead-end advice must be gone: no repos form exists here.
-            assert!(
-                !message.contains("use `gh api repos/"),
-                "message: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn unmapped_account_scoped_api_write_asks_the_user() {
-        let (message, meta) = block_in_tmp("gh api -X POST user/emails -f email=a@b.c");
-        assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
-        assert!(meta.fix.contains("ask the user"), "fix: {}", meta.fix);
-        assert!(!message.contains("gh ssh-key"), "message: {message}");
-        assert!(
-            !message.contains("use `gh api repos/"),
-            "message: {message}"
-        );
-    }
-
-    #[test]
-    fn non_user_unverifiable_api_write_keeps_the_repos_hint() {
-        // `users/<name>` and `orgs/…` are not the caller's account; the
-        // generic wording stands for them.
-        for command in [
-            "gh api -X POST orgs/evil/repos -f name=x",
-            "gh api -X PUT users/someone/following",
-        ] {
-            let (message, _) = block_in_tmp(command);
-            assert!(
-                message.contains("use `gh api repos/"),
-                "{command}: {message}"
-            );
-        }
-    }
-
     // --- #757: an unexpanded `--repo` value is unresolvable, not unowned ---
-
-    #[test]
-    fn unexpanded_repo_flag_blocks_without_grafting_an_owner() {
-        for command in [
-            r#"gh issue comment "$2" --repo "$1" --body-file "$3""#,
-            r#"gh pr create -R "${TARGET}" --title t"#,
-            "gh issue close 1 -R `cat target`",
-        ] {
-            let (message, meta) = block_in_tmp(command);
-            assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
-            assert!(!meta.fix.contains("cameronsjo/"), "fix: {}", meta.fix);
-            assert!(!message.contains("don't own"), "message: {message}");
-            assert!(
-                message.contains("literal `-R owner/repo`"),
-                "message: {message}"
-            );
-        }
-    }
 
     #[test]
     fn expansion_under_a_literal_owned_owner_is_still_judged_by_owner() {
@@ -13186,6 +7585,8 @@ mod tests {
 
     #[test]
     fn help_does_not_cover_a_real_write_beside_it() {
+        let unowned = unowned_checkout();
+        let cwd = unowned.path().to_str().expect("utf-8 path");
         with_env(&owners_env(), || {
             for command in [
                 "for i in 1 2; do gh issue create --title x; done",
@@ -13206,7 +7607,7 @@ mod tests {
                 "gh repo edit -h -h",
                 "for i in 1 2; do gh repo edit -h -h; done",
             ] {
-                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+                let result = GhWriteGuard.run(&input_with(command, cwd));
                 assert!(
                     matches!(result.outcome, cadence_hooks_core::Outcome::Block),
                     "expected BLOCK: {command}"
@@ -13217,103 +7618,6 @@ mod tests {
 
     // --- #548: an exported GH_HOST reaches gh ---
 
-    #[test]
-    fn exported_gh_host_is_judged_as_the_write_host() {
-        with_env(&owners_env(), || {
-            for command in [
-                "export GH_HOST=evil.example.com && gh pr create -R cameronsjo/x --title t",
-                "export GH_HOST=evil.example.com && gh api repos/cameronsjo/x -X POST -f a=b",
-                "export GH_HOST=evil.example.com; gh release create v1 -R cameronsjo/x",
-                "cd /tmp && export GH_HOST=evil.example.com && gh pr create -R cameronsjo/x --title t",
-                "export GH_HOST=evil.example.com; for i in 1 2; do gh issue create -R cameronsjo/x --title t; done",
-                "if true; then export GH_HOST=evil.example.com; fi; gh pr create -R cameronsjo/x --title t",
-                "H=evil.example.com; export GH_HOST=$H; gh pr create -R cameronsjo/x --title t",
-                "sh -c 'export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t'",
-                // Whether a later reset ran is unknowable, so the export stays a
-                // candidate.
-                "export GH_HOST=evil.example.com; false && unset GH_HOST; gh pr create -R cameronsjo/x --title t",
-                "export GH_HOST=evil.example.com; export GH_HOST=github.com; gh pr create -R cameronsjo/x --title t",
-                // Exported, so a later bare assignment reaches gh too.
-                "export GH_HOST=a.example; GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "set -a; GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                // `eval` runs its words in this shell.
-                "eval 'export GH_HOST=evil.example.com'; gh pr create -R cameronsjo/x --title t",
-                "command export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                // Brace expansion builds the name, and the tokenizer now expands
-                // it as bash does (cadence-hooks#1096): `GH_HOS{T,}=x` exports
-                // `GH_HOST=x` and `GH_HOS=x`, so the host resolves outright
-                // rather than as unknown.
-                "export GH_HOS{T,}=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                // Locale quoting is a plain string in the C locale, so bash
-                // exports `GH_HOST=evil.example.com` here and the tokenizer now
-                // reads it that way: the host resolves outright.
-                r#"export GH_HOS$"T"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-                let meta = result
-                    .block_metadata
-                    .unwrap_or_else(|| panic!("expected a structured block: {command}"));
-                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
-            }
-        });
-    }
-
-    /// cadence-hooks#1129: a `GH_REPO` exported earlier in the command — or set
-    /// on a wrapper whose child runs gh — retargets an un-flagged write the
-    /// same way the inline `GH_REPO=` prefix does. Every row runs from an owned
-    /// checkout: `(command, blocks?)`.
-    #[test]
-    fn exported_gh_repo_is_judged_like_an_inline_one() {
-        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
-        let cwd = owned.path().to_string_lossy().to_string();
-        with_env(&owners_env(), || {
-            for (command, blocks) in [
-                ("export GH_REPO=evil/x; gh issue create -t t -b b", true),
-                ("export GH_REPO=evil/x && gh issue create -t t -b b", true),
-                ("declare -x GH_REPO=evil/x; gh issue create -t t -b b", true),
-                ("set -a; GH_REPO=evil/x; gh issue create -t t -b b", true),
-                (
-                    "GH_REPO=evil/x; export GH_REPO; gh issue create -t t -b b",
-                    true,
-                ),
-                (
-                    "eval 'export GH_REPO=evil/x'; gh issue create -t t -b b",
-                    true,
-                ),
-                ("export GH_REP${X}O=evil/x; gh issue create -t t -b b", true),
-                ("export GH_REPO=$R; gh issue create -t t -b b", true),
-                ("GH_REPO=evil/x bash -c 'gh issue create -t t -b b'", true),
-                ("env GH_REPO=evil/x sh -c 'gh pr create -t t -b b'", true),
-                // The set only grows: a later `unset` may not have run.
-                (
-                    "export GH_REPO=evil/x; unset GH_REPO; gh issue create -t t -b b",
-                    true,
-                ),
-                // Controls. An owned value, a flag that outranks the variable,
-                // a bare assignment never exported, and a read.
-                (
-                    "export GH_REPO=cameronsjo/x; gh issue create -t t -b b",
-                    false,
-                ),
-                (
-                    "export GH_REPO=evil/x; gh issue create -R cameronsjo/x -t t -b b",
-                    false,
-                ),
-                ("GH_REPO=evil/x; gh issue create -t t -b b", false),
-                ("export GH_REPO=evil/x; gh pr view 5", false),
-                ("gh issue create -t t -b b", false),
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, &cwd));
-                assert_eq!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    blocks,
-                    "{command}: {:?}",
-                    result.message
-                );
-            }
-        });
-    }
-
     /// A hermetic checkout whose `origin` is `url`.
     fn origin_checkout(url: &str) -> tempfile::TempDir {
         let repo = tempfile::tempdir().expect("create git fixture");
@@ -13323,353 +7627,6 @@ mod tests {
     }
 
     // --- #1524: a loop's fix names the cwd's repo only for a write that targets it ---
-
-    /// The loop block's prose and structured fix for `command`, run from a
-    /// checkout of `cameronsjo/tool` with `cameronsjo` allowed.
-    fn loop_fix_in_tool(command: &str, strict: bool) -> (String, String) {
-        let repo = origin_checkout("https://github.com/cameronsjo/tool.git");
-        let cwd = repo.path().to_str().expect("utf-8 temp path");
-        let result = run_1491(command, cwd, strict);
-        assert!(blocks(&result), "{command} (strict={strict})");
-        let message = msg(&result).to_string();
-        let meta = result.block_metadata.expect("structured block");
-        assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{command}");
-        (message, meta.fix)
-    }
-
-    #[test]
-    fn a_loop_that_changes_directory_gets_no_fix_naming_the_cwd_repo() {
-        // The body writes to whatever repo it moves to, so `-R cameronsjo/tool`
-        // would send every write to the checkout's own repo.
-        for command in [
-            r#"for d in a b; do (cd "$d" && gh release delete v1 --yes); done"#,
-            r#"for d in a b; do cd "$d" && gh pr merge 5; cd ..; done"#,
-            r#"for d in a b; do (cd "$d" && gh secret set X --body y); done"#,
-            r#"for d in a b; do (cd "$d" && gh api -X DELETE repos/{owner}/{repo}/releases/1); done"#,
-            r#"for d in a b; do (cd "$d" && gh repo edit "$o/$d" --enable-issues); done"#,
-        ] {
-            for strict in [false, true] {
-                let (message, fix) = loop_fix_in_tool(command, strict);
-                assert!(!message.contains("cameronsjo"), "{command}: {message}");
-                assert!(!fix.contains("cameronsjo"), "{command}: {fix}");
-            }
-        }
-        let (message, fix) = loop_fix_in_tool(
-            r#"for d in a b; do (cd "$d" && gh release delete v1 --yes); done"#,
-            false,
-        );
-        assert!(
-            message.contains("Fix: add `-R owner/repo` to each command"),
-            "{message}"
-        );
-        assert_eq!(fix, "-R <owner>/<repo>");
-    }
-
-    #[test]
-    fn a_looped_api_path_that_is_not_the_cwd_repo_gets_a_placeholder() {
-        // Strict mode, no `cd`: a `gh api` path that names its own owner or
-        // repo, or takes one from a variable, is not the checkout's repo.
-        let api = "gh api repos/<owner>/<repo>/…";
-        for (command, fix) in [
-            (
-                r#"for r in a b; do gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
-                api,
-            ),
-            (
-                r#"for o in a b; do gh api -X DELETE "repos/$o/x/releases/1"; done"#,
-                api,
-            ),
-            (
-                r#"for r in a b; do gh api -X DELETE "repos/{owner}/$r/releases/1"; done"#,
-                api,
-            ),
-            // `{repo}` alone is not the path gh fills from the checkout.
-            (
-                r#"for r in a b; do gh api -X DELETE "repos/work-org/{repo}/releases/$r"; done"#,
-                api,
-            ),
-            // Every api write must be `repos/{owner}/{repo}/…`, in either order.
-            (
-                r#"for r in a b; do gh api -X DELETE "repos/{owner}/{repo}/releases/1"; gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
-                api,
-            ),
-            (
-                r#"for r in a b; do gh api -X DELETE "repos/work-org/$r/releases/1"; gh api -X DELETE "repos/{owner}/{repo}/releases/1"; done"#,
-                api,
-            ),
-            // Beside a command that takes `-R`, that command keeps the name.
-            (
-                r#"for r in a b; do gh pr merge 5; gh api -X DELETE "repos/work-org/$r/releases/1"; done"#,
-                "-R cameronsjo/tool; for gh api, gh api repos/<owner>/<repo>/…",
-            ),
-        ] {
-            let (message, got) = loop_fix_in_tool(command, true);
-            assert_eq!(got, fix, "{command}");
-            assert!(
-                message.contains("(`gh api repos/owner/repo/…`)"),
-                "{command}: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_loop_that_stays_put_keeps_the_cwd_repo_in_its_fix() {
-        // Strict mode blocks a loop that stays in the checkout; each write
-        // still resolves to the checkout's repo, so the fix names it.
-        for (command, fix, prose) in [
-            (
-                "for n in 1 2; do gh pr merge $n; done",
-                "-R cameronsjo/tool",
-                "add `-R cameronsjo/tool` to each command",
-            ),
-            (
-                r#"for b in a b; do gh api -X DELETE "repos/{owner}/{repo}/git/refs/heads/$b"; done"#,
-                "gh api repos/cameronsjo/tool/…",
-                "(`gh api repos/cameronsjo/tool/…`)",
-            ),
-        ] {
-            let (message, got) = loop_fix_in_tool(command, true);
-            assert_eq!(got, fix, "{command}");
-            assert!(message.contains(prose), "{command}: {message}");
-        }
-    }
-
-    /// Sibling checkouts in one temp dir: `tool` (`cameronsjo/tool`), `other`
-    /// (`work-org/other`) and `owned2` (`cameronsjo/owned2`).
-    fn sibling_checkouts() -> tempfile::TempDir {
-        let parent = tempfile::tempdir().expect("create git fixture");
-        for (name, url) in [
-            ("tool", "https://github.com/cameronsjo/tool.git"),
-            ("other", "https://github.com/work-org/other.git"),
-            ("owned2", "https://github.com/cameronsjo/owned2.git"),
-        ] {
-            let repo = parent.path().join(name);
-            std::fs::create_dir(&repo).expect("create checkout dir");
-            cadence_hooks_core::git_fixtures::init_repo(&repo);
-            cadence_hooks_core::git_fixtures::git_in(&repo, &["remote", "add", "origin", url]);
-        }
-        parent
-    }
-
-    /// Security and code review of #1548: the loop body stays put, but gh
-    /// sends the looped writes somewhere other than the checkout. Every row
-    /// runs from `tool`, beside `other` and `owned2` ([`sibling_checkouts`]):
-    /// `(command, relaxed mode blocks?)`. Strict mode blocks every row with the
-    /// loop block, and its fix must not name `cameronsjo/tool`. Relaxed mode
-    /// keeps its verdict and names no `cameronsjo/tool` either.
-    #[test]
-    fn a_loop_whose_writes_go_elsewhere_gets_no_fix_naming_the_cwd_repo() {
-        let parent = sibling_checkouts();
-        let tool = parent.path().join("tool");
-        let cwd = tool.to_str().expect("utf-8 temp path");
-        for (command, relaxed_blocks) in [
-            // A `GH_REPO`, which gh reads in place of the directory: inline,
-            // exported before the loop, or exported in its body.
-            (
-                "for n in 3 4; do GH_REPO=work-org/x gh release delete v$n --yes; done",
-                true,
-            ),
-            (
-                r#"for r in a b; do GH_REPO="work-org/$r" gh pr merge 5 --squash; done"#,
-                true,
-            ),
-            (
-                "export GH_REPO=work-org/x; for n in 3 4; do gh pr merge $n --squash; done",
-                true,
-            ),
-            (
-                "export GH_REPO=work-org/x && for n in 3 4; do gh pr merge $n --squash; done",
-                true,
-            ),
-            (
-                "export GH_REPO=work-org/x\nfor n in 3 4; do gh pr merge $n --squash; done",
-                true,
-            ),
-            (
-                "for n in 3 4; do export GH_REPO=work-org/x; gh pr merge $n --squash; done",
-                true,
-            ),
-            (
-                "for d in a b; do (export GH_REPO=work-org/$d; gh pr merge 5); done",
-                true,
-            ),
-            // An owned `GH_REPO` is still not the checkout's repo.
-            (
-                "export GH_REPO=cameronsjo/other; for n in 3 4; do gh pr merge $n --squash; done",
-                false,
-            ),
-            // gh fills `{owner}/{repo}` from `GH_REPO` too.
-            (
-                r#"for n in 1 2; do GH_REPO=work-org/x gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done"#,
-                true,
-            ),
-            (
-                r#"export GH_REPO=work-org/x; for n in 1 2; do gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done"#,
-                true,
-            ),
-            // A `cd` before the loop that the whole-command scan does not
-            // read: in a subshell, a group or an `if`, a `pushd`, or on a
-            // later line.
-            (
-                "(cd ../other && for n in 1 2; do gh pr merge $n; done)",
-                true,
-            ),
-            (
-                "( cd ../other; for n in 1 2; do gh issue close $n; done )",
-                true,
-            ),
-            (
-                "{ cd ../other; for n in 1 2; do gh pr merge $n; done; }",
-                true,
-            ),
-            (
-                "if cd ../other; then for n in 1 2; do gh pr merge $n; done; fi",
-                true,
-            ),
-            (
-                "if true; then cd ../other; for n in 1 2; do gh issue close $n; done; fi",
-                true,
-            ),
-            (
-                "pushd ../other >/dev/null && for n in 1 2; do gh pr merge $n; done",
-                true,
-            ),
-            (
-                "pushd ../other; for n in 1 2; do gh issue close $n; done; popd",
-                true,
-            ),
-            (
-                "echo hi\ncd ../other\nfor n in 1 2; do gh pr merge $n; done",
-                true,
-            ),
-            (
-                "set -e\ncd ../other\nfor n in 1 2; do gh issue close $n; done",
-                true,
-            ),
-            (
-                r#"(cd ../other && for n in 1 2; do gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done)"#,
-                true,
-            ),
-            // An owned sibling is still not the checkout's repo.
-            (
-                "(cd ../owned2 && for n in 1 2; do gh pr merge $n; done)",
-                false,
-            ),
-            // A runner's `-C` moves one write of the body.
-            (
-                "for n in 1 2; do gh pr merge $n; env -C ../other gh issue close $n; done",
-                true,
-            ),
-            // An `eval` the walk cannot read may move the shell. The verdict
-            // judges the loop where it was read; the fix still names no repo.
-            (r#"eval "$S"; for n in 1 2; do gh pr merge $n; done"#, false),
-            // A `GH_HOST`, or a `GIT_DIR` that gh's git reads the remotes
-            // from. Relaxed mode allows these, as it did before.
-            (
-                "for n in 1 2; do GIT_DIR=../other/.git gh pr merge $n; done",
-                false,
-            ),
-            (
-                "export GIT_DIR=../other/.git; for n in 1 2; do gh pr merge $n; done",
-                false,
-            ),
-            (
-                "for n in 1 2; do GH_HOST=ghe.example gh pr merge $n; done",
-                false,
-            ),
-        ] {
-            for strict in [false, true] {
-                let result = run_1491(command, cwd, strict);
-                assert_eq!(
-                    blocks(&result),
-                    strict || relaxed_blocks,
-                    "{command} (strict={strict}): {}",
-                    msg(&result)
-                );
-                let fix = result
-                    .block_metadata
-                    .as_ref()
-                    .map_or("", |m| m.fix.as_str());
-                for text in [msg(&result), fix] {
-                    assert!(
-                        !text.contains("cameronsjo/tool"),
-                        "{command} (strict={strict}): {text}"
-                    );
-                }
-                if strict {
-                    let meta = result.block_metadata.as_ref().expect("structured block");
-                    assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{command}");
-                    assert!(fix.contains("<owner>/<repo>"), "{command}: {fix}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_strict_loop_under_an_inherited_gh_repo_gets_no_fix_naming_the_cwd_repo() {
-        // gh reads a `GH_REPO` or `GH_HOST` the session exported as it reads
-        // one in the command. An empty one is unset, so the fix keeps the name.
-        let parent = sibling_checkouts();
-        let tool = parent.path().join("tool");
-        let cwd = tool.to_str().expect("utf-8 temp path");
-        for (gh_repo, gh_host, fix) in [
-            (Some("work-org/x"), None, "-R <owner>/<repo>"),
-            (None, Some("ghe.example"), "-R <owner>/<repo>"),
-            (Some(""), None, "-R cameronsjo/tool"),
-        ] {
-            with_env(
-                &[
-                    ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
-                    ("CADENCE_ALLOWED_REPOS", None),
-                    ("CADENCE_EXTRA_HOSTS", None),
-                    ("CADENCE_GH_STRICT_LOOPS", Some("1")),
-                    ("GH_HOST", gh_host),
-                    ("GH_REPO", gh_repo),
-                ],
-                || {
-                    let result =
-                        GhWriteGuard.run(&input_with("for n in 1 2; do gh pr merge $n; done", cwd));
-                    let meta = result.block_metadata.expect("structured block");
-                    let env = format!("GH_REPO={gh_repo:?} GH_HOST={gh_host:?}");
-                    assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{env}");
-                    assert_eq!(meta.fix, fix, "{env}");
-                },
-            );
-        }
-    }
-
-    #[test]
-    fn a_strict_loop_after_a_cd_both_readings_follow_names_that_repo() {
-        // A leading `cd` is read by the whole-command scan and the per-segment
-        // walk alike, so the loop runs where the suggestion was resolved.
-        let parent = sibling_checkouts();
-        let tool = parent.path().join("tool");
-        let cwd = tool.to_str().expect("utf-8 temp path");
-        for (command, fix) in [
-            (
-                "for n in 1 2; do gh pr merge $n; done",
-                "-R cameronsjo/tool",
-            ),
-            (
-                "cd ../owned2 && for n in 1 2; do gh pr merge $n; done",
-                "-R cameronsjo/owned2",
-            ),
-            (
-                r#"cd ../owned2; for n in 1 2; do gh api -X DELETE "repos/{owner}/{repo}/releases/$n"; done"#,
-                "gh api repos/cameronsjo/owned2/…",
-            ),
-            // Only the writes need to run there: a read elsewhere moves nothing.
-            (
-                "for n in 1 2; do gh pr merge $n; done; env -C ../other gh issue view 1",
-                "-R cameronsjo/tool",
-            ),
-        ] {
-            let result = run_1491(command, cwd, true);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-loop-missing-repo", "{command}");
-            assert_eq!(meta.fix, fix, "{command}");
-        }
-    }
 
     /// How gh's target repo is read (cadence-hooks#1077, #1069, #937, #1115):
     /// every row is `(command, run from the owned checkout?, blocks?)`.
@@ -13700,21 +7657,22 @@ mod tests {
                 ("gh pr co 12 -R evil/x", true, false),
                 ("gh -R cameronsjo/y issue create --title x", true, false),
                 ("gh -R evil/x issue view 1", true, false),
-                // #1077 I3: a GH_HOST on the command that wraps gh.
+                // #1077 I3: a GH_HOST on the command that wraps gh is not read;
+                // the inner gh is judged on the hook's own host.
                 (
                     "GH_HOST=evil.com bash -c \"gh pr create -R cameronsjo/x -t t\"",
                     true,
-                    true,
+                    false,
                 ),
                 (
                     "env GH_HOST=evil.com sh -c 'gh pr create -R cameronsjo/x -t t'",
                     true,
-                    true,
+                    false,
                 ),
                 (
                     "GH_HOST=evil.com timeout 5 bash -c 'gh pr create -R cameronsjo/x -t t'",
                     true,
-                    true,
+                    false,
                 ),
                 (
                     "GH_HOST=github.com bash -c 'gh pr create -R cameronsjo/x -t t'",
@@ -13783,13 +7741,14 @@ mod tests {
                     true,
                 ),
                 // #937: a value gh would refuse, or that cannot be split
-                // exactly as gh does, fails closed.
-                ("gh issue create -R cameronsjo -t t", true, true),
-                ("gh issue create -R cameronsjo/x/y/z -t t", true, true),
+                // exactly as gh does, names no repo this guard can read, so
+                // it is allowed (cadence-ecosystem ADR-0046 rule 3).
+                ("gh issue create -R cameronsjo -t t", true, false),
+                ("gh issue create -R cameronsjo/x/y/z -t t", true, false),
                 (
                     "gh issue create -R https://github.com/%63ameronsjo/x -t t",
                     true,
-                    true,
+                    false,
                 ),
                 // #1069: a `-R`-shaped decoy in another flag's value.
                 ("gh issue create -t t --body -Rcameronsjo/x", false, true),
@@ -13809,6 +7768,7 @@ mod tests {
                 ("gh pr merge --squash -R cameronsjo/x", false, false),
                 // #1128 review: pflag hands `--` to a value-taking flag, so
                 // it ends the flags only when no flag before it can take it.
+                // Readings that disagree leave the target unread: allowed.
                 ("gh issue create -b -- -R stranger/y -t t", true, true),
                 ("gh issue create --title -- -R stranger/y", true, true),
                 ("gh issue create -t -- --repo stranger/y", true, true),
@@ -13816,12 +7776,12 @@ mod tests {
                 (
                     "gh -R cameronsjo/x issue create -b -- -R stranger/y",
                     false,
-                    true,
+                    false,
                 ),
                 (
                     "gh -R cameronsjo/x issue create -b -- -R stranger/y",
                     true,
-                    true,
+                    false,
                 ),
                 (
                     "gh issue create -R cameronsjo/x -t t -- -R stranger/y",
@@ -13868,19 +7828,6 @@ mod tests {
                 let blocked = matches!(result.outcome, cadence_hooks_core::Outcome::Block);
                 assert_eq!(blocked, blocks, "{command}: {:?}", result.message);
             }
-        });
-    }
-
-    #[test]
-    fn a_gh_segment_with_an_unreadable_brace_expansion_blocks() {
-        with_env(&owners_env(), || {
-            let command = format!("gh {}pr create -R cameronsjo/x -t t", "{a,b}".repeat(65));
-            let result = GhWriteGuard.run(&input_with(&command, OWNED_DIR));
-            assert!(result.block_metadata.is_some(), "expected a block");
-            // A flood elsewhere in the command does not touch a gh read.
-            let command = format!("echo {}; gh pr view 1", "{a,b}".repeat(65));
-            let result = GhWriteGuard.run(&input_with(&command, OWNED_DIR));
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
     }
 
@@ -13934,52 +7881,6 @@ mod tests {
         });
     }
 
-    /// cadence-hooks#1142: a literal `printf` substitution is read as the text
-    /// it prints, so the host this builds is `evil.example.com` — named in the
-    /// block, where the unread name once made the host unknown.
-    #[test]
-    fn a_host_name_built_by_a_literal_substitution_is_read() {
-        with_env(&owners_env(), || {
-            let command = "export GH_HOS`printf T`=evil.example.com; \
-                           gh pr create -R cameronsjo/x --title t";
-            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-            let meta = result.block_metadata.expect("expected a structured block");
-            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
-        });
-    }
-
-    #[test]
-    fn unmodeled_gh_host_changes_resolve_to_an_unknown_host() {
-        with_env(&owners_env(), || {
-            for command in [
-                "export GH_HOST; gh pr create -R cameronsjo/x --title t",
-                "export GH_HOST=$UNSET_ELSEWHERE; gh pr create -R cameronsjo/x --title t",
-                "export GH_HOST=; gh pr create -R cameronsjo/x --title t",
-                "export -n GH_HOST; gh pr create -R cameronsjo/x --title t",
-                "declare -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                ": ${GH_HOST:=evil.example.com}; gh pr create -R cameronsjo/x --title t",
-                "export GH_HOST+=.evil; gh pr create -R cameronsjo/x --title t",
-                ": $((GH_HOST=1)); gh pr create -R cameronsjo/x --title t",
-                "(( GH_HOST += 1 )); gh pr create -R cameronsjo/x --title t",
-                // #548 review I2: a name the shell builds at expansion time.
-                "export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "declare -x GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "typeset -x GH_HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "builtin export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                "env GH_HOS${X}T=evil.example.com gh pr create -R cameronsjo/x --title t",
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-                let message = result.message.clone().unwrap_or_default();
-                let meta = result
-                    .block_metadata
-                    .unwrap_or_else(|| panic!("expected a structured block: {command}"));
-                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
-                assert!(message.contains(UNRESOLVED_GH_HOST), "{command}: {message}");
-                assert!(meta.fix.contains("--hostname"), "{command}: {}", meta.fix);
-            }
-        });
-    }
-
     #[test]
     fn gh_host_forms_that_never_reach_gh_are_unchanged() {
         with_env(&owners_env(), || {
@@ -14017,66 +7918,6 @@ mod tests {
     }
 
     #[test]
-    fn gh_host_env_accumulates_candidates() {
-        with_env(&owners_env(), || {
-            let mut env = GhHostEnv::from_process();
-            assert_eq!(env.candidates(), ["github.com"]);
-            env.observe("export GH_HOST=Evil.Example.com");
-            assert_eq!(env.candidates(), ["github.com", "evil.example.com"]);
-            env.observe("unset GH_HOST");
-            assert_eq!(env.candidates(), ["github.com", "evil.example.com"]);
-            env.observe("declare -x GH_HOST=x");
-            assert_eq!(
-                env.candidates(),
-                ["github.com", "evil.example.com", UNRESOLVED_GH_HOST]
-            );
-        });
-    }
-
-    #[test]
-    fn expansion_allowance_blocks_adversarial_floods_quickly() {
-        // cadence-hooks#1141: a 200 KB flood of `"$(cat <<E` spans cost 1.3 s
-        // (release) in `command_segments` alone, past the hook deadline, which
-        // fails OPEN. The expansion allowance turns that into a block, fast.
-        let size = 200 * 1024;
-        let flood = |unit: &str| unit.repeat(size / unit.len());
-        with_env(&owners_env(), || {
-            for (name, body) in [
-                ("quoted-subst-heredoc", flood("\"$(cat <<E\nx\\\nE\n)\" ")),
-                ("gh-in-substitutions", flood("gh api $(gh pr view 1) ")),
-            ] {
-                for tail in ["", "\ngh pr create --title t --body b"] {
-                    let command = format!("{body}{tail}");
-                    let input = HookInput {
-                        tool_name: Some("Bash".into()),
-                        tool_input: Some(cadence_hooks_core::ToolInput {
-                            command: Some(command),
-                            ..Default::default()
-                        }),
-                        cwd: Some(env!("CARGO_MANIFEST_DIR").into()),
-                        ..Default::default()
-                    };
-                    let started = std::time::Instant::now();
-                    let result = GhWriteGuard.run(&input);
-                    let took = started.elapsed();
-                    assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block, "{name}");
-                    // Debug builds get headroom; release is the hook's budget.
-                    let limit = std::time::Duration::from_millis(if cfg!(debug_assertions) {
-                        6000
-                    } else {
-                        500
-                    });
-                    cadence_hooks_core::test_builders::assert_elapsed_under(
-                        &format!("{name}: {took:?}"),
-                        took,
-                        limit,
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
     fn expansion_allowance_leaves_a_large_ordinary_command_alone() {
         // A 60 KB body (GitHub's cap is 64 KB) in a substitution heredoc is
         // read in full: the allowance is for floods, not for big bodies.
@@ -14099,57 +7940,18 @@ mod tests {
         });
     }
 
-    #[test]
-    fn mentions_gh_host_ignores_reads_and_longer_names() {
-        for yes in [
-            "GH_HOST",
-            "GH_HOST=x",
-            "${GH_HOST:=x}",
-            "GH_HOST+=x",
-            "${GH_HOST=x}",
-        ] {
-            assert!(mentions_gh_host(yes), "{yes}");
-        }
-        for no in [
-            "$GH_HOST",
-            "${GH_HOST}",
-            "MY_GH_HOST=x",
-            "GH_HOSTNAME",
-            "x$GH_HOST/y",
-        ] {
-            assert!(!mentions_gh_host(no), "{no}");
-        }
-    }
-
-    #[test]
-    fn escaped_gh_host_names_still_block() {
-        // #548 review I2. Quote removal turns `GH_\HOST` into `GH_HOST`, as the
-        // shell does before `export` reads it — so these resolve either to
-        // `evil.example.com` or to the unresolved host. Both block.
-        with_env(&owners_env(), || {
-            for command in [
-                r"export GH_\HOST=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                r"export GH_HOS\T=evil.example.com; gh pr create -R cameronsjo/x --title t",
-                r#"export "GH_HOST"=evil.example.com; gh pr create -R cameronsjo/x --title t"#,
-                r"env GH_\HOST=evil.example.com gh pr create -R cameronsjo/x --title t",
-            ] {
-                let result = GhWriteGuard.run(&input_with(command, "/tmp"));
-                let meta = result
-                    .block_metadata
-                    .unwrap_or_else(|| panic!("expected a structured block: {command}"));
-                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
-            }
-        });
-    }
-
     // --- #1073 review: help invocations stay writes; GH_HOST edge forms ---
 
     /// Run one delta case, recording a mismatch instead of panicking so a
     /// test reports every failing case at once.
     fn run_case(bad: &mut Vec<String>, command: &str, block: bool) {
+        // An unowned checkout, so a write the help exemption does not cover
+        // blocks.
+        let unowned = unowned_checkout();
+        let cwd = unowned.path().to_str().expect("utf-8 path");
         let mut blocked = false;
         with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(command, "/tmp"));
+            let result = GhWriteGuard.run(&input_with(command, cwd));
             blocked = matches!(result.outcome, cadence_hooks_core::Outcome::Block);
         });
         if blocked != block {
@@ -14188,64 +7990,6 @@ mod tests {
     }
 
     #[test]
-    fn namerefs_and_indirect_gh_host_names_block() {
-        let mut bad = Vec::new();
-        for command in [
-            "declare -n r=GH_HOST; r=evil.example.com; export GH_HOST; gh pr create -R cameronsjo/x -t t",
-            "declare -n r=GH_HOST; r=evil.example.com; gh pr create -R cameronsjo/x -t t",
-            "typeset -n r=GH_HOST; r=evil.example.com; export r; gh pr create -R cameronsjo/x -t t",
-            "declare X=GH_HOST; declare -n r=$X; export r=evil.example.com; gh pr create -R cameronsjo/x -t t",
-            // An owned host exported first, so only the indirect write can
-            // make these block.
-            "export GH_HOST=github.com; printf -v GH_HOS${X}T evil; gh pr create -R cameronsjo/x -t t",
-            "export GH_HOST=github.com; read GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
-            "export GH_HOST=github.com; mapfile -t GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
-            "export GH_HOST=github.com; getopts ab GH_HOS${X}T; gh pr create -R cameronsjo/x -t t",
-            "export GH_HOST=github.com; declare -n r=GH_HOST; r=evil.example.com; gh pr create -R cameronsjo/x -t t",
-            "export GH_HOST=github.com; local -n r=GH_HOST; gh pr create -R cameronsjo/x -t t",
-            "printf -v GH_HOS${X}T evil; gh pr create -R cameronsjo/x -t t",
-            "read GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
-            "mapfile -t GH_HOS${X}T <<<evil; gh pr create -R cameronsjo/x -t t",
-            "getopts ab GH_HOS${X}T; gh pr create -R cameronsjo/x -t t",
-        ] {
-            run_case(&mut bad, command, true);
-        }
-        // A literal, unrelated name is still nothing.
-        run_case(
-            &mut bad,
-            "printf -v OUT '%s' x; read LINE <<<y; read -r -p 'Host name: ' H < /dev/tty; mapfile -t LINES < f; gh pr create -R cameronsjo/x -t t",
-            false,
-        );
-        assert!(bad.is_empty(), "{bad:#?}");
-    }
-
-    #[test]
-    fn eval_past_the_depth_cap_is_unresolved() {
-        let mut bad = Vec::new();
-        run_case(
-            &mut bad,
-            r#"eval "eval \"eval \\\"eval export GH_HOST=evil.example.com\\\"\""; gh pr create -R cameronsjo/x -t t"#,
-            true,
-        );
-        run_case(
-            &mut bad,
-            "eval eval eval eval export GH_HOST=evil.example.com; gh pr create -R cameronsjo/x -t t",
-            true,
-        );
-        run_case(
-            &mut bad,
-            "eval eval eval eval export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x -t t",
-            true,
-        );
-        run_case(
-            &mut bad,
-            "eval eval eval eval eval export GH_HOS${X}T=evil.example.com; gh pr create -R cameronsjo/x -t t",
-            true,
-        );
-        assert!(bad.is_empty(), "{bad:#?}");
-    }
-
-    #[test]
     fn help_behind_steering_prefixes_or_gh_shadows_blocks() {
         let mut bad = Vec::new();
         for command in [
@@ -14278,37 +8022,6 @@ mod tests {
     }
 
     #[test]
-    fn gh_host_set_inside_compound_commands_blocks() {
-        let mut bad = Vec::new();
-        for command in [
-            "(export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b)",
-            "( export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b )",
-            "setit(){ export GH_HOST=evil.com; }; setit; gh issue create -R cameronsjo/x -t a -b b",
-            "setit() { export GH_HOST=evil.com; }; setit; gh issue create -R cameronsjo/x -t a -b b",
-            "function setit { export GH_HOST=evil.com; }; setit; gh issue create -R cameronsjo/x -t a -b b",
-            "f(){ local -x GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b; }; f",
-            "case x in x) export GH_HOST=evil.com;; esac; gh issue create -R cameronsjo/x -t a -b b",
-            "case x in y) true;; x) export GH_HOST=evil.com;; esac; gh issue create -R cameronsjo/x -t a -b b",
-            "(export GH_HOS${X}T=evil.com); gh issue create -R cameronsjo/x -t a -b b",
-            // #5: a trap body runs later from a string.
-            "trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            // #6: a heredoc fed to source.
-            "source /dev/stdin <<EOF\nexport GH_HOST=evil.com\nEOF\ngh issue create -R cameronsjo/x -t a -b b",
-            ". /dev/stdin <<'EOF'\nexport GH_HOS''T=evil.com\nEOF\ngh issue create -R cameronsjo/x -t a -b b",
-            "source <(echo export GH_HOST=evil.com); gh issue create -R cameronsjo/x -t a -b b",
-            // #7: env -S and a sourced-at-start shell env file.
-            "env -S 'GH_HOST=evil.com' gh issue create -R cameronsjo/x -t a -b b",
-            "env --split-string='GH_HOST=evil.com' gh issue create -R cameronsjo/x -t a -b b",
-            "BASH_ENV=/tmp/e bash -c 'gh issue create -R cameronsjo/x -t a -b b'",
-            "ENV=/tmp/e sh -c 'gh issue create -R cameronsjo/x -t a -b b'",
-        ] {
-            run_case(&mut bad, command, true);
-        }
-        assert!(bad.is_empty(), "{bad:#?}");
-    }
-
-    #[test]
     fn common_shell_setup_still_allows_an_owned_write() {
         let mut bad = Vec::new();
         for command in [
@@ -14322,76 +8035,6 @@ mod tests {
             "source .venv/bin/activate && gh issue create -R cameronsjo/x -t a -b b",
             "while read -r line; do echo \"$line\"; done < f; gh issue create -R cameronsjo/x -t a -b b",
             "env FOO=1 gh issue create -R cameronsjo/x -t a -b b",
-        ] {
-            run_case(&mut bad, command, false);
-        }
-        assert!(bad.is_empty(), "{bad:#?}");
-    }
-
-    #[test]
-    fn trap_actions_and_eval_expansions_are_read() {
-        let mut bad = Vec::new();
-        for command in [
-            // I-1: a trap inside a subshell.
-            "(trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b)",
-            // I-2: a backslash-escaped trap.
-            "\\trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap 'export GH_HOS''T=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap -- 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            // Narrow review I-1: after `--`, a leading dash is the action.
-            "trap -- '-x; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "trap -- '- ; export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            // Narrow review I-2: `--` after builtin/command, backslashes inside.
-            "command -- trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "builtin -- trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "t\\rap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "e\\val 'export GH_HOST=evil.com'; gh issue create -R cameronsjo/x -t a -b b",
-            "command -- eval 'export GH_HOST=evil.com'; gh issue create -R cameronsjo/x -t a -b b",
-            "command -p trap 'export GH_HOST=evil.com' DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "command -p eval 'export GH_HOST=evil.com'; gh issue create -R cameronsjo/x -t a -b b",
-            "command -p -- export GH_HOST=evil.com; gh issue create -R cameronsjo/x -t a -b b",
-            // N-2: a function named as the action.
-            "f(){ export GH_HOST=evil.com; }; trap f DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            // Code review of #1471: an `eval` of a variable the command
-            // assigns in plain text reads that text, and a trap action whose
-            // command word is literal `export` sets GH_HOST from a value only
-            // the shell knows. Neither is an unread expansion.
-            "X='export GH_HOST=evil.example'; eval \"$X\"; gh pr comment 1 -R cameronsjo/x --body x",
-            "trap \"export GH_HOST=$H\" DEBUG; gh pr comment 1 -R cameronsjo/x --body x",
-        ] {
-            run_case(&mut bad, command, true);
-        }
-        // The visible assignment is read, not only flagged as a mention: the
-        // block names the host it sets.
-        with_env(&owners_env(), || {
-            let result = GhWriteGuard.run(&input_with(
-                "X='export GH_HOST=evil.example'; eval \"$X\"; gh pr comment 1 -R cameronsjo/x --body x",
-                "/tmp",
-            ));
-            if !msg(&result).contains("evil.example/cameronsjo/x") {
-                bad.push(format!("eval of a visible assignment: {}", msg(&result)));
-            }
-        });
-        for command in [
-            // An `eval` or `trap` of an expansion is text the guard cannot
-            // read, so it steps aside (cadence-ecosystem ADR-0046 rule 3).
-            "eval \"$(direnv export bash)\"; gh pr comment 1 -R cameronsjo/x --body x",
-            "eval \"$(ssh-agent -s)\"; gh pr comment 1 -R cameronsjo/x --body x",
-            "eval \"$X\"; gh issue create -R cameronsjo/x -t a -b b",
-            "eval `cat f`; gh issue create -R cameronsjo/x -t a -b b",
-            "trap \"$CMD\" DEBUG; gh issue create -R cameronsjo/x -t a -b b",
-            "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; gh issue comment 1 -R cameronsjo/x --body-file \"$tmp\"",
-            "trap cleanup EXIT; gh issue create -R cameronsjo/x -t a -b b",
-            "trap - EXIT; trap -p; gh issue create -R cameronsjo/x -t a -b b",
-            "trap -- - EXIT; trap -l; gh issue create -R cameronsjo/x -t a -b b",
-            "command -- echo hi; gh issue create -R cameronsjo/x -t a -b b",
-            "command -v gh; gh issue comment 1 -R cameronsjo/x --body b",
-            "command -V export; gh issue comment 1 -R cameronsjo/x --body b",
-            "grep -rn trap src; gh issue create -R cameronsjo/x -t a -b b",
-            "eval 'echo hi'; gh issue create -R cameronsjo/x -t a -b b",
-            // N-1: a bare `=` in a test is no assignment.
-            "if [ \"$m\" = export ]; then echo y; fi; gh issue comment 1 -R cameronsjo/x --body b",
         ] {
             run_case(&mut bad, command, false);
         }
@@ -14454,9 +8097,10 @@ mod tests {
     }
 
     #[test]
-    fn deep_group_nesting_fails_closed_instead_of_overflowing() {
+    fn deep_group_nesting_allows_instead_of_overflowing() {
         // PR #1118 review: ~900 levels of `{ (` overflowed the parser's stack
-        // and aborted the hook, a noisy fail-open.
+        // and aborted the hook, a noisy fail-open. Past the parser's nesting cap
+        // the command is unread and allowed (cadence-ecosystem ADR-0046 rule 3).
         with_env(&owners_env_212(), || {
             let nest =
                 |k: usize, inner: &str| format!("{}{inner}{}", "{ ( ".repeat(k), " ) }".repeat(k));
@@ -14464,8 +8108,8 @@ mod tests {
                 // Nothing here can spell `gh`: the fast path skips it, so it
                 // never reaches the parser at all.
                 (nest(1000, "echo $HOME"), false),
-                (nest(1000, "echo $(date)"), true),
-                (nest(1000, "gh repo delete x/y --yes"), true),
+                (nest(1000, "echo $(date)"), false),
+                (nest(1000, "gh repo delete x/y --yes"), false),
                 (nest(3, "gh repo delete x/y --yes"), true),
                 (nest(3, "gh pr list"), false),
             ];
@@ -14499,12 +8143,12 @@ mod tests {
     }
 
     #[test]
-    fn deep_group_nesting_write_blocks_in_time() {
+    fn deep_group_nesting_write_allows_in_time() {
         with_env(&owners_env_212(), || {
             for command in deep_nests_1118("gh repo delete x/y --yes") {
                 let start = std::time::Instant::now();
                 let result = GhWriteGuard.run(&input_with(&command, "/tmp"));
-                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
                 cadence_hooks_core::test_builders::assert_elapsed_under(
                     &format!("{:?}", start.elapsed()),
                     start.elapsed(),
@@ -14627,57 +8271,6 @@ mod tests {
         });
     }
 
-    /// A relative `cd` target searches `CDPATH`, so where the write runs is
-    /// unknown and it blocks (cameronsjo/cadence-hooks#1171). `CDPATH` is
-    /// pinned in the same lock as the owner allowlist. Rows are `(CDPATH in
-    /// the hook env, command, blocks?)`, run from the owned checkout.
-    #[test]
-    fn a_cd_that_cdpath_may_redirect_blocks_the_write_after_it() {
-        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
-        let o = owned.path().to_str().unwrap();
-        for (cdpath, command, blocks) in [
-            (Some("/elsewhere"), "cd sub && gh pr create -t x", true),
-            (Some("/elsewhere"), "cd sub\ngh pr create -t x", true),
-            (Some("/elsewhere"), "pushd sub; gh pr create -t x", true),
-            (None, "CDPATH=/e; cd sub; gh pr create -t x", true),
-            (None, "export CDPATH=/e; cd sub; gh pr create -t x", true),
-            (None, "CDPATH=/e cd sub; gh pr create -t x", true),
-            // Not searched: `.` and absolute (`..`, `./…`, `../…` are pinned in
-            // the walk's own table).
-            (Some("/elsewhere"), "cd . && gh pr create -t x", false),
-            (
-                Some("/elsewhere"),
-                "cd /nope && gh pr create -R cameronsjo/x -t x",
-                false,
-            ),
-            // Unset or empty CDPATH: unchanged.
-            (None, "cd sub && gh pr create -R cameronsjo/x -t x", false),
-            (
-                Some(""),
-                "cd sub && gh pr create -R cameronsjo/x -t x",
-                false,
-            ),
-            // A write that names its target is not moved by the cd.
-            (
-                Some("/elsewhere"),
-                "cd sub && gh pr create -R cameronsjo/x -t x",
-                false,
-            ),
-        ] {
-            let mut env = owners_env().to_vec();
-            env.push(("CDPATH", cdpath));
-            with_env(&env, || {
-                let result = GhWriteGuard.run(&input_with(command, o));
-                assert_eq!(
-                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                    blocks,
-                    "CDPATH={cdpath:?} {command}: {:?}",
-                    result.message
-                );
-            });
-        }
-    }
-
     /// Over-blocks the operator ruled FIX (cameronsjo/cadence-hooks#1172):
     /// `cd "$(git rev-parse --show-toplevel)"`, a tool-init `eval`, and a
     /// `pushd`/`popd` pair. Every row is `(command, run from the owned
@@ -14719,8 +8312,10 @@ mod tests {
                     &osub,
                     false,
                 ),
-                // Twins: the root of the unowned checkout, a suffix, another
-                // query, a literal directory name, a replaced `git`.
+                // Twins: the root of the unowned checkout blocks. A suffix,
+                // another query, a replaced `git` or a missing directory
+                // leave the directory unread, which is allowed
+                // (cadence-ecosystem ADR-0046 rule 3).
                 (
                     "cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
                     &usub,
@@ -14734,12 +8329,12 @@ mod tests {
                 (
                     "cd \"$(git rev-parse --show-toplevel)/../{UB}\" && gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "cd \"$(git rev-parse --git-dir)\" && gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "cd '$(git rev-parse --show-toplevel)' && gh pr create -t x",
@@ -14749,22 +8344,22 @@ mod tests {
                 (
                     "git() { echo {U}; }; cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "PATH=/x:$PATH; cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "GIT_DIR={U}/.git cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "cd \"$(git rev-parse --show-toplevel)\" && gh pr create -t x",
                     &"/nonexistent-dir".to_string(),
-                    true,
+                    false,
                 ),
                 // 2. Tool-init evals run nothing that moves.
                 ("eval \"$(ssh-agent -s)\"; gh pr create -t x", &osub, false),
@@ -14812,42 +8407,43 @@ mod tests {
                     false,
                 ),
                 ("eval '$(ssh-agent -s)'; gh pr create -t x", &osub, false),
-                // Twins: a second command, a redefined tool, a `cd`-defining
-                // flag, an unowned cwd.
+                // Twins: an unowned cwd blocks. A second command, a redefined
+                // tool or a `cd`-defining flag leaves the directory unread:
+                // allowed.
                 (
                     "eval \"$(ssh-agent -s; cd {U})\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "eval \"$(zoxide init bash --cmd cd)\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "eval \"$(mise activate bash; cd {U})\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "eval \"$(brew shellenv)\" cd {U}; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "brew() { echo cd {U}; }; eval \"$(brew shellenv)\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "starship() { echo cd {U}; }; eval \"$(starship init bash)\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 (
                     "PATH=/x:$PATH; eval \"$(fnm env)\"; gh pr create -t x",
                     &osub,
-                    true,
+                    false,
                 ),
                 ("eval \"$(ssh-agent -s)\"; gh pr create -t x", &usub, true),
                 // 4. `popd` returns to where the matching `pushd` left.
@@ -14871,20 +8467,20 @@ mod tests {
                     &o.to_string(),
                     false,
                 ),
-                // Twins: still inside, an unmatched or unreadable `popd`, a
-                // `popd` that only ran in a subshell, a maybe-run `pushd`, a
-                // cleared stack, a rotated stack.
+                // Twins: still inside, a `popd` that only ran in a subshell, a
+                // maybe-run `pushd`, a cleared stack and a rotated stack block.
+                // An unmatched or unreadable `popd` is unread: allowed.
                 ("pushd {U} && gh pr create -t x", &o.to_string(), true),
                 (
                     "pushd {U}; pushd {O}; popd; gh pr create -t x",
                     &o.to_string(),
                     true,
                 ),
-                ("popd && gh pr create -t x", &o.to_string(), true),
+                ("popd && gh pr create -t x", &o.to_string(), false),
                 (
                     "pushd sub && popd && popd && gh pr create -t x",
                     &o.to_string(),
-                    true,
+                    false,
                 ),
                 ("pushd {U}; (popd); gh pr create -t x", &o.to_string(), true),
                 (
@@ -14912,11 +8508,15 @@ mod tests {
                     &o.to_string(),
                     true,
                 ),
-                ("(pushd {U}); popd; gh pr create -t x", &o.to_string(), true),
+                (
+                    "(pushd {U}); popd; gh pr create -t x",
+                    &o.to_string(),
+                    false,
+                ),
                 (
                     "pushd {U} | cat; popd; gh pr create -t x",
                     &o.to_string(),
-                    true,
+                    false,
                 ),
                 (
                     "pushd sub && make && popd && gh pr create -t x",
@@ -14937,42 +8537,6 @@ mod tests {
                 );
             }
         });
-    }
-
-    /// The fast paths decline only segments the full reading declines too.
-    #[test]
-    fn plain_segment_fast_paths_agree_with_the_full_reading() {
-        for (segment, invokes_gh) in [
-            ("f", false),
-            ("cd /a/b && make -j4", false),
-            ("GH pr create", true),
-            ("/usr/bin/gh pr create", true),
-            ("eval gh pr create", true),
-            ("env -S gh pr create", true),
-            ("g\\h pr create", true),
-            ("'g'h pr create", true),
-            ("{g,x}h pr create", true),
-            ("echo gh", true),
-        ] {
-            assert_eq!(segment_invokes_gh(segment), invokes_gh, "{segment}");
-        }
-        for (segment, skipped) in [
-            ("f", true),
-            ("cd /a && make", true),
-            ("export GH_HOST=x", false),
-            ("GH_HOST=x", false),
-            ("set -a", false),
-            ("source ./env", false),
-            (". ./env", false),
-            ("read h", false),
-            ("ex\\port GH_HOST=x", false),
-            ("'export' X", false),
-            ("eval x", false),
-            ("trap x EXIT", false),
-            ("builtin export X", false),
-        ] {
-            assert_eq!(observes_nothing(segment, "GH_HOST"), skipped, "{segment}");
-        }
     }
 
     /// A 200 KB flood of plain function calls before a write is judged well
@@ -15040,10 +8604,12 @@ mod tests {
                     "while true; do cd {U}; break; done; gh pr create -t x",
                     true,
                 ),
-                ("for d in {U}; do cd $d; done; gh pr create -t x", true),
+                // A `cd` to a loop variable, a variable command word, or a
+                // trap action is unread: allowed (ADR-0046 rule 3).
+                ("for d in {U}; do cd $d; done; gh pr create -t x", false),
                 ("case x in x) cd {U};; esac; gh pr create -t x", true),
-                ("c=cd; $c {U}; gh pr create -t x", true),
-                ("trap 'cd {U}' DEBUG; gh pr create -t x", true),
+                ("c=cd; $c {U}; gh pr create -t x", false),
+                ("trap 'cd {U}' DEBUG; gh pr create -t x", false),
                 // Unreadable: the shell is somewhere this walk cannot name.
                 ("cd {U}; popd; gh pr create -t x", true),
                 // Controls: the same forms into the owned checkout, or
@@ -15149,9 +8715,15 @@ mod tests {
                     o,
                     true,
                 ),
-                ("eval \"cd {U}; $S\"; gh pr create --fill", o, true),
-                ("S='cd {U}'; eval \"$S\"; gh pr create --fill", o, true),
-                ("f() { cd {U}; }; eval \"$S\"; gh pr create --fill", o, true),
+                // A `cd` mixed into unread text, or a moved directory the
+                // guard cannot name, is unread: allowed (ADR-0046 rule 3).
+                ("eval \"cd {U}; $S\"; gh pr create --fill", o, false),
+                ("S='cd {U}'; eval \"$S\"; gh pr create --fill", o, false),
+                (
+                    "f() { cd {U}; }; eval \"$S\"; gh pr create --fill",
+                    o,
+                    false,
+                ),
             ] {
                 let command = command.replace("{U}", u);
                 let result = GhWriteGuard.run(&input_with(&command, cwd));
@@ -15203,17 +8775,19 @@ mod tests {
                 ("timeout 5 env -C {U} gh pr create -t x", true),
                 // A relative directory resolves against the segment's own.
                 ("env -C ../{UB} gh pr create -t x", true),
-                // The directory cannot be read.
-                ("env -C \"$D\" gh pr create -t x", true),
-                ("env -C $(pwd) gh pr create -t x", true),
-                ("env -C '' gh pr create -t x", true),
-                ("env -C ~root gh pr create -t x", true),
-                ("sudo -D \"$D\" gh pr create -t x", true),
-                // A runner option the peel does not model.
-                ("timeout --weird 5 gh pr create -t x", true),
-                ("sudo --weird gh pr create -t x", true),
-                ("env --weird gh pr create -t x", true),
-                ("xargs --weird gh pr create -t x", true),
+                // The directory cannot be read: allowed (cadence-ecosystem
+                // ADR-0046 rule 3).
+                ("env -C \"$D\" gh pr create -t x", false),
+                ("env -C $(pwd) gh pr create -t x", false),
+                ("env -C '' gh pr create -t x", false),
+                ("env -C ~root gh pr create -t x", false),
+                ("sudo -D \"$D\" gh pr create -t x", false),
+                // A runner option the peel does not model: the directory is
+                // unknown, so allowed too.
+                ("timeout --weird 5 gh pr create -t x", false),
+                ("sudo --weird gh pr create -t x", false),
+                ("env --weird gh pr create -t x", false),
+                ("xargs --weird gh pr create -t x", false),
                 // Controls: the directory is owned, or nothing moves.
                 ("env -C {O} gh pr create -t x", false),
                 ("env --chdir={O} gh pr create -t x", false),
@@ -15269,7 +8843,8 @@ mod tests {
                 ("env -C {U} sh -c 'sh -c \"gh pr create -t x\"'", true),
                 ("env -C {U} FOO=1 sh -c 'gh pr create -t x'", true),
                 ("nice env -C {U} sh -c 'gh pr create -t x'", true),
-                ("env -C \"$D\" sh -c 'gh pr create -t x'", true),
+                // An unread directory is allowed (ADR-0046 rule 3).
+                ("env -C \"$D\" sh -c 'gh pr create -t x'", false),
                 (
                     "env -C {U} sh -c 'gh pr create -R cameronsjo/x -t x'",
                     false,
@@ -15292,46 +8867,6 @@ mod tests {
                     result.message
                 );
             }
-        });
-    }
-
-    /// A flood of writes, each after a `cd` to a distinct directory, blocks
-    /// past [`MAX_SEGMENT_DIRS`] rather than spending a git lookup on each
-    /// and running past the hook deadline.
-    #[test]
-    fn writes_in_too_many_directories_block() {
-        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
-        let o = owned.path().to_str().unwrap();
-        for i in 0..=MAX_SEGMENT_DIRS {
-            std::fs::create_dir(owned.path().join(format!("d{i}"))).unwrap();
-        }
-        with_env(&owners_env(), || {
-            // Every directory is inside the owned checkout, so each write
-            // alone is allowed: only the count blocks.
-            let within: String = (0..MAX_SEGMENT_DIRS)
-                .map(|i| format!("echo\ncd {o}/d{i}\ngh pr create -t x\n"))
-                .collect();
-            let allowed = GhWriteGuard.run(&input_with(&within, o));
-            assert!(
-                !matches!(allowed.outcome, cadence_hooks_core::Outcome::Block),
-                "{:?}",
-                allowed.message
-            );
-            let past = format!("{within}echo\ncd {o}/d{MAX_SEGMENT_DIRS}\ngh pr create -t x");
-            let result = GhWriteGuard.run(&input_with(&past, o));
-            assert!(
-                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
-                "{:?}",
-                result.message
-            );
-            assert!(
-                result
-                    .message
-                    .as_deref()
-                    .is_some_and(|m| m.contains("directories")),
-                "{:?}",
-                result.message
-            );
         });
     }
 
@@ -15527,7 +9062,6 @@ mod tests {
             let url = "https://github.com/cameronsjo/x/issues/3";
             for (command, cwd) in [
                 (format!("gh issue transfer {url} work-org/app"), &*work_app),
-                (format!("gh issue transfer {url} work-org/app"), "/tmp"),
                 (
                     format!("gh issue transfer {url} work-org/app -R evil/z"),
                     &*owned,

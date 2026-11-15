@@ -137,7 +137,6 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space- or comma-separated usernames; any entry the operator did not intend widens what counts as theirs. **Weakens a protected guard** |
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs. **Weakens a protected guard** |
 | `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host. **Weakens a protected guard** |
-| `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
 | `CADENCE_ISSUE_TRACKERS` | `warn-issue-tracker` | Comma-separated set of known ecosystem trackers (`owner/repo`) — replaces the default set (`cameronsjo/cadence`, `cameronsjo/cadence-hooks`, `cameronsjo/forgectl`, `cameronsjo/cadence-ecosystem`, plus its pre-rename alias `cameronsjo/claude-configurations`); the nudge fires only when an owned target is none of them, scoped to owners that appear in this set |
 | `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Legacy singular override — sets a single known tracker (`owner/repo`), replacing the default set. Superseded by `CADENCE_ISSUE_TRACKERS`; still honored when the plural is unset. Also moves the owner-scope for the nudge |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
@@ -226,60 +225,15 @@ an explicit `--hostname` (separate or `=` form) overrides an inline
 hook process's `GH_HOST` and finally the `github.com` default. Host comparisons
 are case-insensitive.
 
-Below those two, an `export GH_HOST=...` in an earlier segment of the same
-command string (`export GH_HOST=... && gh ...`) replaces the hook process's
-`GH_HOST`. The guard cannot tell whether an earlier segment actually ran
-(`false && export ...`), so every host the command may have left in place is a
-candidate, and the write must be owned on each. An `unset GH_HOST` therefore adds
-the default host back as a candidate rather than removing the exported one. A bare
-`GH_HOST=...; gh ...` changes nothing: without `export` it stays a shell variable
-that gh never sees. It does count once the variable is exported: after an earlier
-`export GH_HOST`, after `set -a`, or when the hook process already carries
-`GH_HOST`. An `export` inside `eval` counts like one outside it. Other forms that
-can set the variable resolve to an unknown host that matches no allowlist entry,
-so the write blocks:
+The hook process's `GH_HOST` and `GH_REPO` are what a gh write inherits. An `export GH_HOST=...` or `export GH_REPO=...` earlier in the same command is not read, and neither is a `GH_HOST=` on a wrapper in front of a shell (`GH_HOST=h bash -c 'gh …'`).
 
-- `declare`, `typeset`, `readonly`, or `local` naming `GH_HOST`, any nameref
-  (`declare -n`), and `export -n`.
-- `read`, `printf -v`, `mapfile`/`readarray`, or `getopts` writing `GH_HOST`
-  or a variable whose name is not a plain literal.
-- An `eval` nested more than three levels deep.
-- Inside a subshell, function body, or case arm, a declaring or name-writing
-  builtin next to a `GH_HOST` mention or a non-literal `NAME=`. This rule
-  fails closed wherever the command position is not recognized.
-- A `trap` action or an `eval` string that sets it. Both are read like a
-  command.
-- A `source` or `.` fed by a heredoc, stdin, or `<(…)`, when the command text
-  names `GH_HOST` or declares a non-literal name.
-- An `env -S`/`--split-string` prefix before gh, or a `BASH_ENV=`/`ENV=`
-  assignment anywhere in the command.
-- Any of those builtins, `export` included, or an `env`-style prefix before gh,
-  naming a variable whose name the shell builds at expansion time
-  (`GH_HOS${X}T=...`, `GH_HOS{T,}=...`).
-- A value that is still a `$` expansion.
-- An assignment inside `${GH_HOST:=...}` or `$((GH_HOST=...))`.
+**What blocks.** A write blocks only when the guard read its target exactly and the allowlists reject it: a literal `-R`/`--repo` value, a PR or issue URL argument, a literal `gh repo` positional, an inline `GH_REPO=`, a `gh api repos/<owner>/<repo>/…` path, or the git remotes of the directory the write runs in. A target with a literal unowned owner and an expanded name (`-R "work-org/$r"`) still blocks. A `gh` write with no allowlist configured blocks too.
 
-An `eval` or `trap` whose command word comes from an expansion (`eval "$X"`,
-`eval "$(…)"`, `` eval `…` ``) is text the guard cannot read. It is skipped, and
-the write is judged on the hosts the guard did read. So `eval "$(direnv export
-bash)"` or `eval "$(ssh-agent -s)"` in front of a `-R` write does not block it.
+**What allows** (cadence-ecosystem ADR-0046 rule 3: uncertain means allow): a target the guard cannot read. That covers a `-R` or `GH_REPO` value that holds a shell expansion with no literal owner (`-R "$REPO"`), a host that holds one (`GH_HOST=$GH_HOST`, `--hostname "$h"`), a value gh would not split as `[HOST/]OWNER/REPO`, two `-R` readings that disagree, a directory with no readable remote, a directory the guard cannot follow (`cd "$d"`, `popd` with no matching `pushd`, a runner option it does not model), a `gh api` write to any endpoint other than `repos/<owner>/<repo>/…` (GraphQL, `orgs/…`, `user/…`), and a command too large or too deeply nested to read.
 
-A plain mention changes nothing: `rg GH_HOST`, a commit message, or a gh
-command's own `--title` or `--body`. A gh segment runs as a child process, so it
-is never read for changes. A `source`d file is not read. That includes a file
-written earlier in the same command, the same class as `source
-.venv/bin/activate`.
+**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when every remote the guard can parse belongs to an allowed owner, each judged against its own host. When a parsed remote is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` (or, for `gh repo edit`, `archive`, `delete` and `create`, the repository argument) only for an owned remote, and names that remote in full only when every write in the command creates something (except `gh release create` and `gh label create --force`, and a `gh repo create` that blocks, which always gets `<repo>`): a merge, a delete or any other change gets the remote's owner and `<repo>` (`-R cameronsjo/<repo>` for a fork `cameronsjo/thing`). An unowned upstream is left for the user to write to themselves.
 
-**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`. It offers `-R` (or, for `gh repo edit`, `archive`, `delete` and `create`, the repository argument) only for an owned remote, and names that remote in full only when every write in the command creates something (except `gh release create` and `gh label create --force`, and a `gh repo create` that blocks, which always gets `<repo>`): a merge, a delete or any other change gets the remote's owner and `<repo>` (`-R cameronsjo/<repo>` for a fork `cameronsjo/thing`). An unowned upstream is left for the user to write to themselves.
-
-**Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, forks, unowned directories) still blocks. `gh repo archive`, `delete`, `edit` and `create` take no `-R`; their repository argument names the target instead. When that argument spells out its owner (`gh repo archive "owner/$r" --yes`), the write is judged on that owner wherever the loop runs, as a `-R` write is. In a loop the parser reads, a block for one of these verbs names the argument as the fix. A loop the parser cannot read at all (a command over 12 KB, say) is not refused for that: each gh write in it is judged on its own, as outside a loop. So a write to a repo you do not own still blocks, and so does a write without `-R` after a `cd "$d"` the guard cannot follow, as it would outside a loop. A write with no `-R`, `gh repo` positional (`gh repo edit owner/repo`), `GH_REPO` or literal `repos/<owner>/<repo>/…` path gets a nudge to give each one `-R owner/repo`.
-
-Looped `gh api` calls use the API-specific verdict rather than the generic
-missing-`-R` message. GraphQL reads and the safe review-thread metadata
-mutations remain allowed; other GraphQL or non-repository API mutations block
-when their target cannot be ownership-verified.
-
-Set `CADENCE_GH_STRICT_LOOPS=1` to disable the relaxation and block every looped gh write that lacks `-R` (the pre-0.12 behavior), or for those `gh repo` verbs a repository argument with its owner spelled out. For a loop the parser reads, the block message includes the resolved `-R owner/repo` fix when the working directory is owned and the loop body stays in it; a `gh api` write gets that repository only when its path is `repos/{owner}/{repo}/…`, and any other path gets `repos/owner/repo/…`. The fix gets the placeholder too when the command names `GH_REPO`, `GH_HOST` or `GIT_DIR` or the session exports one, or when a `cd` before the loop sits in a subshell, a `{ …; }` group or an `if`, on a line after another command, or is a `pushd`: gh then writes somewhere other than the working directory's repository. A loop the parser cannot read blocks under strict too, with a generic `-R owner/repo` fix, but only where the command shows a `for … in` or `while …; do` loop. There a `gh repo` positional or a literal `repos/<owner>/<repo>/…` path counts as a target, and the writes allowed without an ownership check (`gh gist`, `gh repo fork`, `gh issue create --web`, a `gh api` write to an allowed owner's `orgs/<org>`) stay allowed.
+**Loops** get no rule of their own. Each gh write in a loop body is judged as a single command: a literal unowned `-R` blocks, a write without `-R` is judged on the repo its directory resolves to, and a `-R "$r"` is unread and allowed.
 
 ### The `configure` subcommand under Claude Code
 
