@@ -26,3 +26,12 @@
 - [x] 4.3 Scan `command`/`cmd` on every tool but a local shell tool's Bash-read key
 - [x] 4.4 Scan a lone old-side value; split tool names at the first `__` and scan an ambiguous one
 - [x] 4.5 Tests for each, each staged off once and seen red
+
+## 5. Review round 4
+
+- [x] 5.1 Credential tier on the top-level `file_path`/`path`; identity tier skips it only when absolute and proven local
+- [x] 5.2 A local shell tool's command skips the identity tier only
+- [x] 5.3 Keep a warn-mode finding from the string scan when the call also carries a command
+- [x] 5.4 Unreadable term source blocks only calls whose input holds a string value
+- [x] 5.5 rea exemption from rea's effect audit (exact, case-sensitive list), pinned by a test
+- [x] 5.6 Tests for each, each staged off once and seen red

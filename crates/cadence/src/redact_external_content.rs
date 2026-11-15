@@ -1160,172 +1160,199 @@ impl Check for RedactExternalContent {
             let identity =
                 (!is_identity_exempt_mcp_tool(input.tool_name.as_deref())).then(identity::load);
             let verdict = run_mcp(input, identity.as_ref());
-            // A call that carries a shell `command` also gets the Bash surface
-            // below, which reads what that command posts (a `--body-file`
-            // included). `run_mcp` has already scanned the command string,
-            // except on a local shell tool.
+            // A call that carries a shell `command` also gets the Bash surface,
+            // on purpose: `run_mcp` has scanned the command as a string, and
+            // the Bash surface adds what that command posts (a `--body-file`
+            // it reads, the shaped tier). A block from either stands; a nudge
+            // from the string scan is kept beside whatever the Bash surface
+            // says.
             if input.command().is_none() || verdict.outcome == Outcome::Block {
                 return verdict;
             }
+            return with_mcp_verdict(verdict, run_command_or_edit(input));
         }
+        run_command_or_edit(input)
+    }
+}
 
-        // Phase 0 — a call that carries neither a command nor editable text is
-        // a tool this check never judges (Read, Grep, an Agent spawn…). It
-        // returns before the term source is touched: under a single-dispatch
-        // wiring this runs on every tool call, and a file read plus TOML parse
-        // per no-op call is pure waste (#580).
-        let command = input.command();
-        if command.is_none() && input.edit_fragments().is_none() {
-            return CheckResult::allow();
+/// The Bash and `Write`/`Edit` surfaces: what a command posts, or what an
+/// edit introduces.
+fn run_command_or_edit(input: &HookInput) -> CheckResult {
+    // Phase 0 — a call that carries neither a command nor editable text is
+    // a tool this check never judges (Read, Grep, an Agent spawn…). It
+    // returns before the term source is touched: under a single-dispatch
+    // wiring this runs on every tool call, and a file read plus TOML parse
+    // per no-op call is pure waste (#580).
+    let command = input.command();
+    if command.is_none() && input.edit_fragments().is_none() {
+        return CheckResult::allow();
+    }
+
+    // Phase 1 — route by surface. Only Bash carries a postable command; a
+    // Write/Edit runs the identity pass ONLY (see `run_edit`).
+    let Some(command) = command else {
+        // The term source, loaded once. Every failure yields an empty
+        // list (fail-open on the guard's own failure); doctor and the
+        // SessionStart probe, not this call, keep an absent file from
+        // being a silent disarm (#1067).
+        let (identity_list, _status) = identity::load();
+        return run_edit(input, &identity_list);
+    };
+
+    // Phase 2 — gate and extract PER SEGMENT (#424). A segment that does
+    // not itself publish contributes no body, so its `--body-file` is never
+    // opened; only a segment that passes the gate has its flag values read.
+    // Quote-strip each segment first so a body merely mentioning `gh pr
+    // create` can't self-trip. Silent allow if no segment yields a body.
+    let base_dir = resolve_base_dir(input);
+    let (bodies, notes) = gather_posted(command, &base_dir);
+    // A command that posts nothing and has nothing to report never needs
+    // the term source: skip the load (#580). `notes` is only ever printed
+    // where the tier is armed, so it is the one reason to look.
+    if bodies.is_empty() && notes.is_empty() {
+        return CheckResult::allow();
+    }
+    // Credential tier (#1022): runs on every posted text, before the term
+    // source is consulted, and no identity setting reaches it. The value
+    // the shell actually passes is scanned too, when it differs.
+    let mut cred_hits: Vec<credential_scan::CredHit> = Vec::new();
+    for posted in &bodies {
+        let passed = shell_passed_value(posted);
+        for text in std::iter::once(posted.0.as_str()).chain(passed.as_deref()) {
+            cred_hits.extend(credential_scan::scan(text));
         }
-
-        // Phase 1 — route by surface. Only Bash carries a postable command; a
-        // Write/Edit runs the identity pass ONLY (see `run_edit`).
-        let Some(command) = command else {
-            // The term source, loaded once. Every failure yields an empty
-            // list (fail-open on the guard's own failure); doctor and the
-            // SessionStart probe, not this call, keep an absent file from
-            // being a silent disarm (#1067).
-            let (identity_list, _status) = identity::load();
-            return run_edit(input, &identity_list);
-        };
-
-        // Phase 2 — gate and extract PER SEGMENT (#424). A segment that does
-        // not itself publish contributes no body, so its `--body-file` is never
-        // opened; only a segment that passes the gate has its flag values read.
-        // Quote-strip each segment first so a body merely mentioning `gh pr
-        // create` can't self-trip. Silent allow if no segment yields a body.
-        let base_dir = resolve_base_dir(input);
-        let (bodies, notes) = gather_posted(command, &base_dir);
-        // A command that posts nothing and has nothing to report never needs
-        // the term source: skip the load (#580). `notes` is only ever printed
-        // where the tier is armed, so it is the one reason to look.
-        if bodies.is_empty() && notes.is_empty() {
-            return CheckResult::allow();
+    }
+    let (identity_list, status) = identity::load();
+    // A term source that is there but cannot be read: the machine expects
+    // the tier, and nothing can be checked against it, so the post stops
+    // (cameronsjo/cadence-hooks#1617). An absent file stays inert.
+    if status.blocks_posts() && !bodies.is_empty() {
+        let mut message = unreadable_source_message();
+        if !cred_hits.is_empty() {
+            message = format!("{}\n{message}", credential_scan::render(&cred_hits));
         }
-        // Credential tier (#1022): runs on every posted text, before the term
-        // source is consulted, and no identity setting reaches it. The value
-        // the shell actually passes is scanned too, when it differs.
-        let mut cred_hits: Vec<credential_scan::CredHit> = Vec::new();
-        for posted in &bodies {
-            let passed = shell_passed_value(posted);
-            for text in std::iter::once(posted.0.as_str()).chain(passed.as_deref()) {
-                cred_hits.extend(credential_scan::scan(text));
+        return CheckResult::block(message);
+    }
+    // A text the identity scan could not read is said once on stderr, and
+    // only where the tier is armed — a machine with no term source has
+    // nothing the scan failed to do. The verdict is unchanged: fail open.
+    if identity_list.is_armed() {
+        for note in &notes {
+            eprintln!("{note}");
+        }
+    }
+    if bodies.is_empty() {
+        return CheckResult::allow();
+    }
+
+    // The destination audience the environment states, if any; it wins
+    // over every repo config's `originAudience`.
+    let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
+
+    // A leading `cd` into a repo nested in the session's tree posts from
+    // that repo (cameronsjo/cadence-hooks#225). Resolved from files only.
+    let moved = input
+        .cwd
+        .as_deref()
+        .and_then(|cwd| cadence_hooks_core::target_repo::moved_repo(command, cwd));
+
+    // The post's target repo, resolved at most once and only when a
+    // consumer needs it: a config that softens anything (#1245), a
+    // `destinations`-scoped allow (#630) or a shaped hit the owned-target
+    // downgrade could silence (#684). It spawns `git` for an origin
+    // lookup, so a command with none of these pays nothing. It runs in the
+    // session repo only, never in a `cd` target (#225).
+    let targets: std::cell::OnceCell<Vec<Option<context::Target>>> = std::cell::OnceCell::new();
+    let targets = || targets.get_or_init(|| context::post_targets(command, &base_dir));
+    let destination = if identity_list.uses_destinations() {
+        context::shared_destination(targets())
+    } else {
+        None
+    };
+
+    // Phase 4a — the identity pass over every body. Config-blind by
+    // signature (no config, no tier, no allowlist), and deliberately not
+    // short-circuited by the shaped pass below: a single post can carry
+    // both, and the operator fixing one should see the other in the same
+    // message rather than discovering it on the retry.
+    let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
+    // Identity reports dedup by (id, snippet), so a text it has already
+    // scanned adds nothing — skipping repeats keeps a command that posts
+    // one value thousands of times inside the hook deadline.
+    let mut identity_seen: HashSet<String> = HashSet::new();
+    for posted in &bodies {
+        // The value the shell actually passes is scanned too, when it
+        // differs.
+        let passed = shell_passed_value(posted);
+        for text in std::iter::once(posted.0.clone()).chain(passed) {
+            if !identity_seen.contains(&text) {
+                identity_hits.extend(identity::scan_identity(
+                    &text,
+                    &identity_list,
+                    None,
+                    destination.as_deref(),
+                ));
+                identity_seen.insert(text);
             }
         }
-        let (identity_list, status) = identity::load();
-        // A term source that is there but cannot be read: the machine expects
-        // the tier, and nothing can be checked against it, so the post stops
-        // (cameronsjo/cadence-hooks#1617). An absent file stays inert.
-        if status.blocks_posts() && !bodies.is_empty() {
-            let mut message = unreadable_source_message();
-            if !cred_hits.is_empty() {
-                message = format!("{}\n{message}", credential_scan::render(&cred_hits));
-            }
-            return CheckResult::block(message);
+    }
+
+    // Phase 3 + 4b — everything the per-repo config decides. A leading
+    // `cd` into a repo nested in the session's tree posts from that repo,
+    // so its config is the primary reading (cameronsjo/cadence-hooks#225);
+    // the session repo's config is read too, and where one finds something
+    // and the other does not, both are named so the model judges. Config
+    // findings only ever nudge, so this never moves a block.
+    let owned = || context::all_owned(targets());
+    // A post to another repo (`gh … -R owner/repo`) does not inherit a
+    // config's softening (#1245). Whichever repo's config is read, the
+    // targets and the "own repo" remotes they are judged against both
+    // come from the session checkout, so no `git` runs in a `cd` target;
+    // that errs strict (a `-R` naming the nested repo's own origin drops
+    // its softening too), never lenient.
+    let findings_in = |config_dir: &str| {
+        config_findings(
+            &bodies,
+            load_redaction_config(config_dir),
+            || targets(),
+            &base_dir,
+            env_audience.as_deref(),
+            &owned,
+        )
+    };
+    let ConfigFindings {
+        hits,
+        warnings,
+        notes,
+    } = match moved {
+        None => findings_in(&base_dir),
+        Some(moved) => {
+            let effective = findings_in(&moved.effective.to_string_lossy());
+            let session = findings_in(&moved.session.to_string_lossy());
+            reconcile_findings(&moved, effective, session)
         }
-        // A text the identity scan could not read is said once on stderr, and
-        // only where the tier is armed — a machine with no term source has
-        // nothing the scan failed to do. The verdict is unchanged: fail open.
-        if identity_list.is_armed() {
-            for note in &notes {
-                eprintln!("{note}");
-            }
+    };
+
+    let folded = combine(&identity_hits, &hits, &warnings, &notes, identity_list.mode);
+    with_credential_block(&cred_hits, folded)
+}
+
+/// `shell`, with the MCP string scan's `mcp` verdict kept: a block from
+/// `shell` stands, and otherwise a nudge from either is shown, joined.
+fn with_mcp_verdict(mcp: CheckResult, shell: CheckResult) -> CheckResult {
+    if mcp.outcome != Outcome::Nudge {
+        return shell;
+    }
+    let Some(found) = mcp.message else {
+        return shell;
+    };
+    match shell.outcome {
+        Outcome::Nudge => {
+            let said = shell.message.unwrap_or_default();
+            CheckResult::nudge(format!("{found}\n{said}"))
         }
-        if bodies.is_empty() {
-            return CheckResult::allow();
-        }
-
-        // The destination audience the environment states, if any; it wins
-        // over every repo config's `originAudience`.
-        let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
-
-        // A leading `cd` into a repo nested in the session's tree posts from
-        // that repo (cameronsjo/cadence-hooks#225). Resolved from files only.
-        let moved = input
-            .cwd
-            .as_deref()
-            .and_then(|cwd| cadence_hooks_core::target_repo::moved_repo(command, cwd));
-
-        // The post's target repo, resolved at most once and only when a
-        // consumer needs it: a config that softens anything (#1245), a
-        // `destinations`-scoped allow (#630) or a shaped hit the owned-target
-        // downgrade could silence (#684). It spawns `git` for an origin
-        // lookup, so a command with none of these pays nothing. It runs in the
-        // session repo only, never in a `cd` target (#225).
-        let targets: std::cell::OnceCell<Vec<Option<context::Target>>> = std::cell::OnceCell::new();
-        let targets = || targets.get_or_init(|| context::post_targets(command, &base_dir));
-        let destination = if identity_list.uses_destinations() {
-            context::shared_destination(targets())
-        } else {
-            None
-        };
-
-        // Phase 4a — the identity pass over every body. Config-blind by
-        // signature (no config, no tier, no allowlist), and deliberately not
-        // short-circuited by the shaped pass below: a single post can carry
-        // both, and the operator fixing one should see the other in the same
-        // message rather than discovering it on the retry.
-        let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
-        // Identity reports dedup by (id, snippet), so a text it has already
-        // scanned adds nothing — skipping repeats keeps a command that posts
-        // one value thousands of times inside the hook deadline.
-        let mut identity_seen: HashSet<String> = HashSet::new();
-        for posted in &bodies {
-            // The value the shell actually passes is scanned too, when it
-            // differs.
-            let passed = shell_passed_value(posted);
-            for text in std::iter::once(posted.0.clone()).chain(passed) {
-                if !identity_seen.contains(&text) {
-                    identity_hits.extend(identity::scan_identity(
-                        &text,
-                        &identity_list,
-                        None,
-                        destination.as_deref(),
-                    ));
-                    identity_seen.insert(text);
-                }
-            }
-        }
-
-        // Phase 3 + 4b — everything the per-repo config decides. A leading
-        // `cd` into a repo nested in the session's tree posts from that repo,
-        // so its config is the primary reading (cameronsjo/cadence-hooks#225);
-        // the session repo's config is read too, and where one finds something
-        // and the other does not, both are named so the model judges. Config
-        // findings only ever nudge, so this never moves a block.
-        let owned = || context::all_owned(targets());
-        // A post to another repo (`gh … -R owner/repo`) does not inherit a
-        // config's softening (#1245). Whichever repo's config is read, the
-        // targets and the "own repo" remotes they are judged against both
-        // come from the session checkout, so no `git` runs in a `cd` target;
-        // that errs strict (a `-R` naming the nested repo's own origin drops
-        // its softening too), never lenient.
-        let findings_in = |config_dir: &str| {
-            config_findings(
-                &bodies,
-                load_redaction_config(config_dir),
-                || targets(),
-                &base_dir,
-                env_audience.as_deref(),
-                &owned,
-            )
-        };
-        let ConfigFindings {
-            hits,
-            warnings,
-            notes,
-        } = match moved {
-            None => findings_in(&base_dir),
-            Some(moved) => {
-                let effective = findings_in(&moved.effective.to_string_lossy());
-                let session = findings_in(&moved.session.to_string_lossy());
-                reconcile_findings(&moved, effective, session)
-            }
-        };
-
-        let folded = combine(&identity_hits, &hits, &warnings, &notes, identity_list.mode);
-        with_credential_block(&cred_hits, folded)
+        Outcome::Allow => CheckResult::nudge(found),
+        _ => shell,
     }
 }
 
@@ -1634,10 +1661,12 @@ const NEW_TEXT_KEYS: &[&str] = &[
 /// Top-level keys that carry a file's content: what the path exemptions cover.
 const FILE_CONTENT_KEYS: &[&str] = &["edits"];
 
-/// Top-level keys naming the call's local target (`file_path`, `path`). They
-/// decide the exemptions and are not scanned as published text: scanning them
-/// would refuse every clean MCP write into a directory whose name holds a
-/// term, which the same write through `Write` is allowed.
+/// Top-level keys naming the call's target (`file_path`, `path`). They decide
+/// the file-content exemptions. The credential tier always reads them. The
+/// identity tier skips them only when the path is absolute and proven local
+/// (a local filesystem server's target, where a term in a directory name is
+/// no leak, as for `Write`); a relative or remote path, such as a file in a
+/// GitHub repo, is published and is scanned.
 const TARGET_PATH_KEYS: &[&str] = &["file_path", "path"];
 
 /// The keys a shell command sits under, in the order `HookInput::command`
@@ -1645,9 +1674,11 @@ const TARGET_PATH_KEYS: &[&str] = &["file_path", "path"];
 const COMMAND_KEYS: &[&str] = &["command", "cmd"];
 
 /// MCP tools that type their `command` into a terminal on this machine, by
-/// full tool name. The command runs here, so it is judged as a Bash command
-/// is (what it posts), not scanned word by word. On every other tool a
-/// `command` or `cmd` is a string sent to the server like any other.
+/// full tool name. The identity tier judges that command as it judges a Bash
+/// command (what it posts), not word by word, so `cd ~/<term-dir>` passes.
+/// The credential tier still reads it: the active pane can be an `ssh`
+/// session or another agent. On every other tool a `command` or `cmd` is a
+/// string sent to the server like any other.
 const LOCAL_SHELL_MCP_TOOLS: &[&str] = &["mcp__iterm__write_to_terminal"];
 
 /// Local MCP tools that skip the identity tier, by server segment and exact
@@ -1666,13 +1697,130 @@ const IDENTITY_EXEMPT_MCP_TOOLS: &[(&str, &[&str])] = &[
     ("herdr-bridge", &["panes", "read"]),
 ];
 
-/// The rea reverse-engineering server: its tools analyse local artifacts, so
-/// they skip the identity tier, except a tool whose name marks it as loading
-/// a page or driving a browser (its URL goes out).
-// debt: name markers, not an exact tool list; switch to one if rea adds a URL-taking tool the markers miss.
+/// The rea reverse-engineering server.
 const REA_SERVER: &str = "rea";
-const REA_REMOTE_PREFIXES: &[&str] = &["capture_", "observe_"];
-const REA_REMOTE_MARKERS: &[&str] = &["web", "browser"];
+
+/// rea tools that skip the identity tier: exactly those whose effect audit
+/// (rea `src/contracts/toolEffects.ts`, at rea `8413ec0`) neither launches a
+/// process nor reaches the network, that is whose MCP `openWorldHint` is
+/// false. They read and annotate local artifacts. Every other rea tool, and
+/// any tool rea adds later, gets both tiers until it is listed here. Matched
+/// exactly and case-sensitively, so a case variant is scanned too.
+const REA_LOCAL_TOOLS: &[&str] = &[
+    "address_name",
+    "address_to_file_offset",
+    "analyze_function",
+    "analyze_swift_types",
+    "batch_decompile",
+    "binary_overview",
+    "build_call_path",
+    "build_reconstruction_obligation_ledger",
+    "close_binary",
+    "comment",
+    "compare_application_versions",
+    "compare_artifacts",
+    "compare_bundles",
+    "compare_functions",
+    "compare_javascript_export_shapes",
+    "compare_managed_members",
+    "compare_process_captures",
+    "compare_source_to_bundle",
+    "compare_wasm_interfaces",
+    "compare_web_captures",
+    "compare_web_screenshots",
+    "correlate_static_and_runtime",
+    "current_address",
+    "current_document",
+    "current_procedure",
+    "decode_interface_builder",
+    "evaluate_reconstruction_coverage",
+    "export_evidence_bundle",
+    "export_web_scripts",
+    "find_changed_behavior",
+    "find_xrefs_to_name",
+    "frida_session_status",
+    "gdb_session_status",
+    "get_call_graph",
+    "get_evidence_bundle",
+    "get_navigation_context",
+    "get_objc_classes",
+    "get_objc_protocols",
+    "goto_address",
+    "identify_flutter_build",
+    "import_evidence_bundle",
+    "import_managed_reconstruction",
+    "inline_comment",
+    "inspect_address_context",
+    "inspect_analysis_view",
+    "inspect_dart_aot",
+    "inspect_desktop_application",
+    "inspect_electron_fuses",
+    "inspect_go_binary",
+    "inspect_gpu_code_objects",
+    "inspect_il2cpp_metadata",
+    "inspect_keyed_archive",
+    "inspect_managed_artifact",
+    "inspect_managed_members",
+    "inspect_managed_native_boundaries",
+    "inspect_model_artifact",
+    "inspect_native_api",
+    "inspect_native_data_type",
+    "inspect_native_dispatch_metadata",
+    "inspect_native_instruction",
+    "inspect_native_load_image",
+    "inspect_pe_resources",
+    "inspect_rust_binary",
+    "list_bookmarks",
+    "list_documents",
+    "list_names",
+    "list_procedures",
+    "list_segments",
+    "list_strings",
+    "list_unknowns",
+    "match_native_functions",
+    "next_address",
+    "open_bundle_resources",
+    "prev_address",
+    "procedure_address",
+    "procedure_assembly",
+    "procedure_callees",
+    "procedure_callers",
+    "procedure_info",
+    "procedure_pseudo_code",
+    "procedure_references",
+    "project_android_application_graph",
+    "project_apple_application_graph",
+    "project_harmony_application_graph",
+    "project_managed_application_graph",
+    "read_bytes",
+    "read_function_instructions",
+    "reconcile_javascript_runtime",
+    "record_unknown",
+    "resolve_containing_procedure",
+    "resolve_native_call_targets",
+    "rizin_debug_session_status",
+    "search_bytes",
+    "search_procedures",
+    "search_strings",
+    "set_address_name",
+    "set_addresses_names",
+    "set_bookmark",
+    "set_comment",
+    "set_inline_comment",
+    "trace_application_feature",
+    "trace_call_path",
+    "trace_dylib_resolution",
+    "trace_feature",
+    "trace_javascript_semantics",
+    "trace_native_ui_action",
+    "trace_native_values",
+    "unset_bookmark",
+    "update_unknown",
+    "verify_managed_native_boundaries",
+    "verify_reconstruction",
+    "verify_unknown_resolution",
+    "xrefs",
+];
 
 /// The server and tool segments of an MCP tool name: (`herdr-bridge`, `send`)
 /// for `mcp__herdr-bridge__send`. Split at the first `__` after the prefix;
@@ -1682,7 +1830,7 @@ fn mcp_server_and_tool(tool_name: &str) -> Option<(&str, &str)> {
 }
 
 /// Whether `tool_name` skips the identity tier: a tool on
-/// [`IDENTITY_EXEMPT_MCP_TOOLS`], or a rea tool without a remote marker. A
+/// [`IDENTITY_EXEMPT_MCP_TOOLS`] or [`REA_LOCAL_TOOLS`]. A
 /// tool segment holding another `__` is never exempt: the split is then
 /// ambiguous (a server could be named `rea__cloud`), so the call is scanned.
 fn is_identity_exempt_mcp_tool(tool_name: Option<&str>) -> bool {
@@ -1693,9 +1841,7 @@ fn is_identity_exempt_mcp_tool(tool_name: Option<&str>) -> bool {
         return false;
     }
     if server == REA_SERVER {
-        let remote = REA_REMOTE_PREFIXES.iter().any(|p| tool.starts_with(p))
-            || REA_REMOTE_MARKERS.iter().any(|m| tool.contains(m));
-        return !remote;
+        return REA_LOCAL_TOOLS.contains(&tool);
     }
     IDENTITY_EXEMPT_MCP_TOOLS
         .iter()
@@ -1775,14 +1921,18 @@ fn mcp_object_texts<'a>(
 /// - **The identity tier** runs unless `identity` is `None`, which `run`
 ///   passes for a tool on the local-tool table
 ///   ([`is_identity_exempt_mcp_tool`]).
-/// - **An unreadable term source** (#1617) blocks a call that carries text,
-///   as it blocks a Bash post: the machine expects the tier and nothing can
-///   be checked against it. An MCP call's text goes to its server, reads
-///   included (ADR-0003). An absent source stays inert.
-/// - **A `command` or `cmd` is scanned** like any other string, except the
-///   one key `HookInput::command` reads on a [`LOCAL_SHELL_MCP_TOOLS`] tool:
-///   that command runs here, and the Bash surface `run` also applies judges
-///   what it posts.
+/// - **An unreadable term source** (#1617) blocks a call whose input holds a
+///   string value, as it blocks a Bash post: the machine expects the tier
+///   and nothing can be checked against it. An MCP call's text goes to its
+///   server, reads included (ADR-0003). A call with only keys, numbers and
+///   booleans sends no text and is let through. An absent source stays inert.
+/// - **A `command` or `cmd` is scanned** like any other string. On a
+///   [`LOCAL_SHELL_MCP_TOOLS`] tool the one key `HookInput::command` reads
+///   skips the identity tier only: that command runs here, and the Bash
+///   surface `run` also applies judges what it posts.
+/// - **The top-level `file_path`/`path`** ([`TARGET_PATH_KEYS`]) gets the
+///   credential tier always and the identity tier unless the path is
+///   absolute and proven local.
 ///
 /// What stays as on the Write/Edit surface ([`run_edit`]):
 ///
@@ -1798,7 +1948,8 @@ fn mcp_object_texts<'a>(
 ///   top-level [`NEW_TEXT_KEYS`] and `edits`) and nothing else: a `title` or
 ///   `initial_comment` beside a local attachment's path is still published,
 ///   and still scanned. Both tiers skip that content: a local file is not a
-///   post.
+///   post. The test reads the path string, not the server, so a remote
+///   tool given a local-looking absolute path gets the same exemption.
 ///
 /// The input read is the payload's own `tool_input`, before the typed parse
 /// dropped any field that failed its shape ([`HookInput::mcp_tool_input`]),
@@ -1826,10 +1977,27 @@ fn run_mcp(
         .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
     let local_file = identity::is_term_source(file_path)
         || (!context::is_prose_draft(file_path) && context::is_provably_local(file_path));
+    // The call's own path, when it is an absolute path on this machine that
+    // goes nowhere: a local filesystem server's target. A relative path (a
+    // file in a GitHub repo) or a remote one is published like any string.
+    let local_target = file_path.is_some_and(|p| std::path::Path::new(p).is_absolute())
+        && (identity::is_term_source(file_path) || context::is_provably_local(file_path));
 
-    let mut skip: Vec<&str> = TARGET_PATH_KEYS.to_vec();
-    // Only the key the Bash surface reads: a `cmd` beside a `command` is read
-    // by nothing else, so it is scanned.
+    // Keys neither tier reads: a local file's content, which is not a post.
+    let mut both_skip: Vec<&str> = Vec::new();
+    if local_file {
+        both_skip.extend(NEW_TEXT_KEYS);
+        both_skip.extend(PRIOR_TEXT_KEYS);
+        both_skip.extend(FILE_CONTENT_KEYS);
+    }
+    // Keys only the identity tier leaves alone; the credential tier reads
+    // them. A local target path (a term in a local directory name is no
+    // leak), and on a local shell tool the one key the Bash surface reads (a
+    // `cmd` beside a `command` is read by nothing else, so it is scanned).
+    let mut identity_skip: Vec<&str> = both_skip.clone();
+    if local_target {
+        identity_skip.extend(TARGET_PATH_KEYS);
+    }
     if input
         .tool_name
         .as_deref()
@@ -1838,31 +2006,23 @@ fn run_mcp(
             .iter()
             .find(|key| raw.get(**key).is_some_and(serde_json::Value::is_string))
     {
-        skip.push(*key);
+        identity_skip.push(*key);
     }
-    if local_file {
-        skip.extend(NEW_TEXT_KEYS);
-        skip.extend(PRIOR_TEXT_KEYS);
-        skip.extend(FILE_CONTENT_KEYS);
-    }
-    let mut texts: Vec<McpText> = Vec::new();
-    match raw.as_ref() {
-        serde_json::Value::Object(map) => mcp_object_texts(map, &skip, &mut texts),
-        other => mcp_texts(other, &mut texts),
-    }
-    // A repeated (text, prior) pair adds nothing to an identity report, which
-    // dedups by (id, snippet).
-    let mut seen: HashSet<(&str, &str)> = HashSet::new();
-    let unique: Vec<(&str, &str)> = texts
-        .iter()
-        .map(|(text, prior)| (*text, prior.as_ref()))
-        .filter(|pair| seen.insert(*pair))
-        .collect();
-    // Credential tier (#1022): every scanned string, armed term source or
-    // not, and no identity setting reaches it. Old-side text is not scanned,
-    // so an edit that removes a token stays possible.
+    let walk = |skip: &[&str]| -> Vec<McpText> {
+        let mut texts: Vec<McpText> = Vec::new();
+        match raw.as_ref() {
+            serde_json::Value::Object(map) => mcp_object_texts(map, skip, &mut texts),
+            other => mcp_texts(other, &mut texts),
+        }
+        texts
+    };
+    // Credential tier (#1022): every string but a local file's content, armed
+    // term source or not, and no identity setting reaches it. Old-side text
+    // beside a new-side value is not scanned, so an edit that removes a token
+    // stays possible.
+    let credential_texts = walk(&both_skip);
     let mut scanned: HashSet<&str> = HashSet::new();
-    let cred_hits: Vec<credential_scan::CredHit> = unique
+    let cred_hits: Vec<credential_scan::CredHit> = credential_texts
         .iter()
         .filter(|(text, _)| scanned.insert(text))
         .flat_map(|(text, _)| credential_scan::scan(text))
@@ -1870,12 +2030,21 @@ fn run_mcp(
     let Some((identity_list, status)) = identity else {
         return with_credential_block(&cred_hits, CheckResult::allow());
     };
-    // A local file's content is not a post, as on `Write`, and a call with no
-    // string at all has nothing to check.
-    if status.blocks_posts() && !local_file && !unique.is_empty() {
+    // A local file's content is not a post, as on `Write`. A call whose input
+    // holds no string value (`{}`, `{"page": 2}`) sends no text to check.
+    if status.blocks_posts() && !local_file && has_string_value(&raw) {
         let unreadable = CheckResult::block(unreadable_source_message());
         return with_credential_block(&cred_hits, unreadable);
     }
+    let identity_texts = walk(&identity_skip);
+    // A repeated (text, prior) pair adds nothing to an identity report, which
+    // dedups by (id, snippet).
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let unique: Vec<(&str, &str)> = identity_texts
+        .iter()
+        .map(|(text, prior)| (*text, prior.as_ref()))
+        .filter(|pair| seen.insert(*pair))
+        .collect();
     let folded = if identity_list.is_armed() {
         let identity_hits = introduced_identity_hits(unique, identity_list, file_path);
         combine(&identity_hits, &[], &[], &[], identity_list.mode)
@@ -1883,6 +2052,16 @@ fn run_mcp(
         CheckResult::allow()
     };
     with_credential_block(&cred_hits, folded)
+}
+
+/// Whether `value` holds a string anywhere: a value, not an object key.
+fn has_string_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(items) => items.iter().any(has_string_value),
+        serde_json::Value::Object(map) => map.values().any(has_string_value),
+        _ => false,
+    }
 }
 
 /// `folded`, unless `cred_hits` holds a token: then a block naming the tokens
@@ -4830,16 +5009,214 @@ term = "acmecorp"
     }
 
     #[test]
-    fn mcp_target_path_is_not_scanned_as_published_text() {
-        // The same write through `Write` is allowed; a term in a work repo's
-        // directory name must not refuse every clean MCP write there.
+    fn mcp_target_path_is_scanned_unless_it_is_local() {
+        // A file path on a remote host is published: a repo file's name is as
+        // public as an issue body.
+        with_terms(FIXTURE, || {
+            for path in [
+                "docs/acmecorp-notes.md",
+                "/Users/x/Projects/acmecorp-platform/README.md",
+            ] {
+                let r = run_mcp_call(
+                    "mcp__github__create_or_update_file",
+                    serde_json::json!({"path": path, "content": "hello"}),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "not proven local: {path}");
+            }
+        });
+        // An absolute path proven local names a directory on this machine.
+        let root = tempfile::tempdir().unwrap();
+        if !context::scratch_counts_as_system_temp(root.path()) {
+            eprintln!("skipped: TMPDIR is not a system temp dir, so nothing in it is exempt");
+            return;
+        }
+        let local = root.path().join("acmecorp-notes").join("data.json");
+        let local = local.to_str().unwrap();
         with_terms(FIXTURE, || {
             let r = run_mcp_call(
                 "mcp__fs__write_file",
-                serde_json::json!({"path": "/Users/x/Projects/acmecorp-platform/README.md", "content": "hello"}),
+                serde_json::json!({"path": local, "content": "hello"}),
             );
-            assert_eq!(r.outcome, Outcome::Allow);
+            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
         });
+    }
+
+    #[test]
+    fn a_token_in_an_mcp_path_is_refused_local_or_not() {
+        let t = fake_ghp();
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join(format!("{t}.json"));
+        with_terms_cleared(|| {
+            for path in [format!("docs/{t}.md"), local.to_str().unwrap().to_string()] {
+                let r = run_mcp_call(
+                    "mcp__github__create_or_update_file",
+                    serde_json::json!({"path": path, "content": "hello"}),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "token in path");
+            }
+        });
+    }
+
+    #[test]
+    fn a_token_in_a_local_terminal_command_is_refused() {
+        // The identity tier passes a local shell's command; the credential
+        // tier does not, since the active pane can be an `ssh` session or
+        // another agent.
+        let t = fake_ghp();
+        with_terms_cleared(|| {
+            let r = run_mcp_call(
+                "mcp__iterm__write_to_terminal",
+                serde_json::json!({"command": format!("export GH_TOKEN={t}")}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+        });
+    }
+
+    #[test]
+    fn an_mcp_nudge_survives_a_command() {
+        // Warn mode: the string scan's finding is shown even when the call
+        // also carries a command the Bash surface allows.
+        with_terms(WARN_FIXTURE, || {
+            let plain = run_mcp_call("mcp__x__run", serde_json::json!({"body": "acmecorp"}));
+            assert_eq!(
+                plain.outcome,
+                Outcome::Nudge,
+                "control: {:?}",
+                plain.message
+            );
+            let r = run_mcp_call(
+                "mcp__x__run",
+                serde_json::json!({"command": "ls", "body": "acmecorp"}),
+            );
+            assert_eq!(r.outcome, Outcome::Nudge, "{:?}", r.message);
+            assert!(r.message.unwrap_or_default().contains("T1"));
+        });
+    }
+
+    #[test]
+    fn rea_local_tools_are_its_closed_world_tools() {
+        // Pinned against rea's effect audit (`toolEffects.ts` at `8413ec0`):
+        // the exempt list is sorted and unique, and none of the tools that
+        // launch a process or reach the network is on it.
+        let mut sorted = REA_LOCAL_TOOLS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, REA_LOCAL_TOOLS, "sorted, no duplicates");
+        assert_eq!(REA_LOCAL_TOOLS.len(), 113);
+        let open_world = [
+            "analyze_javascript_application",
+            "analyze_web_bundle",
+            "annotate_native_function",
+            "binary_session",
+            "capture_adb_screen",
+            "capture_browser_scenario",
+            "capture_electron_scenario",
+            "capture_native_ui_scenario",
+            "capture_process_scenario",
+            "capture_web_screenshot",
+            "close_frida_session",
+            "close_gdb_session",
+            "close_rizin_debug_session",
+            "collect_adb_bugreport",
+            "cutter_command",
+            "decode_android_resources",
+            "decode_signal_recording",
+            "decompile_jeb_item",
+            "demangle_swift",
+            "discover_webmcp_tools",
+            "execute_rizin_command",
+            "extract_artifact",
+            "extract_firmware",
+            "gdb_console",
+            "inspect_adb_client",
+            "inspect_adb_device",
+            "inspect_adb_display",
+            "inspect_adb_package",
+            "inspect_adb_window",
+            "inspect_android_class",
+            "inspect_android_method",
+            "inspect_android_package",
+            "inspect_apktool_client",
+            "inspect_artifact",
+            "inspect_asset_catalog",
+            "inspect_binary_layout",
+            "inspect_electron_page",
+            "inspect_evm_interface",
+            "inspect_firmware_regions",
+            "inspect_jeb_client",
+            "inspect_macho",
+            "inspect_packet_capture",
+            "inspect_packet_fields",
+            "inspect_pcap_capture",
+            "inspect_pcap_client",
+            "inspect_plist",
+            "inspect_recorded_crash",
+            "inspect_signal_decoders",
+            "inspect_signature",
+            "inspect_sqlite_database",
+            "inspect_wasm_artifact",
+            "inspect_web_event_listeners",
+            "inspect_web_network_capture",
+            "inspect_web_page",
+            "inspect_with_objdump",
+            "install_adb_package",
+            "instrument_with_frida",
+            "list_adb_devices",
+            "list_adb_directory",
+            "list_adb_features",
+            "list_adb_packages",
+            "list_adb_processes",
+            "list_adb_services",
+            "list_architectures",
+            "list_browser_targets",
+            "list_cutter_sessions",
+            "list_electron_targets",
+            "list_frida_devices",
+            "list_frida_processes",
+            "list_javascript_runtime_targets",
+            "list_jeb_units",
+            "load_frida_script",
+            "observe_javascript_runtime",
+            "observe_native_calls",
+            "observe_native_ui",
+            "observe_web_execution",
+            "observe_web_session",
+            "open_binary",
+            "open_jeb_project",
+            "pull_adb_file",
+            "pull_adb_package",
+            "push_adb_file",
+            "read_adb_logcat",
+            "read_adb_setting",
+            "recover_javascript_sources",
+            "resolve_adb_packages",
+            "resume_frida_session",
+            "rizin_debug_command",
+            "search_android_classes",
+            "start_adb_activity",
+            "start_adb_app",
+            "start_frida_session",
+            "start_gdb_session",
+            "start_rizin_debug_session",
+            "stop_adb_app",
+            "trace_android_references",
+            "trace_web_module_imports",
+            "trace_web_source_location",
+            "uninstall_adb_package",
+            "unload_frida_script",
+        ];
+        assert_eq!(open_world.len(), 100);
+        for tool in open_world {
+            let name = format!("mcp__rea__{tool}");
+            assert!(
+                !is_identity_exempt_mcp_tool(Some(&name)),
+                "open-world: {name}"
+            );
+        }
+        assert!(is_identity_exempt_mcp_tool(Some("mcp__rea__set_comment")));
+        // Exact and case-sensitive: a variant is scanned, as is an unknown.
+        assert!(!is_identity_exempt_mcp_tool(Some("mcp__rea__Set_Comment")));
+        assert!(!is_identity_exempt_mcp_tool(Some("mcp__rea__open_url")));
     }
 
     #[test]
@@ -4982,7 +5359,7 @@ term = "acmecorp"
                 "mcp__herdr-bridge__panes",
                 "mcp__herdr-bridge__read",
                 "mcp__rea__set_comment",
-                "mcp__rea__inspect_macho",
+                "mcp__rea__list_strings",
             ] {
                 let r = run_mcp_call(tool, term.clone());
                 assert_eq!(r.outcome, Outcome::Allow, "local tool, term: {tool}");
@@ -5000,6 +5377,10 @@ term = "acmecorp"
                 "mcp__rea__observe_native_calls",
                 "mcp__rea__inspect_web_page",
                 "mcp__rea__list_browser_targets",
+                "mcp__rea__inspect_macho",
+                "mcp__rea__gdb_console",
+                "mcp__rea__execute_rizin_command",
+                "mcp__rea__Set_Comment",
                 "mcp__rea__cloud__post",
                 "mcp__c3__post",
                 "mcp__c3x__compact",
@@ -5079,8 +5460,21 @@ term = "acmecorp"
             // state does not reach it; an empty input has nothing to check.
             let r = run_mcp_call("mcp__c3__compact", serde_json::json!({"focus": "x"}));
             assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
-            let r = run_mcp_call("mcp__github__get_me", serde_json::json!({}));
-            assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+            // A call with no string value (keys and numbers only) sends no
+            // text; one string value is enough to block.
+            for input in [
+                serde_json::json!({}),
+                serde_json::json!({"page": 2}),
+                serde_json::json!({"limit": 5, "draft": false}),
+            ] {
+                let r = run_mcp_call("mcp__github__list_issues", input.clone());
+                assert_eq!(r.outcome, Outcome::Allow, "{input}: {:?}", r.message);
+            }
+            let r = run_mcp_call(
+                "mcp__github__list_issues",
+                serde_json::json!({"page": 2, "query": "x"}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
         });
         // No file at all: inert, as on the Bash surface.
         let absent = tempfile::tempdir().unwrap();

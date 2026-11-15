@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Unreadable term source blocks posts
-When the term source exists but cannot be read, `redact-external-content` MUST block (exit 2) every post and commit message, and every `mcp__*` call that carries a string, except a call to a local tool or one whose content is a local file's, naming the path and the fix, and `redact-scan` MUST exit 1 with the same message. An absent file MUST NOT trigger either.
+When the term source exists but cannot be read, `redact-external-content` MUST block (exit 2) every post and commit message, and every `mcp__*` call whose input holds a string value, except a call to a local tool or one whose content is a local file's, naming the path and the fix, and `redact-scan` MUST exit 1 with the same message. An absent file MUST NOT trigger either.
 
 #### Scenario: Term source that cannot be read
 - **WHEN** `redaction.toml` exists but is not a readable regular file (permissions on it or its directory, a dangling link, a directory) and a Bash call posts any text or runs `git commit` with a message
@@ -10,6 +10,10 @@ When the term source exists but cannot be read, `redact-external-content` MUST b
 #### Scenario: MCP post with a term source that cannot be read
 - **WHEN** `redaction.toml` exists but is not a readable regular file and an `mcp__github__create_issue` call carries a clean `body`
 - **THEN** the hook exits 2 and stderr names the path and a `Fix:` line
+
+#### Scenario: MCP call with no string value and a term source that cannot be read
+- **WHEN** `redaction.toml` exists but is not a readable regular file and an MCP call's input is `{"page": 2}`
+- **THEN** the hook exits 0
 
 #### Scenario: redact-scan on a term source that cannot be read
 - **WHEN** `redaction.toml` exists but is not a readable regular file and `redact-scan` scans a clean body
@@ -29,7 +33,7 @@ On Write and Edit calls, `redact-external-content` SHALL run the identity tier o
 ## ADDED Requirements
 
 ### Requirement: Identity scan of MCP calls
-On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over every string value in the call's input at any depth, object keys included, read from the payload as sent so a field that fails the typed parse is still read. The top-level `file_path`/`path` MUST NOT be scanned. The shaped tier MUST NOT run on MCP calls.
+On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over every string value in the call's input at any depth, object keys included, read from the payload as sent so a field that fails the typed parse is still read. The top-level `file_path`/`path` MUST NOT be scanned by this tier when it is an absolute path proven local; any other path SHALL be scanned. The shaped tier MUST NOT run on MCP calls.
 
 #### Scenario: Issue body through an MCP tool
 - **WHEN** an `mcp__github__create_issue` call carries an identity term only in `body`
@@ -39,12 +43,16 @@ On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over 
 - **WHEN** an MCP call carries an identity term only in a string nested in an array of objects
 - **THEN** the hook exits 2
 
-#### Scenario: Term only in the target path
-- **WHEN** an MCP write's `path` names a directory holding an identity term and its `content` is clean
+#### Scenario: Term only in a local target path
+- **WHEN** an MCP write's `path` is an absolute path in a system temp dir naming a directory that holds an identity term, and its `content` is clean
 - **THEN** the hook exits 0
 
+#### Scenario: Term in a repo file path
+- **WHEN** an `mcp__github__create_or_update_file` call's `path` is `docs/<term>-notes.md` and its `content` is clean
+- **THEN** the hook exits 2
+
 ### Requirement: MCP command strings are scanned
-On an `mcp__*` call, a `command` or `cmd` string SHALL be scanned like any other string, except the key the Bash surface reads (`command`, else `cmd`) on a local shell tool (`mcp__iterm__write_to_terminal`). A shell `command` SHALL also get the Bash-surface checks.
+On an `mcp__*` call, a `command` or `cmd` string SHALL be scanned like any other string. On a local shell tool (`mcp__iterm__write_to_terminal`), the key the Bash surface reads (`command`, else `cmd`) MUST NOT get the identity tier; the credential tier SHALL still read it. A shell `command` SHALL also get the Bash-surface checks, and a nudge from the string scan SHALL be shown beside their result.
 
 #### Scenario: Command sent to a server
 - **WHEN** an `mcp__slack__run_command` call's `command` holds an identity term
@@ -54,8 +62,16 @@ On an `mcp__*` call, a `command` or `cmd` string SHALL be scanned like any other
 - **WHEN** an `mcp__iterm__write_to_terminal` call's `command` is `cd ~/<term-dir> && ls`
 - **THEN** the hook exits 0
 
+#### Scenario: Token in a local terminal command
+- **WHEN** an `mcp__iterm__write_to_terminal` call's `command` holds a token
+- **THEN** the hook exits 2
+
+#### Scenario: Warn-mode finding beside a command
+- **WHEN** the term source is in warn mode and an MCP call carries `command: ls` and an identity term in `body`
+- **THEN** the hook exits 0 and shows the finding
+
 ### Requirement: Credential scan of MCP calls
-On every `mcp__*` call, local tools included, `redact-external-content` SHALL run the credential tier over the strings the identity scan reads, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
+On every `mcp__*` call, local tools included, `redact-external-content` SHALL run the credential tier over every string in the input, the top-level `file_path`/`path` included, except a local file's content, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
 
 #### Scenario: Token in an MCP issue body
 - **WHEN** an `mcp__github__create_issue` call carries a GitHub token only in `body` and no term source exists
@@ -69,8 +85,12 @@ On every `mcp__*` call, local tools included, `redact-external-content` SHALL ru
 - **WHEN** an `mcp__herdr-bridge__send` call's `text` holds a token
 - **THEN** the hook exits 2
 
+#### Scenario: Token in a file path
+- **WHEN** an MCP write's `path` holds a token, local or not
+- **THEN** the hook exits 2
+
 ### Requirement: Local MCP tools skip the identity tier
-The identity tier MUST NOT run on a call to a local tool: `c3` `compact`, `model` or `rename`, `easel` `chart`, `herdr-bridge` `panes` or `read`, or a `rea` tool whose name neither starts with `capture_` or `observe_` nor contains `web` or `browser`. Server and tool are the text after `mcp__` split at the next `__`, matched exactly; a tool segment holding another `__` is not a local tool. Every other call SHALL get the identity tier, and every call SHALL get the credential tier.
+The identity tier MUST NOT run on a call to a local tool: `c3` `compact`, `model` or `rename`, `easel` `chart`, `herdr-bridge` `panes` or `read`, or a `rea` tool on the binary's list of rea tools whose effect audit neither launches a process nor reaches the network. Server and tool are the text after `mcp__` split at the next `__`, matched exactly; a tool segment holding another `__` is not a local tool. Every other call SHALL get the identity tier, and every call SHALL get the credential tier.
 
 #### Scenario: Local tool call
 - **WHEN** an `mcp__herdr-bridge__read` call carries an identity term
@@ -82,6 +102,10 @@ The identity tier MUST NOT run on a call to a local tool: `c3` `compact`, `model
 
 #### Scenario: Server that only resembles a listed one
 - **WHEN** an `mcp__c3x__post` call carries an identity term
+- **THEN** the hook exits 2
+
+#### Scenario: rea tool that reaches a process or the network
+- **WHEN** an `mcp__rea__gdb_console` call carries an identity term
 - **THEN** the hook exits 2
 
 ### Requirement: MCP path exemptions cover the file content only
