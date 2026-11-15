@@ -13,7 +13,7 @@ Guards are **stateless pure functions**: they read JSON from stdin describing a 
 
 ## The binary
 
-`cadence-hooks` dispatches to guards via `clap` subcommands in four namespaces: `cadence` (`crates/cadence/`, plugin-specific checks: terminology, secrets, memory), `guardrails` (`crates/guardrails/`, git/GitHub safety), `rules` (`crates/rules/`, code standards), and `obsidian` (`crates/obsidian/`, vault guards). Shared infrastructure lives in `crates/core/` — the `Check` trait, `HookInput` parsing, output protocol, shell parsing, loop analysis, and config utilities.
+`cadence-hooks` dispatches to guards via `clap` subcommands in six namespaces: `cadence` (`crates/cadence/`, plugin-specific checks: terminology, secrets, memory), `guardrails` (`crates/guardrails/`, git/GitHub safety), `rules` (`crates/rules/`, code standards), `obsidian` (`crates/obsidian/`, vault guards), `metrics` (`crates/metrics/`, event ledgers and pricing), and `session` (`crates/session/`, session lifecycle and plans). Shared infrastructure lives in `crates/core/` — the `Check` trait, `HookInput` parsing, output protocol, shell parsing, loop analysis, and config utilities.
 
 ## Guard anatomy
 
