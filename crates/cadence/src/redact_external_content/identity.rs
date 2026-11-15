@@ -18,10 +18,15 @@
 //!
 //! # Fail directions, which run in two different directions on purpose
 //!
-//! - **The guard's own failure is fail-open** (ADR-0001): no file, unreadable,
-//!   malformed, zero terms → the tier is inert and the check allows. A guard
-//!   that hard-fails on a missing config makes every commit impossible on a
-//!   machine that never had the file.
+//! - **The guard's own failure is fail-open** (ADR-0001): no file, malformed,
+//!   zero terms → the tier is inert and the check allows. A guard that
+//!   hard-fails on a missing config makes every commit impossible on a machine
+//!   that never had the file.
+//! - **A term source that exists but cannot be read stops posts**
+//!   (cameronsjo/cadence-hooks#1617). The file being there says the machine is
+//!   set up to scan, so an unreadable one is a disarm, not a machine without
+//!   the tier. The block names the path and both ways out: fix the file's
+//!   permissions, or remove it to run without the tier on purpose.
 //! - **A term match is fail-closed**: it blocks, and no repo config can excuse
 //!   it.
 //!
@@ -254,10 +259,10 @@ pub(crate) enum Status {
     /// No file at the resolved path.
     Absent,
     /// File exists but could not be read — permissions, a directory, a special
-    /// file, or over the bounded-read cap. **Notified exactly like `Absent`**:
-    /// silent-inert on a permissions error is the same silent-disarm class the
-    /// lenient-config work closed, and the operator cannot tell the difference
-    /// from the outcome alone.
+    /// file, or over the bounded-read cap. The posting hook blocks on it
+    /// ([`Status::blocks_posts`], #1617). It is not inert:
+    /// an unreadable file means the machine expects the tier and nothing can
+    /// be checked, the silent-disarm class the lenient-config work closed.
     Unreadable,
     /// Read, but did not parse as the expected schema.
     Malformed(String),
@@ -270,10 +275,28 @@ impl Status {
     pub fn needs_notice(&self) -> bool {
         !matches!(self, Status::Armed(_))
     }
+
+    /// Does this state stop external posts? Only [`Status::Unreadable`]: a
+    /// file is there, so the machine expects the tier, and nothing can be
+    /// scanned against it (cameronsjo/cadence-hooks#1617). An absent file is a
+    /// machine without the tier and stays inert.
+    pub fn blocks_posts(&self) -> bool {
+        matches!(self, Status::Unreadable)
+    }
 }
 
-/// Resolve the term-source path: `$HOME/.config/cadence/redaction.toml`, and
-/// nothing else.
+/// Resolve the term-source path: `<home>/.config/cadence/redaction.toml`, where
+/// `<home>` is the account's home directory from the user database
+/// ([`cadence_hooks_core::paths::account_home`]), and nothing else.
+///
+/// # Why not `HOME`
+///
+/// `HOME` is an environment variable too, and the same settings `env` block
+/// described below can set it. A repo that points `HOME` at a directory with
+/// no term source would make the tier load zero terms and allow every post
+/// (cameronsjo/cadence-hooks#1617). The passwd entry is out of a repo's reach.
+/// When the lookup fails there is no path, which reads as an absent file, the
+/// same as an unset `HOME` did before.
 ///
 /// # Why no environment override in production
 ///
@@ -304,15 +327,48 @@ pub(crate) fn terms_path() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("cadence")
-                .join("redaction.toml")
-        })
+    terms_path_under(account_home())
+}
+
+/// The term-source path under a given home directory.
+fn terms_path_under(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|h| !h.as_os_str().is_empty())
+        .map(|h| h.join(".config").join("cadence").join("redaction.toml"))
+}
+
+/// The account home directory: the user database in production, a
+/// per-thread stand-in in tests that need one (so a test can place a term
+/// source under a fake account home without touching the real one).
+fn account_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = test_seam::ACCOUNT_HOME.with(|h| h.borrow().clone()) {
+        return Some(home);
+    }
+    cadence_hooks_core::paths::account_home()
+}
+
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        pub(super) static ACCOUNT_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` with `home` standing in for the account database's answer on
+    /// this thread.
+    pub(crate) fn with_account_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACCOUNT_HOME.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        ACCOUNT_HOME.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+        let _reset = Reset;
+        f()
+    }
 }
 
 /// Is this edit targeting the term source itself?
@@ -337,8 +393,8 @@ pub(crate) fn terms_path() -> Option<PathBuf> {
 /// positive here would exempt an arbitrary file from the identity scan, which
 /// is the far worse error — so an unresolvable path is scanned, not skipped.
 /// Both the literal and canonicalized comparisons are tried, because the file
-/// may not exist yet (the first write that creates it) and because `HOME` is
-/// often a symlink.
+/// may not exist yet (the first write that creates it) and because the home
+/// directory is often reached through a symlink.
 pub(crate) fn is_term_source(file_path: Option<&str>) -> bool {
     let Some(fp) = file_path.filter(|p| !p.is_empty()) else {
         return false;
@@ -372,8 +428,16 @@ pub(crate) fn load() -> (IdentityList, Status) {
 /// [`load`] against an explicit path — the one reader both the resolved term
 /// source and a test fixture go through.
 pub(crate) fn load_from(path: &std::path::Path) -> (IdentityList, Status) {
-    if !path.exists() {
-        return (IdentityList::default(), Status::Absent);
+    // `symlink_metadata`, not `exists`: `exists` reads a permission error on
+    // a parent directory, and a dangling link, as absent, which would make an
+    // unreadable source inert instead of Unreadable (#1617). Only a real
+    // `NotFound` on the path itself is absent.
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (IdentityList::default(), Status::Absent);
+        }
+        Err(_) => return (IdentityList::default(), Status::Unreadable),
+        Ok(_) => {}
     }
     // Same bounded, regular-file-only reader the body-file path uses: a symlink
     // to /dev/zero or a multi-GB file must not hang the hook (#157/#194).
@@ -739,6 +803,35 @@ mod tests {
         // Not via load() (which reads the real path) — parse directly.
         let err = toml::from_str::<IdentityList>("terms = [ this is not toml").unwrap_err();
         assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn load_from_tells_absent_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_from(&dir.path().join("none.toml")).1, Status::Absent);
+        assert_eq!(load_from(dir.path()).1, Status::Unreadable, "a directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A directory the reader cannot search: `exists` reads this as
+            // absent, which would leave an unreadable source inert (#1617).
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(
+                locked.join("redaction.toml"),
+                "[[terms]]\nid=\"T1\"\nterm=\"x\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let searchable = std::fs::read_dir(&locked).is_ok();
+            let status = load_from(&locked.join("redaction.toml")).1;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if searchable {
+                eprintln!("mode-000 row skipped: running as a user who can read it");
+            } else {
+                assert_eq!(status, Status::Unreadable, "unsearchable parent");
+            }
+        }
     }
 
     #[test]

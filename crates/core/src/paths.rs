@@ -159,9 +159,13 @@ pub fn cloud_sync_marker(path: &Path) -> Option<&'static str> {
 
 /// The current user's home directory from the account database, not `HOME`.
 ///
-/// For a check that widens what is allowed: a repo's settings `env` block
-/// reaches hook processes and can set `HOME`, but not the passwd entry. `None`
-/// on a lookup failure and on platforms without one.
+/// For a check that widens what is allowed, or a control that must not be
+/// pointed away from its config: a repo's settings `env` block reaches hook
+/// processes and can set `HOME` or `USERPROFILE`, but not the account
+/// database. On unix that is the passwd entry (`getpwuid_r`); on Windows the
+/// profile known folder (`SHGetKnownFolderPath(FOLDERID_Profile)`), which
+/// reads the user's profile registration, not the process environment.
+/// `None` on a lookup failure and on other platforms.
 pub fn account_home() -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -192,10 +196,45 @@ pub fn account_home() -> Option<PathBuf> {
         let dir = std::ffi::OsStr::from_bytes(dir.to_bytes());
         (!dir.is_empty()).then(|| PathBuf::from(dir))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_profile_dir()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
+}
+
+/// The Windows profile directory from the known-folder API.
+#[cfg(windows)]
+fn windows_profile_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
+
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `FOLDERID_Profile` is a valid GUID that outlives the call, a
+    // null token means the current user, and `raw` is a writable out-pointer.
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, 0, std::ptr::null_mut(), &mut raw) };
+    let dir = if hr >= 0 && !raw.is_null() {
+        // SAFETY: on success `raw` points at a NUL-terminated UTF-16 string
+        // the call allocated; it is read up to the NUL and freed below.
+        let wide = unsafe {
+            let mut len = 0usize;
+            while *raw.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(raw, len)
+        };
+        Some(PathBuf::from(std::ffi::OsString::from_wide(wide)))
+    } else {
+        None
+    };
+    // SAFETY: the API documents that the caller frees `raw` with
+    // `CoTaskMemFree` whether or not the call succeeded; null is allowed.
+    unsafe { CoTaskMemFree(raw.cast_const().cast()) };
+    dir.filter(|d| !d.as_os_str().is_empty())
 }
 
 /// Does a file at or under `dir` leave the machine with no command at all?
@@ -615,10 +654,10 @@ mod tests {
         assert_eq!(super::cloud_sync_marker(path), Some("OneDrive"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn account_home_is_an_existing_absolute_dir() {
-        let home = super::account_home().expect("passwd entry");
+        let home = super::account_home().expect("account database entry");
         assert!(home.is_absolute(), "{}", home.display());
         assert!(home.is_dir(), "{}", home.display());
     }

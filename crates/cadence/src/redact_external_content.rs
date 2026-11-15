@@ -16,7 +16,9 @@
 //!   work-identifiable terms from `~/.config/cadence/redaction.toml`, outside
 //!   every repo, and is config-blind by signature — no per-repo file can
 //!   soften it. `mode = "warn"` downgrades it to advisory, and it is inert
-//!   when the term source is absent or unreadable (fail-open per ADR-0001).
+//!   when the term source is absent, malformed or empty (fail-open per
+//!   ADR-0001). A term source that exists but cannot be read blocks posts and
+//!   commit messages instead (#1617).
 //!
 //! Both tiers run on every body, deliberately without a short-circuit, and
 //! [`combine`] folds them: only the identity tier can produce a block.
@@ -1214,7 +1216,17 @@ impl Check for RedactExternalContent {
                 cred_hits.extend(credential_scan::scan(text));
             }
         }
-        let (identity_list, _status) = identity::load();
+        let (identity_list, status) = identity::load();
+        // A term source that is there but cannot be read: the machine expects
+        // the tier, and nothing can be checked against it, so the post stops
+        // (cameronsjo/cadence-hooks#1617). An absent file stays inert.
+        if status.blocks_posts() && !bodies.is_empty() {
+            let mut message = unreadable_source_message();
+            if !cred_hits.is_empty() {
+                message = format!("{}\n{message}", credential_scan::render(&cred_hits));
+            }
+            return CheckResult::block(message);
+        }
         // A text the identity scan could not read is said once on stderr, and
         // only where the tier is armed — a machine with no term source has
         // nothing the scan failed to do. The verdict is unchanged: fail open.
@@ -1318,6 +1330,23 @@ impl Check for RedactExternalContent {
         let folded = combine(&identity_hits, &hits, &warnings, &notes, identity_list.mode);
         with_credential_block(&cred_hits, folded)
     }
+}
+
+/// The block for a term source that exists but cannot be read (#1617).
+fn unreadable_source_message() -> String {
+    let path = identity::terms_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
+    format!(
+        "⛔  redact-external-content: BLOCKED — the identity term source exists but could not be \
+         read, so this post or commit message cannot be checked for work-identifiable terms.\n\
+         Found: {path} (permissions on it or its directory, a dangling link, not a regular \
+         file, or over the size cap)\n\
+         Fix: make it a readable regular file (`chmod 600 '{path}'`), then retry. To run this \
+         machine without the identity tier on purpose, remove the file instead. \
+         `CADENCE_ALLOW_SENSITIVE_TERMS` does not release this block.\n\
+         Check: cadence-hooks cadence redact-scan --status"
+    )
 }
 
 /// What one repo's `redaction` config makes of the posted bodies: the shaped
@@ -1822,7 +1851,8 @@ pub struct TermMatch {
 ///
 /// Config-blind like the tier itself: no repo file and no other guard's ignore
 /// list can soften a match. Empty when the source is absent, unreadable, or
-/// unarmed (fail-open, ADR-0001).
+/// unarmed: this reader only nudges, so it never blocks on the source's state
+/// (the posting hook's unreadable-source block is separate, #1617).
 pub fn identity_matches(text: &str) -> Vec<TermMatch> {
     let (list, _) = identity::load();
     to_term_matches(text, &list)
@@ -2411,7 +2441,7 @@ pub fn status_report() -> (String, bool) {
     let (list, status) = identity::load();
     let path = identity::terms_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
+        .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
     let mut report = match &status {
         identity::Status::Armed(n) => {
             let mode = match list.mode {
@@ -2432,9 +2462,9 @@ pub fn status_report() -> (String, bool) {
         ),
         identity::Status::Unreadable => format!(
             "⚠️  redaction identity tier: NOT ARMED — term source at {path} exists but \
-             could not be read (permissions, or not a regular file).\n\
-             This is reported exactly like an absent file on purpose: from the outcome \
-             alone the two are indistinguishable, and both mean nothing is being caught."
+             could not be read (permissions, a dangling link, or not a regular file).\n\
+             Nothing is being caught, so posts and commit messages are BLOCKED until the \
+             file is readable. Fix its permissions, or remove it to run without the tier."
         ),
         identity::Status::ZeroTerms => format!(
             "⚠️  redaction identity tier: NOT ARMED — term source at {path} parsed but \
@@ -2465,7 +2495,7 @@ pub fn run_validate_config() -> u8 {
     let (list, status) = identity::load();
     let path = identity::terms_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
+        .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
     let mut errors: Vec<String> = Vec::new();
     match &status {
         identity::Status::Absent => errors.push(format!("no term source at {path}")),
@@ -2642,11 +2672,19 @@ pub fn run_scan_to(
     // early), which is the fail-open posture ADR-0001 requires and matches the
     // hook, equally inert in that state.
     let (identity_list, status) = identity::load();
-    // An unarmed tier is otherwise indistinguishable from a clean scan: exit 0,
-    // no output. One stderr line says the identity check did not run. The exit
-    // code is unchanged, and the posting guard deliberately does not repeat
-    // this per call — `doctor` reports the state once (#1067).
-    if status.needs_notice() {
+    // A term source that is there but cannot be read blocks, as the hook's
+    // Bash arm does (#1617): exit 1 with the hook's own message, so a caller
+    // that gates a post on this exit code stops where the hook would. The
+    // shaped scan still runs below, as it does after an identity hit.
+    let source_unreadable = status.blocks_posts();
+    if source_unreadable {
+        eprintln!("{}", unreadable_source_message());
+    } else if status.needs_notice() {
+        // An unarmed tier is otherwise indistinguishable from a clean scan:
+        // exit 0, no output. One stderr line says the identity check did not
+        // run. The exit code is unchanged, and the posting guard deliberately
+        // does not repeat this per call — `doctor` reports the state once
+        // (#1067).
         eprintln!(
             "redact-scan: identity tier not armed — no term source loaded, so work-identifiable \
              terms were NOT checked (see `cadence-hooks cadence redact-scan --status`)"
@@ -2659,9 +2697,10 @@ pub fn run_scan_to(
     let identity_hits =
         identity::scan_identity(&input, &identity_list, None, destination.as_deref());
     let bypass = sensitive_terms_bypass();
-    // The EXIT MAPPING mirrors `combine` arm for arm: only Enforce blocks, and
-    // only with no bypass armed. Warn mode and a bypassed block both fall
-    // through to the shaped result.
+    // The EXIT MAPPING mirrors the hook arm for arm: an unreadable source
+    // blocks (above); otherwise only Enforce blocks, and only with no bypass
+    // armed. Warn mode and a bypassed block both fall through to the shaped
+    // result.
     //
     // One property deliberately does NOT mirror: the hook writes a
     // `BypassProvenance` row when the bypass suppresses a block, and this does
@@ -2709,7 +2748,11 @@ pub fn run_scan_to(
     {
         eprintln!("redact-scan: {}", foreign_destination_note(dest));
     }
-    if identity_blocks || any { 1 } else { 0 }
+    if source_unreadable || identity_blocks || any {
+        1
+    } else {
+        0
+    }
 }
 
 /// Port of the script's `--init`: scaffold the `redaction` section of
@@ -6852,5 +6895,124 @@ destinations = ["me/*", "them/exact"]
                 assert!(report.contains("cadence-hooks >="), "{report}");
             },
         );
+    }
+
+    // --- #1617: the term source comes from the account home, not HOME ------
+
+    /// Hold the env lock with the test-only path override cleared, so the
+    /// production lookup runs, with `account` standing in for the passwd entry.
+    fn with_account_home<R>(account: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        with_terms_cleared(|| identity::test_seam::with_account_home(account, f))
+    }
+
+    /// An account home holding `toml_body` as its term source.
+    fn account_with_terms(toml_body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".config/cadence");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("redaction.toml"), toml_body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_term_source_path_is_under_the_account_home() {
+        let account = account_with_terms(FIXTURE);
+        let path = with_account_home(account.path(), identity::terms_path);
+        assert_eq!(
+            path,
+            Some(account.path().join(".config/cadence/redaction.toml"))
+        );
+    }
+
+    #[test]
+    fn the_account_homes_terms_block_a_post_whatever_home_says() {
+        // The real HOME is left alone (other tests and git read it); the seam
+        // stands in for the passwd entry. Read from HOME, this loads the real
+        // machine's list or none, and neither carries the fixture term.
+        let account = account_with_terms(FIXTURE);
+        let r = with_account_home(account.path(), || {
+            post("gh issue comment 1 -R them/x --body 'ships acmecorp tooling'")
+        });
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+        assert!(r.message.as_deref().unwrap_or("").contains("[T1]"));
+    }
+
+    #[test]
+    fn an_unreadable_term_source_blocks_posts_and_an_absent_one_does_not() {
+        // A directory where the file should be reads as Unreadable.
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unreadable.path().join(".config/cadence/redaction.toml")).unwrap();
+        let r = with_account_home(unreadable.path(), || {
+            assert_eq!(identity::load().1, identity::Status::Unreadable);
+            post("gh issue comment 1 -R them/x --body hello")
+        });
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+        let msg = r.message.unwrap_or_default();
+        assert!(msg.contains("could not be"), "{msg}");
+        assert!(msg.contains("Fix:"), "{msg}");
+        // Join per component: a "/"-joined fixture mixes separators on Windows
+        // and never matches the native path the message prints.
+        let source = unreadable
+            .path()
+            .join(".config")
+            .join("cadence")
+            .join("redaction.toml");
+        assert!(msg.contains(&source.display().to_string()), "{msg}");
+        // A commit message is a post to this tier.
+        let r = with_account_home(unreadable.path(), || post("git commit -m 'wip'"));
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+
+        // A dangling link where the file should be: unreadable, not absent.
+        #[cfg(unix)]
+        {
+            let dangling = tempfile::tempdir().unwrap();
+            let cfg = dangling.path().join(".config/cadence");
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::os::unix::fs::symlink(cfg.join("gone.toml"), cfg.join("redaction.toml")).unwrap();
+            let r = with_account_home(dangling.path(), || {
+                assert_eq!(identity::load().1, identity::Status::Unreadable);
+                post("gh issue comment 1 -R them/x --body hello")
+            });
+            assert_eq!(r.outcome, Outcome::Block, "dangling link: {:?}", r.message);
+        }
+
+        // No file at all: a machine without the tier stays inert.
+        let absent = tempfile::tempdir().unwrap();
+        let r = with_account_home(absent.path(), || {
+            assert_eq!(identity::load().1, identity::Status::Absent);
+            post("gh issue comment 1 -R them/x --body hello")
+        });
+        assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+
+        // A command that posts nothing is untouched by an unreadable source.
+        let r = with_account_home(unreadable.path(), || post("ls -la"));
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn redact_scan_exits_nonzero_on_an_unreadable_term_source() {
+        // The CLI is the only gate for surfaces the hook's command shape does
+        // not cover, so it must refuse where the hook refuses (#1617).
+        let body_dir = tempfile::tempdir().unwrap();
+        let body = body_dir.path().join("body.md");
+        std::fs::write(&body, "a plain sentence\n").unwrap();
+        let scan = || {
+            run_scan(
+                Some(body.display().to_string()),
+                Some("owned-internal".into()),
+                false,
+            )
+        };
+
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unreadable.path().join(".config/cadence/redaction.toml")).unwrap();
+        assert_eq!(with_account_home(unreadable.path(), scan), 1, "unreadable");
+
+        // Same body, no term source: inert, exit 0.
+        let absent = tempfile::tempdir().unwrap();
+        assert_eq!(with_account_home(absent.path(), scan), 0, "absent");
+        // Same body, a readable source without a match: exit 0.
+        let armed = account_with_terms(FIXTURE);
+        assert_eq!(with_account_home(armed.path(), scan), 0, "armed, clean");
     }
 }
