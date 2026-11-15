@@ -175,6 +175,18 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **WHEN** the command is `gh api -X POST repos/{owner}/{repo}/issues -f title=x` in a checkout of `cameronsjo/tool`
 - **THEN** the hook allows, because gh fills the placeholders from that checkout
 
+#### Scenario: Placeholder owner on a named host
+- **WHEN** the command is `gh api --hostname evil.example -X POST repos/{owner}/{repo}/issues -f title=x` in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2, because gh sends it to `evil.example`, which the allowlist does not cover
+
+#### Scenario: Upload and GHE.com URL prefixes
+- **WHEN** the command is `gh api -X POST "https://uploads.github.com/repos/evil/x/releases/1/assets?name=a" --input a`, or `https://api.acme.ghe.com/repos/evil/x/…` with `acme.ghe.com` in `CADENCE_EXTRA_HOSTS`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Look-alike API host
+- **WHEN** the command is `gh api -X POST https://api.github.com.evil.example/repos/evil/x/issues -f t=x`
+- **THEN** the hook allows, because the host is compared whole and names no repo this guard reads
+
 #### Scenario: Unconfigured machine
 - **WHEN** `CADENCE_ALLOWED_OWNERS` is unset and the command is `gh pr merge 5 -R cameronsjo/tool`
 - **THEN** the hook exits 2 with `Not configured`

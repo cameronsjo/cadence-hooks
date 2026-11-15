@@ -605,6 +605,10 @@ enum RepoResolution {
         upstream_host: String,
         upstream: String,
     },
+    /// An organization a `gh api orgs/<org>/…` write names ([`api_orgs_target`]).
+    /// Judged on the org as its owner; repo-scoped allowlist entries do not
+    /// cover it.
+    Org { host: String, org: String },
     /// Cannot determine target: allowed (cadence-ecosystem ADR-0046 rule 3).
     Unresolvable,
     /// Resolution abandoned at the #271 subprocess deadline: the guard's own
@@ -936,16 +940,36 @@ fn resolve_unflagged_target(
     if let Some(endpoint) = gh_api_endpoint(command) {
         if let Some((host, repo)) = api_repos_target_on(&endpoint) {
             // gh fills `{owner}` (and `{repo}`) from the checkout's own repo,
-            // so a placeholder owner is judged as an untargeted write is.
+            // so a placeholder owner is judged as an untargeted write is. A
+            // host the command names (a URL host, `--hostname`, an inline
+            // `GH_HOST`) is still where gh sends it, so the filled-in repo is
+            // judged there, as the literal path would be.
             if let Some(name) = repo.strip_prefix("{owner}/") {
+                let named = host.or_else(|| selected_gh_host(command));
                 return match resolve_from_git_remotes(work_dir) {
-                    RepoResolution::Resolved { host, repo: own } if name != "{repo}" => {
-                        let owner = own.split('/').next().unwrap_or_default().to_string();
+                    RepoResolution::Resolved { host, repo: own } => {
+                        let repo = if name == "{repo}" {
+                            own
+                        } else {
+                            let owner = own.split('/').next().unwrap_or_default();
+                            format!("{owner}/{name}")
+                        };
                         RepoResolution::Resolved {
-                            host,
-                            repo: format!("{owner}/{name}"),
+                            host: named.unwrap_or(host),
+                            repo,
                         }
                     }
+                    RepoResolution::Fork {
+                        origin_host,
+                        origin,
+                        upstream_host,
+                        upstream,
+                    } => RepoResolution::Fork {
+                        origin_host: named.clone().unwrap_or(origin_host),
+                        origin,
+                        upstream_host: named.unwrap_or(upstream_host),
+                        upstream,
+                    },
                     resolution => resolution,
                 };
             }
@@ -954,12 +978,11 @@ fn resolve_unflagged_target(
                 repo,
             };
         }
-        // An org-level write is judged on the org as its owner. Repo-scoped
-        // allowlist entries do not cover it: the name half is empty.
-        if let Some(org) = api_orgs_target(&endpoint) {
-            return RepoResolution::Resolved {
-                host: dh.to_string(),
-                repo: format!("{org}/"),
+        // An org-level write is judged on the org as its owner.
+        if let Some((host, org)) = api_orgs_target(&endpoint) {
+            return RepoResolution::Org {
+                host: host.unwrap_or_else(|| dh.to_string()),
+                org,
             };
         }
     }
@@ -1091,6 +1114,31 @@ fn disallowed_message(
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
 ) -> String {
+    disallowed_message_for(
+        "repo",
+        host,
+        repo,
+        allowed_owners,
+        allowed_repos,
+        extra_hosts,
+    )
+}
+
+/// The fix for an org-level write to an org the operator does not own: no
+/// `-R` or repo path moves it, so the user runs it.
+const ORG_WRITE_FIX: &str = "an org-level write has no owned form to switch to; if the user \
+     intends it, write the command for them to run themselves";
+
+/// [`disallowed_message`] for a target of kind `what` (`repo`, or `an org`
+/// for an `orgs/<org>/…` write, whose target is the org alone).
+fn disallowed_message_for(
+    what: &str,
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> String {
     let all_entries = allowed_display_list(allowed_owners, allowed_repos);
 
     // Self-hosted-forge users trip over host scoping: bare allowlist entries
@@ -1112,13 +1160,14 @@ fn disallowed_message(
     };
 
     format!(
-        "🚫 git-guardrails: gh write targets repo you don't own\n   \
+        "🚫 git-guardrails: gh write targets {what} you don't own\n   \
          Target:  {shown_host}/{repo}\n   \
          Allowed: {}{host_hint}\n\n   \
          DO NOT override with env vars. Instead:\n   \
-         1. Confirm the user intends to write to this repo\n   \
+         1. Confirm the user intends to write to this {kind}\n   \
          2. Write a shell script the user can execute manually",
-        all_entries.join(" ")
+        all_entries.join(" "),
+        kind = if what == "repo" { "repo" } else { "org" },
     )
 }
 
@@ -1347,48 +1396,74 @@ fn api_repos_target(endpoint: &str) -> Option<String> {
     api_repos_target_on(endpoint).map(|(_, repo)| repo)
 }
 
-/// [`api_repos_target`], with the host an absolute endpoint URL names. gh
-/// sends an absolute URL where it says, whatever `GH_HOST` or `--hostname`
-/// say, and models copy one from an API response's `url` field. Two literal
-/// prefixes are read: `https://api.github.com/` (host `github.com`) and
-/// `https://<host>/api/v3/` for a host this guard already knows (the default
-/// host or one in `CADENCE_EXTRA_HOSTS`). Any other URL names no repo this
-/// guard reads, and is `None`.
+/// [`api_repos_target`], with the host an absolute endpoint URL names
+/// ([`api_endpoint_path`]).
 fn api_repos_target_on(endpoint: &str) -> Option<(Option<String>, String)> {
-    let path = endpoint.split(['?', '#']).next().unwrap_or("");
-    let (host, path) = match path.strip_prefix("https://") {
-        None => (None, path),
-        Some(rest) => {
-            let (host, tail) = rest.split_once('/')?;
-            let host = host.to_ascii_lowercase();
-            if host == "api.github.com" {
-                (Some("github.com".to_string()), tail)
-            } else if host == default_host() || env_extra_hosts().contains(&host) {
-                (Some(host), tail.strip_prefix("api/v3/")?)
-            } else {
-                return None;
-            }
-        }
-    };
+    let (host, path) = api_endpoint_path(endpoint)?;
     API_REPOS
         .captures(path)
         .and_then(|caps| caps.get(1))
         .map(|m| (host, m.as_str().to_string()))
 }
 
-/// The organization a `gh api` endpoint path `orgs/<org>/…` names, when the
-/// name is literal (letters, digits, `-` and `_`). Reads the path only, like
-/// [`api_repos_target`]. A write there lands on that owner: `gh api -X POST
-/// orgs/<org>/repos` creates a repo under it.
-fn api_orgs_target(endpoint: &str) -> Option<String> {
+/// The host a known host string names, compared whole and case-insensitively:
+/// the default host or one in `CADENCE_EXTRA_HOSTS`.
+fn is_known_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(&default_host())
+        || env_extra_hosts()
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(host))
+}
+
+/// The path of a `gh api` endpoint, cut at `?` or `#`, and the host an
+/// absolute endpoint URL names. gh sends an absolute URL where it says,
+/// whatever `GH_HOST` or `--hostname` say, and models copy one from an API
+/// response's `url`, `repos_url` or `upload_url` field.
+///
+/// A relative endpoint is its own path, with no host. An absolute one is read
+/// only behind these literal prefixes, each host compared whole:
+///
+/// - `https://api.github.com/` and `https://uploads.github.com/` (host
+///   `github.com`);
+/// - `https://<host>/api/v3/` and `https://<host>/api/uploads/` for a known
+///   host ([`is_known_host`]);
+/// - `https://api.<tenant>.ghe.com/` when `<tenant>.ghe.com` is a known host.
+///
+/// Any other URL names no path this guard reads, and is `None`.
+fn api_endpoint_path(endpoint: &str) -> Option<(Option<String>, &str)> {
     let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    let Some(rest) = path.strip_prefix("https://") else {
+        return Some((None, path));
+    };
+    let (host, tail) = rest.split_once('/')?;
+    let host = host.to_ascii_lowercase();
+    if host == "api.github.com" || host == "uploads.github.com" {
+        return Some((Some("github.com".to_string()), tail));
+    }
+    if is_known_host(&host) {
+        let tail = tail
+            .strip_prefix("api/v3/")
+            .or_else(|| tail.strip_prefix("api/uploads/"))?;
+        return Some((Some(host), tail));
+    }
+    let tenant = host.strip_prefix("api.")?;
+    (tenant.ends_with(".ghe.com") && is_known_host(tenant))
+        .then(|| (Some(tenant.to_string()), tail))
+}
+
+/// The organization a `gh api` endpoint path `orgs/<org>/…` names, when the
+/// name is literal (letters, digits, `-` and `_`), with the host an absolute
+/// URL names ([`api_endpoint_path`]). A write there lands on that owner: `gh
+/// api -X POST orgs/<org>/repos` creates a repo under it.
+fn api_orgs_target(endpoint: &str) -> Option<(Option<String>, String)> {
+    let (host, path) = api_endpoint_path(endpoint)?;
     let rest = path.trim_start_matches('/').strip_prefix("orgs/")?;
     let org = rest.split('/').next().unwrap_or("");
     (!org.is_empty()
         && org
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
-    .then(|| org.to_string())
+    .then(|| (host, org.to_string()))
 }
 
 /// Long flags of the `gh repo` verbs in [`REPO_TARGET_VERBS`] that consume a
@@ -2010,7 +2085,7 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// flag, and none of the sub-command shapes that name the repo positionally.
 ///
 /// The complement of the command-text arms of [`resolve_target_repos_on`]
-/// (`-R`, a `gh repo` positional, a `gh api repos/…` path), expressed as a
+/// (`-R`, a `gh repo` positional, a `gh api repos/…` or `orgs/…` path), expressed as a
 /// predicate rather than a resolution: the JIT nudge only needs to know
 /// *whether* a target was spelled out, not what it resolves to. Kept beside the
 /// patterns it reads so a new positional-target shape lands in one file.
@@ -2024,7 +2099,9 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// yet, though resolution reads it first, so such a write keeps the nudge.
 pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
     repo_flag(segment) == RepoFlag::Absent
-        && gh_api_endpoint(segment).is_none_or(|endpoint| api_repos_target(&endpoint).is_none())
+        && gh_api_endpoint(segment).is_none_or(|endpoint| {
+            api_repos_target(&endpoint).is_none() && api_orgs_target(&endpoint).is_none()
+        })
         && gh_repo_positional_target(segment).is_none()
         && !gh_write_is_user_scoped(segment)
 }
@@ -2405,6 +2482,34 @@ fn judge_resolution(
         }
         // No `-R` and no readable remote: nothing to judge (ADR-0046 rule 3).
         RepoResolution::Unresolvable => None,
+        RepoResolution::Org { host, org } => {
+            if config::is_allowed_with_extra_hosts(
+                &host,
+                &org,
+                "",
+                allowed_owners,
+                &[],
+                extra_hosts,
+            ) {
+                return None;
+            }
+            Some(CheckResult::block_structured(
+                disallowed_message_for(
+                    "an org",
+                    &host,
+                    &org,
+                    allowed_owners,
+                    allowed_repos,
+                    extra_hosts,
+                ),
+                BlockMetadata {
+                    rule_id: "gh-write-unauthorized-target".to_string(),
+                    fix: ORG_WRITE_FIX.to_string(),
+                    allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                    severity: "error",
+                },
+            ))
+        }
         RepoResolution::SelectorUrl { host, repo } => {
             if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
                 return None;
@@ -3993,6 +4098,34 @@ mod tests {
                     unowned.path(),
                     true,
                 ),
+                // A host the command names is where gh sends it, so the
+                // filled-in repo is judged there, as the literal path is
+                // (security review round-2 N1 on #1633).
+                (
+                    "gh api --hostname evil.example -X POST repos/{owner}/{repo}/issues -f t=x",
+                    owned.path(),
+                    true,
+                ),
+                (
+                    "GH_HOST=evil.example gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    owned.path(),
+                    true,
+                ),
+                (
+                    "gh api --hostname evil.example -X POST repos/{owner}/other/issues -f t=x",
+                    owned.path(),
+                    true,
+                ),
+                (
+                    "gh api --hostname evil.example -X POST repos/cameronsjo/x/issues -f t=x",
+                    owned.path(),
+                    true,
+                ),
+                (
+                    "gh api --hostname github.com -X POST repos/{owner}/{repo}/issues -f t=x",
+                    owned.path(),
+                    false,
+                ),
             ] {
                 let cwd = cwd.to_str().expect("utf-8 path");
                 let result = GhWriteGuard.run(&input_with(command, cwd));
@@ -4004,15 +4137,15 @@ mod tests {
     #[test]
     fn an_absolute_api_url_is_judged_on_its_repo() {
         // A model copies an endpoint from an API response's `url` field.
-        // `https://api.github.com/` and `https://<host>/api/v3/` on a host the
-        // guard knows are read like a relative `repos/…` path (security
-        // review I1 on #1633).
+        // Each literal prefix `api_endpoint_path` reads is judged like a
+        // relative `repos/…` path, unowned and owned, and a look-alike host
+        // names nothing (security review I1 and round-2 N2 on #1633).
         let owned = origin_checkout("https://github.com/cameronsjo/x.git");
         let cwd = owned.path().to_str().expect("utf-8 path");
         let mut env = owners_env();
         for entry in env.iter_mut() {
             if entry.0 == "CADENCE_EXTRA_HOSTS" {
-                entry.1 = Some("ghe.example");
+                entry.1 = Some("ghe.example,acme.ghe.com");
             }
         }
         with_env(&env, || {
@@ -4040,6 +4173,51 @@ mod tests {
                 // A bare entry covers a known extra host, as for `-R`.
                 (
                     "gh api -X POST https://ghe.example/api/v3/repos/cameronsjo/x/issues -f t=x",
+                    false,
+                ),
+                (
+                    "gh api -X POST \"https://uploads.github.com/repos/work-org/x/releases/1/assets?name=a\" --input a",
+                    true,
+                ),
+                (
+                    "gh api -X POST \"https://uploads.github.com/repos/cameronsjo/x/releases/1/assets?name=a\" --input a",
+                    false,
+                ),
+                (
+                    "gh api -X POST https://ghe.example/api/uploads/repos/work-org/x/releases/1/assets --input a",
+                    true,
+                ),
+                (
+                    "gh api -X POST https://ghe.example/api/uploads/repos/cameronsjo/x/releases/1/assets --input a",
+                    false,
+                ),
+                (
+                    "gh api -X POST https://api.acme.ghe.com/repos/work-org/x/issues -f t=x",
+                    true,
+                ),
+                (
+                    "gh api -X POST https://API.Acme.GHE.com/repos/work-org/x/issues -f t=x",
+                    true,
+                ),
+                (
+                    "gh api -X POST https://api.acme.ghe.com/repos/cameronsjo/x/issues -f t=x",
+                    false,
+                ),
+                // Look-alike hosts: compared whole, never by suffix or part.
+                (
+                    "gh api -X POST https://api.github.com.evil.example/repos/work-org/x/issues -f t=x",
+                    false,
+                ),
+                (
+                    "gh api -X POST https://uploads.github.com.evil.example/repos/work-org/x/issues -f t=x",
+                    false,
+                ),
+                (
+                    "gh api -X POST https://api.other.ghe.com/repos/work-org/x/issues -f t=x",
+                    false,
+                ),
+                (
+                    "gh api -X POST https://ghe.example.evil.example/api/v3/repos/work-org/x/issues -f t=x",
                     false,
                 ),
                 // A host the guard does not know names no repo it reads.
@@ -4075,6 +4253,19 @@ mod tests {
                 ("gh api -X POST orgs/work-org/repos -f name=x", true),
                 ("gh api -X PATCH /orgs/work-org -f name=x", true),
                 ("gh api -X POST orgs/cameronsjo/repos -f name=x", false),
+                // The absolute form is read behind the same prefixes.
+                (
+                    "gh api -X POST https://api.github.com/orgs/work-org/repos -f name=x",
+                    true,
+                ),
+                (
+                    "gh api -X POST https://api.github.com/orgs/cameronsjo/repos -f name=x",
+                    false,
+                ),
+                (
+                    "gh api -X POST https://api.github.com.evil.example/orgs/work-org/repos -f name=x",
+                    false,
+                ),
                 // An expanded org names no owner this guard reads.
                 ("gh api -X POST \"orgs/$o/repos\" -f name=x", false),
                 ("gh api orgs/work-org/repos", false),
@@ -4087,6 +4278,26 @@ mod tests {
                     msg(&result)
                 );
             }
+            // The block names the org as the target and a fix that fits an
+            // org-level write, not a repo path.
+            let result = GhWriteGuard.run(&input_with(
+                "gh api -X POST orgs/work-org/repos -f name=x",
+                cwd,
+            ));
+            let message = msg(&result);
+            assert!(
+                message.contains("gh write targets an org you don't own"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Target:  github.com/work-org\n"),
+                "{message}"
+            );
+            assert!(message.contains("write to this org"), "{message}");
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+            assert_eq!(meta.fix, ORG_WRITE_FIX);
+            assert!(!meta.fix.contains("repos/"), "{}", meta.fix);
         });
     }
 
@@ -4249,8 +4460,6 @@ mod tests {
         let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &extras);
         assert!(!msg.contains("Host scope"));
     }
-
-    // --- CodeRabbit #6: read-only gh loops should not block ---
 
     // --- BlockMetadata payloads on hard blocks ---
 
@@ -4826,8 +5035,6 @@ mod tests {
         assert!(!segment_invokes_gh(r#"eval "echo done""#));
     }
 
-    // --- #78: unverifiable gh api writes block; graphql reads exempt ---
-
     // The crate's own dir is an owned checkout (origin = cameronsjo/cadence-hooks),
     // so it exercises the cwd-remote fallback the bypass relied on.
     const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -5357,14 +5564,6 @@ mod tests {
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
     }
-
-    // --- #262/#263/#300/#317: graphql writes are allowed ---
-
-    // --- unit: strip_graphql_literals ---
-
-    // --- unit: graphql_root_mutation_fields ---
-
-    // --- unit: graphql_is_safe_mutation ---
 
     // --- #463 / #353: targets resolve from parsed argv, never the raw string ---
 
@@ -7153,6 +7352,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn an_api_path_that_names_its_target_silences_the_bare_write_nudge() {
+        // The guard judges a `repos/…` or `orgs/…` path, relative or absolute,
+        // as an explicit target, so the nudge predicate agrees.
+        for command in [
+            "gh api -X POST repos/cameronsjo/x/issues -f t=x",
+            "gh api -X POST https://api.github.com/repos/cameronsjo/x/issues -f t=x",
+            "gh api -X POST orgs/cameronsjo/repos -f name=x",
+            "gh api -X POST https://api.github.com/orgs/cameronsjo/repos -f name=x",
+        ] {
+            assert!(!segment_lacks_explicit_target(command), "{command}");
+        }
+        assert!(segment_lacks_explicit_target(
+            "gh api -X POST user/keys -f key=x"
+        ));
+    }
+
     /// Assert a command blocks as an unowned target from an OWNED checkout —
     /// the direction that matters, since the cwd remote would otherwise answer
     /// and allow it.
@@ -7310,9 +7526,7 @@ mod tests {
         );
     }
 
-    // --- #756: account-scoped `gh api` writes name a form that works ---
-
-    // --- #757: an unexpanded `--repo` value is unresolvable, not unowned ---
+    // --- #757/#1491: an expanded `--repo` value is judged by its literal owner ---
 
     #[test]
     fn expansion_under_a_literal_owned_owner_is_still_judged_by_owner() {
@@ -7687,8 +7901,6 @@ mod tests {
         });
     }
 
-    // --- #548: an exported GH_HOST reaches gh ---
-
     /// A hermetic checkout whose `origin` is `url`.
     fn origin_checkout(url: &str) -> tempfile::TempDir {
         let repo = tempfile::tempdir().expect("create git fixture");
@@ -7696,8 +7908,6 @@ mod tests {
         cadence_hooks_core::git_fixtures::git_in(repo.path(), &["remote", "add", "origin", url]);
         repo
     }
-
-    // --- #1524: a loop's fix names the cwd's repo only for a write that targets it ---
 
     /// How gh's target repo is read (cadence-hooks#1077, #1069, #937, #1115):
     /// every row is `(command, run from the owned checkout?, blocks?)`.
