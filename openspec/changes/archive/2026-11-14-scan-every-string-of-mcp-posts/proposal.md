@@ -1,0 +1,19 @@
+## Why
+
+A security review of cameronsjo/cadence#2131 found that `redact-external-content` read an MCP call only through `content`, `new_string` and `edits` (Linear CAM-714). GitHub's issue and pull-request tools post `body` and `title`, Linear's `save_issue` posts `description`, and review tools post `comment`, so a work-identifiable term in any of them went out unscanned. The reviewer reproduced it with an armed test term: `create_issue`, `create_pull_request` and `update_issue` with the term in `body` exited 0.
+
+## What Changes
+
+- An `mcp__*` call runs the identity tier over every string value in its input, at any depth, object keys included. Every string, not an allowlist of text fields per tool family: field names belong to each MCP server, and an allowlist misses the next server's names silently.
+- The input is read as the payload sent it, before the typed parse drops a field that fails its shape, so a `content` array of blocks or an object `description` is still read.
+- The top-level `file_path`/`path` is scanned by both tiers, and no path exempts any string on an MCP call: whether a path is local is known only for this machine, and the server may be remote. On a local shell tool (`mcp__iterm__write_to_terminal`), the `command` the Bash surface reads skips the identity tier only.
+- Old-side text (`old_string`, `oldString`, `old_str`, `old_text`, `oldText`) beside a new-side value skips the identity tier and is counted only against its paired new-side value, so an MCP edit that removes a term still goes through while a commit message beside it is scanned in full. The credential tier reads old-side text too, since the server receives it. The old side is counted with the term matcher, which is case-insensitive, on Write/Edit too.
+- The term-source, local-config and `~/.ssh/config` exemptions stay on `Write` and `Edit`. With no term source the identity tier allows; a term source that is there but unreadable blocks every MCP call that carries a string, object keys included, as it blocks a Bash post (#1617).
+- The credential tier runs on the same strings on every MCP call, local tools included, with or without a term source, as it does on a Bash post. Before, a token in an MCP `body` went out.
+- Local tools skip the identity tier only: `c3` `compact`/`model`/`rename`, `easel` `chart`, `herdr-bridge` `panes`/`read`, and the `rea` tools whose effect audit neither launches a process, reaches the network, nor writes files. They act on this machine and send their text to no tracker, chat, mail or repo. `herdr-bridge` `send`/`start` type a prompt into another agent and are scanned. Names are matched exactly, so an unlisted tool is scanned. Read, search and navigation calls to other servers are scanned, since their arguments go to the server.
+- The shaped tier still does not run on MCP calls: it judges the audience from a shell command's target repo, which an MCP call does not have, and would fall back to public and nudge on local paths in tools that never leave the machine.
+
+## Impact
+
+- Code: `crates/cadence/src/redact_external_content.rs`, `crates/core/src/lib.rs` (`HookInput::mcp_tool_input`).
+- Which MCP tools reach the check is the cadence plugin's hook matcher, not this binary. It matched only names containing a write-shaped verb, so Linear's `save_*` and GitHub's `add_*` comment tools never reached it. Routing every `mcp__*` call to the hook lands with cameronsjo/cadence#2149; `tests/fixtures/registration-audit/` carries that wiring already. Until an installed cadence plugin carries it, the binary judges only the MCP calls that plugin routes to it.

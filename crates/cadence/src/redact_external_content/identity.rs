@@ -56,8 +56,10 @@ pub(crate) enum Mode {
 
 /// One allow entry — a context in which a term is benign.
 ///
-/// `path` matches when the scanned content's file path contains it (a Write/Edit
-/// surface only — a commit message has no path). `pattern` matches against the
+/// `path` matches when the scanned content's file path contains it (the
+/// Write/Edit surface only, read from the call's `file_path` — a commit
+/// message has no path, and an MCP call's path is not passed, since it may
+/// name a file on a remote server). `pattern` matches against the
 /// surrounding text. Either alone is sufficient; both empty is inert — unless
 /// `destinations` is set (below).
 ///
@@ -68,7 +70,7 @@ pub(crate) enum Mode {
 /// entry applies only to a post whose target resolves and matches, and it is
 /// ANDed with `path`/`pattern` when those are also set. With `destinations` as
 /// the only clause, the destination match alone excuses the term. A surface
-/// with no resolvable destination (a Write/Edit, a commit whose origin cannot
+/// with no resolvable destination (a Write/Edit, an MCP call, a commit whose origin cannot
 /// be read, a command posting to several repos) never satisfies a
 /// destination-scoped entry: unknown means the term stays blocked.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -377,9 +379,9 @@ pub(crate) mod test_seam {
 /// The term source contains every term, so writing a term into it is, by the
 /// introduced-only rule, "introducing" one — and the tier blocks. That makes
 /// the deny-list **unmaintainable through the harness**: adding a term is
-/// exactly the edit the guard refuses. Worse, the block message tells the
-/// operator to add an `allow` entry *in the term source*, which is the edit it
-/// just blocked. A perfectly circular instruction.
+/// exactly the edit the guard refuses. Worse, the block message asks the
+/// operator for an `allow` entry *in the term source*, which is the edit it
+/// would just have blocked. A perfectly circular instruction.
 ///
 /// Writing terms into the deny-list is definitionally legitimate — it is what
 /// the file is for. Same reasoning that makes the removal edit possible: a
