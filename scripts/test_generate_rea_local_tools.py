@@ -24,6 +24,8 @@ export interface ToolEffects {
   readonly writesFilesystem: boolean;
   readonly launchesProcess: boolean;
   readonly accessesNetwork: boolean;
+  readonly executesForeignCode: boolean;
+  readonly mutatesDevice: boolean;
   readonly idempotent: boolean;
 }
 """
@@ -34,6 +36,8 @@ const effects = (overrides: Partial<ToolEffects> = {}): ToolEffects => ({
   writesFilesystem: false,
   launchesProcess: false,
   accessesNetwork: false,
+  executesForeignCode: false,
+  mutatesDevice: false,
   idempotent: true,
   ...overrides,
 });
@@ -122,6 +126,75 @@ class ParseTest(unittest.TestCase):
             gen.Unreadable, r"defaults do not set 'writesFilesystem'"
         ):
             gen.parse(source)
+
+    def test_a_declared_flag_nobody_reviewed_fails_loud(self) -> None:
+        # A new flag rea adds (sendsTelemetry) is set true; ignoring it would
+        # exempt the tool.
+        added = (
+            (INTERFACE + DEFAULTS)
+            .replace(
+                "  readonly idempotent: boolean;\n",
+                "  readonly idempotent: boolean;\n  readonly sendsTelemetry: boolean;\n",
+            )
+            .replace(
+                "  idempotent: true,\n",
+                "  idempotent: true,\n  sendsTelemetry: false,\n",
+            )
+        )
+        source = table(
+            "  ping: effects({\n    sendsTelemetry: true,\n  }),\n",
+            prelude=added + "\n",
+        )
+        with self.assertRaisesRegex(
+            gen.Unreadable, r"declares 'sendsTelemetry', which is neither judged"
+        ):
+            gen.parse(source)
+
+    def test_foreign_code_and_device_changes_are_judged(self) -> None:
+        source = table(
+            "  instrument: effects({\n    executesForeignCode: true,\n  }),\n",
+            "  push_file: effects({\n    mutatesDevice: true,\n  }),\n",
+        )
+        self.assertEqual(gen.parse(source), {"instrument": True, "push_file": True})
+
+    def test_a_block_comment_marker_in_a_line_comment_keeps_the_flags(self) -> None:
+        # Stripping /* */ first, `lib/*.so` would open a comment that runs to
+        # the next `*/` and deletes `launchesProcess: true`.
+        source = table(
+            "  run_tool: effects({\n    launchesProcess: true, // see lib/*.so\n  }),\n",
+            "  list_strings: effects(), /* local */\n",
+        )
+        self.assertEqual(gen.parse(source), {"run_tool": True, "list_strings": False})
+
+    def test_a_comment_marker_in_a_string_is_text(self) -> None:
+        # Read as a comment, the string's `/*` would run to the `*/` below and
+        # swallow the table header with it.
+        source = table(
+            "  fetch_page: effects({\n    accessesNetwork: true, /* remote */\n  }),\n",
+            prelude=PRELUDE + 'const DOCS = "https://example.com/*";\n',
+        )
+        self.assertEqual(gen.parse(source), {"fetch_page": True})
+
+    def test_an_unterminated_block_comment_fails_loud(self) -> None:
+        source = table("  list_strings: effects(), /* never closed\n")
+        with self.assertRaisesRegex(gen.Unreadable, r"unterminated /\* comment"):
+            gen.parse(source)
+
+    def test_the_table_name_is_matched_exactly(self) -> None:
+        older = (
+            PRELUDE
+            + "export const TOOL_EFFECTS_V1 = {\n  gdb_console: effects(),\n};\n"
+        )
+        source = table("  gdb_console: nativeEvidence,\n", prelude=older)
+        self.assertEqual(gen.parse(source), {"gdb_console": True})
+        twice = (
+            table("  a: effects(),\n")
+            + "export const TOOL_EFFECTS = {\n  b: effects(),\n};\n"
+        )
+        with self.assertRaisesRegex(gen.Unreadable, r"found 2"):
+            gen.parse(twice)
+        with self.assertRaisesRegex(gen.Unreadable, r"found 0"):
+            gen.parse(PRELUDE)
 
     def test_the_cli_exits_2_and_names_the_entry(self) -> None:
         source = table("  fetch_page: effects({ ...BASE }),\n")

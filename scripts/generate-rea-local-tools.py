@@ -2,9 +2,9 @@
 """Derive `REA_LOCAL_TOOLS` from rea's tool-effects audit.
 
 rea (the reverse-engineering MCP server) records each public tool's effects in
-`src/contracts/toolEffects.ts` (`TOOL_EFFECTS`). A tool that neither launches
-a process, reaches the network, nor writes files (`launchesProcess`,
-`accessesNetwork` and `writesFilesystem` all false) reads and annotates local
+`src/contracts/toolEffects.ts` (`TOOL_EFFECTS`). A tool with every flag in
+FLAGS false (it neither launches a process, reaches the network, writes
+files, runs foreign code, nor changes a device) reads and annotates local
 artifacts only; `redact-external-content` lets those skip the identity tier.
 A file writer is left out because the file can land in a work tree.
 
@@ -16,7 +16,10 @@ Usage:
       not match the audit; exit 0 when it does.
 
 Exit 2, naming the entry, on anything this parser cannot vouch for:
-- a field `ToolEffects` does not declare (a renamed or misspelled flag);
+- a field `ToolEffects` does not declare (a renamed or misspelled flag), or
+  a flag it declares that is neither in FLAGS nor in REVIEWED_UNJUDGED;
+- zero or several `export const TOOL_EFFECTS` tables, or an unterminated
+  string or block comment;
 - a judged flag the interface does not declare or `effects()` does not
   default (a flag renamed across the file);
 - a table entry that is neither `effects({...})` nor a named effects
@@ -30,12 +33,33 @@ import pathlib
 import re
 import sys
 
-FLAGS = ("launchesProcess", "accessesNetwork", "writesFilesystem")
+# Flags that make a tool scanned: any of them true and the identity tier runs.
+FLAGS = (
+    "launchesProcess",
+    "accessesNetwork",
+    "writesFilesystem",
+    "executesForeignCode",
+    "mutatesDevice",
+)
+
+# Flags reviewed as not reaching beyond rea itself, so they do not decide
+# anything here. Every flag `ToolEffects` declares must be in FLAGS or here; a
+# new one fails the run until someone reviews it into one of the two.
+REVIEWED_UNJUDGED = {
+    "mutatesTarget": "rea's own analysis state for the opened artifact (names, comments)",
+    "mutatesSession": "rea's session and Evidence records",
+    "changesUiState": "rea's own navigation and view state",
+    "mayDiscardData": "loss of rea state, not text sent anywhere",
+    "idempotent": "retry safety, not an effect",
+}
 
 # One field of an effects object: `name: true` or `name: false`, nothing else.
 FIELD = re.compile(r"\s*([A-Za-z]+)\s*:\s*(true|false)\s*")
 CONST = re.compile(r"^const (\w+) = effects\((.*?)\);", re.DOTALL | re.MULTILINE)
-INTERFACE = re.compile(r"export interface ToolEffects \{(.*?)\n\}", re.DOTALL)
+INTERFACE = re.compile(
+    r"^export interface ToolEffects \{(.*?)\n\}", re.DOTALL | re.MULTILINE
+)
+TABLE = re.compile(r"^export const TOOL_EFFECTS\b(?=\s*[:=])", re.MULTILINE)
 DECLARED = re.compile(r"readonly (\w+): boolean;")
 DEFAULTS = re.compile(
     r"const effects = \([^)]*\)[^=]*=>\s*\(\{(.*?)\.\.\.overrides,?\s*\}\);", re.DOTALL
@@ -49,9 +73,42 @@ class Unreadable(Exception):
 
 
 def strip_comments(text: str) -> str:
-    """Drop `//` line comments and `/* */` blocks."""
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    return re.sub(r"//[^\n]*", "", text)
+    """Drop `//` and `/* */` comments in one pass that tracks strings.
+
+    A comment marker inside a string (`"https://x"`) or the other comment
+    kind (`// see lib/*.so`) is text, not a comment: stripping block comments
+    first would let `lib/*.so` open one that eats live flags. An unterminated
+    string or block comment fails.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        two = text[i : i + 2]
+        if two == "//":
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        elif two == "/*":
+            end = text.find("*/", i + 2)
+            if end < 0:
+                raise Unreadable("an unterminated /* comment")
+            i = end + 2
+        elif ch in "\"'`":
+            j = i + 1
+            while j < n and text[j] != ch:
+                if text[j] == "\\":
+                    j += 1
+                elif ch != "`" and text[j] == "\n":
+                    raise Unreadable(f"an unterminated {ch} string")
+                j += 1
+            if j >= n:
+                raise Unreadable(f"an unterminated {ch} string")
+            out.append(text[i : j + 1])
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def fields(body: str, where: str) -> dict[str, bool]:
@@ -92,6 +149,12 @@ def declared_and_defaults(source: str) -> tuple[set[str], dict[str, bool]]:
     for flag in FLAGS:
         if flag not in declared:
             raise Unreadable(f"ToolEffects does not declare {flag!r}")
+    for flag in sorted(declared):
+        if flag not in FLAGS and flag not in REVIEWED_UNJUDGED:
+            raise Unreadable(
+                f"ToolEffects declares {flag!r}, which is neither judged (FLAGS) "
+                "nor reviewed as not mattering (REVIEWED_UNJUDGED)"
+            )
     d = DEFAULTS.search(source)
     if not d:
         raise Unreadable("no `effects()` defaults helper found")
@@ -122,7 +185,12 @@ def parse(source: str) -> dict[str, bool]:
         )
         for m in CONST.finditer(source)
     }
-    start = source.index("export const TOOL_EFFECTS")
+    tables = list(TABLE.finditer(source))
+    if len(tables) != 1:
+        raise Unreadable(
+            f"expected one `export const TOOL_EFFECTS`, found {len(tables)}"
+        )
+    start = tables[0].start()
     body = source[source.index("{", start) + 1 :]
     depth = 1
     for i, ch in enumerate(body):
