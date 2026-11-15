@@ -150,7 +150,8 @@ fn unowned_nudge(
 
 /// At most this many distinct (directory, remote) pairs are probed per
 /// command. Each costs git subprocesses against the shared #271 deadline, and
-/// the count is the command's to choose. Pushes past it are not judged.
+/// the count is the command's to choose. A push that would need a probe past
+/// it is not judged; a literal URL needs none and still is.
 const MAX_PROBES: usize = 4;
 
 /// Git subcommands that neither check out another branch nor change where
@@ -386,7 +387,7 @@ fn judge_push(input: &HookInput) -> Option<String> {
     // leaves the push where the walk read it (cameronsjo/cadence-hooks#1530).
     let pushes = push_locations_reading(command, &input_cwd(input), UnreadEval::StaysPut);
     let mut probed: Vec<(&str, Option<&str>)> = Vec::new();
-    let mut bare_checked: Option<bool> = None;
+    let mut bare_judged: Option<bool> = None;
     for push in pushes.iter().filter(|push| read_exactly(push)) {
         let remote = push.repository.as_deref();
         let url = match remote {
@@ -398,7 +399,7 @@ fn judge_push(input: &HookInput) -> Option<String> {
                 // before the command runs; an earlier branch switch in the
                 // same command can send it elsewhere.
                 if remote.is_none()
-                    && !*bare_checked.get_or_insert_with(|| !moves_branch_or_tracking(command))
+                    && !*bare_judged.get_or_insert_with(|| !moves_branch_or_tracking(command))
                 {
                     continue;
                 }
@@ -407,7 +408,7 @@ fn judge_push(input: &HookInput) -> Option<String> {
                     continue;
                 }
                 if probed.len() == MAX_PROBES {
-                    return None;
+                    continue;
                 }
                 probed.push(pair);
                 match resolve_push_url(&push.work_dir, remote) {
@@ -847,7 +848,7 @@ mod tests {
     }
 
     /// No more than [`MAX_PROBES`] distinct remotes are resolved; the rest
-    /// are not judged.
+    /// are not judged. A literal URL is judged wherever it sits.
     #[test]
     fn pushes_past_the_probe_cap_are_not_judged() {
         let repo = repo_with_remotes(&[
@@ -862,6 +863,9 @@ mod tests {
         assert_eq!(run_in(five, repo.path()).outcome, Outcome::Allow);
         let four = "git push r1 main; git push r2 main; git push r3 main; git push r5 main";
         assert_eq!(run_in(four, repo.path()).outcome, Outcome::Nudge);
+        // A literal URL needs no probe, so the cap does not hide it.
+        let url = format!("{five}; git push {UNOWNED} main");
+        assert_eq!(run_in(&url, repo.path()).outcome, Outcome::Nudge);
     }
 
     /// A made-up token, built so no provider-shaped literal sits in source.
