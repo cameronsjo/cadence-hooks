@@ -351,6 +351,7 @@ fn non_object_tool_response_writes_no_failopen_row() {
         assert!(failopen_rows(tmp.path()).is_empty(), "{args:?}");
     }
 }
+
 /// A panic on the loop parser's thread is contained (cameronsjo/cadence-hooks
 /// #1401 review): the check reads it as a parse failure and judges the command
 /// through its fallback. A looped write to an unowned repo then still blocks
@@ -458,7 +459,8 @@ fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
 /// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): nesting deep
 /// enough to overflow the parse thread's stack. An overflow aborts the
 /// process (signal 6), which drops every verdict. Past [`MAX_PARSE_BYTES`]
-/// the command is not parsed, and the guard still gives its verdict. The
+/// the command is not parsed, and the guard still blocks the unowned write
+/// through its parse-failure fallback. The
 /// `[[ ! …` shape costs 2 bytes per level, the cheapest known; at 16 000
 /// levels it aborts a debug build when the cap is lifted.
 #[test]
@@ -466,36 +468,64 @@ fn nesting_past_the_byte_cap_still_gets_a_verdict() {
     let tmp = tempfile::tempdir().unwrap();
     let depth = 16_000;
     let just_over = MAX_PARSE_BYTES / 2 + 1;
+    // `(command, judged by the fallback?)`. The `while` and `case` shapes nest
+    // the write where `guard-gh-write` refuses the command as too large
+    // before its fallback judges the write, so only their exit code is
+    // pinned.
     let shapes = [
-        format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(just_over)),
-        format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(depth)),
-        format!(
-            "{}{UNOWNED_LOOP}",
-            "true && ".repeat(MAX_PARSE_BYTES / 8 + 1)
+        (
+            format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(just_over)),
+            true,
         ),
-        format!(
-            "{}{UNOWNED_LOOP}{}",
-            "if true; then ".repeat(depth),
-            "; fi".repeat(depth)
+        (
+            format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(depth)),
+            true,
         ),
-        format!(
-            "{}{UNOWNED_LOOP}{}",
-            "while true; do ".repeat(depth),
-            "; done".repeat(depth)
+        (
+            format!(
+                "{}{UNOWNED_LOOP}",
+                "true && ".repeat(MAX_PARSE_BYTES / 8 + 1)
+            ),
+            true,
         ),
-        format!(
-            "{}{UNOWNED_LOOP}{}",
-            "case x in x) ".repeat(depth),
-            " ;; esac".repeat(depth)
+        (
+            format!(
+                "{}{UNOWNED_LOOP}{}",
+                "if true; then ".repeat(depth),
+                "; fi".repeat(depth)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "{}{UNOWNED_LOOP}{}",
+                "while true; do ".repeat(depth),
+                "; done".repeat(depth)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "{}{UNOWNED_LOOP}{}",
+                "case x in x) ".repeat(depth),
+                " ;; esac".repeat(depth)
+            ),
+            false,
         ),
     ];
-    for command in &shapes {
+    for (command, by_fallback) in &shapes {
         assert!(command.len() > MAX_PARSE_BYTES);
         let (out, _) = run_guardrail("guard-gh-write", tmp.path(), command, None);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let head = &command[..40];
         // An exit code, not a signal: the process did not abort.
         assert_eq!(out.status.code(), Some(2), "{head}…: {stderr}");
+        if *by_fallback {
+            assert!(
+                stderr.contains(UNOWNED_CAUSE),
+                "{head}…: judged through the parse-failure fallback: {stderr}"
+            );
+        }
     }
 }
 

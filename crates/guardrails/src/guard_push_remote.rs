@@ -420,7 +420,7 @@ fn judge_push(input: &HookInput) -> Option<String> {
                 if probed.contains(&pair) {
                     continue;
                 }
-                if probed.len() == MAX_PROBES {
+                if probed.len() >= MAX_PROBES {
                     continue;
                 }
                 probed.push(pair);

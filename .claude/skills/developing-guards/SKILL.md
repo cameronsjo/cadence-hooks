@@ -83,7 +83,7 @@ Allowed: <if config-driven, show what IS allowed>
 **Config-driven guard (push-remote):**
 
 ```text
-NUDGE: git-guardrails: Push target is not on your allowlist
+⚠️  git-guardrails: Push target is not on your allowlist
    Would push to: https://github.com/other/repo.git
    Directory:     /home/user/project
    Allowed:       cameronsjo gitea.internal/cameron

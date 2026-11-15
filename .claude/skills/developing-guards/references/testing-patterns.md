@@ -169,11 +169,13 @@ fn main_branch_warns() {
     assert!(result.message.as_deref().unwrap().contains("main"));
 }
 
+// The guard reads `CADENCE_ALLOWED_OWNERS`: set it through the crate's
+// shared `with_env` lock, or the unset allowlist allows before any check.
 #[test]
 fn push_to_unowned_url_nudges() {
-    let result = PushRemoteGuard.run(
-        &make_bash("git push https://github.com/other/repo.git main")
-    );
+    let result = with_env(&[("CADENCE_ALLOWED_OWNERS", Some("cameronsjo"))], || {
+        PushRemoteGuard.run(&make_bash("git push https://github.com/other/repo.git main"))
+    });
     assert_eq!(result.outcome, Outcome::Nudge);
     assert!(result.message.unwrap().contains("not on your allowlist"));
 }
@@ -189,14 +191,14 @@ fn push_to_unowned_url_nudges() {
 Test structural analysis robustness against real-world shell patterns.
 
 ```rust
-// Quote variants
+// Quote variants: a push spelled inside a quoted argument is data
 #[test]
-fn multi_push_false_positive_in_quotes() {
-    let result = PushRemoteGuard.run(
-        &make_bash("echo 'do not git push this' && git push origin main")
-    );
-    let msg = result.message.as_deref().unwrap_or("");
-    assert!(!msg.contains("multiple"), "false positive: quoted text counted");
+fn quoted_push_text_is_not_a_push() {
+    let result = with_env(&[("CADENCE_ALLOWED_OWNERS", Some("cameronsjo"))], || {
+        PushRemoteGuard.run(&make_bash("echo 'git push https://github.com/other/repo.git main'"))
+    });
+    assert_eq!(result.outcome, Outcome::Allow);
+    assert!(result.message.is_none(), "quoted text read as a push");
 }
 
 // Chained commands
@@ -205,14 +207,15 @@ fn semicolon_no_space() {
     assert_eq!(parse_work_dir("cd /project;git push", "/home"), "/project");
 }
 
-// Pipe chains
+// Pipe chains: the push before the pipe is still judged
 #[test]
-fn push_with_pipe_counted_once() {
-    let result = PushRemoteGuard.run(
-        &make_bash("git push origin main 2>&1 | tee push.log")
-    );
-    let msg = result.message.as_deref().unwrap_or("");
-    assert!(!msg.contains("multiple"));
+fn push_before_a_pipe_is_judged() {
+    let result = with_env(&[("CADENCE_ALLOWED_OWNERS", Some("cameronsjo"))], || {
+        PushRemoteGuard.run(&make_bash(
+            "git push https://github.com/other/repo.git main 2>&1 | tee push.log",
+        ))
+    });
+    assert_eq!(result.outcome, Outcome::Nudge);
 }
 
 // Subshells
