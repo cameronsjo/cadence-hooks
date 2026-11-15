@@ -1577,7 +1577,11 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
     // and the post-time scan does not read through either. A file inside a
     // work tree keeps the scan, because the post-time scan never sees a
     // commit's file content. MCP calls never reach here (`run_mcp`).
-    if !context::is_prose_draft(file_path) && context::is_provably_local(file_path) {
+    // `~/.ssh/config` has no extension, so the name reads as a draft; it is
+    // the one such file taken as config, on its exact resolved path.
+    let code_or_config =
+        !context::is_prose_draft(file_path) || context::is_ssh_client_config(file_path);
+    if code_or_config && context::is_provably_local(file_path) {
         return CheckResult::allow();
     }
 
@@ -7319,6 +7323,75 @@ destinations = ["me/*", "them/exact"]
             ] {
                 assert_eq!(term_edit(&home.join(rel)).outcome, Outcome::Block, "{rel}");
             }
+        });
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ssh_config_is_exempt_and_aws_and_kube_configs_still_block() {
+        // The operator's ruling on #1431's scope: `~/.ssh/config` is local
+        // config; the AWS and Kubernetes configs stay scanned. Its name has no
+        // extension, so only the exact-path rule can exempt it: the same name
+        // anywhere else reads as a prose draft and blocks. The fake home sits
+        // in a temp dir, where code-extension lookalikes are exempt by the
+        // temp rule; `context`'s tests pin those with the temp rule off.
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        for dir in [".ssh/config.d", ".aws", ".kube"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::fs::write(home.join(".ssh/config"), "label = \"x\"\n").unwrap();
+        context::test_seam::with_home(&home, || {
+            with_env(FIXTURE, &[], || {
+                assert_eq!(
+                    term_edit(&home.join(".ssh/config")).outcome,
+                    Outcome::Allow,
+                    "~/.ssh/config"
+                );
+                for rel in [
+                    ".aws/config",
+                    ".kube/config",
+                    ".ssh/../.aws/config",
+                    ".ssh/config.d/x",
+                    ".ssh/known_hosts",
+                ] {
+                    assert_eq!(term_edit(&home.join(rel)).outcome, Outcome::Block, "{rel}");
+                }
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ssh_config_that_links_elsewhere_still_blocks() {
+        // Judged where the write lands: a `~/.ssh/config` that is a link into
+        // a repo, or a `~/.ssh` that is a link into a synced folder, is not
+        // the exempt file.
+        let (root, home, repo) = home_and_repo();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(repo.join("ssh_config"), "label = \"x\"\n").unwrap();
+        std::os::unix::fs::symlink(repo.join("ssh_config"), home.join(".ssh/config")).unwrap();
+        let other_home = root.path().join("home2");
+        let synced = root.path().join("Dropbox (Acme)/ssh");
+        std::fs::create_dir_all(&synced).unwrap();
+        std::fs::create_dir_all(&other_home).unwrap();
+        std::fs::write(synced.join("config"), "label = \"x\"\n").unwrap();
+        std::os::unix::fs::symlink(&synced, other_home.join(".ssh")).unwrap();
+        with_env(FIXTURE, &[], || {
+            context::test_seam::with_home(&home, || {
+                assert_eq!(
+                    term_edit(&home.join(".ssh/config")).outcome,
+                    Outcome::Block,
+                    "link into a repo"
+                );
+            });
+            context::test_seam::with_home(&other_home, || {
+                assert_eq!(
+                    term_edit(&other_home.join(".ssh/config")).outcome,
+                    Outcome::Block,
+                    "~/.ssh linked into a sync folder"
+                );
+            });
         });
     }
 
