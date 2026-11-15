@@ -86,13 +86,14 @@ fn try_runs_a_check_and_reports_outcome() {
 
 #[test]
 fn try_nudge_renders_context_as_readable_text() {
-    // warn-curl-alias is pure string logic: bare curl + custom header → nudge.
+    // warn-cron-datetime is pure logic: any CronCreate nudges, with a newline
+    // in the context.
     let dir = std::env::temp_dir().join(format!("cadence-try-nudge-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let payload_path = dir.join("payload.json");
     std::fs::write(
         &payload_path,
-        r#"{"tool_name":"Bash","tool_input":{"command":"curl -H 'Accept: application/json' https://example.com"}}"#,
+        r#"{"tool_name":"CronCreate","tool_input":{}}"#,
     )
     .unwrap();
 
@@ -100,7 +101,7 @@ fn try_nudge_renders_context_as_readable_text() {
     cmd.args([
         "try",
         "guardrails",
-        "warn-curl-alias",
+        "warn-cron-datetime",
         "--payload",
         payload_path.to_str().unwrap(),
     ]);

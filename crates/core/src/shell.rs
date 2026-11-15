@@ -3016,10 +3016,9 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 /// Shared by `enforce_worktree`, `core::push` (`guard-push-remote`), and the
 /// polish ship anchor (a nudge), so the set cannot drift between the code that skips these and the code that asks
 /// whether a word is one. **It is not the repo's only prefix set, and is not
-/// meant to become one** — three others answer adjacent questions with
+/// meant to become one** — two others answer adjacent questions with
 /// deliberately different membership, and each admits words this set excludes:
 ///
-/// - `warn_alias_parsing::WRAPPERS` — `xargs`/`sudo`/`env`/`nice`/`timeout`
 /// - [`COMMAND_RUNNERS`], walked by [`peel_command_runners`] — `sudo`/`xargs`/
 ///   `nice`/`stdbuf`/`timeout`/`env`/`setsid` with their own flags; what
 ///   `prevent_secret_writes` (a **blocking** check) peels since #1153 retired
