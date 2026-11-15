@@ -19,8 +19,15 @@ fn manifest_json_exports_complete_registry_and_criticality() {
         .iter()
         .find(|row| row["name"] == "guard-push-remote")
         .expect("push guard");
-    assert_eq!(push["criticality"], "security-critical");
-    assert_eq!(push["protected"], true);
+    // A nudge since cadence-ecosystem ADR-0046 phase 2 (#1443).
+    assert_eq!(push["criticality"], "workflow");
+    assert_eq!(push["protected"], false);
+    let gh_write = hooks
+        .iter()
+        .find(|row| row["name"] == "guard-gh-write")
+        .expect("gh write guard");
+    assert_eq!(gh_write["criticality"], "security-critical");
+    assert_eq!(gh_write["protected"], true);
     // Security-critical but deliberately unprotected from CADENCE_DISABLE.
     let worktree = hooks
         .iter()
