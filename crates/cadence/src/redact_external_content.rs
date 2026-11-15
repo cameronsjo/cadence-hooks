@@ -1708,9 +1708,10 @@ const REA_SERVER: &str = "rea";
 
 /// rea tools that skip the identity tier: exactly those whose effect audit
 /// (rea `src/contracts/toolEffects.ts`, at rea `8413ec0`) neither launches a
-/// process, reaches the network, nor writes files (`launchesProcess`,
-/// `accessesNetwork` and `writesFilesystem` all false; rea derives its MCP
-/// `openWorldHint` from the first two). They read and annotate local artifacts. A tool
+/// process, reaches the network, writes files, runs foreign code, nor changes
+/// a device (`launchesProcess`, `accessesNetwork`, `writesFilesystem`,
+/// `executesForeignCode` and `mutatesDevice` all false, the generator's
+/// FLAGS; rea derives its MCP `openWorldHint` from the first two). They read and annotate local artifacts. A tool
 /// that writes a file to a path the caller picks (an evidence export, a
 /// snapshot) is left out: that file can land in a work tree and be
 /// committed. Every other rea tool, and

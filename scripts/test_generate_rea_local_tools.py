@@ -167,13 +167,31 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(gen.parse(source), {"run_tool": True, "list_strings": False})
 
     def test_a_comment_marker_in_a_string_is_text(self) -> None:
-        # Read as a comment, the string's `/*` would run to the `*/` below and
-        # swallow the table header with it.
+        # No `//` in the string, so only string tracking keeps it text: read as
+        # code, its `/*` would run to the `*/` below and swallow the table
+        # header with it.
         source = table(
             "  fetch_page: effects({\n    accessesNetwork: true, /* remote */\n  }),\n",
-            prelude=PRELUDE + 'const DOCS = "https://example.com/*";\n',
+            prelude=PRELUDE + 'const LIBS = "lib/*.so";\n',
         )
         self.assertEqual(gen.parse(source), {"fetch_page": True})
+
+    def test_an_escaped_quote_does_not_end_a_string(self) -> None:
+        # Without the backslash skip, `\"` would end the string and its
+        # `/*` would open a comment running to the `*/` below.
+        source = table(
+            "  fetch_page: effects({\n    accessesNetwork: true, /* remote */\n  }),\n",
+            prelude=PRELUDE + 'const NOTE = "a \\" /* b";\n',
+        )
+        self.assertEqual(gen.parse(source), {"fetch_page": True})
+
+    def test_an_unterminated_string_fails_loud(self) -> None:
+        source = table(
+            "  list_strings: effects(),\n",
+            prelude=PRELUDE + 'const NOTE = "never closed;\n',
+        )
+        with self.assertRaisesRegex(gen.Unreadable, r'unterminated " string'):
+            gen.parse(source)
 
     def test_an_unterminated_block_comment_fails_loud(self) -> None:
         source = table("  list_strings: effects(), /* never closed\n")
