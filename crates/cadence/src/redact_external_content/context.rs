@@ -40,9 +40,10 @@ use std::path::{Component, Path, PathBuf};
 /// - the path is non-empty, absolute, and carries no `..` component (an MCP
 ///   write has no path and is always scanned);
 /// - the resolved path sits in a fixed local location: a dotfile directly in
-///   the home directory, `~/.config`, `~/.local`, `~/.cache`, or a system
-///   temp dir. Everything else is scanned, so a sync folder this code has
-///   never heard of (`Dropbox (<team>)`, `Insync`, `Sync`) is scanned too
+///   the home directory, `~/.ssh/config` (that file only), `~/.config`,
+///   `~/.local`, `~/.cache`, or a system temp dir. Everything else is
+///   scanned, so a sync folder this code has never heard of
+///   (`Dropbox (<team>)`, `Insync`, `Sync`) is scanned too
 ///   (cameronsjo/cadence-hooks#1429). The checks below still apply inside
 ///   those locations;
 /// - every symlink on the way resolves: a dangling link (to the file or to a
@@ -124,6 +125,13 @@ impl LocalRoots {
     /// temp dirs are fixed paths. (`core::worktree`'s temp roots read
     /// `TMPDIR`, so they are not reused here.)
     fn current() -> Self {
+        #[cfg(test)]
+        if let Some(home) = test_seam::HOME.with(|h| h.borrow().clone()) {
+            return Self {
+                home: home.canonicalize().ok(),
+                system_temp: true,
+            };
+        }
         Self {
             home: paths::account_home().and_then(|h| h.canonicalize().ok()),
             system_temp: true,
@@ -131,9 +139,71 @@ impl LocalRoots {
     }
 }
 
+/// A per-thread stand-in for the account home, so guard-level tests can place
+/// a fake home without touching the real one.
+#[cfg(test)]
+pub(super) mod test_seam {
+    use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    thread_local! {
+        pub(super) static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` with `home` as the account home on this thread.
+    // Unix-only: every caller is a unix-gated test, so on Windows it is dead
+    // code and `-D warnings` fails the clippy leg.
+    #[cfg(unix)]
+    pub(in crate::redact_external_content) fn with_home<R>(
+        home: &Path,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HOME.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        HOME.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+        let _reset = Reset;
+        f()
+    }
+}
+
+/// The OpenSSH client config, relative to the home directory. The one file
+/// outside the [`in_local_location`] dotfile and XDG rules that is exempt
+/// (cameronsjo/cadence-hooks#1431 scanned it; the operator ruled it local).
+/// Only this exact path: not `~/.ssh/config.d/…`, not another file in
+/// `~/.ssh`, and not the AWS or Kubernetes configs, which stay scanned.
+const SSH_CLIENT_CONFIG: &str = ".ssh/config";
+
+/// Is `file_path` the account's `~/.ssh/config`, judged on the resolved path?
+///
+/// The same resolution [`is_provably_local`] uses: absolute, no `..`, every
+/// symlink resolved. So `~/.ssh/../.aws/config` is refused, and a
+/// `~/.ssh/config` that is a link into a repo or a sync folder resolves there
+/// and is not this file. It does not answer whether the file is local; the
+/// caller still requires [`is_provably_local`].
+pub(super) fn is_ssh_client_config(file_path: Option<&str>) -> bool {
+    is_ssh_client_config_in(file_path, &LocalRoots::current())
+}
+
+fn is_ssh_client_config_in(file_path: Option<&str>, roots: &LocalRoots) -> bool {
+    let (Some(raw), Some(home)) = (file_path.filter(|p| !p.is_empty()), roots.home.as_ref()) else {
+        return false;
+    };
+    let path = Path::new(raw);
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    resolve_deepest(path).is_some_and(|resolved| resolved == home.join(SSH_CLIENT_CONFIG))
+}
+
 /// Is the resolved path in one of the fixed local locations: a dotfile
-/// directly in the home directory, a file under [`LOCAL_HOME_DIRS`], or a file
-/// under a system temp dir?
+/// directly in the home directory, `~/.ssh/config` ([`SSH_CLIENT_CONFIG`]), a
+/// file under [`LOCAL_HOME_DIRS`], or a file under a system temp dir?
 ///
 /// An allowlist, because a list of sync folders is never complete
 /// (cameronsjo/cadence-hooks#1429).
@@ -150,6 +220,7 @@ fn in_local_location(resolved: &Path, roots: &LocalRoots) -> bool {
                 .and_then(std::ffi::OsStr::to_str)
                 .is_some_and(|n| n.len() > 1 && n.starts_with('.'));
         if dotfile
+            || resolved == home.join(SSH_CLIENT_CONFIG)
             || LOCAL_HOME_DIRS
                 .iter()
                 .any(|d| strictly_under(&home.join(d)))
@@ -580,6 +651,76 @@ mod tests {
                 "{rel}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ssh_config_is_local_and_only_that_exact_file() {
+        let (_dir, roots, home) = fake_home();
+        let ssh_config = home.join(".ssh/config");
+        assert!(in_local_location(&ssh_config, &roots));
+        assert!(is_ssh_client_config_in(ssh_config.to_str(), &roots));
+        assert!(is_provably_local_in(ssh_config.to_str(), &roots));
+        for rel in [
+            ".aws/config",
+            ".kube/config",
+            ".ssh/config.d/x",
+            ".ssh/config.d/work.conf",
+            ".ssh/config.toml",
+            ".ssh/configx",
+            ".ssh/config/x",
+            ".ssh/known_hosts",
+            ".ssh/id_ed25519.pub",
+            ".SSHX/config",
+        ] {
+            let p = home.join(rel);
+            assert!(!in_local_location(&p, &roots), "{rel}");
+            assert!(!is_ssh_client_config_in(p.to_str(), &roots), "{rel}");
+            assert!(!is_provably_local_in(p.to_str(), &roots), "{rel}");
+        }
+        // `..` is refused before any resolution, as is a relative path.
+        let traversal = format!("{}/.ssh/../.aws/config", home.display());
+        let dotdot_back = format!("{}/.aws/../.ssh/config", home.display());
+        for raw in [traversal.as_str(), dotdot_back.as_str(), ".ssh/config", ""] {
+            assert!(!is_ssh_client_config_in(Some(raw), &roots), "{raw}");
+            assert!(!is_provably_local_in(Some(raw), &roots), "{raw}");
+        }
+        assert!(!is_ssh_client_config_in(None, &roots));
+        // No home known, no exemption.
+        let no_home = LocalRoots {
+            home: None,
+            system_temp: false,
+        };
+        assert!(!is_ssh_client_config_in(ssh_config.to_str(), &no_home));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_ssh_config_link_is_judged_where_it_lands() {
+        let (_dir, roots, home) = fake_home();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        // A link to another file that is itself local, under `~/.config`: the
+        // resolved path is not `~/.ssh/config`, so the exact-file rule does
+        // not apply (that file is judged by its own name and location).
+        std::fs::create_dir_all(home.join(".config/ssh")).unwrap();
+        std::fs::write(home.join(".config/ssh/config"), "x").unwrap();
+        std::os::unix::fs::symlink(home.join(".config/ssh/config"), home.join(".ssh/config"))
+            .unwrap();
+        assert!(!is_ssh_client_config_in(
+            home.join(".ssh/config").to_str(),
+            &roots
+        ));
+        // A dangling link: the write lands wherever it points.
+        std::fs::remove_file(home.join(".ssh/config")).unwrap();
+        std::os::unix::fs::symlink(home.join("gone/config"), home.join(".ssh/config")).unwrap();
+        assert!(!is_ssh_client_config_in(
+            home.join(".ssh/config").to_str(),
+            &roots
+        ));
+        assert!(!is_provably_local_in(
+            home.join(".ssh/config").to_str(),
+            &roots
+        ));
     }
 
     #[test]
