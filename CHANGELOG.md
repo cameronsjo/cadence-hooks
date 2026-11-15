@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.133.1] - 2026-11-14
+
 ### Fixed
 
 - **`redact-external-content` finds its term source in the account's home directory, not `HOME`.** The identity tier read `$HOME/.config/cadence/redaction.toml`, and a repo's `.claude/settings.json` `env` block can set `HOME`, so a repo that pointed it elsewhere made the tier load zero terms and allow every post unscanned (cameronsjo/cadence-hooks#1617). The path now comes from the account database: the passwd entry (`getpwuid_r`) on unix, as the Write/Edit exemption already did, and the profile known folder (`SHGetKnownFolderPath(FOLDERID_Profile)`) on Windows, which does not follow `USERPROFILE` either. A term source that exists but cannot be read (permissions, not a regular file, over the size cap) now blocks posts and commit messages with a message naming the path and the fix (that includes a dangling link and a directory the hook cannot search); remove the file to run without the tier on purpose. `redact-scan` exits 1 with the same message in that state, so a skill that gates a post on its exit code stops too. A machine with no term source, a malformed one, or one with zero terms is unchanged: the tier stays inert and `redact-scan --status` reports it.
