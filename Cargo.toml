@@ -57,6 +57,9 @@ serde_json.workspace = true
 # Timestamps for the `doctor` rotate-health tests.
 jiff.workspace = true
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
+# Reads a regex hooks.json matcher (`mcp__.*`) the way the platform does, in
+# `tests/hook_registration_audit.rs`. Already a workspace dependency.
+regex.workspace = true
 
 [dependencies]
 clap.workspace = true

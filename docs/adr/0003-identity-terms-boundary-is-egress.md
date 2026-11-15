@@ -41,7 +41,10 @@ The identity scan runs at each egress point the binary can see:
   agent itself writes into a repository;
 - every string in an `mcp__*` call's input (added 2026-11-14, Linear CAM-714),
   so an issue, comment or document an MCP tool publishes is scanned whatever
-  its server names the field.
+  its server names the field. Calls to the local servers `c3`, `easel`,
+  `herdr-bridge` and `rea`, which publish nothing to a tracker, chat, mail or
+  repo, are not scanned. Read, search and navigation calls to any other server
+  are scanned: their query text and URLs go to that server.
 
 A derived artifact that is later published goes through one of those points at
 publication time. That is the check that matters, and it runs whichever tool

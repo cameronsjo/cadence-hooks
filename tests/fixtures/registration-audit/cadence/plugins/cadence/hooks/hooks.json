@@ -81,12 +81,22 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/memory-guard cadence/terminology cadence/orphaned-todos cadence/prevent-secret-writes cadence/env-vars cadence/line-endings cadence/warn-overshare cadence/redact-external-content cadence/warn-instruction-narrative cadence/warn-plugin-root-cruft",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" group cadence/memory-guard cadence/terminology cadence/orphaned-todos cadence/prevent-secret-writes cadence/env-vars cadence/line-endings cadence/warn-overshare cadence/warn-instruction-narrative cadence/warn-plugin-root-cruft",
             "timeout": 10
           },
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence markdown-lint",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence redact-external-content",
             "timeout": 10
           }
         ]

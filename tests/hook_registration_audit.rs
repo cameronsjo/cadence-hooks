@@ -3343,6 +3343,130 @@ fn matcher_covers_reads_literal_alternatives_only() {
     assert!(!matcher_covers("mcp__.*(write|edit).*", "Edit"));
 }
 
+/// MCP tools that post or publish, one or two per server family the
+/// redaction hook must see (CAM-714): GitHub, Linear, Slack, Gmail and the
+/// docs tool. A name the wiring's own word list would miss (`save_issue`,
+/// `send_message`, `update`) is the point.
+const MCP_POSTING_PROBES: &[&str] = &[
+    "mcp__github__create_issue",
+    "mcp__github__add_issue_comment",
+    "mcp__plugin_linear_linear__save_issue",
+    "mcp__plugin_linear_linear__save_comment",
+    "mcp__slack__slack_post_message",
+    "mcp__claude_ai_Gmail__send_message",
+    "mcp__claude_ai_Claude_Docs__update",
+];
+
+/// Calls to the local servers the binary exempts (`LOCAL_MCP_SERVERS` in
+/// `redact_external_content.rs`). The wiring routes them like any MCP call;
+/// the binary allows them without scanning.
+const MCP_LOCAL_PROBES: &[&str] = &[
+    "mcp__c3__compact",
+    "mcp__easel__chart",
+    "mcp__herdr-bridge__send",
+    "mcp__rea__set_comment",
+];
+
+/// Does `matcher` fire on `probe`, read as the platform reads it: literal
+/// alternatives exactly ([`matcher_covers`]), anything else as a regex over
+/// the whole name.
+fn matcher_fires(matcher: &str, probe: &str) -> bool {
+    matcher_covers(matcher, probe)
+        || regex::Regex::new(&format!("^(?:{matcher})$")).is_ok_and(|re| re.is_match(probe))
+}
+
+#[test]
+fn matcher_fires_reads_regex_alternatives() {
+    assert!(matcher_fires(
+        "Write|Edit|mcp__.*",
+        "mcp__github__create_issue"
+    ));
+    assert!(matcher_fires("Write|Edit|mcp__.*", "Edit"));
+    assert!(!matcher_fires(
+        "mcp__.*(write|edit).*",
+        "mcp__linear__save_issue"
+    ));
+    assert!(!matcher_fires("mcp__.*", "Bash"));
+}
+
+#[test]
+fn every_mcp_call_reaches_redact_external_content_once() {
+    for subject in audit_subjects() {
+        let label = subject.label;
+        let hint = &subject.hint;
+        let matchers: Vec<&str> = subject
+            .refs
+            .values()
+            .flatten()
+            .filter(|r| {
+                r.command == "cadence redact-external-content" && r.event_type == "PreToolUse"
+            })
+            .map(|r| r.matcher.as_str())
+            .collect();
+        let mut wrong = Vec::new();
+        for probe in MCP_POSTING_PROBES.iter().chain(MCP_LOCAL_PROBES) {
+            let runs = matchers.iter().filter(|m| matcher_fires(m, probe)).count();
+            if runs != 1 {
+                wrong.push(format!("{probe}: {runs} runs"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "[{label}] redact-external-content must run exactly once on every MCP call:\n  {}\n{hint}",
+            wrong.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn routed_mcp_calls_are_judged_and_local_servers_are_not() {
+    // The binary leg of the routing: a token in each posting tool's input
+    // blocks; the same input to an exempt local server allows. The credential
+    // tier needs no term source, so a scratch HOME keeps this hermetic.
+    let home = tempfile::tempdir().unwrap();
+    let metrics = tempfile::tempdir().unwrap();
+    let token = ["gh", "p_"].concat() + &"aB3dE5gH7jK9mN1pQ2sT4vW6yZ8cF0hL".repeat(2)[..36];
+    let verdict = |tool: &str| {
+        let payload = serde_json::json!({
+            "tool_name": tool,
+            "tool_input": {"body": format!("see {token}")},
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+            .args(["cadence", "redact-external-content"])
+            .env("HOME", home.path())
+            .env("CADENCE_METRICS_DIR", metrics.path())
+            .env_remove("CADENCE_DISABLE")
+            .env_remove("CADENCE_BYPASS")
+            .env_remove("CADENCE_ALLOW_MAIN")
+            .env_remove("CADENCE_REDACTION_TERMS")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cadence-hooks");
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child.wait().unwrap().code()
+    };
+    let mut wrong = Vec::new();
+    for tool in MCP_POSTING_PROBES {
+        if verdict(tool) != Some(2) {
+            wrong.push(format!("{tool}: expected block (2)"));
+        }
+    }
+    for tool in MCP_LOCAL_PROBES {
+        if verdict(tool) != Some(0) {
+            wrong.push(format!("{tool}: expected allow (0)"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn multi_matcher_hooks_keep_every_entry() {
     for subject in audit_subjects() {

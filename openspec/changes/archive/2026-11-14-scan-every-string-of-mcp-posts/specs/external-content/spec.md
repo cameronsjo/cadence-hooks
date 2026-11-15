@@ -14,7 +14,7 @@ On Write and Edit calls, `redact-external-content` SHALL run the identity tier o
 ## ADDED Requirements
 
 ### Requirement: Identity scan of MCP calls
-On an `mcp__*` call, `redact-external-content` SHALL run the identity tier only, over every string value in the call's input at any depth, object keys included, read from the payload as sent so a field that fails the typed parse is still read. The top-level `file_path`/`path` MUST NOT be scanned. A shell `command` the call carries SHALL get the Bash-surface checks instead. The shaped tier MUST NOT run on MCP calls.
+On an `mcp__*` call, `redact-external-content` SHALL run the identity tier over every string value in the call's input at any depth, object keys included, read from the payload as sent so a field that fails the typed parse is still read. The top-level `file_path`/`path` MUST NOT be scanned. A shell `command` the call carries SHALL get the Bash-surface checks instead. The shaped tier MUST NOT run on MCP calls.
 
 #### Scenario: Issue body through an MCP tool
 - **WHEN** an `mcp__github__create_issue` call carries an identity term only in `body`
@@ -27,6 +27,28 @@ On an `mcp__*` call, `redact-external-content` SHALL run the identity tier only,
 #### Scenario: Term only in the target path
 - **WHEN** an MCP write's `path` names a directory holding an identity term and its `content` is clean
 - **THEN** the hook exits 0
+
+### Requirement: Credential scan of MCP calls
+On an `mcp__*` call, `redact-external-content` SHALL run the credential tier over the strings the identity tier reads, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
+
+#### Scenario: Token in an MCP issue body
+- **WHEN** an `mcp__github__create_issue` call carries a GitHub token only in `body` and no term source exists
+- **THEN** the hook exits 2 and the message names the token's kind without the token
+
+#### Scenario: MCP edit removes a token
+- **WHEN** an MCP edit's `old_string` holds a token and its `new_string` does not
+- **THEN** the hook exits 0
+
+### Requirement: Local MCP servers are not scanned
+An `mcp__*` call whose server segment (the text after `mcp__` up to the next `__`) is exactly `c3`, `easel`, `herdr-bridge` or `rea` MUST NOT be scanned, except that a shell `command` it carries SHALL get the Bash-surface checks. A call to any other server SHALL be scanned.
+
+#### Scenario: Local server call
+- **WHEN** an `mcp__herdr-bridge__send` call carries an identity term and a token
+- **THEN** the hook exits 0
+
+#### Scenario: Server that only resembles a listed one
+- **WHEN** an `mcp__c3x__post` call carries an identity term
+- **THEN** the hook exits 2
 
 ### Requirement: MCP path exemptions cover the file content only
 When an MCP call's `file_path` or `path` is the term source or a code or config file proven local, the top-level new-side keys, old-side keys and `edits` MUST NOT be scanned, and every other string in the call MUST still be scanned.
