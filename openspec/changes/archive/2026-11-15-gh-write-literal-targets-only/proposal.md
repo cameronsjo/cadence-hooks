@@ -6,7 +6,7 @@
 
 - A write blocks only when the guard read its target exactly and the allowlists reject it: a literal `-R`/`--repo`, a PR or issue URL argument, a literal `gh repo` positional, an inline `GH_REPO=`, a `gh api repos/<owner>/<repo>/…` path, or the remotes of the directory the write runs in (a fork included). A literal unowned owner with an expanded name (`-R "evil/$r"`) still blocks.
 - Every "cannot determine target" block becomes an allow: no readable remote, an unreadable or ambiguous `-R`, an expansion in the target or host (`$GH_HOST`, #1503), an unknown directory, a runner option the guard does not model, and a command too large or too deeply nested to read.
-- A `gh api` write to any endpoint other than `repos/<owner>/<repo>/…` (GraphQL, `orgs/…`, `user/…`) is allowed; the GraphQL mutation classifier goes.
+- A `gh api` write to any endpoint other than `repos/<owner>/<repo>/…` and `orgs/<org>/…` (GraphQL, `user/…`) is allowed; the GraphQL mutation classifier goes. An absolute `https://api.github.com/repos/…` URL (or `https://<host>/api/v3/repos/…` on a known host) is read like the relative path, and gh's `{owner}`/`{repo}` placeholders are judged on the checkout's own repo.
 - The loop gate goes, with `CADENCE_GH_STRICT_LOOPS`. Each write in a loop body is judged as a single command.
 - `export GH_HOST`/`export GH_REPO` earlier in the command, and a `GH_HOST=` on a wrapper in front of a shell, are no longer read. The hook's own `GH_HOST` and `GH_REPO` still are.
 - A fork remote the guard cannot parse names no repo to judge; a parsed unowned remote still blocks.

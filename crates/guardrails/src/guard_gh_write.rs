@@ -190,13 +190,10 @@ pub(crate) fn is_write_command(command: &str) -> bool {
         //
         // `graphql` is exempt from the narrowing entirely, because on that
         // endpoint the METHOD does not decide whether the call writes — the
-        // query does, and `gh api graphql -X GET -f query='mutation …'` would
-        // otherwise read as a GET and skip the mutation classifier altogether.
-        // GitHub happens to ignore a query parameter on `GET /graphql` today,
-        // but that is server transport behavior, and a guard must not delegate
-        // its verdict to it: `--hostname` points the same command at a GHES
-        // instance answering on someone else's terms, and an `--input` body
-        // transmits on a GET regardless. Let it fall through to the graphql arm.
+        // query does, so `gh api graphql -X GET -f query='mutation …'` stays a
+        // write. This guard allows every GraphQL write (it names no repo the
+        // guard can read), but `inject-gh-write-context` reads this predicate
+        // and nudges on it.
         if segment_is_graphql(command) {
             return true;
         }
@@ -853,9 +850,8 @@ fn host_is_read(host: &str) -> bool {
 /// names a literal owner this guard can read, and the allowlist rejects that
 /// owner. Only then does the block say "targets repo you don't own" rather
 /// than "cannot resolve" (#757, #1491). `host` and `repo` are the target as
-/// [`flag_value_resolution`] split it. Both block arms use it, after their own
-/// test for an expansion: the loop's `-R` arm
-/// ([`loop_target_is_unresolvable`]) and [`judge_resolution`].
+/// [`flag_value_resolution`] split it. [`judge_resolution`] uses it, after
+/// its own test for an expansion.
 ///
 /// All three must hold:
 ///
@@ -937,13 +933,35 @@ fn resolve_unflagged_target(
     // the whole command: a `repos/owner/repo` string sitting in a `--body`,
     // `--jq`, or commit-message argument used to donate its owner to an
     // unrelated write, resolving a target the command never named (#463).
-    if let Some(endpoint) = gh_api_endpoint(command)
-        && let Some(repo) = api_repos_target(&endpoint)
-    {
-        return RepoResolution::Resolved {
-            host: dh.to_string(),
-            repo,
-        };
+    if let Some(endpoint) = gh_api_endpoint(command) {
+        if let Some((host, repo)) = api_repos_target_on(&endpoint) {
+            // gh fills `{owner}` (and `{repo}`) from the checkout's own repo,
+            // so a placeholder owner is judged as an untargeted write is.
+            if let Some(name) = repo.strip_prefix("{owner}/") {
+                return match resolve_from_git_remotes(work_dir) {
+                    RepoResolution::Resolved { host, repo: own } if name != "{repo}" => {
+                        let owner = own.split('/').next().unwrap_or_default().to_string();
+                        RepoResolution::Resolved {
+                            host,
+                            repo: format!("{owner}/{name}"),
+                        }
+                    }
+                    resolution => resolution,
+                };
+            }
+            return RepoResolution::Resolved {
+                host: host.unwrap_or_else(|| dh.to_string()),
+                repo,
+            };
+        }
+        // An org-level write is judged on the org as its owner. Repo-scoped
+        // allowlist entries do not cover it: the name half is empty.
+        if let Some(org) = api_orgs_target(&endpoint) {
+            return RepoResolution::Resolved {
+                host: dh.to_string(),
+                repo: format!("{org}/"),
+            };
+        }
     }
 
     // 4. Git remotes (with fork detection)
@@ -1283,22 +1301,19 @@ fn env_split_string_script(tokens: &[String]) -> Option<String> {
 /// Exact string equality against `"graphql"` was not enough, and the gap was
 /// live: `/graphql`, `graphql?x=1`, and `https://api.github.com/graphql` all
 /// reach the same endpoint while comparing unequal, so each took the GET
-/// narrowing and skipped the mutation classifier that `graphql` alone reached.
+/// narrowing and read as a read.
 ///
 /// Compares the PATH, cut at `?`/`#` before anything else — so a query-string
-/// red herring like `repos/<owner>/<repo>?graphql=1` is NOT graphql and still
-/// takes the ordinary owner-checked path.
+/// red herring like `repos/<owner>/<repo>?graphql=1` is NOT graphql, so the
+/// GET narrowing still applies to it.
 ///
 /// A URL is reduced to its path component and matched against BOTH endpoint
 /// layouts: `/graphql` as github.com serves it, and `/api/graphql` as a GitHub
-/// Enterprise Server instance does. Any host counts, which is the fail-closed
-/// direction — a non-github host is exactly where "GitHub ignores the query
-/// parameter on `GET /graphql`" stops being a safe assumption to rest a verdict
-/// on. The `/api/` spelling is accepted only for URL forms: a RELATIVE endpoint
-/// is resolved against the API base by gh itself, so there `graphql` is the
-/// only spelling, and matching a trailing `/graphql` would swallow
-/// `repos/<owner>/graphql` — a real repo named `graphql`, which must stay
-/// owner-checked rather than becoming unverifiable.
+/// Enterprise Server instance does. Any host counts. The `/api/` spelling is
+/// accepted only for URL forms: a RELATIVE endpoint is resolved against the
+/// API base by gh itself, so there `graphql` is the only spelling, and
+/// matching a trailing `/graphql` would swallow `repos/<owner>/graphql` — a
+/// real repo named `graphql`, whose writes stay owner-checked.
 fn is_graphql_endpoint(endpoint: &str) -> bool {
     let path = endpoint.split(['?', '#']).next().unwrap_or("");
     match path.split_once("://") {
@@ -1329,11 +1344,51 @@ fn segment_is_graphql(segment: &str) -> bool {
 /// resolver handed back an allowed repo — while gh POSTed to the org endpoint
 /// (#463 review).
 fn api_repos_target(endpoint: &str) -> Option<String> {
+    api_repos_target_on(endpoint).map(|(_, repo)| repo)
+}
+
+/// [`api_repos_target`], with the host an absolute endpoint URL names. gh
+/// sends an absolute URL where it says, whatever `GH_HOST` or `--hostname`
+/// say, and models copy one from an API response's `url` field. Two literal
+/// prefixes are read: `https://api.github.com/` (host `github.com`) and
+/// `https://<host>/api/v3/` for a host this guard already knows (the default
+/// host or one in `CADENCE_EXTRA_HOSTS`). Any other URL names no repo this
+/// guard reads, and is `None`.
+fn api_repos_target_on(endpoint: &str) -> Option<(Option<String>, String)> {
     let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    let (host, path) = match path.strip_prefix("https://") {
+        None => (None, path),
+        Some(rest) => {
+            let (host, tail) = rest.split_once('/')?;
+            let host = host.to_ascii_lowercase();
+            if host == "api.github.com" {
+                (Some("github.com".to_string()), tail)
+            } else if host == default_host() || env_extra_hosts().contains(&host) {
+                (Some(host), tail.strip_prefix("api/v3/")?)
+            } else {
+                return None;
+            }
+        }
+    };
     API_REPOS
         .captures(path)
         .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
+        .map(|m| (host, m.as_str().to_string()))
+}
+
+/// The organization a `gh api` endpoint path `orgs/<org>/…` names, when the
+/// name is literal (letters, digits, `-` and `_`). Reads the path only, like
+/// [`api_repos_target`]. A write there lands on that owner: `gh api -X POST
+/// orgs/<org>/repos` creates a repo under it.
+fn api_orgs_target(endpoint: &str) -> Option<String> {
+    let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    let rest = path.trim_start_matches('/').strip_prefix("orgs/")?;
+    let org = rest.split('/').next().unwrap_or("");
+    (!org.is_empty()
+        && org
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    .then(|| org.to_string())
 }
 
 /// Long flags of the `gh repo` verbs in [`REPO_TARGET_VERBS`] that consume a
@@ -1388,7 +1443,7 @@ const CREATE_VALUE_SHORTS: &str = "dhtglrsup";
 /// positional names the repo, per [`REPO_TARGET_VERBS`]. `None` when the
 /// segment isn't that shape, or no positional follows the verb.
 ///
-/// Shared by [`resolve_target_repo`]'s positional arm and
+/// Shared by [`resolve_unflagged_target`]'s positional arm and
 /// [`segment_lacks_explicit_target`] so a new target-naming verb lands in one
 /// place and the resolver and the nudge predicate can't drift apart.
 ///
@@ -1954,8 +2009,9 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// True when a segment carries no explicit write target — no `-R`/`--repo`
 /// flag, and none of the sub-command shapes that name the repo positionally.
 ///
-/// The complement of the first three arms of [`resolve_target_repo`], expressed
-/// as a predicate rather than a resolution: the JIT nudge only needs to know
+/// The complement of the command-text arms of [`resolve_target_repos_on`]
+/// (`-R`, a `gh repo` positional, a `gh api repos/…` path), expressed as a
+/// predicate rather than a resolution: the JIT nudge only needs to know
 /// *whether* a target was spelled out, not what it resolves to. Kept beside the
 /// patterns it reads so a new positional-target shape lands in one file.
 ///
@@ -2822,13 +2878,15 @@ fn judge_write_segments(
         }
 
         // A `gh api` write names its repo only in a `repos/<owner>/<repo>`
-        // endpoint. GraphQL and every other endpoint name no repo this guard
-        // can read, so they are allowed (cadence-ecosystem ADR-0046 rule 3).
+        // endpoint (or an `orgs/<org>/…` one, which names its owner).
+        // GraphQL and every other endpoint name no repo this guard can read,
+        // so they are allowed (cadence-ecosystem ADR-0046 rule 3).
         //
         // Read the parsed ENDPOINT, not the raw segment: a `repos/<owner>/<repo>`
         // string in a header or body value is not the target (#463 review).
         if let Some(endpoint) = gh_api_endpoint(&segment)
             && api_repos_target(&endpoint).is_none()
+            && api_orgs_target(&endpoint).is_none()
         {
             continue;
         }
@@ -3618,9 +3676,7 @@ mod tests {
         );
     }
 
-    // --- #44: loop write policy (relaxed-when-deterministic + strict toggle) ---
-
-    // --- #44: loop block message ---
+    // --- block message advice ---
 
     #[test]
     fn advice_reuses_a_repo_by_its_name_alone() {
@@ -3711,7 +3767,8 @@ mod tests {
             ("CADENCE_EXTRA_HOSTS", Some("git.example")),
             ("GH_HOST", None),
             ("GH_REPO", None),
-            ("CADENCE_GH_STRICT_LOOPS", None),
+            // CDPATH moves where a `cd` lands; pin it with the rest.
+            ("CDPATH", None),
         ];
         let theirs_env = owners_env();
         // Each `(URL, the owner/repo as printed)`.
@@ -3815,7 +3872,8 @@ mod tests {
             ("CADENCE_EXTRA_HOSTS", Some("git.example")),
             ("GH_HOST", None),
             ("GH_REPO", None),
-            ("CADENCE_GH_STRICT_LOOPS", None),
+            // CDPATH moves where a `cd` lands; pin it with the rest.
+            ("CDPATH", None),
         ]
     }
 
@@ -3887,17 +3945,177 @@ mod tests {
     // Unix only, like the hostile rows above, whose helpers it shares.
     #[cfg(unix)]
     #[test]
-    fn gh_placeholders_get_the_repo_placeholder_in_an_ordinary_checkout() {
-        // gh fills `{owner}/{repo}` from the cwd remote, but the guard judges
-        // the command as written: `{owner}` is an unowned owner, and `{repo}`
-        // is not a GitHub name. So the fix names `<repo>`, in an owned
-        // checkout as in any other (code review N4 on #1539).
+    fn gh_placeholders_are_judged_on_the_checkout_repo() {
+        // gh fills `{owner}` and `{repo}` from the checkout's own repo, so the
+        // guard judges a placeholder write as it judges an untargeted one: an
+        // owned checkout allows it, an unowned one blocks it, and a directory
+        // with no remote names nothing. The fix names `<repo>` (code review N4
+        // on #1539).
         assert_advice_line(
             &advice_env(None),
             "gh api -X POST repos/{owner}/{repo}/issues -f title=x",
-            &[("origin", "git@git.example:cameronsjo/thing")],
+            &[("origin", "git@git.example:work-org/thing")],
             "Fix: gh api repos/cameronsjo/<repo>/…",
         );
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let unowned = origin_checkout("https://github.com/work-org/x.git");
+        let plain = tempfile::tempdir().expect("tempdir");
+        with_env(&owners_env(), || {
+            for (command, cwd, blocks_expected) in [
+                (
+                    "gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    owned.path(),
+                    false,
+                ),
+                (
+                    "gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/b",
+                    owned.path(),
+                    false,
+                ),
+                (
+                    "gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    unowned.path(),
+                    true,
+                ),
+                (
+                    "gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    plain.path(),
+                    false,
+                ),
+                // A literal name under the placeholder owner keeps the owner.
+                (
+                    "gh api -X POST repos/{owner}/other/issues -f t=x",
+                    owned.path(),
+                    false,
+                ),
+                (
+                    "gh api -X POST repos/{owner}/other/issues -f t=x",
+                    unowned.path(),
+                    true,
+                ),
+            ] {
+                let cwd = cwd.to_str().expect("utf-8 path");
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(blocks(&result), blocks_expected, "{command} in {cwd}");
+            }
+        });
+    }
+
+    #[test]
+    fn an_absolute_api_url_is_judged_on_its_repo() {
+        // A model copies an endpoint from an API response's `url` field.
+        // `https://api.github.com/` and `https://<host>/api/v3/` on a host the
+        // guard knows are read like a relative `repos/…` path (security
+        // review I1 on #1633).
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        let mut env = owners_env();
+        for entry in env.iter_mut() {
+            if entry.0 == "CADENCE_EXTRA_HOSTS" {
+                entry.1 = Some("ghe.example");
+            }
+        }
+        with_env(&env, || {
+            for (command, blocks_expected) in [
+                (
+                    "gh api -X POST https://api.github.com/repos/work-org/x/issues/1/comments -f body=hi",
+                    true,
+                ),
+                (
+                    "gh api -X PATCH https://api.github.com/repos/work-org/x/pulls/3 -f state=closed",
+                    true,
+                ),
+                (
+                    "gh api https://api.github.com/repos/work-org/x/issues --input b.json",
+                    true,
+                ),
+                (
+                    "gh api -X POST https://ghe.example/api/v3/repos/work-org/x/issues -f t=x",
+                    true,
+                ),
+                (
+                    "gh api -X POST https://api.github.com/repos/cameronsjo/x/issues/1/comments -f body=hi",
+                    false,
+                ),
+                // A bare entry covers a known extra host, as for `-R`.
+                (
+                    "gh api -X POST https://ghe.example/api/v3/repos/cameronsjo/x/issues -f t=x",
+                    false,
+                ),
+                // A host the guard does not know names no repo it reads.
+                (
+                    "gh api -X POST https://other.example/api/v3/repos/work-org/x/issues -f t=x",
+                    false,
+                ),
+                // A read is a read.
+                (
+                    "gh api https://api.github.com/repos/work-org/x/issues",
+                    false,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn an_org_api_write_is_judged_on_the_org() {
+        // `gh api -X POST orgs/<org>/repos` is the API spelling of `gh repo
+        // create <org>/<name>` (security review N2 on #1633).
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            for (command, blocks_expected) in [
+                ("gh api -X POST orgs/work-org/repos -f name=x", true),
+                ("gh api -X PATCH /orgs/work-org -f name=x", true),
+                ("gh api -X POST orgs/cameronsjo/repos -f name=x", false),
+                // An expanded org names no owner this guard reads.
+                ("gh api -X POST \"orgs/$o/repos\" -f name=x", false),
+                ("gh api orgs/work-org/repos", false),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn an_unconfigured_machine_blocks_writes_that_otherwise_allow() {
+        // The fail-safe runs before every allow below it: an untargeted write
+        // and a GraphQL mutation block too (code review N6 on #1633).
+        let plain = tempfile::tempdir().expect("tempdir");
+        let cwd = plain.path().to_str().expect("utf-8 path");
+        let mut env = owners_env();
+        for entry in env.iter_mut() {
+            if entry.0 == "CADENCE_ALLOWED_OWNERS" {
+                entry.1 = None;
+            }
+        }
+        with_env(&env, || {
+            for command in [
+                "gh pr create --fill",
+                "gh api graphql -f query='mutation { addComment(input: {}) { clientMutationId } }'",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert!(blocks(&result), "{command}");
+                assert!(
+                    msg(&result).contains("Not configured"),
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
     }
 
     // Unix only, like the hostile rows above, whose helpers it shares.
@@ -4085,15 +4303,14 @@ mod tests {
     const ISSUE_1344_LOOP: &str = r#"for b in a b; do gh api -X DELETE "repos/cameronsjo/forgectl/git/refs/heads/${b}"; done"#;
 
     /// Run the guard from `/tmp` (no git remote, so no cwd fallback) with
-    /// `owners` allowed, in relaxed or strict loop mode.
-    fn run_1344(command: &str, owners: &str, strict: bool) -> CheckResult {
+    /// `owners` allowed.
+    fn run_1344(command: &str, owners: &str) -> CheckResult {
         let mut result = None;
         with_env(
             &[
                 ("CADENCE_ALLOWED_OWNERS", Some(owners)),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
-                ("CADENCE_GH_STRICT_LOOPS", strict.then_some("1")),
                 ("GH_HOST", None),
                 ("GH_REPO", None),
             ],
@@ -4111,19 +4328,17 @@ mod tests {
     }
 
     #[test]
-    fn looped_api_write_to_owned_path_is_allowed_in_both_loop_modes() {
-        // #1344: the path names the target, so the loop gate needs no -R.
-        for strict in [false, true] {
-            let result = run_1344(ISSUE_1344_LOOP, "cameronsjo", strict);
-            assert!(!blocks(&result), "strict={strict}: {}", msg(&result));
-        }
+    fn looped_api_write_to_an_owned_path_is_allowed() {
+        // #1344: the path names the target, so the write needs no -R.
+        let result = run_1344(ISSUE_1344_LOOP, "cameronsjo");
+        assert!(!blocks(&result), "{}", msg(&result));
     }
 
     #[test]
     fn looped_api_write_to_unowned_path_is_refused_without_dash_r_advice() {
         // The exact #1344 command against an allowlist that does not own it:
         // still refused, now as an ownership verdict, never "add -R".
-        let result = run_1344(ISSUE_1344_LOOP, "someone-else", false);
+        let result = run_1344(ISSUE_1344_LOOP, "someone-else");
         assert!(blocks(&result));
         assert!(
             msg(&result).contains("targets repo you don't own"),
@@ -4146,17 +4361,16 @@ mod tests {
         // Each block a gh api write can reach advises the path in its
         // structured fix, and its message never advises `-R` alone.
         for (command, rule) in [
-            // A placeholder is judged as written, an unowned `{owner}` account.
-            (
-                "gh api -X DELETE repos/{owner}/{repo}/x",
-                "gh-write-unauthorized-target",
-            ),
             (
                 "gh api -X DELETE repos/evil/x/y",
                 "gh-write-unauthorized-target",
             ),
+            (
+                "gh api -X DELETE https://api.github.com/repos/evil/x/y",
+                "gh-write-unauthorized-target",
+            ),
         ] {
-            let result = run_1344(command, "cameronsjo", false);
+            let result = run_1344(command, "cameronsjo");
             assert!(blocks(&result), "{command} was allowed");
             assert!(
                 !msg(&result).contains("add `-R"),
@@ -4226,7 +4440,7 @@ mod tests {
             "gh api -X DELETE -if repos/cameronsjo/forgectl/x=1 repos/evil/x/y",
         ] {
             assert!(
-                blocks(&run_1344(command, "cameronsjo", false)),
+                blocks(&run_1344(command, "cameronsjo")),
                 "{command} was allowed"
             );
         }
@@ -4241,7 +4455,7 @@ mod tests {
             "gh api -R cameronsjo/x -X DELETE repos/evil/x/y",
             "for b in a b; do gh api -R cameronsjo/x -X DELETE repos/evil/x/$b; done",
         ] {
-            let result = run_1344(command, "cameronsjo", false);
+            let result = run_1344(command, "cameronsjo");
             assert!(blocks(&result), "{command} was allowed");
         }
     }
@@ -4252,7 +4466,7 @@ mod tests {
             "for n in 1 2; do gh api repos/o/r/pulls/$n; done",
             "for n in 1 2; do gh api -R o/r repos/o/r/pulls/$n; done",
         ] {
-            let result = run_1344(command, "cameronsjo", false);
+            let result = run_1344(command, "cameronsjo");
             assert!(!blocks(&result), "{command}: {}", msg(&result));
         }
     }
@@ -4264,14 +4478,12 @@ mod tests {
         let result = run_1344(
             "gh api -R cameronsjo/forgectl repos/cameronsjo/forgectl",
             "cameronsjo",
-            false,
         );
         assert!(!blocks(&result), "{}", msg(&result));
         // A real write carrying -R is still judged on its path.
         let result = run_1344(
             "gh api -R cameronsjo/x -X DELETE repos/evil/x/y",
             "cameronsjo",
-            false,
         );
         assert!(blocks(&result));
         assert!(msg(&result).contains("evil/x"), "{}", msg(&result));
@@ -4662,25 +4874,30 @@ mod tests {
     }
 
     #[test]
-    fn graphql_read_query_inline_allows() {
-        // False-block guard: a `query { … }` read must pass even with no -R / cwd.
+    fn every_graphql_call_is_allowed() {
+        // A GraphQL call names no repo this guard can read (a mutation names a
+        // node id at most), so reads and mutations are both allowed, in any
+        // directory and in a loop body (cadence-ecosystem ADR-0046 rule 3).
+        // The control that a `repos/<unowned>/…` write still blocks is
+        // [`a_graphql_red_herring_endpoint_is_not_exempted`].
+        let unowned = unowned_checkout();
+        let unowned = unowned.path().to_str().expect("utf-8 path");
         with_env(&owners_env(), || {
-            let input = input_with(
+            for command in [
                 "gh api graphql -f query='query { viewer { login } }'",
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_read_shorthand_allows() {
-        // Anonymous-operation shorthand `{ … }` is also a read.
-        with_env(&owners_env(), || {
-            let input = input_with("gh api graphql -f query='{ viewer { login } }'", "/tmp");
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+                "gh api graphql -f query=query{viewer{login}}",
+                "gh api graphql -X GET -f query='query { viewer { login } }'",
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                r#"gh api graphql -f query='mutation { addComment(input: {subjectId: "S", body: "x"}) { clientMutationId } }'"#,
+                "gh api graphql -F query=@q.graphql",
+                r#"for n in 1 2; do gh api graphql -f query="query { viewer { login } }"; done"#,
+                r#"for n in 1 2; do gh api graphql -f query="mutation { resolveReviewThread(input: {}) { thread { id } } }"; done"#,
+            ] {
+                for cwd in ["/tmp", OWNED_DIR, unowned] {
+                    let result = GhWriteGuard.run(&input_with(command, cwd));
+                    assert!(!blocks(&result), "{command} in {cwd}: {}", msg(&result));
+                }
+            }
         });
     }
 
@@ -5141,101 +5358,7 @@ mod tests {
         });
     }
 
-    // --- #262/#263/#300/#317: graphql safe-mutation allowlist + string-stripped classifier ---
-
-    #[test]
-    fn graphql_resolve_review_thread_allows() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_unresolve_review_thread_allows() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { unresolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_resolve_review_thread_multiline_allows() {
-        // Whitespace/newlines between the keyword, selection set, and fields
-        // must not defeat the extractor.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "gh api graphql -f query='mutation {\n  resolveReviewThread(input: {threadId: \"T\"}) {\n    thread { id }\n  }\n}'",
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_aliased_safe_field_allows() {
-        // `alias: field` resolves to the underlying safe field.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { foo: resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_introspection_mutation_typename_read_allows() {
-        // #263 regression: a read whose string arg is the `Mutation` type name
-        // must not be misread as a write. Case-sensitive keyword + literal
-        // stripping both defend this.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='query { __type(name: "Mutation") { fields { name } } }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_block_string_escaped_triple_quote_legit_allows() {
-        // A genuine `\"""` inside a string value, with no smuggled field, must
-        // still ALLOW — the escape is honored in both directions, not blanket-blocked.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""has \""" a literal triple-quote"""}) {clientMutationId} }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn graphql_block_string_bare_brace_no_escape_allows() {
-        // A normal block string containing a bare `}` (no escape) with a single
-        // safe root field must still ALLOW — the escape fix didn't over-tighten.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""note } with brace"""}) {clientMutationId} }'"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
+    // --- #262/#263/#300/#317: graphql writes are allowed ---
 
     // --- unit: strip_graphql_literals ---
 
@@ -5434,33 +5557,6 @@ mod tests {
 
     // e2e: #353 — a loop body's `do` keyword no longer hides gh api from the
     // per-segment judgment
-
-    #[test]
-    fn looped_graphql_read_is_allowed() {
-        // The `do` prefix made gh_api_endpoint return None, so the graphql arm
-        // never ran and a READ fell through to cwd resolution — an unowned cwd
-        // then blocked it as unresolvable.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"for n in 1 2; do gh api graphql -f query="query { viewer { login } }"; done"#,
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
-    #[test]
-    fn looped_graphql_read_stays_allowed() {
-        with_env(&owners_env(), || {
-            let input = input_with(
-                "for n in 1 2; do gh api graphql -f query=query{viewer{login}}; done",
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
 
     // --- #463 review: quote-escape divergence and the raw-segment api gate ---
 
@@ -5837,21 +5933,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn looped_safe_graphql_mutation_stays_allowed() {
-        // Now that the loop body is judged, the safe-mutation exemption must
-        // still apply through it — otherwise the fix converts a working review
-        // workflow into a hard block.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"for n in 1 2; do gh api graphql -f query="mutation { resolveReviewThread(input: {}) { thread { id } } }"; done"#,
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
-    }
-
     // --- #454: an explicit `-X GET` is a read, not a write ---
 
     /// The command from the issue: an explicit GET carrying `-f` fields, which
@@ -6050,16 +6131,6 @@ mod tests {
     }
 
     #[test]
-    fn a_graphql_read_with_an_explicit_get_still_allows() {
-        // Positive control: routing graphql past the narrowing must not start
-        // blocking graphql READS, which is #353 all over again.
-        assert_allows("gh api graphql -X GET -f query='query { viewer { login } }'");
-        assert_allows(
-            "gh api graphql -X GET -f query='mutation { resolveReviewThread(input: {}) { thread { id } } }'",
-        );
-    }
-
-    #[test]
     fn a_quoted_get_method_cannot_pose_as_the_flag() {
         // Reads argv, so a method flag inside another flag's value is one
         // token and never a reading of its own.
@@ -6113,21 +6184,19 @@ mod tests {
     const ISSUE_1491_LOOP: &str =
         r#"for r in alpha beta; do gh repo archive "cameronsjo/$r" --yes; done"#;
 
-    /// Run the guard from `cwd` with `cameronsjo` allowed, in relaxed or
-    /// strict loop mode.
-    fn run_1491(command: &str, cwd: &str, strict: bool) -> CheckResult {
-        run_1491_owners("cameronsjo", command, cwd, strict)
+    /// Run the guard from `cwd` with `cameronsjo` allowed.
+    fn run_1491(command: &str, cwd: &str) -> CheckResult {
+        run_1491_owners("cameronsjo", command, cwd)
     }
 
     /// [`run_1491`] with `owners` allowed instead.
-    fn run_1491_owners(owners: &str, command: &str, cwd: &str, strict: bool) -> CheckResult {
+    fn run_1491_owners(owners: &str, command: &str, cwd: &str) -> CheckResult {
         let mut result = None;
         with_env(
             &[
                 ("CADENCE_ALLOWED_OWNERS", Some(owners)),
                 ("CADENCE_ALLOWED_REPOS", None),
                 ("CADENCE_EXTRA_HOSTS", None),
-                ("CADENCE_GH_STRICT_LOOPS", strict.then_some("1")),
                 ("GH_HOST", None),
                 ("GH_REPO", None),
             ],
@@ -6139,8 +6208,7 @@ mod tests {
     #[test]
     fn issue_1491_loop_of_literal_owner_archives_allows_anywhere() {
         // The argument names the target as `-R cameronsjo/$r` would, so the
-        // directory the loop runs in, a `cd` in its body, and strict mode do
-        // not matter. /tmp has no git remote, so before #1491 the loop gate
+        // directory the loop runs in and a `cd` in its body do not matter. /tmp has no git remote, so before #1491 the loop gate
         // blocked there and asked for `-R`, which `gh repo archive` lacks.
         let cd_loop = r#"for d in a b; do cd "$d"; gh repo archive "cameronsjo/$d" --yes; done"#;
         let repo_verbs = r#"for r in a b; do gh repo create "cameronsjo/$r" --private; gh repo edit cameronsjo/$r --enable-issues; gh repo delete "cameronsjo/${r}" --yes; done"#;
@@ -6149,24 +6217,24 @@ mod tests {
         // A read beside the write needs no target of its own.
         let with_read = r#"for r in alpha beta; do gh repo view "cameronsjo/$r"; gh repo archive "cameronsjo/$r" --yes; done"#;
         for command in [ISSUE_1491_LOOP, cd_loop, repo_verbs, with_dash_r, with_read] {
-            for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
-                let result = run_1491(command, cwd, strict);
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(command, cwd);
                 assert_eq!(
                     result.outcome,
                     cadence_hooks_core::Outcome::Allow,
-                    "{command} in {cwd} (strict {strict}): {:?}",
+                    "{command} in {cwd}: {:?}",
                     result.message
                 );
             }
         }
         // `_` is an owner character too: managed-user owners carry one.
         let managed_user = r#"for r in a b; do gh repo archive "mona_acme/$r" --yes; done"#;
-        for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
-            let result = run_1491_owners("cameronsjo,mona_acme", managed_user, cwd, strict);
+        for cwd in ["/tmp", OWNED_DIR] {
+            let result = run_1491_owners("cameronsjo,mona_acme", managed_user, cwd);
             assert_eq!(
                 result.outcome,
                 cadence_hooks_core::Outcome::Allow,
-                "{managed_user} in {cwd} (strict {strict}): {:?}",
+                "{managed_user} in {cwd}: {:?}",
                 result.message
             );
         }
@@ -6178,7 +6246,7 @@ mod tests {
         // rather than calling the target unresolvable.
         let command = r#"for r in alpha beta; do gh repo archive "evil-corp/$r" --yes; done"#;
         for cwd in ["/tmp", OWNED_DIR] {
-            let result = run_1491(command, cwd, false);
+            let result = run_1491(command, cwd);
             assert!(blocks(&result), "{cwd}");
             assert!(!msg(&result).contains("`-R "), "{cwd}: {}", msg(&result));
             assert!(
@@ -6193,12 +6261,12 @@ mod tests {
         // A `_` owner is literal too, so the loop names it as unowned rather
         // than asking for an explicit target.
         let underscore = r#"for r in alpha beta; do gh repo archive "my_org/$r" --yes; done"#;
-        for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
-            let result = run_1491(underscore, cwd, strict);
-            assert!(blocks(&result), "{cwd} (strict {strict})");
+        for cwd in ["/tmp", OWNED_DIR] {
+            let result = run_1491(underscore, cwd);
+            assert!(blocks(&result), "{cwd}");
             assert!(
                 msg(&result).contains("gh write targets repo you don't own"),
-                "{cwd} (strict {strict}): {}",
+                "{cwd}: {}",
                 msg(&result)
             );
             let meta = result.block_metadata.expect("structured block");
@@ -6231,7 +6299,7 @@ mod tests {
             ),
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(command, cwd, false);
+                let result = run_1491(command, cwd);
                 assert!(blocks(&result), "{command} in {cwd}");
                 let meta = result.block_metadata.expect("structured block");
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
@@ -6243,7 +6311,7 @@ mod tests {
     /// The unowned block's fix for `command`, run from `cwd` with
     /// `cameronsjo` allowed.
     fn unowned_fix(command: &str, cwd: &str) -> String {
-        let result = run_1491(command, cwd, false);
+        let result = run_1491(command, cwd);
         assert!(blocks(&result), "{command} in {cwd}");
         let meta = result.block_metadata.expect("structured block");
         assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
@@ -6573,7 +6641,7 @@ mod tests {
         // The loop parser keeps the `-R` word as typed, quotes on, so the
         // owner it read was `"cameronsjo` and an owned repo blocked. The
         // unquoted form and a single command already allowed.
-        let contexts = [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)];
+        let contexts = ["/tmp", OWNED_DIR];
         let for_close =
             |flag: &str| format!(r#"for n in 1 2 3; do gh issue close "$n" {flag}; done"#);
         for flag in [
@@ -6594,13 +6662,13 @@ mod tests {
             // The unquoted form, which allowed before.
             "-R cameronsjo/tool",
         ] {
-            for (cwd, strict) in contexts {
+            for cwd in contexts {
                 let command = for_close(flag);
-                let result = run_1491(&command, cwd, strict);
+                let result = run_1491(&command, cwd);
                 assert_eq!(
                     result.outcome,
                     cadence_hooks_core::Outcome::Allow,
-                    "{command} in {cwd} (strict {strict}): {:?}",
+                    "{command} in {cwd}: {:?}",
                     result.message
                 );
             }
@@ -6615,12 +6683,12 @@ mod tests {
             // Beside a command that was already allowed.
             r#"for n in 1 2; do gh issue close "$n" -R "cameronsjo/tool"; gh issue close "$n" -R cameronsjo/tool; done"#,
         ] {
-            for (cwd, strict) in contexts {
-                let result = run_1491(command, cwd, strict);
+            for cwd in contexts {
+                let result = run_1491(command, cwd);
                 assert_eq!(
                     result.outcome,
                     cadence_hooks_core::Outcome::Allow,
-                    "{command} in {cwd} (strict {strict}): {:?}",
+                    "{command} in {cwd}: {:?}",
                     result.message
                 );
             }
@@ -6649,10 +6717,10 @@ mod tests {
                 r#"{"work-org/x","cameronsjo/x"}"#,
             ),
         ] {
-            for (cwd, strict) in contexts {
+            for cwd in contexts {
                 let command = for_close(flag);
-                let result = run_1491(&command, cwd, strict);
-                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+                let result = run_1491(&command, cwd);
+                assert!(blocks(&result), "{command} in {cwd}");
                 let message = msg(&result);
                 assert!(
                     message.contains("gh write targets repo you don't own"),
@@ -6667,24 +6735,27 @@ mod tests {
             "-R {cameronsjo,mona_acme}/tool",
             r#"--repo={"cameronsjo","mona_acme"}/tool"#,
         ] {
-            for (cwd, strict) in contexts {
+            for cwd in contexts {
                 let command = for_close(flag);
-                let result = run_1491_owners("cameronsjo,mona_acme", &command, cwd, strict);
+                let result = run_1491_owners("cameronsjo,mona_acme", &command, cwd);
                 assert_eq!(
                     result.outcome,
                     cadence_hooks_core::Outcome::Allow,
-                    "{command} in {cwd} (strict {strict}): {:?}",
+                    "{command} in {cwd}: {:?}",
                     result.message
                 );
             }
         }
         // It blocks when the word gh takes as the repo, the first, is a repo
         // the allowlist rejects.
-        for (owners, value) in [("cameronsjo,mona_acme", "{work-org,cameronsjo}/tool")] {
-            for (cwd, strict) in contexts {
+        for (owners, value) in [
+            ("cameronsjo,mona_acme", "{work-org,cameronsjo}/tool"),
+            ("cameronsjo", "{work-org,mona_acme}/tool"),
+        ] {
+            for cwd in contexts {
                 let command = for_close(&format!("-R {value}"));
-                let result = run_1491_owners(owners, &command, cwd, strict);
-                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+                let result = run_1491_owners(owners, &command, cwd);
+                assert!(blocks(&result), "{command} in {cwd}");
                 let message = msg(&result);
                 assert!(
                     message.contains("gh write targets repo you don't own"),
@@ -6694,9 +6765,9 @@ mod tests {
         }
         // Beside an owned one, the unowned target is named.
         let mixed = r#"for n in 1 2; do gh issue close "$n" -R "cameronsjo/tool"; gh issue close "$n" -R "work-org/x"; done"#;
-        for (cwd, strict) in contexts {
-            let result = run_1491(mixed, cwd, strict);
-            assert!(blocks(&result), "{cwd} (strict {strict})");
+        for cwd in contexts {
+            let result = run_1491(mixed, cwd);
+            assert!(blocks(&result), "{cwd}");
             let message = msg(&result);
             assert!(message.contains("work-org/x"), "{cwd}: {message}");
         }
@@ -6714,25 +6785,25 @@ mod tests {
             "-R $'cameronsjo/tool'",
             r#"-R $"cameronsjo/tool""#,
         ] {
-            for (cwd, strict) in contexts {
+            for cwd in contexts {
                 let command = for_close(flag);
-                let result = run_1491(&command, cwd, strict);
+                let result = run_1491(&command, cwd);
                 assert_eq!(
                     result.outcome,
                     cadence_hooks_core::Outcome::Allow,
-                    "{command} in {cwd} (strict {strict}): {:?}",
+                    "{command} in {cwd}: {:?}",
                     result.message
                 );
             }
         }
         let create =
             r#"for r in a b; do gh issue create -R "cameronsjo/$r" --title t --body b; done"#;
-        for (cwd, strict) in contexts {
-            let result = run_1491(create, cwd, strict);
+        for cwd in contexts {
+            let result = run_1491(create, cwd);
             assert_eq!(
                 result.outcome,
                 cadence_hooks_core::Outcome::Allow,
-                "{cwd} (strict {strict}): {:?}",
+                "{cwd}: {:?}",
                 result.message
             );
         }
@@ -6855,7 +6926,7 @@ mod tests {
             let checkout = origin_checkout(url);
             let cwd = checkout.path().to_str().expect("utf-8 path");
             for command in UNTARGETED_WRITES {
-                let result = run_1491(command, cwd, false);
+                let result = run_1491(command, cwd);
                 assert!(blocks(&result), "{url}: {command}");
                 let message = msg(&result);
                 assert!(
@@ -6890,7 +6961,7 @@ mod tests {
         ] {
             let checkout = origin_checkout(url);
             let cwd = checkout.path().to_str().expect("utf-8 path");
-            let result = run_1491(command, cwd, false);
+            let result = run_1491(command, cwd);
             assert!(blocks(&result), "{url}: {command}");
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{url}");
@@ -6899,7 +6970,7 @@ mod tests {
         // A literal name from the remote is still reused.
         let checkout = origin_checkout("git@git.example:work-org/cool-tool.git");
         let cwd = checkout.path().to_str().expect("utf-8 path");
-        let result = run_1491(UNTARGETED_WRITES[0], cwd, false);
+        let result = run_1491(UNTARGETED_WRITES[0], cwd);
         let meta = result.block_metadata.expect("structured block");
         assert_eq!(meta.fix, "-R cameronsjo/cool-tool");
     }
@@ -6945,7 +7016,7 @@ mod tests {
             ),
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
-                let result = run_1491(command, cwd, false);
+                let result = run_1491(command, cwd);
                 assert!(blocks(&result), "{command} in {cwd}");
                 let meta = result.block_metadata.expect("structured block");
                 assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
@@ -6964,14 +7035,14 @@ mod tests {
             r#"for r in a b; do gh repo create -p cameronsjo/tpl "work-org/$r" --private; done"#,
             r#"for r in a b; do gh repo new --private --template cameronsjo/tpl "work-org/$r"; done"#,
         ] {
-            for (cwd, strict) in [("/tmp", false), (OWNED_DIR, false), ("/tmp", true)] {
-                let result = run_1491(command, cwd, strict);
-                assert!(blocks(&result), "{command} in {cwd} (strict {strict})");
+            for cwd in ["/tmp", OWNED_DIR] {
+                let result = run_1491(command, cwd);
+                assert!(blocks(&result), "{command} in {cwd}");
             }
         }
         // An unowned template copied into an owned repo writes only there.
         let owned = r#"for r in a b; do gh repo create --template work-org/tpl "cameronsjo/$r" --private; done"#;
-        let result = run_1491(owned, "/tmp", false);
+        let result = run_1491(owned, "/tmp");
         assert_eq!(
             result.outcome,
             cadence_hooks_core::Outcome::Allow,
@@ -6991,7 +7062,7 @@ mod tests {
             "gh repo edit --template work-org/x",
         ] {
             for cwd in ["/tmp", OWNED_DIR] {
-                assert!(blocks(&run_1491(command, cwd, false)), "{command} in {cwd}");
+                assert!(blocks(&run_1491(command, cwd)), "{command} in {cwd}");
             }
         }
         for command in [
@@ -7000,7 +7071,7 @@ mod tests {
             "gh repo create --template=work-org/tpl cameronsjo/x",
             "gh repo create -pwork-org/tpl cameronsjo/x",
         ] {
-            let result = run_1491(command, "/tmp", false);
+            let result = run_1491(command, "/tmp");
             assert_eq!(
                 result.outcome,
                 cadence_hooks_core::Outcome::Allow,

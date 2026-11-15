@@ -137,7 +137,7 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook allows
 
 ### Requirement: gh writes the guard cannot place
-`guard-gh-write` MUST allow a write whose target it cannot read exactly (cadence-ecosystem ADR-0046 rule 3): no readable `-R` or remote, `-R` readings that disagree, a target or host holding a shell expansion with no literal owner, a directory it cannot follow, a `gh api` write outside `repos/<owner>/<repo>/…`, and a command too large or nested to read. With no allowlist configured, a write MUST still block.
+`guard-gh-write` MUST allow a write whose target it cannot read exactly (cadence-ecosystem ADR-0046 rule 3): no readable `-R` or remote, `-R` readings that disagree, a target or host holding a shell expansion with no literal owner, a directory it cannot follow, a `gh api` write outside `repos/<owner>/<repo>/…` and `orgs/<org>/…`, and a command too large or nested to read. With no allowlist configured, a write MUST still block.
 
 #### Scenario: Write with no resolvable target
 - **WHEN** `gh issue create --title t` runs in a directory with no git remote
@@ -162,6 +162,18 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 #### Scenario: GraphQL mutation
 - **WHEN** the command is `gh api graphql -f query='mutation { addComment(input: {subjectId: "S", body: "x"}) { clientMutationId } }'`
 - **THEN** the hook allows
+
+#### Scenario: Absolute API URL
+- **WHEN** the command is `gh api -X POST https://api.github.com/repos/evil/x/issues/1/comments -f body=hi`
+- **THEN** the hook exits 2 naming `evil/x`, as for the relative `repos/evil/x/…` path
+
+#### Scenario: Org-level API write
+- **WHEN** the command is `gh api -X POST orgs/evil/repos -f name=x`
+- **THEN** the hook exits 2 naming the owner `evil`
+
+#### Scenario: Placeholder owner
+- **WHEN** the command is `gh api -X POST repos/{owner}/{repo}/issues -f title=x` in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows, because gh fills the placeholders from that checkout
 
 #### Scenario: Unconfigured machine
 - **WHEN** `CADENCE_ALLOWED_OWNERS` is unset and the command is `gh pr merge 5 -R cameronsjo/tool`
