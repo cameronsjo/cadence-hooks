@@ -175,16 +175,27 @@ The `redaction` section of `.claude/cadence.json` SHALL tune the shaped tier onl
 - **WHEN** the command is `echo 'docs: gh pr comment usage'`
 - **THEN** the hook exits 0 with no output
 
-### Requirement: Overshare audit fires once per session per repo
-`warn-overshare` SHALL nudge at most once per session per repo. The repo is the git root above the edited file's directory, or above `cwd` for Bash, else that directory. Later matching calls in the same session and repo MUST exit 0 with no output.
+### Requirement: Overshare audit fires once per agent per target
+`warn-overshare` SHALL nudge at most once per session, per agent (`agent_id`), per trigger (Bash, or a field-report Write/Edit), per target. The target of a Write or Edit is the git root above the edited file's directory. The target of a Bash command is the git root above `cwd`, or a literal `gh -R owner/repo` slug. Later matching calls for a target already reminded MUST exit 0 with no output.
 
 #### Scenario: Second push in the same session
-- **WHEN** a Bash call runs `git push origin main` after an earlier call in the same session and repo already nudged
+- **WHEN** a Bash call runs `git push origin main` after an earlier call by the same agent in the same session and repo already nudged
 - **THEN** the hook exits 0 with no output
 
-#### Scenario: Another repo
-- **WHEN** the same session then pushes from a different repo
+#### Scenario: Another repo or agent
+- **WHEN** the same session then pushes from a different repo, or a subagent with its own `agent_id` pushes from the same repo
 - **THEN** the hook nudges again
+
+#### Scenario: A post to another repo by -R
+- **WHEN** the same agent, after a nudge in repo A, runs `gh issue create -R owner/public …` from A
+- **THEN** the hook nudges once for `owner/public`
+
+### Requirement: Overshare audit nudges every time for an unresolved target
+A Bash command that moves its work dir with a leading `cd`, runs `git` with a global option such as `-C`, names a `gh` repo that is not one literal slug, or posts with `tea` MUST nudge every time, since no marker key names its target exactly.
+
+#### Scenario: A commit in another directory
+- **WHEN** the same agent runs `git -C ../b commit -m x` twice
+- **THEN** the hook nudges both times
 
 ### Requirement: Overshare audit escapes
 `warn-overshare` SHALL allow a write whose path starts with a non-empty `OBSIDIAN_VAULT`. With `CADENCE_SKIP_OVERSHARE_AUDIT=1` exactly, it SHALL allow every call and record a bypass row only for a call that would have nudged; any other value MUST NOT silence it. It MAY also be silenced through the `nudges` map of `.claude/cadence.json`.

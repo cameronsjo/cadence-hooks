@@ -107,8 +107,12 @@ Rules for wiring:
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
-judgment to the model. It nudges at most once per session per repo (keyed
-on the git root above the edited file, or above `cwd` for Bash). It exempts
+judgment to the model. It nudges at most once per session, per agent
+(`agent_id`), per trigger (Bash, or a field-report edit) and per target: the
+git root above the edited file or above `cwd`, or a literal `gh -R` slug. A
+command that names a target it cannot resolve exactly (a leading `cd`, `git -C`
+or another git global option, a non-literal `-R`, any `tea` post) nudges every
+time. It exempts
 writes under `$OBSIDIAN_VAULT` (the safe home for personal context), and is
 silenced session-wide with `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 

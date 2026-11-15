@@ -3,8 +3,8 @@
 //! Fires on commit/push/PR/issue Bash commands and on Write/Edit to
 //! `docs/field-reports/` paths. The hook does the path triage; the model
 //! does the content judgment from the nudge text. It nudges at most once per
-//! session per repo (a session marker keyed on the git root), since the text
-//! is the same every time (cadence-hooks#1443).
+//! session per agent per target (a session marker keyed on the target repo and
+//! the `agent_id`), since the text is the same every time (cadence-hooks#1443).
 //!
 //! Skips:
 //! - `CADENCE_SKIP_OVERSHARE_AUDIT=1` — session-scoped bypass for repos
@@ -46,32 +46,129 @@ impl Check for WarnOvershare {
         if result.outcome != Outcome::Nudge {
             return result;
         }
-        once_per_session(result, &marker_path(input))
+        match marker_paths(input) {
+            Some(markers) => once_per_session(result, &markers),
+            None => result,
+        }
     }
 }
 
-/// The session marker for the repo this input touches: the git root above
-/// the edited file's directory, or above `cwd` for Bash, else that directory
-/// itself. Read from disk only; no `git` process (cadence-hooks#1443).
-fn marker_path(input: &HookInput) -> std::path::PathBuf {
+/// Marker kind for a Bash commit, push or post.
+const BASH_MARKER_KIND: &str = "overshare-warned-bash";
+/// Marker kind for a field-report Write or Edit, kept apart from the Bash one
+/// so a reminder spent on an edit does not silence the later push.
+const WRITE_MARKER_KIND: &str = "overshare-warned-write";
+
+/// The session markers that stand for "this agent was already reminded about
+/// this target" (cadence-hooks#1443), or `None` when the input names a target
+/// the existing readers do not resolve exactly, so it nudges every time.
+///
+/// Each key is one target plus the payload's `agent_id`: a subagent carries
+/// its parent's `session_id`, and the reminder has to reach the context that
+/// writes the outgoing text, so each agent gets its own first nudge.
+///
+/// Targets, read from disk and existing argv readers only (no `git` process,
+/// no new parsing):
+/// - Write/Edit: the git root above the edited file's directory.
+/// - Bash with no target named: the git root above `cwd`.
+/// - `gh` with a literal `-R`/`--repo` that [`gh_repo_flags`] resolves: that
+///   slug.
+/// - Ungated: a leading `cd` that moves the work dir, `git` with any global
+///   option (`-C`, `--git-dir`, `-c`, ...), a `gh` repo flag that is not one
+///   literal slug, and every `tea` post.
+///
+/// [`gh_repo_flags`]: cadence_hooks_core::shell::gh_repo_flags
+fn marker_paths(input: &HookInput) -> Option<Vec<std::path::PathBuf>> {
+    let agent = input.agent_id.as_deref().unwrap_or_default();
+    let key = |kind: &str, target: &str| {
+        cadence_hooks_core::markers::session_marker(
+            input,
+            kind,
+            Some(&format!("{target}\u{1f}{agent}")),
+        )
+    };
     let dir = cadence_hooks_core::worktree::git_dir_for_input(input);
-    let dir = dir.to_string_lossy();
+    let dir = dir.to_string_lossy().into_owned();
     let root = cadence_hooks_core::paths::find_git_root(&dir)
         .map(|root| root.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.into_owned());
-    cadence_hooks_core::markers::session_marker(input, "overshare-warned", Some(&root))
+        .unwrap_or_else(|| dir.clone());
+    let Some(command) = input.command() else {
+        return Some(vec![key(WRITE_MARKER_KIND, &root)]);
+    };
+    bash_targets(command, &dir).map(|targets| {
+        targets
+            .iter()
+            .map(|target| match target {
+                Target::Cwd => key(BASH_MARKER_KIND, &root),
+                Target::GhRepo(slug) => key(BASH_MARKER_KIND, &format!("gh:{slug}")),
+            })
+            .collect()
+    })
 }
 
-/// Let `nudge` through only the first time `marker` is seen this session,
-/// and record it. The audit text is the same on every firing, so one reminder
-/// per session per repo carries all of it (cadence-hooks#1443). A marker that
-/// cannot be written lets the next firing nudge again: fail open toward the
-/// reminder, never away from it.
-fn once_per_session(nudge: CheckResult, marker: &std::path::Path) -> CheckResult {
-    if marker.exists() {
+/// Where a Bash post goes, as far as the existing readers say exactly.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// The repo `cwd` is in.
+    Cwd,
+    /// A literal `gh -R owner/repo` (lowercased).
+    GhRepo(String),
+}
+
+/// The targets of `command`'s posting segments, or `None` when one names a
+/// target not resolved exactly. See [`marker_paths`].
+fn bash_targets(command: &str, cwd: &str) -> Option<Vec<Target>> {
+    use cadence_hooks_core::shell::{
+        GhRepoFlag, command_segments, command_word, executable_tokens, gh_repo_flags,
+        parse_work_dir, peel_command_runners, skip_git_global_options,
+    };
+    if parse_work_dir(command, cwd) != cwd {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for segment in command_segments(command) {
+        let tokens = executable_tokens(&segment);
+        let argv = peel_command_runners(&tokens);
+        let Some(head) = argv.first() else { continue };
+        let target = match command_word(head).as_ref() {
+            "git" if skip_git_global_options(&argv[1..]).len() + 1 == argv.len() => Target::Cwd,
+            "git" | "tea" => return None,
+            "gh" => match gh_repo_flags(argv).resolve() {
+                GhRepoFlag::Absent => Target::Cwd,
+                GhRepoFlag::Target(slug) if !slug.contains(['$', '`']) => {
+                    Target::GhRepo(slug.to_ascii_lowercase())
+                }
+                _ => return None,
+            },
+            _ => continue,
+        };
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    if targets.is_empty() {
+        targets.push(Target::Cwd);
+    }
+    Some(targets)
+}
+
+/// Let `nudge` through unless every marker in `markers` is already recorded
+/// this session, and record them all. The audit text is the same on every
+/// firing, so one reminder per agent per target carries it (cadence-hooks#1443).
+/// A marker that cannot be written lets the next firing nudge again: fail open
+/// toward the reminder, never away from it.
+///
+/// Known limit: the marker is written when this check returns the nudge, not
+/// when the model receives it. If another guard blocks the same call, the
+/// retry in that session gets no reminder. It also outlives a compaction or
+/// `/clear` under the same session id.
+fn once_per_session(nudge: CheckResult, markers: &[std::path::PathBuf]) -> CheckResult {
+    if markers.iter().all(|marker| marker.exists()) {
         return CheckResult::allow();
     }
-    let _ = cadence_hooks_core::markers::write_marker(marker, "");
+    for marker in markers {
+        let _ = cadence_hooks_core::markers::write_marker(marker, "");
+    }
     nudge
 }
 
@@ -591,49 +688,140 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Nudge);
     }
 
-    // --- Once per session per repo (cadence-hooks#1443) ---
+    // --- Once per agent per target (cadence-hooks#1443) ---
+
+    /// A Bash payload with a fixed session, agent and cwd.
+    fn bash_at(command: &str, cwd: &std::path::Path, sid: &str, agent: Option<&str>) -> HookInput {
+        HookInput {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            session_id: Some(sid.into()),
+            agent_id: agent.map(Into::into),
+            ..make_bash(command)
+        }
+    }
+
+    /// A scratch dir holding two git roots, `a` (with `a/sub`) and `b`.
+    fn two_repos() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        for repo in ["a/.git", "a/sub", "b/.git"] {
+            std::fs::create_dir_all(dir.path().join(repo)).unwrap();
+        }
+        dir
+    }
 
     #[test]
     fn nudge_fires_once_per_marker_then_allows() {
         let dir = tempfile::tempdir().expect("scratch dir");
-        let marker = dir.path().join("overshare-warned-x");
+        let markers = [dir.path().join("m1"), dir.path().join("m2")];
         let nudge = || CheckResult::nudge(nudge_text());
-        let first = once_per_session(nudge(), &marker);
+        let first = once_per_session(nudge(), &markers);
         assert_eq!(first.outcome, Outcome::Nudge);
-        assert!(marker.exists(), "the first firing records the marker");
-        let second = once_per_session(nudge(), &marker);
+        assert!(
+            markers.iter().all(|m| m.exists()),
+            "the first firing records every marker"
+        );
+        let second = once_per_session(nudge(), &markers);
         assert_eq!(second.outcome, Outcome::Allow);
         assert!(second.message.is_none());
+        // One unseen target is enough to nudge again.
+        let third = once_per_session(nudge(), &[markers[0].clone(), dir.path().join("m3")]);
+        assert_eq!(third.outcome, Outcome::Nudge);
     }
 
     #[test]
-    fn marker_is_keyed_per_repo_and_per_session() {
-        let a = tempfile::tempdir().expect("repo a");
-        let b = tempfile::tempdir().expect("repo b");
-        std::fs::create_dir(a.path().join(".git")).unwrap();
-        std::fs::create_dir(b.path().join(".git")).unwrap();
-        std::fs::create_dir(a.path().join("sub")).unwrap();
-        let at = |cwd: &std::path::Path, sid: &str| HookInput {
-            tool_name: Some("Bash".into()),
-            cwd: Some(cwd.to_string_lossy().into_owned()),
-            session_id: Some(sid.into()),
-            ..make_bash("git push")
-        };
-        let root = marker_path(&at(a.path(), "s1"));
+    fn marker_is_keyed_per_repo_session_agent_and_trigger() {
+        let dir = two_repos();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let key = |input: &HookInput| marker_paths(input).expect("gated");
+        let root = key(&bash_at("git push", &a, "s1", None));
         assert_eq!(
             root,
-            marker_path(&at(&a.path().join("sub"), "s1")),
-            "same repo, same marker"
+            key(&bash_at("git push", &a.join("sub"), "s1", None)),
+            "same repo"
         );
         assert_ne!(
             root,
-            marker_path(&at(b.path(), "s1")),
-            "another repo nudges again"
+            key(&bash_at("git push", &b, "s1", None)),
+            "another repo"
         );
         assert_ne!(
             root,
-            marker_path(&at(a.path(), "s2")),
-            "another session nudges again"
+            key(&bash_at("git push", &a, "s2", None)),
+            "another session"
         );
+        assert_ne!(
+            root,
+            key(&bash_at("git push", &a, "s1", Some("ag1"))),
+            "another agent"
+        );
+        let write = HookInput {
+            session_id: Some("s1".into()),
+            ..make_write(&a.join("docs/field-reports/x.md").to_string_lossy(), "x")
+        };
+        assert_ne!(
+            root,
+            key(&write),
+            "a field-report edit does not spend the push reminder"
+        );
+    }
+
+    #[test]
+    fn a_named_target_keys_on_the_target_or_skips_the_gate() {
+        let dir = two_repos();
+        let a = dir.path().join("a");
+        let key = |command: &str| marker_paths(&bash_at(command, &a, "s1", None));
+        let cwd_key = key("gh issue create --title x --body-file b.md").expect("gated");
+        let public = key("gh issue create -R owner/public --title x --body-file b.md")
+            .expect("a literal -R slug is read exactly");
+        assert_ne!(cwd_key, public, "-R names another repo's key");
+        assert_eq!(
+            public,
+            key("gh -R Owner/Public issue create --title x").expect("gated")
+        );
+        for command in [
+            "git -C ../b push",
+            "git -C ../b commit -m x",
+            "cd ../b && git push",
+            "gh issue create -R \"$REPO\" --title x",
+            "tea pr create --title x",
+        ] {
+            assert!(
+                key(command).is_none(),
+                "{command}: an unresolved target nudges every time"
+            );
+        }
+    }
+
+    /// The real check, end to end: nudge, then silence for the same agent and
+    /// target, then a nudge for another target or agent.
+    #[test]
+    fn run_nudges_once_per_agent_and_target() {
+        let dir = two_repos();
+        let markers = tempfile::tempdir().expect("marker dir");
+        let a = dir.path().join("a");
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let run = |command: &str, agent: Option<&str>| {
+                WarnOvershare
+                    .run(&bash_at(command, &a, "s1", agent))
+                    .outcome
+            };
+            assert_eq!(run("git push origin x", None), Outcome::Nudge);
+            assert_eq!(run("git commit -m y", None), Outcome::Allow);
+            assert_eq!(run("git push origin z", Some("ag1")), Outcome::Nudge);
+            assert_eq!(
+                run("gh pr create -R owner/public --title t", None),
+                Outcome::Nudge
+            );
+            assert_eq!(
+                run("gh pr comment 5 -R owner/public --body b", None),
+                Outcome::Allow
+            );
+            assert_eq!(run("git -C ../b commit -m x", None), Outcome::Nudge);
+            assert_eq!(run("git -C ../b commit -m x", None), Outcome::Nudge);
+            assert_eq!(run("git status", None), Outcome::Allow);
+            // A call that does not nudge spends no reminder.
+            assert_eq!(run("git status", Some("ag2")), Outcome::Allow);
+            assert_eq!(run("git push origin q", Some("ag2")), Outcome::Nudge);
+        });
     }
 }
