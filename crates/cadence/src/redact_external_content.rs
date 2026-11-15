@@ -1227,7 +1227,7 @@ fn run_command_or_edit(input: &HookInput) -> CheckResult {
     // the tier, and nothing can be checked against it, so the post stops
     // (cameronsjo/cadence-hooks#1617). An absent file stays inert.
     if status.blocks_posts() && !bodies.is_empty() {
-        let mut message = unreadable_source_message();
+        let mut message = unreadable_source_message("this post or commit message");
         if !cred_hits.is_empty() {
             message = format!("{}\n{message}", credential_scan::render(&cred_hits));
         }
@@ -1362,13 +1362,13 @@ fn with_mcp_verdict(mcp: CheckResult, shell: CheckResult) -> CheckResult {
 }
 
 /// The block for a term source that exists but cannot be read (#1617).
-fn unreadable_source_message() -> String {
+fn unreadable_source_message(subject: &str) -> String {
     let path = identity::terms_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unresolvable: no account home>".to_string());
     format!(
         "⛔  redact-external-content: BLOCKED — the identity term source exists but could not be \
-         read, so this post or commit message cannot be checked for work-identifiable terms.\n\
+         read, so {subject} cannot be checked for work-identifiable terms.\n\
          Found: {path} (permissions on it or its directory, a dangling link, not a regular \
          file, or over the size cap)\n\
          Fix: make it a readable regular file (`chmod 600 '{path}'`), then retry. To run this \
@@ -1708,8 +1708,9 @@ const REA_SERVER: &str = "rea";
 
 /// rea tools that skip the identity tier: exactly those whose effect audit
 /// (rea `src/contracts/toolEffects.ts`, at rea `8413ec0`) neither launches a
-/// process, reaches the network, nor writes files (`openWorldHint` false and
-/// `writesFilesystem` false). They read and annotate local artifacts. A tool
+/// process, reaches the network, nor writes files (`launchesProcess`,
+/// `accessesNetwork` and `writesFilesystem` all false; rea derives its MCP
+/// `openWorldHint` from the first two). They read and annotate local artifacts. A tool
 /// that writes a file to a path the caller picks (an evidence export, a
 /// snapshot) is left out: that file can land in a work tree and be
 /// committed. Every other rea tool, and
@@ -1721,7 +1722,9 @@ const REA_SERVER: &str = "rea";
 /// and paste its output here (it prints the list sorted), or pass
 /// `--check crates/cadence/src/redact_external_content.rs` to see the
 /// difference. Update the rea commit above, and move any tool that left the
-/// list into the open-world rows of `rea_local_tools_are_its_closed_world_tools`.
+/// list into the scanned rows of `rea_local_tools_are_its_closed_world_tools`.
+/// The check is manual: rea's source is in another repo, so CI cannot run
+/// it. Whoever adopts a newer rea runs it.
 const REA_LOCAL_TOOLS: &[&str] = &[
     "address_name",
     "address_to_file_offset",
@@ -1877,6 +1880,20 @@ fn mcp_texts<'a>(value: &'a serde_json::Value, out: &mut Vec<McpText<'a>>) {
     }
 }
 
+/// Every string in `value` at any depth, object keys included, with no key
+/// left out: what the credential tier reads.
+fn every_string<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| every_string(v, out)),
+        serde_json::Value::Object(map) => map.iter().for_each(|(k, v)| {
+            out.push(k);
+            every_string(v, out);
+        }),
+        _ => {}
+    }
+}
+
 /// [`mcp_texts`] over one object, leaving out the keys in `skip`.
 fn mcp_object_texts<'a>(
     map: &'a serde_json::Map<String, serde_json::Value>,
@@ -1945,9 +1962,9 @@ fn mcp_object_texts<'a>(
 /// - **No path exempts anything.** The `file_path`/`path` and the content
 ///   beside it get both tiers, whatever the path says: whether a path is
 ///   local is known only for this machine, and the server that receives the
-///   call may be a remote sandbox or container. An exemption for a local
-///   filesystem server would need an exact table of such servers; none is
-///   installed, so there is none, and `Write`/`Edit` cover local files.
+///   call may be a remote sandbox or container. `Write`/`Edit` cover local
+///   files. A path-scoped `allow` entry does not apply either; a `pattern`
+///   entry does.
 ///
 /// What stays as on the Write/Edit surface ([`run_edit`]):
 ///
@@ -1955,9 +1972,11 @@ fn mcp_object_texts<'a>(
 ///   algebra resolves the destination from a shell command's target repo,
 ///   which an MCP call does not have, so it would fall back to public and
 ///   nudge on every local path in tools that never leave the machine.
-/// - **Removal edits stay possible.** Old-side text ([`PRIOR_TEXT_KEYS`])
-///   beside a new-side value is not scanned by either tier, and is counted
-///   against that value only. Without a new-side sibling it is scanned.
+/// - **Removal edits stay possible for terms.** Old-side text
+///   ([`PRIOR_TEXT_KEYS`]) beside a new-side value skips the identity tier
+///   and is counted against that value only; without a new-side sibling it
+///   gets the identity tier too. The credential tier always reads it: the
+///   server receives the old side, so a token there is sent.
 ///
 /// The input read is the payload's own `tool_input`, before the typed parse
 /// dropped any field that failed its shape ([`HookInput::mcp_tool_input`]),
@@ -1979,14 +1998,13 @@ fn run_mcp(
             None => return CheckResult::allow(),
         },
     };
-    let file_path = input
-        .tool_input
-        .as_ref()
-        .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
     // No path exempts anything here: whether `/tmp/notes.json` is local is
     // known only for this machine, and the server that receives the call may
-    // be a remote sandbox or container. No local filesystem MCP server is
-    // installed, so none is exempt; `Write` and `Edit` cover local files.
+    // be a remote sandbox or container; `Write` and `Edit` cover local files.
+    // For the same reason a path-scoped `allow` entry does not apply here
+    // (no file path is passed below): an entry scoped to `docs/` would
+    // otherwise excuse a term in a remote repo's `docs/` file. A `pattern`
+    // entry still applies.
     //
     // Keys only the identity tier leaves alone: on a local shell tool, the one
     // key the Bash surface reads (a `cmd` beside a `command` is read by
@@ -2010,16 +2028,17 @@ fn run_mcp(
         }
         texts
     };
-    // Credential tier (#1022): every string, whatever the path or the server,
-    // armed term source or not, and no identity setting reaches it. Old-side
-    // text beside a new-side value is not scanned, so an edit that removes a
-    // token stays possible.
-    let credential_texts = walk(&[]);
+    // Credential tier (#1022): every string, keys and old-side text included,
+    // whatever the path or the server, armed term source or not, and no
+    // identity setting reaches it. The server receives the old side too, so a
+    // token there is sent; removing one is an `Edit`, not an MCP call.
+    let mut credential_texts: Vec<&str> = Vec::new();
+    every_string(raw.as_ref(), &mut credential_texts);
     let mut scanned: HashSet<&str> = HashSet::new();
     let cred_hits: Vec<credential_scan::CredHit> = credential_texts
-        .iter()
-        .filter(|(text, _)| scanned.insert(text))
-        .flat_map(|(text, _)| credential_scan::scan(text))
+        .into_iter()
+        .filter(|text| scanned.insert(text))
+        .flat_map(credential_scan::scan)
         .collect();
     let Some((identity_list, status)) = identity else {
         return with_credential_block(&cred_hits, CheckResult::allow());
@@ -2037,11 +2056,11 @@ fn run_mcp(
     // a key goes to the server and is scanned when the source is readable.
     // Only a call with nothing to read (`{}`) goes through.
     if status.blocks_posts() && unique.iter().any(|(text, _)| !text.is_empty()) {
-        let unreadable = CheckResult::block(unreadable_source_message());
+        let unreadable = CheckResult::block(unreadable_source_message("this MCP call"));
         return with_credential_block(&cred_hits, unreadable);
     }
     let folded = if identity_list.is_armed() {
-        let identity_hits = introduced_identity_hits(unique, identity_list, file_path);
+        let identity_hits = introduced_identity_hits(unique, identity_list, None);
         combine(&identity_hits, &[], &[], &[], identity_list.mode)
     } else {
         CheckResult::allow()
@@ -2911,7 +2930,7 @@ pub fn run_scan_to(
     // shaped scan still runs below, as it does after an identity hit.
     let source_unreadable = status.blocks_posts();
     if source_unreadable {
-        eprintln!("{}", unreadable_source_message());
+        eprintln!("{}", unreadable_source_message("this text"));
     } else if status.needs_notice() {
         // An unarmed tier is otherwise indistinguishable from a clean scan:
         // exit 0, no output. One stderr line says the identity check did not
@@ -4866,7 +4885,7 @@ term = "acmecorp"
 
     #[test]
     fn mcp_post_is_refused_whatever_field_carries_the_term() {
-        // CAM-714: only `content`/`new_string`/`edits` were read, so a GitHub
+        // CAM-714 (cameronsjo/cadence-hooks#1623): only `content`/`new_string`/`edits` were read, so a GitHub
         // or Linear tool posting `body`/`title`/`description` went unscanned.
         with_terms(FIXTURE, || {
             let mut missed: Vec<String> = Vec::new();
@@ -5126,6 +5145,58 @@ term = "acmecorp"
     }
 
     #[test]
+    fn a_path_scoped_allow_does_not_reach_an_mcp_call() {
+        // An entry scoped to `docs/` excuses a term in a local docs file on
+        // `Edit`; an MCP call's path may name a remote repo's file, so the
+        // same entry does not excuse it there. A `pattern` entry still does.
+        let scoped = "version = 1\n[[terms]]\nid = \"T1\"\nterm = \"acmecorp\"\n[[terms.allow]]\npath = \"docs/\"\n";
+        with_terms(scoped, || {
+            let edit = HookInput {
+                tool_name: Some("Edit".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/repo/docs/x.md".into()),
+                    new_string: Some("about acmecorp".into()),
+                    old_string: Some("about x".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let r = RedactExternalContent.run(&edit);
+            assert_eq!(r.outcome, Outcome::Allow, "control, Edit: {:?}", r.message);
+            let r = run_mcp_call(
+                "mcp__github__create_or_update_file",
+                serde_json::json!({"path": "docs/x.md", "content": "about acmecorp"}),
+            );
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+        });
+        // The security review's probes: an entry scoped to `/tmp/`.
+        let tmp = "version = 1\n[[terms]]\nid = \"T1\"\nterm = \"acmecorp\"\n[[terms.allow]]\npath = \"/tmp/\"\n";
+        with_terms(tmp, || {
+            for (tool, input) in [
+                (
+                    "mcp__github__create_issue",
+                    serde_json::json!({"path": "/tmp/x", "body": "acmecorp"}),
+                ),
+                (
+                    "mcp__github__create_or_update_file",
+                    serde_json::json!({"path": "docs/tmp/x.md", "content": "acmecorp"}),
+                ),
+            ] {
+                let r = run_mcp_call(tool, input.clone());
+                assert_eq!(r.outcome, Outcome::Block, "{tool} {input}");
+            }
+        });
+        let pattern = "version = 1\n[[terms]]\nid = \"T1\"\nterm = \"acmecorp\"\n[[terms.allow]]\npattern = \"acmecorp-public\"\n";
+        with_terms(pattern, || {
+            let r = run_mcp_call(
+                "mcp__github__create_issue",
+                serde_json::json!({"body": "see acmecorp-public"}),
+            );
+            assert_eq!(r.outcome, Outcome::Allow, "pattern entry: {:?}", r.message);
+        });
+    }
+
+    #[test]
     fn rea_local_tools_are_its_closed_world_tools() {
         // Pinned against rea's effect audit (`toolEffects.ts` at `8413ec0`;
         // refresh with `scripts/generate-rea-local-tools.py`): the exempt
@@ -5376,15 +5447,35 @@ term = "acmecorp"
     }
 
     #[test]
-    fn mcp_edit_that_removes_a_token_stays_possible() {
-        // Old-side text is not scanned by the credential tier either.
+    fn a_token_in_mcp_old_side_text_is_refused_and_a_removed_term_is_not() {
+        // The server receives the old side too, so the credential tier reads
+        // every old-side spelling, on any server. The identity tier still
+        // counts a term there against the new side, so removing a term works.
         let t = fake_ghp();
         with_terms_cleared(|| {
+            for key in ["old_string", "oldString", "old_str", "old_text", "oldText"] {
+                let r = run_mcp_call(
+                    "mcp__remote__edit_file",
+                    serde_json::json!({key: format!("key = {t}"), "new_string": "key = <redacted>"}),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "token in {key}");
+            }
+            let r = run_mcp_call(
+                "mcp__c3__rename",
+                serde_json::json!({"oldText": format!("key = {t}"), "newText": "x"}),
+            );
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "token in a local tool's old side"
+            );
+        });
+        with_terms(FIXTURE, || {
             let r = run_mcp_call(
                 "mcp__remote__edit_file",
-                serde_json::json!({"old_string": format!("key = {t}"), "new_string": "key = <redacted>"}),
+                serde_json::json!({"old_string": "about acmecorp", "new_string": "about the parser"}),
             );
-            assert_eq!(r.outcome, Outcome::Allow);
+            assert_eq!(r.outcome, Outcome::Allow, "a removed term: {:?}", r.message);
         });
     }
 

@@ -3,7 +3,7 @@
 - [x] 1.1 Capture an MCP call's `tool_input` before the typed salvage (`HookInput::mcp_tool_input`)
 - [x] 1.2 Route `mcp__*` calls to an identity pass over every string, keys included, at any depth
 - [x] 1.3 Leave old-side text unscanned and subtract its occurrences from its siblings'
-- [x] 1.4 Keep the term-source and provably-local exemptions and the fail-open on no term source
+- [x] 1.4 Keep the term-source and provably-local exemptions and the fail-open on no term source (path exemptions superseded by 6.1)
 
 ## 2. Tests
 
@@ -15,13 +15,13 @@
 ## 3. Credential tier and routing
 
 - [x] 3.1 Run the credential tier over every scanned MCP string, term source or not
-- [x] 3.2 Exempt the local servers `c3`, `easel`, `herdr-bridge` and `rea` in the binary, matched exactly on the server segment
+- [x] 3.2 Exempt the local servers `c3`, `easel`, `herdr-bridge` and `rea` in the binary, matched exactly on the server segment (superseded by 4.1)
 - [x] 3.3 Route every `mcp__*` call to the hook in the registration-audit fixture, once per call
 - [x] 3.4 Tests: a token in an MCP `body` blocks, the same token through `gh` blocks, a clean call allows, a removal edit allows, listed servers allow and look-alikes block, every posting probe reaches the hook once; each staged off once and seen red
 
 ## 4. Review round 3
 
-- [x] 4.1 Run the credential tier on every MCP call, local tools included; narrow the identity exemption to exact local tool names (rea by name markers)
+- [x] 4.1 Run the credential tier on every MCP call, local tools included; narrow the identity exemption to exact local tool names (rea by name markers) (rea part superseded by 5.5 and 6.4)
 - [x] 4.2 Block MCP calls that carry text when the term source is unreadable (#1617)
 - [x] 4.3 Scan `command`/`cmd` on every tool but a local shell tool's Bash-read key
 - [x] 4.4 Scan a lone old-side value; split tool names at the first `__` and scan an ambiguous one
@@ -29,7 +29,7 @@
 
 ## 5. Review round 4
 
-- [x] 5.1 Credential tier on the top-level `file_path`/`path`; identity tier skips it only when absolute and proven local
+- [x] 5.1 Credential tier on the top-level `file_path`/`path`; identity tier skips it only when absolute and proven local (identity skip superseded by 6.1)
 - [x] 5.2 A local shell tool's command skips the identity tier only
 - [x] 5.3 Keep a warn-mode finding from the string scan when the call also carries a command
 - [x] 5.4 Unreadable term source blocks only calls whose input holds a string value
@@ -44,3 +44,10 @@
 - [x] 6.4 Leave rea's file-writing tools off `REA_LOCAL_TOOLS`; `scripts/generate-rea-local-tools.py` derives the list
 - [x] 6.5 `Write` and `Edit` probes in the exactly-once wiring test; cite cameronsjo/cadence-hooks#1624 at the parse fail-open
 - [x] 6.6 Tests for each, each staged off once and seen red
+
+## 7. Review round 6
+
+- [x] 7.1 Path-scoped `allow` entries do not apply on MCP calls; `pattern` entries still do
+- [x] 7.2 `scripts/generate-rea-local-tools.py` fails on any effects form it cannot read; tests cover a spread and a shorthand flag
+- [x] 7.3 The unreadable-source message names what it stopped (a post, an MCP call, a scanned text)
+- [x] 7.4 The credential tier reads old-side text on MCP calls (the server receives it); the identity tier still skips it beside a new-side value

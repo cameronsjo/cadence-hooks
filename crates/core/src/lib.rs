@@ -360,7 +360,7 @@ pub struct HookInput {
     pub mistyped_top_level: Vec<&'static str>,
     /// An MCP call's `tool_input` exactly as the payload sent it, captured by
     /// [`Self::from_json`] before the per-field salvage drops anything that
-    /// fails [`ToolInput`]'s typed shape (Linear CAM-714). A
+    /// fails [`ToolInput`]'s typed shape (Linear CAM-714, cameronsjo/cadence-hooks#1623). A
     /// third-party server's `content` can be an array of blocks or its
     /// `description` an object, and the salvage would remove either from the
     /// typed view; a guard that must read every string the call publishes

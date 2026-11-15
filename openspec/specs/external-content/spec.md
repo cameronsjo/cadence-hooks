@@ -225,7 +225,7 @@ On an `mcp__*` call, a `command` or `cmd` string SHALL be scanned like any other
 - **THEN** the hook exits 0 and shows the finding
 
 ### Requirement: Credential scan of MCP calls
-On every `mcp__*` call, local tools included, `redact-external-content` SHALL run the credential tier over every string in the input, the top-level `file_path`/`path` and the content beside any path included, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
+On every `mcp__*` call, local tools included, `redact-external-content` SHALL run the credential tier over every string in the input, the top-level `file_path`/`path`, the content beside any path and old-side edit text included, with or without a term source and in every identity mode. A token MUST block, and no bypass applies.
 
 #### Scenario: Token in an MCP issue body
 - **WHEN** an `mcp__github__create_issue` call carries a GitHub token only in `body` and no term source exists
@@ -233,7 +233,7 @@ On every `mcp__*` call, local tools included, `redact-external-content` SHALL ru
 
 #### Scenario: MCP edit removes a token
 - **WHEN** an MCP edit's `old_string` holds a token and its `new_string` does not
-- **THEN** the hook exits 0
+- **THEN** the hook exits 2, since the server receives the old side too
 
 #### Scenario: Token typed into another agent
 - **WHEN** an `mcp__herdr-bridge__send` call's `text` holds a token
@@ -263,7 +263,7 @@ The identity tier MUST NOT run on a call to a local tool: `c3` `compact`, `model
 - **THEN** the hook exits 2
 
 ### Requirement: No path exemption on MCP calls
-An MCP call's `file_path` or `path` MUST NOT exempt any string from either tier, whatever it names: whether a path is local is known only for this machine, and the server that receives the call may be remote. The term source, a code or config file proven local and `~/.ssh/config` are exempt on `Write` and `Edit` only.
+An MCP call's `file_path` or `path` MUST NOT exempt any string from either tier, whatever it names, and a `path`-scoped allow entry MUST NOT apply to an MCP call: whether a path is local is known only for this machine, and the server that receives the call may be remote. The term source, a code or config file proven local and `~/.ssh/config` are exempt on `Write` and `Edit` only.
 
 #### Scenario: Token beside a local-looking path
 - **WHEN** an `mcp__sandbox__write_file` call's `path` is `/tmp/notes.json` and its `content` holds a token
@@ -273,8 +273,12 @@ An MCP call's `file_path` or `path` MUST NOT exempt any string from either tier,
 - **WHEN** an MCP call's `file_path` is a provably local path and its `path` is `docs/<term>.md`
 - **THEN** the hook exits 2
 
+#### Scenario: Path-scoped allow entry on an MCP call
+- **WHEN** the term source holds an allow entry scoped to `path = "docs/"` and an `mcp__github__create_or_update_file` call's `path` is `docs/x.md` with an identity term in `content`
+- **THEN** the hook exits 2
+
 ### Requirement: MCP edits count against their old-side text
-In an MCP call, a string under an old-side key (`old_string`, `oldString`, `old_str`, `old_text`, `oldText`) beside a new-side string MUST NOT be scanned; with no new-side sibling it SHALL be scanned like any other string. A new-side string beside it (`new_string`, `newString`, `new_str`, `new_text`, `newText`, `content`) MUST block only on each term's occurrences beyond that term's occurrences in the old-side text; any other string beside it MUST be scanned in full.
+In an MCP call, a string under an old-side key (`old_string`, `oldString`, `old_str`, `old_text`, `oldText`) beside a new-side string MUST NOT get the identity tier; with no new-side sibling it SHALL get it. The credential tier reads it either way. A new-side string beside it (`new_string`, `newString`, `new_str`, `new_text`, `newText`, `content`) MUST block only on each term's occurrences beyond that term's occurrences in the old-side text; any other string beside it MUST be scanned in full.
 
 #### Scenario: MCP edit removes a term
 - **WHEN** an MCP edit's `oldText` holds an identity term and its `newText` does not

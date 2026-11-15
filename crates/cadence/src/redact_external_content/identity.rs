@@ -56,9 +56,10 @@ pub(crate) enum Mode {
 
 /// One allow entry — a context in which a term is benign.
 ///
-/// `path` matches when the scanned content's file path contains it (a Write/Edit
-/// or MCP surface only, read from the call's `file_path` or `path` — a commit
-/// message has no path). `pattern` matches against the
+/// `path` matches when the scanned content's file path contains it (the
+/// Write/Edit surface only, read from the call's `file_path` — a commit
+/// message has no path, and an MCP call's path is not passed, since it may
+/// name a file on a remote server). `pattern` matches against the
 /// surrounding text. Either alone is sufficient; both empty is inert — unless
 /// `destinations` is set (below).
 ///
