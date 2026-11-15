@@ -8,7 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`git-safety` no longer prints "cannot see inside a script file" (or an `eval`, or a command named by a substitution).** The note fired on every script run, including the write-a-script-then-run-it pattern, and named no action to take (cadence-ecosystem ADR-0046 rule 3). A command the guard cannot read now exits 0 with no output. Every block and the history-rewrite nudge are unchanged, and a script run beside a destructive git command still blocks (cameronsjo/cadence-hooks#1443).
+- **`warn-overshare` nudges at most once per session per repo.** It repeated the same pre-ship audit text on every commit, push and post. The first matching call in a session writes an `overshare-warned` session marker keyed on the git root (above the edited file, or above `cwd` for Bash); later calls in that session and repo exit 0 with no output. What it matches is unchanged (cameronsjo/cadence-hooks#1443).
 - **`redact-external-content` no longer scans an edit to `~/.ssh/config`.** Since cameronsjo/cadence-hooks#1431 a Write or Edit skips the identity scan only in fixed local locations, and `~/.ssh/config` was not one, so adding a work host to it blocked. That exact file, resolved under the account's home directory, is now a local location read as config. Every other check still applies (no repo, sync tree, remote mount, hard link, or symlink that lands elsewhere). `~/.aws/config`, `~/.kube/config`, every other path under `~/.ssh` (`config.d/…`, `known_hosts`) and any path with `..` stay scanned.
+
+### Removed
+
+- **`guardrails warn-alias-parsing` and `guardrails warn-curl-alias` no longer nudge.** Both told the model that a tool (`cat`, `ls`, `du`, `df`, `top`, `curl`) is aliased to a replacement "on this machine" without checking, and in Claude Code's shells (`CLAUDECODE=1`) the operator's dotfiles define no such alias. Their logic and tests are deleted. The subcommands stay as a silent stub that exits 0 with no output, because the `cadence-guardrails` plugin still calls them until its wiring is removed in cameronsjo/cadence; an unknown subcommand would print the version notice and exit 1 on every matching call (cameronsjo/cadence-hooks#1443).
 
 ### Fixed
 

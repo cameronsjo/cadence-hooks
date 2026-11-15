@@ -107,9 +107,10 @@ Rules for wiring:
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
-judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
-(the safe home for personal context), and is silenced session-wide with
-`CADENCE_SKIP_OVERSHARE_AUDIT=1`.
+judgment to the model. It nudges at most once per session per repo (keyed
+on the git root above the edited file, or above `cwd` for Bash). It exempts
+writes under `$OBSIDIAN_VAULT` (the safe home for personal context), and is
+silenced session-wide with `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
 ## guardrails (git-guardrails)
 
@@ -135,14 +136,14 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed | run |
 | `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` | run |
 | `guard-runbook-scrub` | PreToolUse (Write, Edit) | When `CADENCE_RUNBOOKS_DIR` is set, block a Write/Edit/MultiEdit (or MCP write) into that directory unless the resulting document's SHA-256 matches a marker from `cadence record-scrub`. Paths are resolved through symlinks and `..`, case-insensitively. An Edit whose result cannot be simulated literally blocks, and so does any write into the scrub-marker directory. Bash is not judged: what a command writes is not knowable before it runs (cameronsjo/cadence-hooks#1442). Inert when the variable is unset. Escape: `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK=1` | run |
-| `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers | run |
+| `warn-curl-alias` | PreToolUse (Bash) | Retired: exits 0 with no output, kept so older plugin wiring does not print a version notice (cameronsjo/cadence-hooks#1443) | run |
 | `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) | run |
 | `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker), or a reviewer's latest decisive review is still `CHANGES_REQUESTED` (the warning names the dismissal command for the operator) | run |
 | `warn-stale-pr-body` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR body was never edited since the PR was opened while the branch has gained commits since — the placeholder body is about to become the squash-merge record | run |
 | `warn-stacked-base-delete` | PreToolUse (Bash) | Warn before `git push <remote> --delete <branch>` / `:<branch>` or `gh pr merge --delete-branch` when open PRs base on the branch (deleting it closes them, never retargets); names the PRs | run |
 | `warn-entry-posture` | PreToolUse (Write, Edit) | Once per session per linked worktree, at the first write: warn when the branch has no upstream (`git push -u`) or no open PR (`gh pr create --draft`) | run |
 | `warn-chezmoi-apply` | PreToolUse (Bash) | Warn when `chezmoi apply` would overwrite files `chezmoi status` shows drifted locally (`MM`/`MD`), narrowed to the apply's targets and `--include`/`--exclude`; an unscoped apply gets a scoping clause. Silent on a clean tree, a dry run, a relocated source/config, or no `chezmoi` | run |
-| `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers | run |
+| `warn-alias-parsing` | PreToolUse (Bash) | Retired: exits 0 with no output, kept so older plugin wiring does not print a version notice (cameronsjo/cadence-hooks#1443) | run |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed | run |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target | run |
 | `warn-agent-dispatch` | PreToolUse (Agent, Task) | Advisory only. Warn on a non-fork dispatch with no `model`, a `model` on a fork dispatch (ignored by the platform), and a brief that asks the subagent to execute commands without naming a scrubbed/isolated HOME. Never echoes the prompt | run |
