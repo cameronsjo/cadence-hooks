@@ -316,6 +316,17 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // Retired to a silent stub and unwired on purpose: the subcommands stay so
+    // an installed plugin pin that still calls them exits 0 with no output.
+    // Both entries leave when the stubs are deleted.
+    (
+        "guardrails warn-alias-parsing",
+        "cameronsjo/cadence-hooks#1634",
+    ),
+    (
+        "guardrails warn-curl-alias",
+        "cameronsjo/cadence-hooks#1634",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -484,7 +495,6 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     "cadence warn-overshare",
     "guardrails guard-op-vault-scan",
     "guardrails verify-pr-autoclose",
-    "guardrails warn-alias-parsing",
     "guardrails warn-branch-base",
     "guardrails warn-going-public",
     "guardrails warn-issue-tracker",

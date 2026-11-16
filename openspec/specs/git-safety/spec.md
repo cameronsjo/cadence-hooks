@@ -78,13 +78,6 @@ Per ADR-0046, `git-safety` MUST NOT refuse a command because part of it could no
 - **WHEN** a Bash command is `echo {1..9999}; git status`
 - **THEN** the hook does not block
 
-### Requirement: Unseen execution nudges
-When a command otherwise allows but runs text the guard cannot read (a script file that may run git, a sourced script, an `eval` of text built at run time, or a command named by a substitution), `git-safety` SHALL nudge with `git-safety cannot see inside ...` and MUST NOT block. A script file it reads whole that never names `git`, and known tool-init evals such as `eval "$(ssh-agent -s)"`, MUST draw no nudge.
-
-#### Scenario: Runtime eval
-- **WHEN** a Bash command is `eval "$CMD"`
-- **THEN** the hook exits 0 with a nudge that git-safety cannot see inside an eval of text built at run time
-
 ### Requirement: Fail-open on its own failures
 `git-safety` SHALL allow when the payload carries no Bash command. When resolving the current branch for a bare-`HEAD` force push times out under the hook deadline, it MUST NOT block on that basis and SHALL record a suppressed block instead. It is a protected guard: `CADENCE_DISABLE` naming it MUST NOT switch it off.
 
@@ -156,3 +149,14 @@ When a segment runs `git rebase`, the history nudge SHALL add a line telling the
 #### Scenario: Amend
 - **WHEN** a Bash command is `git commit --amend`
 - **THEN** the hook exits 0 with the history nudge and no `git reflog` line
+
+### Requirement: Commands the guard cannot read are allowed silently
+When a command runs text `git-safety` cannot read (a script file, a sourced script, an `eval` of text built at run time, or a command named by a substitution) and no segment it does read blocks or nudges, the hook SHALL exit 0 with no output. A block or nudge from a segment it reads MUST still apply.
+
+#### Scenario: Script run
+- **WHEN** a Bash command is `bash x.sh` or `eval "$CMD"`
+- **THEN** the hook exits 0 with no output
+
+#### Scenario: Script beside a destructive git command
+- **WHEN** a Bash command is `bash x.sh && git reset --hard`
+- **THEN** the hook blocks
