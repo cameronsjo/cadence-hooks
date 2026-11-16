@@ -1438,10 +1438,9 @@ pub const DEDUPE_ELIGIBLE_HOOKS: &[&str] = &[
     // to dedupe (cameronsjo/cadence-hooks#673 hygiene).
     "redact-external-content",
     "warn-overshare",
-    // cadence-guardrails wires warn-alias-parsing six times with different
-    // tool-name `if:` globs, so one pipeline naming several of them spawns one
-    // process per matching glob (cameronsjo/cadence-hooks#1029).
-    "warn-alias-parsing",
+    // warn-alias-parsing left this list when it was retired to a silent stub
+    // (cameronsjo/cadence-hooks#1443): it prints nothing, so its fan-out has
+    // nothing to dedupe.
 ];
 
 /// Is `hook` one of the known fan-out registrations the dedupe gate covers?

@@ -584,7 +584,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "warn-curl-alias",
-        description: "Warn when bare curl (aliased to curlie) is used with custom headers",
+        description: "Retired (cadence-hooks#1443): exits 0 silently for older plugin wiring",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.
@@ -647,7 +647,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "warn-alias-parsing",
-        description: "Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers",
+        description: "Retired (cadence-hooks#1443): exits 0 silently for older plugin wiring",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only guard or nudge over the command or repo.

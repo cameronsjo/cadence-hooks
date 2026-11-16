@@ -460,7 +460,7 @@ enum GuardrailsCommands {
     GuardSopsDecrypt,
     /// Block an unscrubbed Write/Edit (or any Bash write) into $CADENCE_RUNBOOKS_DIR
     GuardRunbookScrub,
-    /// Warn when bare curl (aliased to curlie) is used with custom headers
+    /// Retired (cadence-hooks#1443): exits 0 silently for older plugin wiring
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
     WarnGhMergePreflight,
@@ -475,7 +475,7 @@ enum GuardrailsCommands {
     WarnStackedBaseDelete,
     /// Warn on gh pr ready/merge when the PR body was never edited since the branch gained commits
     WarnStalePrBody,
-    /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
+    /// Retired (cadence-hooks#1443): exits 0 silently for older plugin wiring
     WarnAliasParsing,
     /// Block the first Claude-in-Chrome action per session until the device is confirmed
     GuardBrowserDevice,
@@ -1061,7 +1061,9 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 pre,
             ),
             GuardrailsCommands::WarnCurlAlias => CheckPlan::new(
-                Box::new(cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias),
+                Box::new(cadence_hooks_guardrails::retired::Retired(
+                    "warn-curl-alias",
+                )),
                 pre,
             ),
             GuardrailsCommands::WarnGhMergePreflight => CheckPlan::new(
@@ -1091,7 +1093,9 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
                 pre,
             ),
             GuardrailsCommands::WarnAliasParsing => CheckPlan::new(
-                Box::new(cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing),
+                Box::new(cadence_hooks_guardrails::retired::Retired(
+                    "warn-alias-parsing",
+                )),
                 pre,
             ),
             GuardrailsCommands::GuardBrowserDevice => CheckPlan::new(

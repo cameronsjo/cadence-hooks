@@ -1,47 +1,9 @@
 # tool-nudges Specification
 
 ## Purpose
-Tool nudges are the advisory and narrow gating hooks around single tools and session events: aliased shell tools (`cadence-hooks guardrails warn-curl-alias`, `cadence-hooks guardrails warn-alias-parsing`), cron (`cadence-hooks guardrails warn-cron-datetime`), chezmoi and dotfiles (`cadence-hooks guardrails warn-chezmoi-apply`, `cadence-hooks guardrails guard-dotfiles`), model and device gates (`cadence-hooks guardrails guard-read-model`, `cadence-hooks guardrails guard-browser-device`), subagent dispatch (`cadence-hooks guardrails warn-agent-dispatch`), AskUserQuestion (`cadence-hooks rules warn-recommended-option`, `cadence-hooks rules warn-empty-answers`), and session posture (`cadence-hooks cadence model-posture`, `cadence-hooks cadence platform-drift`).
+Tool nudges are the advisory and narrow gating hooks around single tools and session events: cron (`cadence-hooks guardrails warn-cron-datetime`), chezmoi and dotfiles (`cadence-hooks guardrails warn-chezmoi-apply`, `cadence-hooks guardrails guard-dotfiles`), model and device gates (`cadence-hooks guardrails guard-read-model`, `cadence-hooks guardrails guard-browser-device`), subagent dispatch (`cadence-hooks guardrails warn-agent-dispatch`), AskUserQuestion (`cadence-hooks rules warn-recommended-option`, `cadence-hooks rules warn-empty-answers`), and session posture (`cadence-hooks cadence model-posture`, `cadence-hooks cadence platform-drift`). The retired alias hooks (`cadence-hooks guardrails warn-curl-alias`, `cadence-hooks guardrails warn-alias-parsing`) keep their subcommands and exit silently.
 
 ## Requirements
-
-### Requirement: Bare curl with custom headers nudges
-`warn-curl-alias` SHALL nudge on a PreToolUse Bash command in which a pipeline or chain segment runs bare `curl` (not preceded by `command`, not an absolute path) with a header flag (`-H`, `-H<value>`, `--header`, or `--header=`) later in the same segment. The nudge MUST name the `curlie` alias and the `command curl` fix. It MUST NOT block, and it SHALL allow `command curl`, an absolute-path curl, curl with no header flag, and curl mentioned only in quoted text.
-
-#### Scenario: API call through the alias
-- **WHEN** the command is `curl -H 'Accept: application/json' https://api.example.com/items`
-- **THEN** the hook exits 0 with a nudge that names `curlie` and `command curl`
-
-#### Scenario: Plain download is allowed
-- **WHEN** the command is `curl -fsSL https://example.com/install.sh`
-- **THEN** the hook allows silently
-
-#### Scenario: Header flag on another tool in the pipe
-- **WHEN** the command is `command curl -H 'Accept: application/json' https://api.example.com | grep -H x`
-- **THEN** the hook allows silently, because no bare curl segment carries a header flag
-
-### Requirement: Aliased tool output piped into a parser nudges
-`warn-alias-parsing` SHALL nudge when a bare `cat`, `ls`, `du`, `df`, or `top` produces the output of a non-final pipe stage, including behind `xargs`, `sudo`, `env`, `nice`, `timeout`, or `VAR=value`, and inside `$(...)`, backticks, or a subshell. The nudge MUST name the tool, its replacement, and the `command <tool>` fix. It MUST NOT fire on `find`, an unpiped command, a consumer stage, `command <tool>`, an absolute path, or text in quotes or heredoc bodies.
-
-#### Scenario: Listing piped into grep
-- **WHEN** the command is `ls | grep config`
-- **THEN** the hook exits 0 with a nudge naming `ls`, `eza`, and `command ls`
-
-#### Scenario: Producer inside a substitution
-- **WHEN** the command is `f=$(ls | head -1)`
-- **THEN** the hook nudges, and `f=$(command ls | head -1)` is allowed silently
-
-#### Scenario: Interactive listing is allowed
-- **WHEN** the command is `ls -la`
-- **THEN** the hook allows silently
-
-#### Scenario: Consumer position is allowed
-- **WHEN** the command is `git diff | cat`
-- **THEN** the hook allows silently
-
-#### Scenario: Pipe inside a heredoc body
-- **WHEN** a heredoc body written by the command contains `cat f | jq .`
-- **THEN** the hook allows silently
 
 ### Requirement: CronCreate receives the current date and time
 `warn-cron-datetime` SHALL nudge on every PreToolUse `CronCreate` call with the current local date and time, the UTC time, and the day of week, as `Current date/time: <local> (<utc>)` followed by `Day of week: <day>`. Every other tool, including `CronDelete` and `CronList`, MUST be allowed silently.
@@ -258,11 +220,18 @@ When `guard-read-model` is enabled but cannot identify the session model (no tra
 - **WHEN** both halves fired this morning and the binary is then upgraded
 - **THEN** the remaining Claude Code nudge fires again the same day
 
-### Requirement: Advisory tool nudges are suppressible per repo
-Nudges from `warn-curl-alias`, `warn-alias-parsing`, `warn-cron-datetime`, `warn-chezmoi-apply`, `warn-agent-dispatch`, `warn-recommended-option`, and `warn-empty-answers` SHALL be silenceable by the repository's `.claude/cadence.json` `nudges` map. The other five hooks in this capability MUST NOT be, and suppression MUST never turn a block into an allow. Every hook here SHALL run unchanged in a cloud session.
+### Requirement: Retired alias hooks exit silently
+`warn-curl-alias` and `warn-alias-parsing` SHALL exit 0 with no output on every input, so plugin wiring that still names them prints nothing and blocks nothing.
 
-#### Scenario: Repo silences the curl nudge
-- **WHEN** the repo's `.claude/cadence.json` has `"nudges": {"warn-curl-alias": {"suppress": true}}` and a bare curl with `-H` runs
+#### Scenario: Old wiring calls a retired hook
+- **WHEN** `cadence-hooks guardrails warn-alias-parsing` runs on `ls | grep config`, or `cadence-hooks guardrails warn-curl-alias` runs on `curl -H 'Accept: application/json' https://api.example.com`
+- **THEN** the hook exits 0 with no output
+
+### Requirement: Advisory tool nudges can be silenced per repo
+Nudges from `warn-cron-datetime`, `warn-chezmoi-apply`, `warn-agent-dispatch`, `warn-recommended-option`, and `warn-empty-answers` SHALL be silenceable by the repository's `.claude/cadence.json` `nudges` map. The other five hooks in this capability MUST NOT be, and suppression MUST never turn a block into an allow. Every hook here SHALL run unchanged in a cloud session.
+
+#### Scenario: Repo silences the cron nudge
+- **WHEN** the repo's `.claude/cadence.json` has `"nudges": {"warn-cron-datetime": {"suppress": true}}` and a `CronCreate` call runs
 - **THEN** the hook allows silently
 
 #### Scenario: Repo cannot silence the device gate

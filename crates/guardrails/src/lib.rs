@@ -248,14 +248,14 @@ pub mod issue_refs;
 pub mod messages;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
+/// Retired hooks kept as silent subcommands for older plugin wiring.
+pub mod retired;
 /// Shared provenance sidecar for the `dismiss-*` snooze markers.
 pub mod snooze_meta;
 /// Warn about broken issue refs on PR create; close straggler issues on PR merge.
 pub mod verify_pr_autoclose;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_agent_dispatch;
-/// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers.
-pub mod warn_alias_parsing;
 /// Warn when `git commit --amend` would rewrite a commit a remote already has.
 pub mod warn_amend_pushed;
 /// Warn when creating a branch from a non-main base.
@@ -264,8 +264,6 @@ pub mod warn_branch_base;
 pub mod warn_chezmoi_apply;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
-/// Warn when bare `curl` (aliased to curlie) is used with custom headers.
-pub mod warn_curl_alias;
 /// Warn on a session's first write in a worktree with no upstream or no open PR.
 pub mod warn_entry_posture;
 /// Pre-flight checklist nudge before `gh pr merge` (draft, worktree, verify).
