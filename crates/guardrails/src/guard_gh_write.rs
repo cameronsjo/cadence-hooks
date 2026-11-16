@@ -4384,6 +4384,8 @@ mod tests {
         );
     }
 
+    // `crate::repo_with_remotes` exists only on unix (`lib.rs`).
+    #[cfg(unix)]
     #[test]
     fn a_placeholder_in_a_fork_is_judged_on_the_named_host() {
         // In a fork checkout gh fills `{owner}`/`{repo}` from the fork's
