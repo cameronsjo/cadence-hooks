@@ -371,10 +371,16 @@ fn a_parser_panic_is_judged_through_the_fallback() {
         stderr.contains("the loop parser panicked"),
         "the synthetic parser panic fired: {stderr}"
     );
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    // The pin: exit 2, not the 1 an uncontained panic or a timed-out hook
+    // gives. A parse that succeeded would print the same cause.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the guard still exited 2 (contained, not 1 or a signal): {stderr}"
+    );
     assert!(
         stderr.contains(UNOWNED_CAUSE),
-        "judged through the parse-failure fallback: {stderr}"
+        "still blocked as a write to an unowned repo: {stderr}"
     );
     assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
 }
@@ -443,10 +449,16 @@ fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
         stderr.contains("CADENCE_TEST_PANIC=hang"),
         "the synthetic hang fired: {stderr}"
     );
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    // The pin: exit 2, not the 1 an uncontained panic or a timed-out hook
+    // gives. A parse that succeeded would print the same cause.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the guard still exited 2 (contained, not 1 or a signal): {stderr}"
+    );
     assert!(
         stderr.contains(UNOWNED_CAUSE),
-        "judged through the parse-failure fallback: {stderr}"
+        "still blocked as a write to an unowned repo: {stderr}"
     );
     cadence_hooks_core::test_builders::assert_elapsed_under(
         &format!("judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"),
@@ -459,8 +471,8 @@ fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
 /// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): nesting deep
 /// enough to overflow the parse thread's stack. An overflow aborts the
 /// process (signal 6), which drops every verdict. Past [`MAX_PARSE_BYTES`]
-/// the command is not parsed, and the guard still blocks the unowned write
-/// through its parse-failure fallback. The
+/// the command is not parsed, and the guard still exits 2 on the unowned
+/// write. The
 /// `[[ ! …` shape costs 2 bytes per level, the cheapest known; at 16 000
 /// levels it aborts a debug build when the cap is lifted.
 #[test]
@@ -518,12 +530,16 @@ fn nesting_past_the_byte_cap_still_gets_a_verdict() {
         let (out, _) = run_guardrail("guard-gh-write", tmp.path(), command, None);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let head = &command[..40];
-        // An exit code, not a signal: the process did not abort.
-        assert_eq!(out.status.code(), Some(2), "{head}…: {stderr}");
+        // The pin: an exit code, not a signal, so the process did not abort.
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{head}…: exited 2, not aborted: {stderr}"
+        );
         if *by_fallback {
             assert!(
                 stderr.contains(UNOWNED_CAUSE),
-                "{head}…: judged through the parse-failure fallback: {stderr}"
+                "{head}…: still blocked as a write to an unowned repo: {stderr}"
             );
         }
     }

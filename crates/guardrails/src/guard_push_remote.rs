@@ -885,6 +885,30 @@ mod tests {
         assert!(result.message.is_none(), "{:?}", result.message);
     }
 
+    /// A command past the loop parser's 12 KB cap is still judged: the push
+    /// walk has no such cap, so a long commit message or comment beside a
+    /// push to an unowned remote does not silence the nudge.
+    #[test]
+    fn a_push_in_a_command_past_the_parse_cap_still_nudges() {
+        let owned = repo_with_remotes(&[("origin", OWNED)]);
+        let unowned = repo_with_remotes(&[("origin", UNOWNED)]);
+        let pad = "x".repeat(cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES);
+        for (command, cwd) in [
+            (format!("git push {UNOWNED} main\n# {pad}"), owned.path()),
+            (format!("git commit -m '{pad}' && git push"), unowned.path()),
+        ] {
+            assert!(command.len() > cadence_hooks_core::loop_analysis::MAX_PARSE_BYTES);
+            let result = run_in(&command, cwd);
+            assert_eq!(
+                result.outcome,
+                Outcome::Nudge,
+                "{:.40}…: {:?}",
+                command,
+                result.message
+            );
+        }
+    }
+
     /// No more than [`MAX_PROBES`] distinct remotes are resolved; the rest
     /// are not judged. A literal URL is judged wherever it sits.
     #[test]

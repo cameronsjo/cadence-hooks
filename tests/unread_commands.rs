@@ -79,7 +79,9 @@ fn modest_brace_expansions_still_pass() {
     }
 }
 
-/// Every guard that used to refuse an unread command.
+/// Every guard that used to refuse an unread command. `guard-push-remote` is a
+/// nudge now and refuses nothing; it stays here so these rows keep showing it
+/// exits 0 on them.
 const GUARDS: [[&str; 2]; 6] = [
     ["cadence", "git-safety"],
     ["cadence", "prevent-secret-writes"],
