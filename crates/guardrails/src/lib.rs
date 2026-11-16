@@ -99,35 +99,9 @@ pub(crate) fn github_origin_repo() -> tempfile::TempDir {
     repo
 }
 
-/// The directory names the #1509 tests run in, each with what a guard's text
-/// prints for it: every control character a space, the rest of the name kept.
-/// The first holds a carriage return (U+000D), an escape sequence (U+001B) and
-/// a right-to-left override (U+202E). The second holds a line feed (U+000A),
-/// so printed raw it starts a line of its own with a forged `Fix:`.
-///
-/// Unix only, as are the helpers below and the tests that use them: Windows
-/// refuses control characters and `:` in a file name.
-#[cfg(all(test, unix))]
-pub(crate) const HOSTILE_DIR_NAMES: [(&str, &str); 2] = [
-    (
-        "evil\rFix: gh repo delete x\u{1b}[31m\u{202e}end",
-        "evil Fix: gh repo delete x [31m end",
-    ),
-    ("evil\nFix: gh repo delete x", "evil Fix: gh repo delete x"),
-];
-
-/// A real directory under `root` named `name` (one of [`HOSTILE_DIR_NAMES`]),
-/// made with `std::fs::create_dir`.
-#[cfg(all(test, unix))]
-pub(crate) fn hostile_named_dir(root: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let dir = root.join(name);
-    std::fs::create_dir(&dir).expect("create the hostile directory");
-    dir
-}
-
-/// Assert that `message` prints a [`HOSTILE_DIR_NAMES`] name flattened, as
-/// `displayed`: no carriage return, escape or right-to-left override survives,
-/// no line starts with the forged text, and the flattened name is there. The
+/// Assert that `message` prints a hostile name flattened, as `displayed`: no
+/// carriage return, escape or right-to-left override survives, no line starts
+/// with the forged text, and the flattened name is there. The
 /// line check runs before the name check so that a raw line feed is reported
 /// as the forged line it makes.
 #[cfg(all(test, unix))]

@@ -4202,6 +4202,11 @@ mod tests {
                     false,
                 ),
                 // Look-alike hosts: compared whole, never by suffix or part.
+                // `api.<known host>` is read only for a `.ghe.com` tenant.
+                (
+                    "gh api -X POST https://api.ghe.example/repos/work-org/x/issues -f t=x",
+                    false,
+                ),
                 (
                     "gh api -X POST https://api.github.com.evil.example/repos/work-org/x/issues -f t=x",
                     false,
@@ -4384,6 +4389,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_host_holding_an_expansion_names_no_host_and_allows() {
+        // A host only the shell knows (`$GH_HOST`, `"$h"`, a substitution
+        // read as the glob `*`) is not read as a host, so the write is not
+        // judged on it and allows (cadence-ecosystem ADR-0046 rule 3; the
+        // #1503 report). The controls still block: a literal unowned owner
+        // with an expanded name, and a literal host the allowlist does not
+        // cover (code review round-4 I1 on #1633).
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            for (command, blocks_expected) in [
+                ("GH_HOST=$GH_HOST gh pr edit 1 -R cameronsjo/x -t t", false),
+                ("gh pr edit 1 --hostname \"$h\" -R cameronsjo/x -t t", false),
+                ("gh issue create -R \"$h/cameronsjo/x\" -t t", false),
+                ("GH_HOST=$(cat h) gh pr edit 1 -R cameronsjo/x -t t", false),
+                ("gh issue create -R \"work-org/$r\" -t t", true),
+                (
+                    "GH_HOST=evil.example gh pr edit 1 -R cameronsjo/x -t t",
+                    true,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
     // `crate::repo_with_remotes` exists only on unix (`lib.rs`).
     #[cfg(unix)]
     #[test]
@@ -4422,6 +4460,39 @@ mod tests {
                 );
             }
         });
+        // Each remote alone must move to the named host: `mona` is owned
+        // only on `ghe.example`, and bare `cameronsjo` covers both hosts. A
+        // remote left on github.com with `mona` blocks the row (code review
+        // round-4 N2 on #1633).
+        let named = "gh api --hostname ghe.example -X POST repos/{owner}/{repo}/issues -f t=x";
+        let bare = "gh api -X POST repos/{owner}/{repo}/issues -f t=x";
+        for (origin, upstream) in [
+            (
+                "https://github.com/mona/x.git",
+                "https://github.com/cameronsjo/y.git",
+            ),
+            (
+                "https://github.com/cameronsjo/x.git",
+                "https://github.com/mona/y.git",
+            ),
+        ] {
+            let fork = crate::repo_with_remotes(&[("origin", origin), ("upstream", upstream)]);
+            let cwd = fork.path().to_str().expect("utf-8 path");
+            with_env(
+                &hosts_env("cameronsjo ghe.example/mona", "ghe.example"),
+                || {
+                    for (command, blocks_expected) in [(named, false), (bare, true)] {
+                        let result = GhWriteGuard.run(&input_with(command, cwd));
+                        assert_eq!(
+                            blocks(&result),
+                            blocks_expected,
+                            "{command} with origin {origin}, upstream {upstream}: {}",
+                            msg(&result)
+                        );
+                    }
+                },
+            );
+        }
     }
 
     #[test]
