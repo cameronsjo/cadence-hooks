@@ -192,7 +192,7 @@ A command of at most 4096 bytes that begins with `for` and is one loop over lite
 - **THEN** the hook exits 2 with `Not configured`
 
 ### Requirement: Untargeted gh write context
-`inject-gh-write-context` (PreToolUse, Bash) SHALL nudge on every `gh` write segment that names no target (no `-R`, no `repos/owner/repo` path, no positional repo), restating that writes are allowlist-policed, that `-R owner/repo` should always be passed, and the allowed owners or that none are configured. It MUST repeat on every such write, MUST NOT block, and SHALL stay silent on reads and on writes that name their target.
+`inject-gh-write-context` (PreToolUse, Bash) SHALL nudge on every `gh` write segment that names no target (no `-R`, no `repos/owner/repo` or `orgs/<org>` path, no positional repo), restating that writes are allowlist-policed, that `-R owner/repo` should always be passed, and the allowed owners or that none are configured. It MUST repeat on every such write, MUST NOT block, and SHALL stay silent on reads and on writes that name their target.
 
 #### Scenario: Bare write
 - **WHEN** the command is `gh pr create --title t --body-file b.md`

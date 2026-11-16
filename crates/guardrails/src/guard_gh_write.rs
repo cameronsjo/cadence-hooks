@@ -850,12 +850,12 @@ fn host_is_read(host: &str) -> bool {
     !(repo_has_unexpanded_expansion(host) || host.contains('*'))
 }
 
-/// For a blocked target that carries a shell expansion: true when it still
-/// names a literal owner this guard can read, and the allowlist rejects that
-/// owner. Only then does the block say "targets repo you don't own" rather
-/// than "cannot resolve" (#757, #1491). `host` and `repo` are the target as
-/// [`flag_value_resolution`] split it. [`judge_resolution`] uses it, after
-/// its own test for an expansion.
+/// For a target that carries a shell expansion: true when it still names a
+/// literal owner this guard can read, and the allowlist rejects that owner
+/// (#757, #1491). This decides the verdict: [`judge_resolution`] blocks an
+/// expanded target only when this is true (`-R "work-org/$r"`) and allows it
+/// otherwise (`-R "$o/$r"`). `host` and `repo` are the target as
+/// [`flag_value_resolution`] split it.
 ///
 /// All three must hold:
 ///
@@ -871,7 +871,7 @@ fn host_is_read(host: &str) -> bool {
 /// - The allowlist rejects the target. An allowed owner (`cameronsjo/$r`)
 ///   is not a repo you don't own.
 ///
-/// Message only: every caller has already decided to block.
+/// Loosening any of the three turns a kept block into an allow.
 fn names_literal_unowned_owner(
     host: &str,
     repo: &str,
@@ -993,9 +993,8 @@ fn resolve_unflagged_target(
 
 /// Resolve a repo purely from a directory's git remotes (fork-aware).
 ///
-/// Shared by single-command resolution (when no explicit target appears in
-/// the command) and the deterministic-loop policy (where command-string
-/// flags are absent by definition).
+/// Used when no explicit target appears in the command, and to fill gh's
+/// `{owner}`/`{repo}` placeholders in a `gh api` path.
 fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
     use cadence_hooks_core::shell::{GitQuery, git_command_detailed};
 
@@ -1050,9 +1049,9 @@ fn is_allowed(
 }
 
 /// Like [`is_allowed`], but bare allowlist entries also match hosts listed in
-/// `CADENCE_EXTRA_HOSTS`. Used on paths where the target host comes from git
-/// remotes (single-command resolution, fork checks, deterministic loops) —
-/// explicit `-R` targets always go to the default host, so they don't need it.
+/// `CADENCE_EXTRA_HOSTS`. Every verdict in [`judge_resolution`] reads it, so
+/// a bare entry covers a known self-hosted forge wherever the host came
+/// from; [`names_literal_unowned_owner`] reads [`is_allowed`] instead.
 fn is_allowed_with_extras(
     host: &str,
     repo: &str,
@@ -1389,9 +1388,8 @@ fn segment_is_graphql(segment: &str) -> bool {
 /// never changes which endpoint is addressed, so it must never supply the
 /// target. Combined with the unanchored `API_REPOS`, it did:
 /// `gh api "orgs/evil-org/repos?ref=repos/cameronsjo/allowed" -X POST` matched
-/// the decoy in the query, so the unverifiable-write gate stayed silent and the
-/// resolver handed back an allowed repo — while gh POSTed to the org endpoint
-/// (#463 review).
+/// the decoy in the query, and the resolver handed back an allowed repo while
+/// gh POSTed to the org endpoint (#463 review).
 fn api_repos_target(endpoint: &str) -> Option<String> {
     api_repos_target_on(endpoint).map(|(_, repo)| repo)
 }
@@ -4301,6 +4299,129 @@ mod tests {
         });
     }
 
+    /// `owners_env` with `owners` allowed and `extra` as `CADENCE_EXTRA_HOSTS`.
+    fn hosts_env(
+        owners: &'static str,
+        extra: &'static str,
+    ) -> [(&'static str, Option<&'static str>); 6] {
+        let mut env = owners_env();
+        for entry in env.iter_mut() {
+            match entry.0 {
+                "CADENCE_ALLOWED_OWNERS" => entry.1 = Some(owners),
+                "CADENCE_EXTRA_HOSTS" => entry.1 = Some(extra),
+                _ => {}
+            }
+        }
+        env
+    }
+
+    #[test]
+    fn an_absolute_url_host_outranks_the_named_host() {
+        // gh sends an absolute endpoint to the URL's host, whatever
+        // `--hostname` or `GH_HOST` say, so the verdict reads the URL's host
+        // for `repos/` and `orgs/` alike. `mona` is allowed only on
+        // `ghe.example`, so each row's verdict differs between the URL's
+        // host and the named one (code review round-3 I1 on #1633).
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        with_env(
+            &hosts_env("cameronsjo ghe.example/mona", "ghe.example"),
+            || {
+                for (command, blocks_expected) in [
+                    // Owned on the URL's host, unowned on the named one.
+                    (
+                        "gh api --hostname evil.example -X POST https://api.github.com/repos/cameronsjo/x/issues -f t=x",
+                        false,
+                    ),
+                    (
+                        "GH_HOST=evil.example gh api -X POST https://api.github.com/repos/cameronsjo/x/issues -f t=x",
+                        false,
+                    ),
+                    (
+                        "gh api --hostname evil.example -X POST https://api.github.com/orgs/cameronsjo/repos -f name=x",
+                        false,
+                    ),
+                    (
+                        "GH_HOST=evil.example gh api -X POST https://api.github.com/orgs/cameronsjo/repos -f name=x",
+                        false,
+                    ),
+                    // Unowned on the URL's host, owned on the named one.
+                    (
+                        "gh api --hostname ghe.example -X POST https://api.github.com/repos/mona/x/issues -f t=x",
+                        true,
+                    ),
+                    (
+                        "GH_HOST=ghe.example gh api -X POST https://api.github.com/repos/mona/x/issues -f t=x",
+                        true,
+                    ),
+                    (
+                        "gh api --hostname ghe.example -X POST https://api.github.com/orgs/mona/repos -f name=x",
+                        true,
+                    ),
+                    (
+                        "GH_HOST=ghe.example gh api -X POST https://api.github.com/orgs/mona/repos -f name=x",
+                        true,
+                    ),
+                    // Controls: the relative form follows the named host.
+                    (
+                        "gh api --hostname ghe.example -X POST repos/mona/x/issues -f t=x",
+                        false,
+                    ),
+                    (
+                        "gh api --hostname ghe.example -X POST orgs/mona/repos -f name=x",
+                        false,
+                    ),
+                ] {
+                    let result = GhWriteGuard.run(&input_with(command, cwd));
+                    assert_eq!(
+                        blocks(&result),
+                        blocks_expected,
+                        "{command}: {}",
+                        msg(&result)
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn a_placeholder_in_a_fork_is_judged_on_the_named_host() {
+        // In a fork checkout gh fills `{owner}`/`{repo}` from the fork's
+        // remotes, and a host the command names is still where it sends the
+        // write: both remotes are judged there (code review round-3 I1 on
+        // #1633). Both remotes are owned on github.com.
+        let fork = crate::repo_with_remotes(&[
+            ("origin", "https://github.com/cameronsjo/x.git"),
+            ("upstream", "https://github.com/cameronsjo/y.git"),
+        ]);
+        let cwd = fork.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            for (command, blocks_expected) in [
+                ("gh api -X POST repos/{owner}/{repo}/issues -f t=x", false),
+                (
+                    "gh api --hostname evil.example -X POST repos/{owner}/{repo}/issues -f t=x",
+                    true,
+                ),
+                (
+                    "GH_HOST=evil.example gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    true,
+                ),
+                (
+                    "gh api --hostname evil.example -X POST repos/{owner}/other/issues -f t=x",
+                    true,
+                ),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
     #[test]
     fn an_unconfigured_machine_blocks_writes_that_otherwise_allow() {
         // The fail-safe runs before every allow below it: an untargeted write
@@ -6358,9 +6479,9 @@ mod tests {
 
     #[test]
     fn issue_454_repro_allows_from_an_owned_dir() {
-        // End-to-end: the reported command blocked as
-        // `gh-write-api-unverifiable` because `search/issues` names no
-        // owner/repo. As a read it never reaches that gate.
+        // End-to-end: the reported command, a `gh api search/issues` read with
+        // `-X GET` and fields, blocked when it was read as a write. As a read
+        // it is allowed.
         with_env(&owners_env(), || {
             let result = GhWriteGuard.run(&input_with(ISSUE_454_CMD, OWNED_DIR));
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
