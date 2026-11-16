@@ -363,7 +363,7 @@ fn non_object_tool_response_writes_no_failopen_row() {
     not(debug_assertions),
     ignore = "CADENCE_TEST_PANIC exists only in debug builds"
 )]
-fn a_parser_panic_is_judged_through_the_fallback() {
+fn a_parser_panic_is_contained_and_the_write_still_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, _) = run_guardrail("guard-gh-write", tmp.path(), UNOWNED_LOOP, Some("parse"));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -441,7 +441,7 @@ fn run_guardrail(
     not(debug_assertions),
     ignore = "CADENCE_TEST_PANIC exists only in debug builds"
 )]
-fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
+fn a_parser_hang_is_abandoned_within_the_budget_and_the_write_still_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, elapsed) = run_guardrail("guard-gh-write", tmp.path(), UNOWNED_LOOP, Some("hang"));
     let stderr = String::from_utf8_lossy(&out.stderr);

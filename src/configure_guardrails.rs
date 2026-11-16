@@ -414,8 +414,8 @@ fn show(path: &Path, current: &Current) -> ! {
     }
     if current.owners.is_empty() {
         cadence_hooks_core::outln!(
-            "\n{OWNERS_KEY} is unset — the push and gh-write guards block every \
-             operation until it is set."
+            "\n{OWNERS_KEY} is unset — the gh-write guard blocks every gh write, and \
+             the push guard checks no push, until it is set."
         );
     }
     process::exit(0);
@@ -562,8 +562,8 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
 
     if owners.is_empty() {
         eprintln!(
-            "Error: {OWNERS_KEY} would be empty, and the guards block every push and \
-             gh write when it is unset.\n\
+            "Error: {OWNERS_KEY} would be empty: the gh-write guard blocks every gh \
+             write, and the push guard checks no push, when it is unset.\n\
              Pass --owners <github-user> [more...] or run without --yes to be prompted.\n\
              {}",
             detection_failure_note()

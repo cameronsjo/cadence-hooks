@@ -89,7 +89,7 @@ body:
     id: actual
     attributes:
       label: Actual behavior
-      placeholder: Push is blocked even though the URL path owner is in the allow-list.
+      placeholder: A push nudges with "Push target is not on your allowlist" even though the URL path owner is in the allow-list.
     validations:
       required: true
 

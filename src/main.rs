@@ -410,7 +410,7 @@ enum CadenceCommands {
 
 #[derive(Subcommand)]
 enum GuardrailsCommands {
-    /// Block git push to non-owned remotes
+    /// Nudge when git push targets a non-owned remote
     GuardPushRemote,
     /// Block irreversible gh operations (repo delete)
     GuardGhDangerous,

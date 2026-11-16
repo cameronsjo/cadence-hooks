@@ -1,7 +1,7 @@
 # repo-ownership Specification
 
 ## Purpose
-Repo ownership is the set of Bash hooks that keep writes on repositories the operator owns, refuse repository deletion, and advise when a repo is created or published: `cadence-hooks guardrails guard-push-remote`, `cadence-hooks guardrails guard-gh-write`, `cadence-hooks guardrails guard-forge-write`, `cadence-hooks guardrails guard-gh-dangerous`, `cadence-hooks guardrails inject-gh-write-context`, `cadence-hooks guardrails guard-git-init` and `cadence-hooks guardrails warn-going-public`.
+Repo ownership is the set of Bash hooks that keep `gh` and forge writes on repositories the operator owns, nudge on a push to a remote the operator does not own, refuse repository deletion, and advise when a repo is created or published: `cadence-hooks guardrails guard-push-remote`, `cadence-hooks guardrails guard-gh-write`, `cadence-hooks guardrails guard-forge-write`, `cadence-hooks guardrails guard-gh-dangerous`, `cadence-hooks guardrails inject-gh-write-context`, `cadence-hooks guardrails guard-git-init` and `cadence-hooks guardrails warn-going-public`.
 
 ## Requirements
 

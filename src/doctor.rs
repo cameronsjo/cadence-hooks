@@ -4473,13 +4473,14 @@ fn guardrails_identity_finding(settings_path: &Path, process_owners_set: bool) -
         ),
         (true, true) => format!(
             "only the retired `{}` key is set — this binary reads `{}`, so every \
-             `git push` and `gh` write is blocked",
+             `gh` write is blocked and no `git push` is checked",
             crate::configure_guardrails::LEGACY_OWNERS_KEY,
             crate::configure_guardrails::OWNERS_KEY,
         ),
         (true, false) => format!(
-            "`{}` is unset or empty — the push and gh-write guards block every \
-             operation until it names at least one GitHub owner",
+            "`{}` is unset or empty — the gh-write guard blocks every `gh` write, and \
+             the push guard checks no `git push`, until it names at least one \
+             GitHub owner",
             crate::configure_guardrails::OWNERS_KEY,
         ),
     };
@@ -9556,7 +9557,7 @@ mod tests {
     }
 
     #[test]
-    fn guardrails_identity_unset_owners_warns_about_blocked_pushes() {
+    fn guardrails_identity_unset_owners_warns_about_blocked_writes_and_unchecked_pushes() {
         let (_dir, path) = seed_user_settings(r#"{"env":{"SOMETHING_ELSE":"x"}}"#);
 
         let finding = guardrails_identity_finding(&path, false).expect("unset owners warns");
@@ -9568,6 +9569,12 @@ mod tests {
             finding.diagnosis
         );
         assert!(
+            finding.diagnosis.contains("blocks every `gh` write")
+                && finding.diagnosis.contains("checks no `git push`"),
+            "says what each guard does: {}",
+            finding.diagnosis
+        );
+        assert!(
             finding.remediation.contains("configure guardrails"),
             "names the fix: {}",
             finding.remediation
@@ -9575,14 +9582,15 @@ mod tests {
     }
 
     #[test]
-    fn guardrails_identity_legacy_only_says_every_push_is_blocked() {
+    fn guardrails_identity_legacy_only_says_gh_writes_block_and_pushes_go_unchecked() {
         let (_dir, path) =
             seed_user_settings(r#"{"env":{"GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"}}"#);
 
         let finding = guardrails_identity_finding(&path, false).expect("legacy-only warns");
 
         assert!(
-            finding.diagnosis.contains("is blocked"),
+            finding.diagnosis.contains("is blocked")
+                && finding.diagnosis.contains("no `git push` is checked"),
             "{}",
             finding.diagnosis
         );
