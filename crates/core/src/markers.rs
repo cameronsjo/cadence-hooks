@@ -173,9 +173,8 @@ fn hash_of(s: &str) -> u64 {
 ///
 /// The hash is non-cryptographic and fixed-seed, so marker names are predictable
 /// by design: security rests on the `0700` [`marker_dir`], never on name
-/// secrecy. `agent_id` is not part of this key; a caller that needs per-agent
-/// markers folds it into `repo_root` (`warn-overshare` does, since a subagent
-/// carries its parent's `session_id`).
+/// secrecy. `agent_id` is deliberately NOT part of the key — `HookInput` carries
+/// none today, and CP2 will decide whether subagent-scoped markers extend it.
 pub fn session_marker(input: &HookInput, kind: &str, repo_root: Option<&str>) -> PathBuf {
     let sid_hash = hash_of(&session_scope(input));
     let name = match repo_root {

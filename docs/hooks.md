@@ -107,15 +107,9 @@ Rules for wiring:
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
-judgment to the model. It nudges at most once per session, per agent
-(`agent_id`) and per target, but only for an allowlisted form: a plain
-`git commit`, a plain `git push` (no global option, no URL or path argument),
-or a `gh` post other than `api`/`gist` with no URL argument, keyed on the git
-root above `cwd` or a literal `gh -R` slug, in a line with no `cd ` or `pushd `.
-Every other trigger nudges every time. Field-report edits have their own
-once-per-session key. It exempts
-writes under `$OBSIDIAN_VAULT` (the safe home for personal context), and is
-silenced session-wide with `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
+judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
+(the safe home for personal context), and is silenced session-wide with
+`CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
 ## guardrails (git-guardrails)
 
