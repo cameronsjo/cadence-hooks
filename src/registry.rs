@@ -349,7 +349,7 @@ pub const HOOKS: &[HookEntry] = &[
     // guardrails
     HookEntry {
         name: "guard-push-remote",
-        description: "Block git push to non-owned remotes",
+        description: "Nudge when git push targets a non-owned remote",
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
         // Remote: the guards worth having in the cloud (#1197).
@@ -977,7 +977,6 @@ pub(crate) const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "prevent-secret-writes",
     "prevent-secret-push",
     "git-safety",
-    "guard-push-remote",
     "guard-gh-dangerous",
     "guard-gh-write",
     "guard-op-vault-scan",
@@ -1270,7 +1269,10 @@ mod tests {
 
     #[test]
     fn security_critical_registry_covers_protected_guards() {
-        assert!(is_security_critical("guard-push-remote"));
+        assert!(is_security_critical("guard-gh-write"));
+        // A nudge since cadence-ecosystem ADR-0046 phase 2 (#1443): a payload it
+        // cannot parse must not block.
+        assert!(!is_security_critical("guard-push-remote"));
         assert!(is_security_critical("prevent-secret-writes"));
         assert!(!is_security_critical("warn-main-branch"));
     }

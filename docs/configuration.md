@@ -134,9 +134,9 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_DISABLE` | all hooks | Comma-separated hook names to skip (e.g., `warn-main-branch,warn-overshare`). Not every name is honoured — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
 | `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass); CLI actions stay available, and so does the status check `enforcement-status` — see [What a disable request resolves to](#what-a-disable-request-resolves-to) |
 | `CADENCE_NO_FEEDBACK_FOOTER` | all hooks | Set to any non-empty value to suppress the `If this fired in error: /cadence:feedback` footer appended to hard blocks |
-| `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space- or comma-separated usernames; any entry the operator did not intend widens what counts as theirs. **Weakens a protected guard** |
+| `CADENCE_ALLOWED_OWNERS` | `guard-gh-write`, `guard-push-remote` (a nudge) | Space- or comma-separated usernames; any entry the operator did not intend widens what counts as theirs. **Weakens a protected guard** (`guard-gh-write`; for `guard-push-remote` it only moves which pushes get a nudge) |
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs. **Weakens a protected guard** |
-| `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host. **Weakens a protected guard** |
+| `CADENCE_EXTRA_HOSTS` | `guard-gh-write`, `guard-push-remote` (a nudge) | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host. **Weakens a protected guard** (`guard-gh-write`; for `guard-push-remote` it only moves which pushes get a nudge) |
 | `CADENCE_ISSUE_TRACKERS` | `warn-issue-tracker` | Comma-separated set of known ecosystem trackers (`owner/repo`) — replaces the default set (`cameronsjo/cadence`, `cameronsjo/cadence-hooks`, `cameronsjo/forgectl`, `cameronsjo/cadence-ecosystem`, plus its pre-rename alias `cameronsjo/claude-configurations`); the nudge fires only when an owned target is none of them, scoped to owners that appear in this set |
 | `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Legacy singular override — sets a single known tracker (`owner/repo`), replacing the default set. Superseded by `CADENCE_ISSUE_TRACKERS`; still honored when the plural is unset. Also moves the owner-scope for the nudge |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
@@ -175,7 +175,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_HOOKS_BIN` | plugin wrapper (`run-cadence-hooks.sh`) | Absolute path to the binary the wrapper runs, instead of `cadence-hooks` on `PATH`. Whatever it names runs every hook; any value that is not an absolute path to an executable makes the wrapper inert (every hook exits 0, one notice per day) — see [Folder trust is the boundary](#folder-trust-is-the-boundary) |
 | `CLAUDE_EFFORT` | every hook (latent) | A check can skip itself at a given effort level; no check does today |
 | `CADENCE_FAILOPEN_DISCLOSE_MIN` | `session start` fail-open disclosure | How many fail-open events before the session-start disclosure fires; a large value hides it |
-| `GH_HOST` | `guard-push-remote`, `guard-gh-write` | The host bare allowlist entries match; changing it moves which forge counts as the operator's own. **Weakens a protected guard** |
+| `GH_HOST` | `guard-gh-write`, `guard-push-remote` (a nudge) | The host bare allowlist entries match; changing it moves which forge counts as the operator's own. **Weakens a protected guard** (`guard-gh-write`; for `guard-push-remote` it only moves which pushes get a nudge) |
 
 ### Folder trust is the boundary
 

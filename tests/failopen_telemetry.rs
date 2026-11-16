@@ -353,36 +353,45 @@ fn non_object_tool_response_writes_no_failopen_row() {
 }
 
 /// A panic on the loop parser's thread is contained (cameronsjo/cadence-hooks
-/// #1401 review): the check reads it as a parse failure and judges the command
-/// through its fallback. Two pushes then get the fallback's nudge (exit 0).
-/// Before the containment the global panic hook exited the process with 1,
-/// which in `group` mode also dropped every other member's block.
+/// #1401 review); the containment itself is pinned by `loop_analysis`'s unit
+/// tests. `guard-gh-write` no longer runs the loop parser (each write in a
+/// loop body is judged as a single command, cameronsjo/cadence-hooks#1633),
+/// and no other hook does either, so the forced panic never fires here. What
+/// this pins end to end: with the panic forced, the looped write to an
+/// unowned repo still blocks (exit 2) on what the guard read, and nothing
+/// fails open.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "CADENCE_TEST_PANIC exists only in debug builds"
 )]
-fn a_parser_panic_is_judged_through_the_fallback() {
+fn a_forced_parser_panic_does_not_reach_guard_gh_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let (out, _) = run_guardrail("guard-push-remote", tmp.path(), TWO_PUSHES, Some("parse"));
+    let (out, _) = run_guardrail("guard-gh-write", tmp.path(), UNOWNED_LOOP, Some("parse"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("the loop parser panicked"),
-        "the synthetic parser panic fired: {stderr}"
+        !stderr.contains("CADENCE_TEST_PANIC"),
+        "guard-gh-write ran the loop parser: {stderr}"
     );
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // The pin: exit 2 on the literal unowned target, not the 1 an
+    // uncontained panic gives.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the guard exited 2 on what it read: {stderr}"
+    );
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains(UNPARSED_PUSHES),
-        "judged through the parse-failure fallback: {stderr}"
+        stderr.contains(UNOWNED_CAUSE),
+        "still blocked as a write to an unowned repo: {stderr}"
     );
     assert!(failopen_rows(tmp.path()).is_empty(), "nothing failed open");
 }
 
-/// Two pushes: the parse-failure fallback counts them and nudges.
-const TWO_PUSHES: &str = "git push origin main && git push upstream main";
+/// A looped gh write to a repo the operator does not own.
+const UNOWNED_LOOP: &str = "for i in 1 2; do gh issue close $i -R other/r; done";
 
-/// The parse-failure fallback's nudge for several pushes.
-const UNPARSED_PUSHES: &str = "several git pushes in a command the guard could not parse";
+/// The block reason for [`UNOWNED_LOOP`].
+const UNOWNED_CAUSE: &str = "repo you don't own";
 
 /// `guardrails <guard>` on `command`, owners set to `cameronsjo`, with
 /// `CADENCE_TEST_PANIC` set to `test_panic` when given. Returns the output and
@@ -426,29 +435,38 @@ fn run_guardrail(
     (out, started.elapsed())
 }
 
-/// cameronsjo/cadence-hooks#1401: `parse_command` gives the parser a budget.
-/// The debug-only `hang` mode makes the parse sleep 30 s. Without the budget
-/// the hook waits it out and the 5 s hook timeout lets the pushes through.
+/// cameronsjo/cadence-hooks#1401: `parse_command` gives the parser a budget,
+/// pinned by `loop_analysis`'s unit tests. The debug-only `hang` mode makes
+/// the parse sleep 30 s. `guard-gh-write` no longer runs the loop parser
+/// (cameronsjo/cadence-hooks#1633), so a forced hang cannot hold it past the
+/// 5 s hook timeout: the looped write to an unowned repo blocks at once, on
+/// what the guard read.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "CADENCE_TEST_PANIC exists only in debug builds"
 )]
-fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
+fn a_forced_parser_hang_does_not_delay_guard_gh_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let (out, elapsed) = run_guardrail("guard-push-remote", tmp.path(), TWO_PUSHES, Some("hang"));
+    let (out, elapsed) = run_guardrail("guard-gh-write", tmp.path(), UNOWNED_LOOP, Some("hang"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("CADENCE_TEST_PANIC=hang"),
-        "the synthetic hang fired: {stderr}"
+        !stderr.contains("CADENCE_TEST_PANIC"),
+        "guard-gh-write ran the loop parser: {stderr}"
     );
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // The pin: exit 2 on the literal unowned target, not the 1 a timed-out
+    // hook gives.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the guard exited 2 on what it read: {stderr}"
+    );
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains(UNPARSED_PUSHES),
-        "judged through the parse-failure fallback: {stderr}"
+        stderr.contains(UNOWNED_CAUSE),
+        "still blocked as a write to an unowned repo: {stderr}"
     );
     cadence_hooks_core::test_builders::assert_elapsed_under(
-        &format!("judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"),
+        &format!("judged at once, under the 5 s hook timeout: {elapsed:?}"),
         elapsed,
         std::time::Duration::from_secs(4),
     );
@@ -458,45 +476,76 @@ fn a_parser_hang_is_judged_through_the_fallback_within_the_budget() {
 /// cameronsjo/cadence-hooks#1405 security reviews (I2, r2 I1): nesting deep
 /// enough to overflow the parse thread's stack. An overflow aborts the
 /// process (signal 6), which drops every verdict. Past [`MAX_PARSE_BYTES`]
-/// the command is not parsed, and the fallback judges the pushes. The `[[ ! …`
-/// shape costs 2 bytes per level, the cheapest known; at 16 000 levels it
-/// aborts a debug build when the cap is lifted.
+/// the command is not parsed, and the guard still exits 2 on the unowned
+/// write. The `[[ ! …` shape costs 2 bytes per level, the cheapest known; at 16 000
+/// levels it aborts a debug build when the cap is lifted.
 #[test]
-fn nesting_past_the_byte_cap_is_judged_through_the_fallback() {
+fn nesting_past_the_byte_cap_still_gets_a_verdict() {
     let tmp = tempfile::tempdir().unwrap();
     let depth = 16_000;
     let just_over = MAX_PARSE_BYTES / 2 + 1;
+    // `(command, blocked on the unowned target?)`. Every shape is:
+    // `guard-gh-write` no longer refuses a command as too large to read, so
+    // the `while` and `case` shapes are judged on the write they hold too
+    // (cameronsjo/cadence-hooks#1633).
     let shapes = [
-        format!("[[ {}x ]] && {TWO_PUSHES}", "! ".repeat(just_over)),
-        format!("[[ {}x ]] && {TWO_PUSHES}", "! ".repeat(depth)),
-        format!("{}{TWO_PUSHES}", "true && ".repeat(MAX_PARSE_BYTES / 8 + 1)),
-        format!(
-            "{}{TWO_PUSHES}{}",
-            "if true; then ".repeat(depth),
-            "; fi".repeat(depth)
+        (
+            format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(just_over)),
+            true,
         ),
-        format!(
-            "{}{TWO_PUSHES}{}",
-            "while true; do ".repeat(depth),
-            "; done".repeat(depth)
+        (
+            format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(depth)),
+            true,
         ),
-        format!(
-            "{}{TWO_PUSHES}{}",
-            "case x in x) ".repeat(depth),
-            " ;; esac".repeat(depth)
+        (
+            format!(
+                "{}{UNOWNED_LOOP}",
+                "true && ".repeat(MAX_PARSE_BYTES / 8 + 1)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "{}{UNOWNED_LOOP}{}",
+                "if true; then ".repeat(depth),
+                "; fi".repeat(depth)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "{}{UNOWNED_LOOP}{}",
+                "while true; do ".repeat(depth),
+                "; done".repeat(depth)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "{}{UNOWNED_LOOP}{}",
+                "case x in x) ".repeat(depth),
+                " ;; esac".repeat(depth)
+            ),
+            true,
         ),
     ];
-    for command in &shapes {
+    for (command, by_fallback) in &shapes {
         assert!(command.len() > MAX_PARSE_BYTES);
-        let (out, _) = run_guardrail("guard-push-remote", tmp.path(), command, None);
+        let (out, _) = run_guardrail("guard-gh-write", tmp.path(), command, None);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let head = &command[..40];
-        assert_eq!(out.status.code(), Some(0), "{head}…: {stderr}");
-        // The chain nudge, or the loop one for the `while` shape.
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("the guard could not parse"),
-            "{head}…: judged through the parse-failure fallback: {stderr}"
+        // The pin: an exit code, not a signal, so the process did not abort.
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{head}…: exited 2, not aborted: {stderr}"
         );
+        if *by_fallback {
+            assert!(
+                stderr.contains(UNOWNED_CAUSE),
+                "{head}…: still blocked as a write to an unowned repo: {stderr}"
+            );
+        }
     }
 }
 
@@ -509,15 +558,11 @@ fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let pad = format!("\n# {}", "x".repeat(MAX_PARSE_BYTES));
     for (guard, command, cause) in [
-        (
-            "guard-gh-write",
-            "for i in 1 2; do gh issue close $i -R other/r; done",
-            "repo you don't own",
-        ),
+        ("guard-gh-write", UNOWNED_LOOP, UNOWNED_CAUSE),
         (
             "guard-gh-write",
             "while read i; do gh pr merge $i -R other/r; done < prs",
-            "repo you don't own",
+            UNOWNED_CAUSE,
         ),
     ] {
         let padded = format!("{command}{pad}");
@@ -525,70 +570,5 @@ fn padding_past_the_byte_cap_keeps_loop_and_chain_blocks() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{guard} {command:?}: {stderr}");
         assert!(stderr.contains(cause), "{guard} {command:?}: {stderr}");
-    }
-}
-
-/// Past [`MAX_PARSE_BYTES`] `guard-push-remote` still checks each push it can
-/// read, a bare one against the branch checked out now (cadence-ecosystem
-/// ADR-0046 rule 3): a chain of owned pushes
-/// nudges, a loop nudges only when a push names no remote, and a push to a
-/// remote the operator does not own blocks.
-#[test]
-fn padding_past_the_byte_cap_still_judges_each_push() {
-    let tmp = tempfile::tempdir().unwrap();
-    cadence_hooks_core::git_fixtures::init_repo(tmp.path());
-    for (name, url) in [
-        ("origin", "https://github.com/cameronsjo/x.git"),
-        ("evil", "https://github.com/evil/x.git"),
-    ] {
-        cadence_hooks_core::git_fixtures::git_in(tmp.path(), &["remote", "add", name, url]);
-    }
-    let pad = format!("\n# {}", "x".repeat(MAX_PARSE_BYTES));
-    for (command, code, nudge) in [
-        (
-            "git push origin main && git push origin main:feat",
-            0,
-            UNPARSED_PUSHES,
-        ),
-        // The bare push may go to `other`'s remote, not the one it was
-        // checked against: the nudge says which branch it read.
-        (
-            "git push origin main && git checkout other && git push",
-            0,
-            "a bare one against the branch checked out now",
-        ),
-        (
-            "for b in main feat; do git push; done",
-            0,
-            "give every push in the command an explicit remote",
-        ),
-        (
-            "for b in main feat; do git push; done",
-            0,
-            "a bare one against the branch checked out now",
-        ),
-        // Every push names `origin`: no nudge.
-        ("for b in main feat; do git push origin $b; done", 0, ""),
-        ("git push origin main && git push evil main", 2, ""),
-        (
-            "for b in main feat; do git push https://github.com/evil/x.git $b; done",
-            2,
-            "",
-        ),
-    ] {
-        let (out, _) = run_guardrail(
-            "guard-push-remote",
-            tmp.path(),
-            &format!("{command}{pad}"),
-            None,
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(code), "{command}: {stderr}");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if nudge.is_empty() {
-            assert!(!stdout.contains("could not parse"), "{command}: {stdout}");
-        } else {
-            assert!(stdout.contains(nudge), "{command}: {stdout}");
-        }
     }
 }

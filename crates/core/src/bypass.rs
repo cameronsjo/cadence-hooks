@@ -90,9 +90,10 @@
 //! `CADENCE_NO_ENFORCE_WORKTREE` disarm `enforce-worktree`; `CADENCE_MARKER_DIR`
 //! relocates the marker state other checks key on. `CADENCE_ALLOWED_OWNERS`,
 //! `CADENCE_ALLOWED_REPOS` and `CADENCE_EXTRA_HOSTS` widen what
-//! `guard-push-remote` and `guard-gh-write` accept as the operator's own, and
-//! `CADENCE_ALLOW_SOPS_DECRYPT` lets `guard-sops-decrypt` allow a decrypt (it
-//! still writes a bypass row). All three guards are protected, and none of
+//! `guard-gh-write` accepts as the operator's own (and which pushes
+//! `guard-push-remote` nudges on), and `CADENCE_ALLOW_SOPS_DECRYPT` lets
+//! `guard-sops-decrypt` allow a decrypt (it still writes a bypass row). Both
+//! blocking guards are protected, and none of
 //! these variables is reported at session start: `enforcement-status` covers
 //! only the two switches above. The identity tier already
 //! removed one such override (`CADENCE_REDACTION_TERMS`) for exactly this
@@ -171,7 +172,6 @@ pub const PROTECTED_GUARDS: &[&str] = &[
     // line, one environment variable silently disarms the leak protection.
     "redact-external-content",
     "git-safety",
-    "guard-push-remote",
     "guard-gh-dangerous",
     "guard-gh-write",
     "guard-op-vault-scan",
