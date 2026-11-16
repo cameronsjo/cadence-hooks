@@ -236,67 +236,93 @@ fn suppressed_block_not_logged_when_a_later_static_check_blocks() {
 }
 
 #[test]
-fn push_loop_padding_flood_blocks_instead_of_failing_open() {
-    // The #271 security regression gate. A push loop that resolves a flood of
-    // remotes drains the shared deadline; if the trailing push's ownership
-    // probe times out and the loop arm fails OPEN, an unowned push executes.
-    // The loop arm therefore fails CLOSED on ANY resolution timeout — this is
-    // robust to a slow host inflating each probe (which defeats a completion-
-    // count discriminator), because it doesn't depend on how the budget drained.
-    let shim = tempfile::tempdir().unwrap();
-    // Slow fake git: every remote resolution outlives the whole budget, so
-    // the loop arm's first probe times out. (A flood of distinct remotes used
-    // to drain the budget here, one probe each; the arm now refuses more than
-    // a handful of distinct remotes before spawning — cadence-hooks#1161 —
-    // so the timeout is reached by a slow probe instead, as on a slow host.)
-    let git_path = shim.path().join("git");
-    std::fs::write(&git_path, "#!/bin/sh\nexec /bin/sleep 3\n").unwrap();
-    std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let metrics = tempfile::tempdir().unwrap();
+fn a_push_remote_probe_timeout_allows_silently() {
+    // `guard-push-remote` is a nudge (cadence-ecosystem ADR-0046 phase 2,
+    // cameronsjo/cadence-hooks#1443). A probe that outlives the git-probe
+    // deadline means it did not read the remote, so it says nothing and
+    // allows. It used to block a looped push on that timeout (#271).
+    //
+    // One checkout whose `origin` is unowned, judged twice. With the real
+    // git the guard reads the remote and nudges: the positive control that
+    // shows the push reached the probe. With a git that outlives the budget,
+    // the only change, it stays silent and the dispatcher records a plain
+    // `deadline` row, the one a probe timeout on an allowed command writes.
     let work = tempfile::tempdir().unwrap();
-
-    let command = "for x in 1; do git push r1 main; git push evilremote main; done";
-
-    let payload = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": { "command": command },
-        "cwd": work.path().to_string_lossy(),
-    })
-    .to_string();
-
-    let mut cmd = cadence_hooks();
-    cmd.args(["guardrails", "guard-push-remote"]);
-    cmd.env("PATH", shim.path());
-    cmd.env("CADENCE_HOOK_DEADLINE_MS", "1000");
-    cmd.env("CADENCE_METRICS_DIR", metrics.path());
-    cmd.env("CADENCE_ALLOWED_OWNERS", "cameronsjo");
-    cmd.env_remove("CADENCE_DISABLE");
-    let out = run_with_payload(&mut cmd, &payload);
-
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "a loop-arm resolution timeout must BLOCK, not fail open: {}",
-        String::from_utf8_lossy(&out.stderr)
+    cadence_hooks_core::git_fixtures::init_repo(work.path());
+    git_in(
+        work.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/work-org/y.git",
+        ],
     );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("timed out"),
-        "block message names the timeout: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // The guard ENFORCED (blocked), so nothing degraded to fail-open — the
-    // timed-out probe must NOT emit a plain `deadline` row or the misleading
-    // "degraded to fail-open" breadcrumb (CodeRabbit finding on #273).
-    let rows = failopen_rows(metrics.path());
-    assert!(
-        rows.iter().all(|r| r["reason"] != "deadline"),
-        "a block must not log a fail-open deadline row: {rows:?}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("degraded to fail-open"),
-        "no fail-open breadcrumb on an enforced block: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let shim = tempfile::tempdir().unwrap();
+    write_hanging_git(shim.path());
+
+    let run = |command: &str, hanging: bool, metrics: &std::path::Path| {
+        let payload = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "cwd": work.path().to_string_lossy(),
+        })
+        .to_string();
+        let mut cmd = cadence_hooks();
+        cmd.args(["guardrails", "guard-push-remote"]);
+        if hanging {
+            cmd.env("PATH", shim.path());
+        }
+        cmd.env("CADENCE_HOOK_DEADLINE_MS", "1000");
+        cmd.env("CADENCE_METRICS_DIR", metrics);
+        cmd.env("CADENCE_ALLOWED_OWNERS", "cameronsjo");
+        cmd.env_remove("CADENCE_DISABLE");
+        run_with_payload(&mut cmd, &payload)
+    };
+
+    for command in [
+        "git push origin main",
+        "for x in 1; do git push origin main; done",
+    ] {
+        let metrics = tempfile::tempdir().unwrap();
+        let out = run(command, false, metrics.path());
+        assert_eq!(out.status.code(), Some(0), "{command}: control exit");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Push target is not on your allowlist"),
+            "{command}: with a working git the guard reads the remote and nudges: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            failopen_rows(metrics.path()).is_empty(),
+            "{command}: control wrote no deadline row"
+        );
+
+        let metrics = tempfile::tempdir().unwrap();
+        let out = run(command, true, metrics.path());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{command}: a probe timeout allows: {stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{command}: no nudge for a remote it did not read: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let rows = failopen_rows(metrics.path());
+        assert!(
+            rows.iter()
+                .any(|r| r["reason"] == "deadline" && r["subcommand"] == "guard-push-remote"),
+            "{command}: the timeout is recorded as a deadline row: {rows:?}"
+        );
+        // Nothing was suppressed: a nudge-only guard has no block to give up.
+        assert!(
+            rows.iter()
+                .all(|r| r["reason"] != "deadline_block_suppressed"),
+            "{command}: {rows:?}"
+        );
+    }
 }
 
 #[test]

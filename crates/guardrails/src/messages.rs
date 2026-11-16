@@ -55,9 +55,10 @@ pub fn shown_url(url: &str) -> String {
     sanitize_field(&mask_url_userinfo(url), MAX_PATH_DISPLAY)
 }
 
-/// Emitted when a `CADENCE_ALLOWED_OWNERS`-gated guard fires with no
-/// allowlist configured at all — `guard_push_remote` and `guard_gh_write`
-/// share this exact fail-safe message.
+/// Emitted when `guard_gh_write` fires with no `CADENCE_ALLOWED_OWNERS`
+/// allowlist configured at all. `guard_push_remote` is a nudge and allows
+/// silently then (cadence-ecosystem ADR-0046 phase 2), so this has one
+/// caller now.
 pub const NOT_CONFIGURED_MSG: &str = "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
      CADENCE_ALLOWED_OWNERS is not set.";
 

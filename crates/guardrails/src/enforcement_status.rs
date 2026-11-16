@@ -130,12 +130,13 @@ pub fn armed_switches_line(lookup: impl Fn(&str) -> Option<String>) -> Option<St
     ))
 }
 
-/// The allowlist that arms the push and `gh` write guards.
+/// The allowlist that arms the `gh` write guard and the push nudge.
 pub const ALLOWED_OWNERS_VAR: &str = "CADENCE_ALLOWED_OWNERS";
 
 /// The one-line cloud-session status (cameronsjo/cadence-hooks#1197), or `None`
 /// outside a cloud session. `ARMED` when the owner allowlist is non-empty,
-/// `INERT` otherwise, because without it the push guards refuse every push.
+/// `INERT` otherwise, because without it `guard-gh-write` refuses every write
+/// and `guard-push-remote` checks no push.
 /// It reports the state at session start only. Under `CADENCE_BYPASS=1` it is
 /// withheld: the bypass report already says every guard is off, and ARMED
 /// would contradict it.

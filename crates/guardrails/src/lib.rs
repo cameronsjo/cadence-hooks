@@ -232,7 +232,7 @@ pub mod guard_gh_write;
 pub mod guard_git_init;
 /// Block uninvited 1Password vault enumeration (`op item list`).
 pub mod guard_op_vault_scan;
-/// Block `git push` to remotes owned by others.
+/// Nudge when git push targets a non-owned remote.
 pub mod guard_push_remote;
 /// Opt-in per-model Read/Grep guard; block reads by the resolved session model.
 pub mod guard_read_model;

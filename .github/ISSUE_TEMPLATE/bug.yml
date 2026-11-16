@@ -71,7 +71,7 @@ body:
       render: shell
       placeholder: |
         $ git push origin main
-        🚫 git-guardrails: Push target is not yours
+        ⚠️  git-guardrails: Push target is not on your allowlist
            Would push to: ...
            Allowed:       ...
     validations:
@@ -81,7 +81,7 @@ body:
     id: expected
     attributes:
       label: Expected behavior
-      placeholder: Push proceeds because the path owner matches the allow-list.
+      placeholder: Push proceeds with no nudge because the remote owner matches the allow-list.
     validations:
       required: true
 
@@ -89,7 +89,7 @@ body:
     id: actual
     attributes:
       label: Actual behavior
-      placeholder: Push is blocked even though the URL path owner is in the allow-list.
+      placeholder: A push nudges with "Push target is not on your allowlist" even though the URL path owner is in the allow-list.
     validations:
       required: true
 
