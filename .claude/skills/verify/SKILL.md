@@ -22,7 +22,7 @@ HEAD_BIN="$PWD/target/debug/cadence-hooks"
 BASE_BIN="$V/target/debug/cadence-hooks"
 ```
 
-Stop if either build fails: an old binary left in the target dir would give stale verdicts. When the change only adds a new hook, skip the base build and leave `BASE_BIN` empty: the loop below then records `n/a` for base.
+Stop if either build fails: an old binary left in the target dir would give stale verdicts. When the change only adds a new hook, skip the base build and leave `BASE_BIN` empty: the loop below then records `n/a` for base. When it adds one hook and changes others, keep the base build: the new hook's base rows print ERROR because the base binary has no such hook, and you record them as `n/a`.
 
 ## 2. Name the hooks the change touches
 
@@ -63,7 +63,7 @@ done
 ## 5. Read the result
 
 - **PASS:** every claim case gives its stated verdict at head, and every everyday control is ALLOW at head.
-- **FAIL:** any claim case gives another verdict, any control is NUDGE or BLOCK at head, or any row says ERROR. Fix it before committing.
+- **FAIL:** any claim case gives another verdict, any control is NUDGE or BLOCK at head, or any row says ERROR (other than a new hook's base rows). Fix it before committing.
 
 Wiring is a separate check. If the change also needs a `hooks.json` entry in the cadence monorepo, a hook with no matching `if:` never runs: `tests/hook_registration_audit.rs` covers that side.
 
