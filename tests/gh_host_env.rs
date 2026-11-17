@@ -182,6 +182,11 @@ fn the_hook_process_gh_repo_is_judged() {
 /// that checkout's remotes in every spelling bash expands. A `$HOME` bash
 /// does not expand (`'$HOME/x'`), or one the command may have rebound, is a
 /// directory the guard cannot follow and allows.
+///
+/// Runs on every platform, Windows included, with the same expected verdicts:
+/// `$HOME` and `~` both expand against the child's `HOME` (the guard's
+/// `user_home`), so on Windows both land on the same native path with `/up`
+/// joined, and the guard reads that checkout's remotes the same way.
 #[test]
 fn a_home_cd_target_lands_where_the_tilde_does() {
     let root = tempfile::tempdir().expect("temp root");
@@ -198,11 +203,39 @@ fn a_home_cd_target_lands_where_the_tilde_does() {
         ("cd \"${HOME}\"/up && gh issue comment 3 --body hi", 2),
         ("cd '$HOME/up' && gh pr create --title t", 0),
         ("HOME=/x; cd \"$HOME/up\" && gh pr create --title t", 0),
+        // A `HOME=` the command carries anywhere leaves the target unread,
+        // even where it would not move the `cd` (over-reading, never a miss):
+        // inline on the gh word, behind `env`, and on the `cd` itself.
+        ("cd \"$HOME/up\" && HOME=/x gh pr create --title t", 0),
+        ("cd \"$HOME/up\" && env HOME=/x gh pr create --title t", 0),
+        ("HOME=/x cd \"$HOME/up\"; gh pr create --title t", 0),
         (
             "XDG_CONFIG_HOME=/x; cd \"$HOME/up\" && gh pr create --title t",
             2,
         ),
         ("gh pr create --title t", 0),
+    ] {
+        assert_eq!(guard_in(command, cwd, &env), expected, "{command}");
+    }
+}
+
+/// With a home path that holds a space, bash splits an unquoted `$HOME/up`
+/// into two words, so `cd` fails and the write after `;` runs in the owned
+/// checkout: the guard leaves that target unread and allows. The quoted form
+/// is one word and still lands in `~/up`.
+#[test]
+fn an_unquoted_home_with_a_space_is_left_unread() {
+    let root = tempfile::tempdir().expect("temp root");
+    let home = root.path().join("with space");
+    checkout(&home.join("up"), "https://github.com/evil/up.git");
+    let owned = root.path().join("owned");
+    checkout(&owned, "https://github.com/cameronsjo/tool.git");
+    let cwd = owned.to_str().expect("utf-8 path");
+    let env = [("HOME", home.to_str().expect("utf-8 path"))];
+    for (command, expected) in [
+        ("cd $HOME/up; gh pr create --title t", 0),
+        ("cd \"$HOME/up\"; gh pr create --title t", 2),
+        ("cd \"$HOME\"/up; gh pr create --title t", 2),
     ] {
         assert_eq!(guard_in(command, cwd, &env), expected, "{command}");
     }

@@ -6920,6 +6920,16 @@ fn verb_target(words: &[MarkedToken], home: Option<&str>) -> VerbTarget {
         operands.push(word);
     }
     let home_target = match operands.as_slice() {
+        // An unquoted `$HOME` is split and globbed by bash after expansion;
+        // a home holding whitespace or a glob character then lands somewhere
+        // this walk does not model (`cd $HOME/x` with two words fails), so
+        // it stays unread.
+        [target]
+            if target.unquoted_prefix_len > 0
+                && home.is_some_and(|home| home.contains([' ', '\t', '\n', '*', '?', '['])) =>
+        {
+            None
+        }
         [target] => home
             .and_then(|home| expand_leading_home(target, home))
             .filter(|expanded| !expanded.contains(['$', '`'])),
@@ -7731,8 +7741,10 @@ fn segment_work_dirs_with_cdpath(
     };
     // [`home_may_be_rebound`] lets a plain `HOME=/x` through, since a
     // placeholder can stand for it; an expansion cannot, so any
-    // assignment to `HOME` (not `XDG_CONFIG_HOME=`) leaves `$HOME` targets
-    // unread.
+    // `HOME=` anywhere in the command (not `XDG_CONFIG_HOME=`) leaves `$HOME`
+    // targets unread. The match is textual, so a `HOME=` inside quoted text
+    // counts too: that over-reads, and the target is then unread, never
+    // misread.
     static HOME_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?:^|[^A-Za-z0-9_])HOME=").expect("HOME assignment pattern compiles")
     });
@@ -25963,6 +25975,59 @@ mod tests {
             let want: std::collections::BTreeSet<String> =
                 want.into_iter().map(String::from).collect();
             assert_eq!(got, want, "CDPATH env {env_cdpath}: {command:?}");
+        }
+    }
+
+    /// A `cd` to a leading `$HOME` bash expands lands under the process home,
+    /// and any `HOME=` in the command leaves it unread: a later inline one,
+    /// one behind `env`, one on the `cd` itself, an `export`, and one inside
+    /// quoted text (over-reading, never a miss). Reads the live home and
+    /// never sets `HOME`, which other tests in this process read unlocked.
+    #[test]
+    fn segment_work_dirs_reads_a_home_target_unless_home_may_be_rebound() {
+        const X: &str = UNRESOLVABLE_DIR;
+        let home = crate::paths::user_home_lossy_or_default();
+        // An unquoted `$HOME` is unread for a home bash would split or glob,
+        // so the expected landing below holds only for a plain home.
+        if home.is_empty() || home.contains([' ', '\t', '\n', '*', '?', '[']) {
+            return;
+        }
+        let up = format!("{home}/up");
+        for (command, want) in [
+            ("cd \"$HOME/up\"; gh pr create", vec![up.as_str()]),
+            ("cd $HOME/up; gh pr create", vec![up.as_str()]),
+            ("cd \"${HOME}\"/up; gh pr create", vec![up.as_str()]),
+            (
+                "XDG_CONFIG_HOME=/x; cd \"$HOME/up\"; gh pr create",
+                vec![up.as_str()],
+            ),
+            ("cd \"$HOME/up\" && HOME=/x gh pr create", vec!["/cwd", X]),
+            (
+                "cd \"$HOME/up\" && env HOME=/x gh pr create",
+                vec!["/cwd", X],
+            ),
+            ("HOME=/x cd \"$HOME/up\"; gh pr create", vec!["/cwd", X]),
+            (
+                "export HOME=/x; cd \"$HOME/up\"; gh pr create",
+                vec!["/cwd", X],
+            ),
+            (
+                "git commit -m \"fix HOME=x\"; cd \"$HOME/up\"; gh pr create",
+                vec!["/cwd", X],
+            ),
+            ("cd '$HOME/up'; gh pr create", vec!["/cwd", X]),
+        ] {
+            let located =
+                segment_work_dirs_with_cdpath(command, "/cwd", false, UnreadEval::MayMove);
+            let last = located.last().map(|segment| segment.raw.clone());
+            let got: std::collections::BTreeSet<String> = located
+                .iter()
+                .filter(|segment| Some(&segment.raw) == last.as_ref())
+                .map(|segment| segment.dir.to_string())
+                .collect();
+            let want: std::collections::BTreeSet<String> =
+                want.into_iter().map(String::from).collect();
+            assert_eq!(got, want, "{command:?}");
         }
     }
 

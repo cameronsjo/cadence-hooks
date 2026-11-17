@@ -807,17 +807,13 @@ fn resolve_target_repos_on(
         RepoFlag::TargetOrAbsent(repo) => resolutions.extend(flag_value_resolution(&repo, &dh)),
         RepoFlag::Absent => {}
     }
-    if let Some(repo) = inline_gh_repo(command) {
-        resolutions.extend(flag_value_resolution(&repo, &dh));
-    } else if !inline_gh_repo_unset(command)
-        && gh_api_endpoint(command).is_none_or(|endpoint| {
-            ["{", ":owner", ":repo"]
-                .iter()
-                .any(|p| endpoint.contains(p))
-        })
-    {
-        for repo in env_repos.iter().filter(|repo| !repo.is_empty()) {
-            resolutions.extend(flag_value_resolution(repo, &dh));
+    if segment_reads_gh_repo(command) {
+        if let Some(repo) = inline_gh_repo(command) {
+            resolutions.extend(flag_value_resolution(&repo, &dh));
+        } else if !inline_gh_repo_unset(command) {
+            for repo in env_repos.iter().filter(|repo| !repo.is_empty()) {
+                resolutions.extend(flag_value_resolution(repo, &dh));
+            }
         }
     }
     resolutions.push(resolve_unflagged_target(
@@ -900,28 +896,44 @@ fn names_literal_unowned_owner(
 
 /// How a plain `export` or `unset` segment changes the `GH_REPO` gh
 /// inherits: `Some(Some(value))` for `export GH_REPO=value`, `Some(None)`
-/// for `unset GH_REPO`, `export -n GH_REPO` or an empty `export GH_REPO=`
-/// (gh treats empty as unset), and `None` when the segment leaves it alone
-/// or uses another option (`unset -f`).
+/// for `unset GH_REPO` (also `-v` and `--`), `export -n GH_REPO` or an empty
+/// `export GH_REPO=` (gh treats empty as unset), and `None` when the segment
+/// leaves it alone or uses an option that touches no variable (`unset -f`,
+/// `unset -n`, `export -f`, `export -p`). Options end at `--` or the first
+/// word that is not one, as bash's builtins read them.
 fn gh_repo_export(segment: &str) -> Option<Option<String>> {
     let tokens = tokenize(segment);
     let (first, rest) = tokens.split_first()?;
-    if first == "export" && rest.first().is_some_and(|flag| flag == "-n") {
-        return rest[1..]
-            .iter()
-            .any(|token| token == "GH_REPO" || token.starts_with("GH_REPO="))
-            .then_some(None);
+    let mut options = String::new();
+    let mut at = 0;
+    while let Some(word) = rest.get(at) {
+        at += 1;
+        if word == "--" {
+            break;
+        }
+        match word.strip_prefix('-') {
+            Some(letters) if !letters.is_empty() => options.push_str(letters),
+            _ => {
+                at -= 1;
+                break;
+            }
+        }
     }
-    if rest.iter().any(|token| token.starts_with('-')) {
-        return None;
-    }
+    let operands = &rest[at..];
+    let names_it = |word: &String| word == "GH_REPO" || word.starts_with("GH_REPO=");
     match first.as_str() {
-        "export" => rest
+        "unset" if options.chars().all(|c| c == 'v') => operands
             .iter()
-            .filter_map(|token| token.strip_prefix("GH_REPO="))
+            .any(|word| word == "GH_REPO")
+            .then_some(None),
+        "export" if options.is_empty() => operands
+            .iter()
+            .filter_map(|word| word.strip_prefix("GH_REPO="))
             .next_back()
             .map(|value| (!value.is_empty()).then(|| value.to_string())),
-        "unset" => rest.iter().any(|token| token == "GH_REPO").then_some(None),
+        "export" if options.chars().all(|c| c == 'n') => {
+            operands.iter().any(names_it).then_some(None)
+        }
         _ => None,
     }
 }
@@ -935,6 +947,36 @@ fn inline_gh_repo(command: &str) -> Option<String> {
         .filter_map(|token| token.strip_prefix("GH_REPO="))
         .rfind(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// The `gh repo` verbs that read `GH_REPO`: the ones gh gives `-R`
+/// (`cmdutil.EnableRepoOverride` in gh 2.104.0's `pkg/cmd/repo/rename`,
+/// `deploy-key` and `autolink`). `create`, `edit`, `archive`, `delete` and
+/// `fork` take their repository from an argument or the checkout and never
+/// read it.
+const REPO_VERBS_READING_GH_REPO: &[&str] = &["rename", "deploy-key", "autolink"];
+
+/// Does this segment's gh invocation read `GH_REPO`, from any source (inline,
+/// exported or inherited)? gh reads it only through `-R`'s override
+/// (`cmdutil.OverrideBaseRepoFunc`), which every write group but `repo` and
+/// `gist` installs, and in `gh api` only to fill an `{owner}`/`{repo}` or
+/// `:owner`/`:repo` placeholder (`pkg/cmd/api/api.go`). A `gh repo` verb
+/// reads it only when [`REPO_VERBS_READING_GH_REPO`] lists it.
+fn segment_reads_gh_repo(segment: &str) -> bool {
+    if let Some(endpoint) = gh_api_endpoint(segment) {
+        return ["{", ":owner", ":repo"]
+            .iter()
+            .any(|placeholder| endpoint.contains(placeholder));
+    }
+    match gh_argv(segment)
+        .as_deref()
+        .map(|argv| gh_command_path(argv, 2))
+    {
+        Some(path) if path.first().copied() == Some("repo") => path
+            .get(1)
+            .is_some_and(|verb| REPO_VERBS_READING_GH_REPO.contains(verb)),
+        _ => true,
+    }
 }
 
 /// True when the gh invocation's last inline `GH_REPO=` is empty
@@ -4583,6 +4625,39 @@ mod tests {
                     "export GH_REPO=evil/x; export -n GH_REPO; gh issue comment 1 --body hi",
                     false,
                 ),
+                // bash's option forms clear it the same way.
+                (
+                    "export GH_REPO=evil/x; unset -v GH_REPO; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; unset -- GH_REPO; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; export -- GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=cameronsjo/tool; export -- GH_REPO=evil/x; gh issue comment 1 --body hi",
+                    true,
+                ),
+                // `unset -f` names a function, so the value stays in force.
+                (
+                    "export GH_REPO=evil/x; unset -f GH_REPO; gh issue comment 1 --body hi",
+                    true,
+                ),
+                // Accepted gaps, pinned so a change to either is deliberate:
+                // an export spelled any other way is not read, and one behind
+                // `&&` or `||` is read as if it ran.
+                (
+                    "GH_REPO=evil/x; export GH_REPO; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "false && export GH_REPO=evil/x; gh issue comment 1 --body hi",
+                    true,
+                ),
                 (
                     "export GH_REPO=evil/x; GH_REPO= gh issue comment 1 --body hi",
                     false,
@@ -4614,6 +4689,58 @@ mod tests {
                     true,
                 ),
                 ("gh issue comment 1 --body hi", false),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn gh_repo_is_judged_only_on_commands_that_read_it() {
+        // gh reads `GH_REPO` only through `-R`'s override, which the `repo`
+        // group installs only on `rename`, `deploy-key` and `autolink`, and
+        // in `gh api` only to fill a placeholder. Every source of it (inline,
+        // exported) is judged on exactly those commands, so an owned
+        // positional or literal path is not blocked by an unowned
+        // `GH_REPO` gh never reads there.
+        let owned = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            for (command, blocks_expected) in [
+                (
+                    "export GH_REPO=evil/x; gh repo create cameronsjo/new --private",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; gh repo edit cameronsjo/tool --description d",
+                    false,
+                ),
+                (
+                    "GH_REPO=evil/x gh repo create cameronsjo/new --private",
+                    false,
+                ),
+                (
+                    "GH_REPO=evil/x gh repo edit cameronsjo/tool --description d",
+                    false,
+                ),
+                (
+                    "GH_REPO=evil/x gh api -X POST repos/cameronsjo/tool/issues -f title=x",
+                    false,
+                ),
+                // Commands that read it still judge it.
+                ("export GH_REPO=evil/x; gh repo rename tool2 --yes", true),
+                (
+                    "GH_REPO=evil/x gh api -X POST repos/{owner}/{repo}/issues -f title=x",
+                    true,
+                ),
+                ("GH_REPO=evil/x gh issue comment 1 --body hi", true),
+                ("export GH_REPO=evil/x; gh release create v1", true),
             ] {
                 let result = GhWriteGuard.run(&input_with(command, cwd));
                 assert_eq!(

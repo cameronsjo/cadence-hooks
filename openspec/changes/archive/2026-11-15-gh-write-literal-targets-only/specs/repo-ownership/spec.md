@@ -145,7 +145,11 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **THEN** the hook allows
 
 ### Requirement: GH_REPO a gh write inherits
-`guard-gh-write` SHALL read `GH_REPO` from an inline `GH_REPO=` on the gh word, and otherwise from the `GH_REPO` in force: the hook process's, replaced by each literal `export GH_REPO=` and cleared by each `unset GH_REPO` the command runs in its own shell before the write. A `gh api` write whose endpoint holds no placeholder reads no inherited `GH_REPO`.
+`guard-gh-write` SHALL read `GH_REPO` from an inline `GH_REPO=` on the gh word, and otherwise from the `GH_REPO` in force: the hook process's, replaced by each literal `export GH_REPO=` and cleared by each `unset GH_REPO` the command runs in its own shell before the write (bash's `unset -v` and `--` forms included). Any `GH_REPO` SHALL be judged only on a command gh reads it for: not `gh repo create`, `edit`, `archive`, `delete` or `fork`, and in `gh api` only to fill a placeholder.
+
+#### Scenario: Command that never reads GH_REPO
+- **WHEN** the command is `export GH_REPO=evil/x; gh repo create cameronsjo/new --private`
+- **THEN** the hook allows, because `gh repo create` takes its repository from its argument
 
 #### Scenario: Export in a child shell
 - **WHEN** the command is `bash -c 'export GH_REPO=evil/x'; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
@@ -158,6 +162,17 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 #### Scenario: Hook process GH_REPO
 - **WHEN** the hook process has `GH_REPO=evil/x` and `gh issue comment 1 --body hi` runs in a checkout of `cameronsjo/tool`
 - **THEN** the hook exits 2
+
+### Requirement: GH_REPO spellings the guard does not read
+`guard-gh-write` MUST NOT read a `GH_REPO` set any other way, as an accepted gap (cadence-ecosystem ADR-0046 rule 3): an assignment exported afterwards (`GH_REPO=x; export GH_REPO`), `declare -x` or `typeset -x`, `set -a`, and an `export` inside a loop, `if` or other compound command. An `export` behind `&&` or `||` SHALL be read as if it ran.
+
+#### Scenario: Assignment exported afterwards
+- **WHEN** the command is `GH_REPO=evil/x; export GH_REPO; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: Conditional export
+- **WHEN** the command is `false && export GH_REPO=evil/x; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2, reading the export as if it ran
 
 ### Requirement: GH_HOST a gh write inherits
 `guard-gh-write` SHALL judge a write on the host it names (`--hostname`, an inline `GH_HOST=`), else the hook process's `GH_HOST`. A `GH_HOST` the command sets other than inline on the gh word (an `export`, a bare reassignment of an inherited one, an `unset`) MUST NOT be read.
