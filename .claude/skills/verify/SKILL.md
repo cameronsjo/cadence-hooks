@@ -13,16 +13,16 @@ Tests prove the code does what the tests say. This proves the shipped binary doe
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --bin cadence-hooks
+CARGO_TARGET_DIR="$PWD/target" cargo build --bin cadence-hooks || exit 1
 V="$(mktemp -d)"; mkdir "$V/payloads"
 git fetch -q origin main
 git worktree add -q --detach "$V/base" origin/main
-(cd "$V/base" && CARGO_TARGET_DIR="$V/target" cargo build --bin cadence-hooks)
+(cd "$V/base" && CARGO_TARGET_DIR="$V/target" cargo build --bin cadence-hooks) || exit 1
 HEAD_BIN="$PWD/target/debug/cadence-hooks"
 BASE_BIN="$V/target/debug/cadence-hooks"
 ```
 
-Skip the base build when the change adds a new hook: there is nothing to compare.
+Stop if either build fails: an old binary left in the target dir would give stale verdicts. When the change only adds a new hook, skip the base build and leave `BASE_BIN` empty: the loop below then records `n/a` for base.
 
 ## 2. Name the hooks the change touches
 
@@ -47,21 +47,23 @@ Run under a scratch metrics dir, with the three exemption variables cleared. Oth
 ```bash
 export CADENCE_METRICS_DIR="$(mktemp -d)"
 for p in "$V"/payloads/*.json; do
-  for b in "$BASE_BIN" "$HEAD_BIN"; do
-    printf '%s %s: ' "$(basename "$p")" "$([ "$b" = "$HEAD_BIN" ] && echo head || echo base)"
-    env -u CADENCE_DISABLE -u CADENCE_ALLOW_MAIN -u CADENCE_BYPASS \
-      "$b" try <ns> <hook> --payload "$p" | sed -n 's/^Outcome: *//p'
+  for side in base head; do
+    b="$BASE_BIN"; [ "$side" = head ] && b="$HEAD_BIN"
+    printf '%s %s: ' "$(basename "$p")" "$side"
+    [ -n "$b" ] || { echo n/a; continue; }
+    out="$(env -u CADENCE_DISABLE -u CADENCE_ALLOW_MAIN -u CADENCE_BYPASS \
+      "$b" try <ns> <hook> --payload "$p")"
+    printf '%s\n' "$out" | sed -n 's/^Outcome: *//p' | grep . || echo "ERROR (no outcome: wrong hook name or bad payload)"
   done
 done
 ```
 
-`try` swaps the payload's `cwd` for the shell's cwd. For a hook that reads git state from `cwd`, pipe the payload to the bare `"$b" <ns> <hook>` instead and read the exit code: 2 is BLOCK, 0 with JSON on stdout is NUDGE, 0 with nothing is ALLOW.
+`try` keeps the `cwd` of a payload you give it; only its generated sample gets the shell's cwd. For a hook that reads git state, set `cwd` in the payload to a repo in the state the case needs.
 
 ## 5. Read the result
 
-- **PASS:** every claim case gives its stated verdict at head, and no everyday control moved from ALLOW.
-- **FAIL:** a claim case gives the old verdict, or any control moved ALLOW to BLOCK. Fix it before committing.
-- A case that moved and is neither of these: name it in the PR body.
+- **PASS:** every claim case gives its stated verdict at head, and every everyday control is ALLOW at head.
+- **FAIL:** any claim case gives another verdict, any control is NUDGE or BLOCK at head, or any row says ERROR. Fix it before committing.
 
 Wiring is a separate check. If the change also needs a `hooks.json` entry in the cadence monorepo, a hook with no matching `if:` never runs: `tests/hook_registration_audit.rs` covers that side.
 
