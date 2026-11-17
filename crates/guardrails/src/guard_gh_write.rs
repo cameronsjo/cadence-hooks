@@ -230,10 +230,26 @@ fn argv_names_write(segment: &str) -> bool {
 /// The group and verb of the gh invocation `argv` (`argv[0]` is `gh`), found
 /// the way cobra finds them ([`gh_command_path`]), when they name a write.
 /// `None` for anything else, `gh api` included: it has no verb.
+///
+/// The `gh repo` writes one level deeper are matched on the parsed path only,
+/// never the raw text, so the words inside a quoted value (`--search "gh repo
+/// deploy-key add"`) are not a write: a deploy key or an autolink added to or
+/// removed from a repository (gh 2.104.0 `pkg/cmd/repo/deploy-key/{add,delete}`
+/// and `pkg/cmd/repo/autolink/{create,delete}`; `new` is `create`'s alias).
+/// Both groups take `-R` and read `GH_REPO`. The pair returned for them is
+/// `[repo, deploy-key]` or `[repo, autolink]`.
 fn argv_write_path(argv: &[String]) -> Option<[&str; 2]> {
-    let [group, verb] = gh_command_path(argv, 2)[..] else {
+    let path = gh_command_path(argv, 3);
+    let [group, verb, ..] = path[..] else {
         return None;
     };
+    if matches!(
+        path[..],
+        ["repo", "deploy-key", "add" | "delete"]
+            | ["repo", "autolink", "create" | "new" | "delete"]
+    ) {
+        return Some([group, verb]);
+    }
     let canonical = format!("gh {group} {verb}");
     (WRITE_ACTIONS.is_match(&canonical) || WRITE_ACTIONS_EXTRA.is_match(&canonical))
         .then_some([group, verb])
@@ -4659,6 +4675,32 @@ mod tests {
                     true,
                 ),
                 (
+                    "for i in 1; do export GH_REPO=evil/x; done; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "if true; then export GH_REPO=evil/x; fi; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "{ export GH_REPO=evil/x; }; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export -p GH_REPO=evil/x; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "readonly -x GH_REPO=evil/x; gh issue comment 1 --body hi",
+                    false,
+                ),
+                // An `unset` in a compound command is not read either, so the
+                // export stays in force: a false block, the safe direction.
+                (
+                    "export GH_REPO=evil/x; { unset GH_REPO; }; gh issue comment 1 --body hi",
+                    true,
+                ),
+                (
                     "export GH_REPO=evil/x; GH_REPO= gh issue comment 1 --body hi",
                     false,
                 ),
@@ -4742,6 +4784,71 @@ mod tests {
                 ("GH_REPO=evil/x gh issue comment 1 --body hi", true),
                 ("export GH_REPO=evil/x; gh release create v1", true),
             ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn deploy_key_and_autolink_writes_are_judged() {
+        // `gh repo deploy-key add|delete` and `gh repo autolink
+        // create|new|delete` write to the repo `-R` names, else `GH_REPO`,
+        // else the checkout, like every other `-R` write. Their `list` and
+        // `view` verbs are reads.
+        let owned = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let unowned = origin_checkout("https://github.com/evil/up.git");
+        with_env(&owners_env(), || {
+            for (command, dir, blocks_expected) in [
+                ("gh repo deploy-key add key.pub -R evil/x", &owned, true),
+                ("gh repo deploy-key delete 1 -R evil/x", &owned, true),
+                (
+                    "gh repo autolink create KEY https://u -R evil/x",
+                    &owned,
+                    true,
+                ),
+                ("gh repo autolink new KEY https://u -R evil/x", &owned, true),
+                ("gh repo autolink delete 1 -R evil/x", &owned, true),
+                ("gh -R evil/x repo deploy-key add key.pub", &owned, true),
+                ("gh repo deploy-key add key.pub", &unowned, true),
+                (
+                    "export GH_REPO=evil/x; gh repo deploy-key delete 1",
+                    &owned,
+                    true,
+                ),
+                (
+                    "export GH_REPO=evil/x; gh repo autolink delete 1",
+                    &owned,
+                    true,
+                ),
+                (
+                    "gh repo deploy-key add key.pub -R cameronsjo/tool",
+                    &owned,
+                    false,
+                ),
+                ("gh repo autolink create KEY https://u", &owned, false),
+                (
+                    "export GH_REPO=cameronsjo/tool; gh repo deploy-key delete 1",
+                    &owned,
+                    false,
+                ),
+                ("GH_REPO=evil/x gh repo autolink delete 1", &owned, true),
+                ("gh repo deploy-key list -R evil/x", &owned, false),
+                ("gh repo autolink view 1 -R evil/x", &owned, false),
+                // Read on the parsed path only: the words inside a quoted
+                // value are not a write.
+                (
+                    "gh issue list --search \"gh repo deploy-key add\" -R evil/x",
+                    &owned,
+                    false,
+                ),
+            ] {
+                let cwd = dir.path().to_str().expect("utf-8 path");
                 let result = GhWriteGuard.run(&input_with(command, cwd));
                 assert_eq!(
                     blocks(&result),

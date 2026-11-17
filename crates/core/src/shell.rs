@@ -6923,7 +6923,9 @@ fn verb_target(words: &[MarkedToken], home: Option<&str>) -> VerbTarget {
         // An unquoted `$HOME` is split and globbed by bash after expansion;
         // a home holding whitespace or a glob character then lands somewhere
         // this walk does not model (`cd $HOME/x` with two words fails), so
-        // it stays unread.
+        // it stays unread. zsh neither splits nor globs it and lands in the
+        // directory; reading it there is an accepted gap (the repo-ownership
+        // spec, "Home directory in a gh write's cd").
         [target]
             if target.unquoted_prefix_len > 0
                 && home.is_some_and(|home| home.contains([' ', '\t', '\n', '*', '?', '['])) =>

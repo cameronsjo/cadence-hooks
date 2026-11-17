@@ -176,6 +176,18 @@ fn the_hook_process_gh_repo_is_judged() {
         0,
         "a literal export replaces the inherited GH_REPO"
     );
+    // The deploy-key and autolink writes read it too (they take `-R`).
+    for command in [
+        "gh repo deploy-key delete 1",
+        "gh repo autolink create KEY https://u",
+    ] {
+        assert_eq!(
+            guard_in(command, cwd, &[("GH_REPO", "evil/x")]),
+            2,
+            "inherited GH_REPO on {command}"
+        );
+        assert_eq!(guard_in(command, cwd, &[]), 0, "control: {command}");
+    }
 }
 
 /// `cd "$HOME/x"` lands where `cd ~/x` does, so a write after it is judged on
@@ -221,8 +233,9 @@ fn a_home_cd_target_lands_where_the_tilde_does() {
 
 /// With a home path that holds a space, bash splits an unquoted `$HOME/up`
 /// into two words, so `cd` fails and the write after `;` runs in the owned
-/// checkout: the guard leaves that target unread and allows. The quoted form
-/// is one word and still lands in `~/up`.
+/// checkout: the guard leaves that target unread and allows. zsh would land
+/// in `~/up` instead; that miss is an accepted gap. The quoted form is one
+/// word and still lands in `~/up`.
 #[test]
 fn an_unquoted_home_with_a_space_is_left_unread() {
     let root = tempfile::tempdir().expect("temp root");

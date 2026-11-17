@@ -1,5 +1,16 @@
 ## MODIFIED Requirements
 
+### Requirement: What counts as a gh write
+`guard-gh-write` SHALL treat as writes: `gh pr|issue|release|label|repo|gist|workflow` with a mutating verb (`create`, `merge`, `close`, `comment`, `edit`, `delete`, `review`, `ready`, `reopen`, `lock`, `archive`, `rename`, `transfer`, `fork`, `run`, `enable`, `disable`), `gh secret|variable set|delete`, `gh release upload`, `gh label clone`, the deploy-key and autolink writes, and `gh api` with a mutating `-X`/`--method`, a field flag or `--input`, unless an explicit `GET` method is given.
+
+#### Scenario: API field write
+- **WHEN** the command is `gh api repos/evil/repo/issues -f title=x`
+- **THEN** the hook exits 2
+
+#### Scenario: Explicit GET with fields
+- **WHEN** the command is `gh api repos/evil/repo/issues -X GET -f state=open`
+- **THEN** the hook allows
+
 ### Requirement: gh writes the guard cannot place
 `guard-gh-write` MUST allow a write whose target it cannot read exactly (cadence-ecosystem ADR-0046 rule 3): no readable `-R` or remote, `-R` readings that disagree, a target or host holding a shell expansion with no literal owner, a directory it cannot follow, a `gh api` write outside `repos/<owner>/<repo>/…` and `orgs/<org>/…`, and a command too large or nested to read. With no allowlist configured, a write MUST still block.
 
@@ -144,8 +155,19 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **WHEN** the command is `for r in a b; do gh issue close 1 -R "$o/$r"; done`
 - **THEN** the hook allows
 
+### Requirement: Deploy-key and autolink writes
+`guard-gh-write` SHALL treat `gh repo deploy-key add|delete` and `gh repo autolink create|new|delete` as writes, judged on the same targets as every other `-R` write (`-R`, else `GH_REPO` and the checkout's remotes). Their `list` and `view` verbs SHALL be reads.
+
+#### Scenario: Deploy key on an unowned repo
+- **WHEN** the command is `gh repo deploy-key add key.pub -R evil/x`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Autolink through an exported GH_REPO
+- **WHEN** the command is `export GH_REPO=evil/x; gh repo autolink delete 1`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2
+
 ### Requirement: GH_REPO a gh write inherits
-`guard-gh-write` SHALL read `GH_REPO` from an inline `GH_REPO=` on the gh word, and otherwise from the `GH_REPO` in force: the hook process's, replaced by each literal `export GH_REPO=` and cleared by each `unset GH_REPO` the command runs in its own shell before the write (bash's `unset -v` and `--` forms included). Any `GH_REPO` SHALL be judged only on a command gh reads it for: not `gh repo create`, `edit`, `archive`, `delete` or `fork`, and in `gh api` only to fill a placeholder.
+`guard-gh-write` SHALL read `GH_REPO` from an inline `GH_REPO=` on the gh word, and otherwise from the `GH_REPO` in force: the hook process's, replaced by each literal `export GH_REPO=` and cleared by each `unset GH_REPO` the command runs in its own shell before the write (bash's `unset -v` and `--` forms included). Any `GH_REPO` SHALL be judged only on a command gh reads it for: in the `gh repo` group only `rename`, `deploy-key` and `autolink`, and in `gh api` only to fill a placeholder.
 
 #### Scenario: Command that never reads GH_REPO
 - **WHEN** the command is `export GH_REPO=evil/x; gh repo create cameronsjo/new --private`
@@ -164,7 +186,11 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **THEN** the hook exits 2
 
 ### Requirement: GH_REPO spellings the guard does not read
-`guard-gh-write` MUST NOT read a `GH_REPO` set any other way, as an accepted gap (cadence-ecosystem ADR-0046 rule 3): an assignment exported afterwards (`GH_REPO=x; export GH_REPO`), `declare -x` or `typeset -x`, `set -a`, and an `export` inside a loop, `if` or other compound command. An `export` behind `&&` or `||` SHALL be read as if it ran.
+`guard-gh-write` MUST NOT read a `GH_REPO` set any other way, as an accepted gap (cadence-ecosystem ADR-0046 rule 3): `GH_REPO=x; export GH_REPO`, `declare -x`, `typeset -x`, `readonly -x` (zsh), `export -p` (bash), `set -a`, and an `export` or `unset` inside a loop, `if`, brace group or other compound command. An `export` behind `&&` or `||` SHALL be read as if it ran.
+
+#### Scenario: Unset in a brace group
+- **WHEN** the command is `export GH_REPO=evil/x; { unset GH_REPO; }; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2, an accepted false block: the `unset` is not read, so the export stays in force
 
 #### Scenario: Assignment exported afterwards
 - **WHEN** the command is `GH_REPO=evil/x; export GH_REPO; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
@@ -182,7 +208,11 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **THEN** the hook allows, judging `cameronsjo/x` on the hook process's host
 
 ### Requirement: Home directory in a gh write's cd
-`guard-gh-write` SHALL follow a `cd` or `pushd` to a leading `$HOME` or `${HOME}` that bash expands as it follows `cd ~/…`, unless the command may rebind `HOME`, and judge a write after it on that directory's remotes.
+`guard-gh-write` SHALL follow a `cd` or `pushd` to a leading `$HOME` or `${HOME}` that bash expands as it follows `cd ~/…`, unless the command may rebind `HOME`, and judge a write after it on that directory's remotes. An unquoted `$HOME` whose home path holds whitespace or a glob character MUST be left unread, as an accepted gap: that matches bash, which splits and globs it, and not zsh, which does neither and lands in the directory.
+
+#### Scenario: Unquoted HOME with a space
+- **WHEN** the home path holds a space, `~/up` is a checkout of `evil/up`, and the command is `cd $HOME/up; gh pr create --title t`, run from a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
 
 #### Scenario: Home directory spelled with $HOME
 - **WHEN** `~/up` is a checkout of `evil/up` and the command is `cd "$HOME/up" && gh pr create --title t`
@@ -191,3 +221,10 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 #### Scenario: HOME rebound first
 - **WHEN** the command is `HOME=/x; cd "$HOME/up" && gh pr create --title t`
 - **THEN** the hook allows, because it cannot follow the directory
+
+### Requirement: gh writes the guard does not judge
+`guard-gh-write` MUST allow, as an accepted gap, the gh writes outside its write set, whatever their target: `gh repo unarchive`, `gh repo sync`, `gh pr revert`, `gh pr update-branch`, `gh issue pin`, `unpin` and `develop`, `gh run rerun`, `cancel` and `delete`, `gh cache delete`, and `gh discussion create`, `edit` and `comment`.
+
+#### Scenario: Run rerun on an unowned repo
+- **WHEN** the command is `gh run rerun 1 -R evil/x`
+- **THEN** the hook allows
