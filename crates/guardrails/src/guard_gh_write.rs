@@ -783,6 +783,12 @@ fn resolve_target_repo_on(
 ///   `export GH_REPO=` before it ([`gh_repo_export`]). Empty means none. A
 ///   `gh api` call with no placeholder in its endpoint reads none of them:
 ///   gh uses `GH_REPO` there only to fill `{owner}`/`{repo}`.
+/// - A placeholder owner keeps the endpoint's literal name: gh writes
+///   `repos/{owner}/other/…` to `<base owner>/other`, the base being the
+///   `GH_REPO` value or each checkout remote ([`fill_placeholder_owner`]), and
+///   `{repo}` keeps the base repo whole. An `orgs/{owner}/…` write is judged
+///   on the base owner as an org: the `GH_REPO` owner when one is in force,
+///   else the checkout's, both remotes' in a fork ([`checkout_org_targets`]).
 ///
 /// A PR or issue URL argument comes before all of these: gh takes the repo
 /// and host from it and never reads `-R`, `GH_REPO` or the checkout
@@ -824,35 +830,58 @@ fn resolve_target_repos_on(
         RepoFlag::TargetOrAbsent(repo) => resolutions.extend(flag_value_resolution(&repo, &dh)),
         RepoFlag::Absent => {}
     }
+    let endpoint = gh_api_endpoint(command);
+    // An `orgs/{owner}/…` (or `:owner`) write names the org gh fills in:
+    // the `GH_REPO` owner when one is in force, else the checkout's.
+    let org_placeholder = endpoint.as_deref().and_then(api_orgs_placeholder_host);
+    let mut gh_repo_in_force = false;
     if segment_reads_gh_repo(command) {
         // gh fills a placeholder owner from `GH_REPO`, so the write goes to
         // the `GH_REPO` owner with the endpoint's literal name.
-        let api_target = gh_api_endpoint(command)
-            .as_deref()
-            .and_then(api_repos_target_on);
+        let api_target = endpoint.as_deref().and_then(api_repos_target_on);
         let placeholder_name = api_target
             .as_ref()
             .and_then(|(_, repo)| placeholder_owner_name(repo));
         let gh_repo_resolution = |value: &str| {
-            flag_value_resolution(value, &dh).map(|resolution| {
+            flag_value_resolution(value, &dh).and_then(|resolution| {
                 match (resolution, placeholder_name) {
+                    // An owner holding a shell expansion names no org this
+                    // guard can read (ADR-0046 rule 3).
+                    (RepoResolution::Resolved { host, repo }, _) if org_placeholder.is_some() => {
+                        let org = repo_owner(&repo);
+                        is_read_exactly(org).then(|| RepoResolution::Org {
+                            host,
+                            org: org.to_string(),
+                        })
+                    }
                     (RepoResolution::Resolved { host, repo }, Some(name)) => {
-                        RepoResolution::Resolved {
+                        Some(RepoResolution::Resolved {
                             host,
                             repo: fill_placeholder_owner(&repo, name),
-                        }
+                        })
                     }
-                    (resolution, _) => resolution,
+                    (resolution, _) => Some(resolution),
                 }
             })
         };
         if let Some(repo) = inline_gh_repo(command) {
+            gh_repo_in_force = true;
             resolutions.extend(gh_repo_resolution(&repo));
         } else if !inline_gh_repo_unset(command) {
             for repo in env_repos.iter().filter(|repo| !repo.is_empty()) {
+                gh_repo_in_force = true;
                 resolutions.extend(gh_repo_resolution(repo));
             }
         }
+    }
+    if let Some(named) = org_placeholder {
+        if !gh_repo_in_force {
+            resolutions.extend(checkout_org_targets(
+                work_dir,
+                named.or_else(|| selected_gh_host(command)),
+            ));
+        }
+        return resolutions;
     }
     resolutions.push(resolve_unflagged_target(
         command,
@@ -1133,8 +1162,37 @@ fn fill_placeholder_owner(base: &str, name: &str) -> String {
     if base.is_empty() || matches!(name, "{repo}" | ":repo") {
         return base.to_string();
     }
-    let owner = base.split('/').next().unwrap_or_default();
-    format!("{owner}/{name}")
+    format!("{}/{name}", repo_owner(base))
+}
+
+/// The owner part of an `owner/repo`.
+fn repo_owner(repo: &str) -> &str {
+    repo.split('/').next().unwrap_or_default()
+}
+
+/// The orgs gh may fill an `orgs/{owner}/…` placeholder from when no
+/// `GH_REPO` is in force: the checkout's owner, or both remotes' owners in a
+/// fork, each judged on `named` (the host the command names) if it names one.
+fn checkout_org_targets(work_dir: &str, named: Option<String>) -> Vec<RepoResolution> {
+    let org = |host: String, repo: &str| RepoResolution::Org {
+        host: named.clone().unwrap_or(host),
+        org: repo_owner(repo).to_string(),
+    };
+    match resolve_from_git_remotes(work_dir) {
+        RepoResolution::Resolved { host, repo } => vec![org(host, &repo)],
+        RepoResolution::Fork {
+            origin_host,
+            origin,
+            upstream_host,
+            upstream,
+        } => [(origin_host, origin), (upstream_host, upstream)]
+            .into_iter()
+            .filter(|(_, repo)| !repo.is_empty())
+            .map(|(host, repo)| org(host, &repo))
+            .collect(),
+        RepoResolution::TimedOut => vec![RepoResolution::TimedOut],
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve a repo purely from a directory's git remotes (fork-aware).
@@ -1608,6 +1666,16 @@ fn api_orgs_target(endpoint: &str) -> Option<(Option<String>, String)> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
     .then(|| (host, org.to_string()))
+}
+
+/// For an `orgs/{owner}/…` or `orgs/:owner/…` endpoint, the host its URL
+/// prefix names (`None` for a relative path); `None` overall for any other
+/// endpoint. gh fills that placeholder like a `repos/` one.
+fn api_orgs_placeholder_host(endpoint: &str) -> Option<Option<String>> {
+    let (host, path) = api_endpoint_path(endpoint)?;
+    let rest = path.trim_start_matches('/').strip_prefix("orgs/")?;
+    let org = rest.split('/').next()?;
+    matches!(org, "{owner}" | ":owner").then_some(host)
 }
 
 /// Long flags of the `gh repo` verbs in [`REPO_TARGET_VERBS`] that consume a
@@ -3166,6 +3234,7 @@ fn judge_write_segments(
         if let Some(endpoint) = gh_api_endpoint(&segment)
             && api_repos_target(&endpoint).is_none()
             && api_orgs_target(&endpoint).is_none()
+            && api_orgs_placeholder_host(&endpoint).is_none()
         {
             continue;
         }
@@ -4452,6 +4521,97 @@ mod tests {
             with_env(&env, || {
                 let result = GhWriteGuard.run(&input_with(command, cwd));
                 assert_eq!(blocks(&result), blocks_expected, "row {row}: {command}");
+            });
+        }
+    }
+
+    #[test]
+    fn an_org_placeholder_is_judged_on_the_owner_gh_fills_in() {
+        // gh fills `orgs/{owner}/…` (and `:owner`) like a `repos/` path: from
+        // the `GH_REPO` in force, else from the checkout, either remote in a
+        // fork (PR #1641 review round 5).
+        let fork = origin_checkout("https://github.com/cameronsjo/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            fork.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/work-org/y.git",
+            ],
+        );
+        let tool = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let create = "gh api -X POST 'orgs/{owner}/repos' -f name=x";
+        let inline = |repo: &str| format!("GH_REPO={repo} {create}");
+        let export = |repo: &str| format!("export GH_REPO={repo}; {create}");
+        let rows: [(&tempfile::TempDir, Option<&str>, String, bool); 11] = [
+            (&tool, None, inline("evil/x"), true),
+            (
+                &tool,
+                None,
+                "GH_REPO=evil/x gh api -X POST orgs/:owner/repos -f name=x".to_string(),
+                true,
+            ),
+            (&tool, None, export("evil/x"), true),
+            (&tool, Some("evil/x"), create.to_string(), true),
+            (&tool, None, inline("cameronsjo/x"), false),
+            (&tool, None, export("cameronsjo/x"), false),
+            (&tool, Some("cameronsjo/x"), create.to_string(), false),
+            (&fork, None, create.to_string(), true),
+            (&tool, None, create.to_string(), false),
+            // A host only the shell knows is not read exactly, so it allows.
+            (
+                &tool,
+                None,
+                "gh api --hostname \"$h\" -X POST 'orgs/{owner}/repos' -f name=x".to_string(),
+                false,
+            ),
+            (
+                &tool,
+                None,
+                format!("GH_HOST=\"$h\" GH_REPO=evil/x {create}"),
+                false,
+            ),
+        ];
+        for (checkout, hook_gh_repo, command, blocks_expected) in rows {
+            let env = [
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+                ("CDPATH", None),
+                ("GH_HOST", None),
+                ("GH_REPO", hook_gh_repo),
+            ];
+            let cwd = checkout.path().to_str().expect("utf-8 path");
+            with_env(&env, || {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command} (hook GH_REPO {hook_gh_repo:?})"
+                );
+            });
+        }
+        // The filled owner is judged as an org, alone when `GH_REPO` is in
+        // force: an `owner/repo` entry does not own the org, and an owned
+        // `GH_REPO` is not blocked by an unowned checkout.
+        let unowned = origin_checkout("https://github.com/work-org/tool.git");
+        let env = [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", Some("work-org/template")),
+            ("CADENCE_EXTRA_HOSTS", None),
+            ("CDPATH", None),
+            ("GH_HOST", None),
+            ("GH_REPO", None),
+        ];
+        for (checkout, command, blocks_expected) in [
+            (&tool, inline("work-org/template"), true),
+            (&unowned, inline("cameronsjo/x"), false),
+        ] {
+            let cwd = checkout.path().to_str().expect("utf-8 path");
+            with_env(&env, || {
+                let result = GhWriteGuard.run(&input_with(&command, cwd));
+                assert_eq!(blocks(&result), blocks_expected, "{command} in {cwd}");
             });
         }
     }

