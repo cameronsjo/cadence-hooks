@@ -825,11 +825,32 @@ fn resolve_target_repos_on(
         RepoFlag::Absent => {}
     }
     if segment_reads_gh_repo(command) {
+        // gh fills a placeholder owner from `GH_REPO`, so the write goes to
+        // the `GH_REPO` owner with the endpoint's literal name.
+        let api_target = gh_api_endpoint(command)
+            .as_deref()
+            .and_then(api_repos_target_on);
+        let placeholder_name = api_target
+            .as_ref()
+            .and_then(|(_, repo)| placeholder_owner_name(repo));
+        let gh_repo_resolution = |value: &str| {
+            flag_value_resolution(value, &dh).map(|resolution| {
+                match (resolution, placeholder_name) {
+                    (RepoResolution::Resolved { host, repo }, Some(name)) => {
+                        RepoResolution::Resolved {
+                            host,
+                            repo: fill_placeholder_owner(&repo, name),
+                        }
+                    }
+                    (resolution, _) => resolution,
+                }
+            })
+        };
         if let Some(repo) = inline_gh_repo(command) {
-            resolutions.extend(flag_value_resolution(&repo, &dh));
+            resolutions.extend(gh_repo_resolution(&repo));
         } else if !inline_gh_repo_unset(command) {
             for repo in env_repos.iter().filter(|repo| !repo.is_empty()) {
-                resolutions.extend(flag_value_resolution(repo, &dh));
+                resolutions.extend(gh_repo_resolution(repo));
             }
         }
     }
@@ -1056,24 +1077,13 @@ fn resolve_unflagged_target(
             // `GH_HOST`) is still where gh sends it, so the filled-in repo is
             // judged there, as the literal path would be.
             // gh fills the colon spellings (`:owner`, `:repo`) the same way.
-            if let Some(name) = repo
-                .strip_prefix("{owner}/")
-                .or_else(|| repo.strip_prefix(":owner/"))
-            {
+            if let Some(name) = placeholder_owner_name(&repo) {
                 let named = host.or_else(|| selected_gh_host(command));
                 return match resolve_from_git_remotes(work_dir) {
-                    RepoResolution::Resolved { host, repo: own } => {
-                        let repo = if matches!(name, "{repo}" | ":repo") {
-                            own
-                        } else {
-                            let owner = own.split('/').next().unwrap_or_default();
-                            format!("{owner}/{name}")
-                        };
-                        RepoResolution::Resolved {
-                            host: named.unwrap_or(host),
-                            repo,
-                        }
-                    }
+                    RepoResolution::Resolved { host, repo: own } => RepoResolution::Resolved {
+                        host: named.unwrap_or(host),
+                        repo: fill_placeholder_owner(&own, name),
+                    },
                     RepoResolution::Fork {
                         origin_host,
                         origin,
@@ -1081,9 +1091,9 @@ fn resolve_unflagged_target(
                         upstream,
                     } => RepoResolution::Fork {
                         origin_host: named.clone().unwrap_or(origin_host),
-                        origin,
+                        origin: fill_placeholder_owner(&origin, name),
                         upstream_host: named.unwrap_or(upstream_host),
-                        upstream,
+                        upstream: fill_placeholder_owner(&upstream, name),
                     },
                     resolution => resolution,
                 };
@@ -1104,6 +1114,27 @@ fn resolve_unflagged_target(
 
     // 4. Git remotes (with fork detection)
     resolve_from_git_remotes(work_dir)
+}
+
+/// The repository name after a placeholder owner in a `gh api repos/…`
+/// target (`{owner}/other` or `:owner/other` gives `other`, and
+/// `{owner}/{repo}` gives `{repo}`), or `None` when the owner is literal.
+fn placeholder_owner_name(repo: &str) -> Option<&str> {
+    repo.strip_prefix("{owner}/")
+        .or_else(|| repo.strip_prefix(":owner/"))
+}
+
+/// The repository gh writes to when it fills a placeholder owner from
+/// `base` (a checkout remote's or `GH_REPO`'s `owner/repo`): `base` itself
+/// when the name is `{repo}` or `:repo`, else `base`'s owner with the
+/// endpoint's literal name. An empty `base` (a remote this guard could not
+/// read) stays empty.
+fn fill_placeholder_owner(base: &str, name: &str) -> String {
+    if base.is_empty() || matches!(name, "{repo}" | ":repo") {
+        return base.to_string();
+    }
+    let owner = base.split('/').next().unwrap_or_default();
+    format!("{owner}/{name}")
 }
 
 /// Resolve a repo purely from a directory's git remotes (fork-aware).
@@ -4278,6 +4309,151 @@ mod tests {
                 assert_eq!(blocks(&result), blocks_expected, "{command} in {cwd}");
             }
         });
+    }
+
+    #[test]
+    fn a_placeholder_owner_keeps_the_endpoints_literal_name() {
+        // gh fills a placeholder owner from the base repo, whether a fork's
+        // remote or `GH_REPO`, and keeps the endpoint's literal name, so
+        // `repos/{owner}/other` writes to `<that owner>/other`. An
+        // `owner/repo` allowlist entry for the base repo does not own that
+        // sibling (PR #1641 triage, claims 1 and 2).
+        let fork = origin_checkout("https://github.com/work-org/x.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            fork.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/work-org/y.git",
+            ],
+        );
+        let tool = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let sibling = "gh api -X POST 'repos/{owner}/other/issues' -f title=x";
+        let sibling_inline = format!("GH_REPO=work-org/template {sibling}");
+        let sibling_export = format!("export GH_REPO=work-org/template; {sibling}");
+        let sibling_evil = format!("GH_REPO=evil/template {sibling}");
+        let own_repo_inline =
+            "GH_REPO=work-org/template gh api -X POST 'repos/{owner}/{repo}/issues' -f title=x";
+        // (row, checkout, owners, repos, hook GH_REPO, command, blocks?)
+        type Row<'a> = (
+            &'a str,
+            &'a tempfile::TempDir,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            &'a str,
+            bool,
+        );
+        let rows: [Row; 12] = [
+            (
+                "1a",
+                &fork,
+                "cameronsjo",
+                Some("work-org/x,work-org/y"),
+                None,
+                sibling,
+                true,
+            ),
+            (
+                "1b",
+                &fork,
+                "cameronsjo",
+                Some("work-org/x,work-org/y"),
+                None,
+                "gh api -X POST repos/:owner/other/issues -f title=x",
+                true,
+            ),
+            (
+                "1c",
+                &fork,
+                "cameronsjo",
+                Some("work-org/x,work-org/y"),
+                None,
+                "gh api -X POST 'repos/{owner}/{repo}/issues' -f title=x",
+                false,
+            ),
+            (
+                "1e",
+                &fork,
+                "cameronsjo,work-org",
+                None,
+                None,
+                sibling,
+                false,
+            ),
+            ("1f", &fork, "cameronsjo", None, None, sibling, true),
+            (
+                "1g",
+                &tool,
+                "cameronsjo",
+                Some("work-org/x"),
+                None,
+                sibling,
+                false,
+            ),
+            (
+                "2a",
+                &tool,
+                "cameronsjo",
+                Some("work-org/template"),
+                None,
+                &sibling_inline,
+                true,
+            ),
+            (
+                "2b",
+                &tool,
+                "cameronsjo",
+                Some("work-org/template"),
+                None,
+                &sibling_export,
+                true,
+            ),
+            (
+                "2c",
+                &tool,
+                "cameronsjo",
+                Some("work-org/template"),
+                Some("work-org/template"),
+                sibling,
+                true,
+            ),
+            (
+                "2d",
+                &tool,
+                "cameronsjo",
+                Some("work-org/template"),
+                None,
+                own_repo_inline,
+                false,
+            ),
+            ("2e", &tool, "cameronsjo", None, None, &sibling_evil, true),
+            (
+                "2f",
+                &tool,
+                "cameronsjo,work-org",
+                None,
+                None,
+                &sibling_inline,
+                false,
+            ),
+        ];
+        for (row, checkout, owners, repos, hook_gh_repo, command, blocks_expected) in rows {
+            let env = [
+                ("CADENCE_ALLOWED_OWNERS", Some(owners)),
+                ("CADENCE_ALLOWED_REPOS", repos),
+                ("CADENCE_EXTRA_HOSTS", None),
+                ("CDPATH", None),
+                ("GH_HOST", None),
+                ("GH_REPO", hook_gh_repo),
+            ];
+            let cwd = checkout.path().to_str().expect("utf-8 path");
+            with_env(&env, || {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(blocks(&result), blocks_expected, "row {row}: {command}");
+            });
+        }
     }
 
     #[test]
