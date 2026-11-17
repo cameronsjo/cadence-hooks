@@ -703,7 +703,8 @@ fn selected_gh_host(command: &str) -> Option<String> {
     let inline_host = tokens[..gh_index]
         .iter()
         .filter_map(|token| token.strip_prefix("GH_HOST="))
-        .rfind(|host| !host.is_empty())
+        .next_back()
+        .filter(|host| !host.is_empty())
         .map(str::to_ascii_lowercase);
 
     let mut flag_host = None;
@@ -954,14 +955,15 @@ fn gh_repo_export(segment: &str) -> Option<Option<String>> {
     }
 }
 
-/// The last non-empty `GH_REPO=` in the assignment prefix of the segment's gh
-/// invocation. gh treats an empty one as unset.
+/// The last `GH_REPO=` in the assignment prefix of the segment's gh
+/// invocation, or `None` when it is empty: gh treats an empty one as unset.
 fn inline_gh_repo(command: &str) -> Option<String> {
     let (tokens, gh_index) = gh_command_tokens(command)?;
     tokens[..gh_index]
         .iter()
         .filter_map(|token| token.strip_prefix("GH_REPO="))
-        .rfind(|value| !value.is_empty())
+        .next_back()
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
@@ -2552,6 +2554,11 @@ fn judge_resolution(
             upstream_host,
             upstream,
         } => {
+            // A host holding a shell expansion is a value only the running
+            // shell knows, so it is allowed, as in the `Resolved` arm.
+            if !is_read_exactly(&origin_host) || !is_read_exactly(&upstream_host) {
+                return None;
+            }
             // Every remote this guard could read is owned (each judged
             // against its own host) — the write lands somewhere you control.
             if fork_allowed(
@@ -2594,6 +2601,10 @@ fn judge_resolution(
         // No `-R` and no readable remote: nothing to judge (ADR-0046 rule 3).
         RepoResolution::Unresolvable => None,
         RepoResolution::Org { host, org } => {
+            // A host holding a shell expansion is allowed, as in `Resolved`.
+            if !is_read_exactly(&host) {
+                return None;
+            }
             if config::is_allowed_with_extra_hosts(
                 &host,
                 &org,
@@ -2802,8 +2813,9 @@ type Reading = Vec<(String, std::rc::Rc<str>)>;
 
 /// What [`judge_write_segments`] carries across both readings of a command.
 struct Judged {
-    /// (segment, directory) already judged.
-    seen: std::collections::HashSet<[String; 2]>,
+    /// (segment, directory, exported `GH_REPO` in force) already judged: the
+    /// same write after an `export GH_REPO=` change is a new target.
+    seen: std::collections::HashSet<(String, String, Vec<String>)>,
     /// The `GH_HOST` a gh process inherits from the hook's environment.
     env_host: String,
 }
@@ -3131,9 +3143,12 @@ fn judge_write_segments(
             moved if moved != *dir => std::rc::Rc::from(moved.as_str()),
             _ => dir,
         };
-        // A repeat of a judged (segment, directory) can only repeat its
-        // verdict; skip its git probes.
-        if !judged.seen.insert([segment.clone(), dir.to_string()]) {
+        // A repeat of a judged (segment, directory, exported `GH_REPO`) can
+        // only repeat its verdict; skip its git probes.
+        if !judged
+            .seen
+            .insert((segment.clone(), dir.to_string(), exported.clone()))
+        {
             continue;
         }
         if let Some(block) = judge_write_segment(
@@ -4577,6 +4592,19 @@ mod tests {
                 ),
                 ("gh issue close 1 -R \"evil/$(cat n)\"", true),
                 ("gh issue close 1 -R evil/x", true),
+                // An org write is judged on its host the same way.
+                (
+                    "gh api --hostname \"$h\" -X POST orgs/cameronsjo/repos -f name=x",
+                    false,
+                ),
+                (
+                    "GH_HOST=\"$h\" gh api -X POST orgs/cameronsjo/repos -f name=x",
+                    false,
+                ),
+                (
+                    "gh api --hostname evil.example -X POST orgs/evil/repos -f name=x",
+                    true,
+                ),
             ] {
                 let result = GhWriteGuard.run(&input_with(command, cwd));
                 assert_eq!(
@@ -4627,6 +4655,18 @@ mod tests {
                 ),
                 ("export GH_REPO=evil/x; gh pr view 1", false),
                 ("export GH_REPO=\"$R\"; gh issue comment 1 --body hi", false),
+                // A repeated write after the export changes is a new target.
+                (
+                    "export GH_REPO=cameronsjo/x; gh issue comment 1 --body hi; export GH_REPO=evil/x; gh issue comment 1 --body hi",
+                    true,
+                ),
+                // The last inline assignment is the one gh reads, and gh
+                // reads an empty one as unset.
+                (
+                    "GH_REPO=evil/x GH_REPO= gh issue comment 1 --body hi",
+                    false,
+                ),
+                ("GH_REPO= GH_REPO=evil/x gh issue comment 1 --body hi", true),
                 // The value in force replaces the one before it, and an
                 // export in a child shell never reaches this one.
                 (
@@ -4928,6 +4968,25 @@ mod tests {
                 ),
                 (
                     "gh api --hostname evil.example -X POST repos/{owner}/other/issues -f t=x",
+                    true,
+                ),
+                // A host only the shell knows is not read exactly, so the
+                // write is allowed, as it is outside a fork.
+                (
+                    "gh api --hostname \"$h\" -X POST repos/{owner}/{repo}/issues -f t=x",
+                    false,
+                ),
+                (
+                    "GH_HOST=\"$h\" gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    false,
+                ),
+                // The last inline `GH_HOST=` is the one gh reads.
+                (
+                    "GH_HOST=evil.example GH_HOST= gh api -X POST repos/{owner}/{repo}/issues -f t=x",
+                    false,
+                ),
+                (
+                    "GH_HOST= GH_HOST=evil.example gh api -X POST repos/{owner}/{repo}/issues -f t=x",
                     true,
                 ),
             ] {
