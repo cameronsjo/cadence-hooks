@@ -15,7 +15,7 @@ use cadence_hooks_core::shell::{
     carries_substitution, command_segments, command_segments_with_dirs_reading, command_word,
     contains_ignoring_ascii_case, gh_canonical_verb, gh_command_path, gh_repo_flags,
     host_and_repo_from_url, may_spell_word, parse_gh_repo_value, parse_work_dir, requote_words,
-    tokenize,
+    split_segments, tokenize,
 };
 use cadence_hooks_core::shell::{
     UNRESOLVABLE_DIR, apply_cd_target, executable_tokens, skip_env_assignment_operands,
@@ -745,7 +745,7 @@ fn resolve_target_repo_on(
     allowed_owners: &[AllowEntry],
     env_host: &str,
 ) -> RepoResolution {
-    resolve_target_repos_on(command, work_dir, allowed_owners, env_host, "")
+    resolve_target_repos_on(command, work_dir, allowed_owners, env_host, &[])
         .into_iter()
         .next()
         .unwrap_or(RepoResolution::Unresolvable)
@@ -761,8 +761,11 @@ fn resolve_target_repo_on(
 ///   without it (cadence-hooks#1069).
 /// - An inline `GH_REPO=` adds its value: gh reads it wherever `-R` is absent
 ///   or empty, and this guard cannot tell which subcommands honor it.
-/// - Without one, an `env_repo` the gh process inherits from the hook's
-///   environment adds its value the same way. Empty means none.
+/// - Without one, `env_repos` adds its value the same way: the `GH_REPO` in
+///   force where the gh process runs, the hook's own or the last literal
+///   `export GH_REPO=` before it ([`gh_repo_export`]). Empty means none. A
+///   `gh api` call with no placeholder in its endpoint reads none of them:
+///   gh uses `GH_REPO` there only to fill `{owner}`/`{repo}`.
 ///
 /// A PR or issue URL argument comes before all of these: gh takes the repo
 /// and host from it and never reads `-R`, `GH_REPO` or the checkout
@@ -773,7 +776,7 @@ fn resolve_target_repos_on(
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     env_host: &str,
-    env_repo: &str,
+    env_repos: &[String],
 ) -> Vec<RepoResolution> {
     let mut resolutions: Vec<RepoResolution> = selector_url_targets(command)
         .into_iter()
@@ -806,8 +809,16 @@ fn resolve_target_repos_on(
     }
     if let Some(repo) = inline_gh_repo(command) {
         resolutions.extend(flag_value_resolution(&repo, &dh));
-    } else if !env_repo.is_empty() {
-        resolutions.extend(flag_value_resolution(env_repo, &dh));
+    } else if !inline_gh_repo_unset(command)
+        && gh_api_endpoint(command).is_none_or(|endpoint| {
+            ["{", ":owner", ":repo"]
+                .iter()
+                .any(|p| endpoint.contains(p))
+        })
+    {
+        for repo in env_repos.iter().filter(|repo| !repo.is_empty()) {
+            resolutions.extend(flag_value_resolution(repo, &dh));
+        }
     }
     resolutions.push(resolve_unflagged_target(
         command,
@@ -842,12 +853,12 @@ fn flag_value_resolution(value: &str, dh: &str) -> Option<RepoResolution> {
     }
 }
 
-/// True when a target's host is one this guard can judge: no expansion in it
-/// (no `$` or backtick), and no `*`, which stands for a command substitution
-/// in the globbed reading (`GH_HOST=$(cat h)` and `-R "$(cat h)/o/r"` read as
-/// the host `*`).
-fn host_is_read(host: &str) -> bool {
-    !(repo_has_unexpanded_expansion(host) || host.contains('*'))
+/// True when a target's host or `owner/repo` is one this guard can judge: no
+/// expansion in it (no `$` or backtick), and no `*`, which stands for a
+/// command substitution in the globbed reading (`GH_HOST=$(cat h)` reads as
+/// the host `*`, and `-R "$(cat o)/x"` as the repo `*/x`).
+fn is_read_exactly(text: &str) -> bool {
+    !(repo_has_unexpanded_expansion(text) || text.contains('*'))
 }
 
 /// For a target that carries a shell expansion: true when it still names a
@@ -859,7 +870,7 @@ fn host_is_read(host: &str) -> bool {
 ///
 /// All three must hold:
 ///
-/// - The host is one [`host_is_read`] can judge.
+/// - The host is one [`is_read_exactly`] can judge.
 /// - The owner is non-empty and uses only letters, digits, `-` and `_`. A
 ///   `_` cannot come from a host, a scheme or an expansion fragment, and
 ///   managed-user owners carry one (`mona_acme`). A `.` or `:` there means a
@@ -879,12 +890,40 @@ fn names_literal_unowned_owner(
     allowed_repos: &[AllowEntry],
 ) -> bool {
     let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
-    host_is_read(host)
+    is_read_exactly(host)
         && !owner.is_empty()
         && owner
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         && !is_allowed(host, repo, allowed_owners, allowed_repos)
+}
+
+/// How a plain `export` or `unset` segment changes the `GH_REPO` gh
+/// inherits: `Some(Some(value))` for `export GH_REPO=value`, `Some(None)`
+/// for `unset GH_REPO`, `export -n GH_REPO` or an empty `export GH_REPO=`
+/// (gh treats empty as unset), and `None` when the segment leaves it alone
+/// or uses another option (`unset -f`).
+fn gh_repo_export(segment: &str) -> Option<Option<String>> {
+    let tokens = tokenize(segment);
+    let (first, rest) = tokens.split_first()?;
+    if first == "export" && rest.first().is_some_and(|flag| flag == "-n") {
+        return rest[1..]
+            .iter()
+            .any(|token| token == "GH_REPO" || token.starts_with("GH_REPO="))
+            .then_some(None);
+    }
+    if rest.iter().any(|token| token.starts_with('-')) {
+        return None;
+    }
+    match first.as_str() {
+        "export" => rest
+            .iter()
+            .filter_map(|token| token.strip_prefix("GH_REPO="))
+            .next_back()
+            .map(|value| (!value.is_empty()).then(|| value.to_string())),
+        "unset" => rest.iter().any(|token| token == "GH_REPO").then_some(None),
+        _ => None,
+    }
 }
 
 /// The last non-empty `GH_REPO=` in the assignment prefix of the segment's gh
@@ -896,6 +935,18 @@ fn inline_gh_repo(command: &str) -> Option<String> {
         .filter_map(|token| token.strip_prefix("GH_REPO="))
         .rfind(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// True when the gh invocation's last inline `GH_REPO=` is empty
+/// (`GH_REPO= gh …`): gh then reads no `GH_REPO` at all, inherited or not.
+fn inline_gh_repo_unset(command: &str) -> bool {
+    gh_command_tokens(command).is_some_and(|(tokens, gh_index)| {
+        tokens[..gh_index]
+            .iter()
+            .filter_map(|token| token.strip_prefix("GH_REPO="))
+            .next_back()
+            .is_some_and(str::is_empty)
+    })
 }
 
 /// Where a write goes when no `-R` names its target: a `gh repo` positional,
@@ -944,11 +995,15 @@ fn resolve_unflagged_target(
             // host the command names (a URL host, `--hostname`, an inline
             // `GH_HOST`) is still where gh sends it, so the filled-in repo is
             // judged there, as the literal path would be.
-            if let Some(name) = repo.strip_prefix("{owner}/") {
+            // gh fills the colon spellings (`:owner`, `:repo`) the same way.
+            if let Some(name) = repo
+                .strip_prefix("{owner}/")
+                .or_else(|| repo.strip_prefix(":owner/"))
+            {
                 let named = host.or_else(|| selected_gh_host(command));
                 return match resolve_from_git_remotes(work_dir) {
                     RepoResolution::Resolved { host, repo: own } => {
-                        let repo = if name == "{repo}" {
+                        let repo = if matches!(name, "{repo}" | ":repo") {
                             own
                         } else {
                             let owner = own.split('/').next().unwrap_or_default();
@@ -2311,9 +2366,9 @@ fn judge_write_segment(
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
     env_host: &str,
-    env_repo: &str,
+    env_repos: &[String],
 ) -> Option<CheckResult> {
-    resolve_target_repos_on(segment, work_dir, allowed_owners, env_host, env_repo)
+    resolve_target_repos_on(segment, work_dir, allowed_owners, env_host, env_repos)
         .into_iter()
         .find_map(|resolution| {
             judge_resolution(
@@ -2532,9 +2587,11 @@ fn judge_resolution(
             // A host or name holding a shell expansion is a value only the
             // running shell knows, so it is allowed (ADR-0046 rule 3, #1503).
             // A literal owner with an expanded name (`evil/$r`) is still read
-            // exactly, by its owner, and blocks (#1491).
-            if !host_is_read(&host)
-                || (repo_has_unexpanded_expansion(&repo)
+            // exactly, by its owner, and blocks (#1491). A `*` is a command
+            // substitution in the globbed reading, as for the host
+            // ([`is_read_exactly`]): `-R "$(cat o)/x"` reads as `*/x`.
+            if !is_read_exactly(&host)
+                || (!is_read_exactly(&repo)
                     && !names_literal_unowned_owner(&host, &repo, allowed_owners, allowed_repos))
             {
                 return None;
@@ -2651,6 +2708,8 @@ impl Check for GhWriteGuard {
         // read something in it that moves (cadence-ecosystem ADR-0046 rule 3).
         let own = || command_segments_with_dirs_reading(command, cwd, UnreadEval::StaysPut);
         let mut judged = Judged::default();
+        // gh reads an inherited GH_REPO too; an empty one is unset.
+        let inherited = [std::env::var("GH_REPO").unwrap_or_default()];
         let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
         for reading in readings {
             if let Some(block) = judge_write_segments(
@@ -2661,6 +2720,7 @@ impl Check for GhWriteGuard {
                 &allowed_repos,
                 &extra_hosts,
                 &mut judged,
+                &inherited,
             ) {
                 return block;
             }
@@ -2688,8 +2748,6 @@ struct Judged {
     seen: std::collections::HashSet<[String; 2]>,
     /// The `GH_HOST` a gh process inherits from the hook's environment.
     env_host: String,
-    /// The `GH_REPO` it inherits; empty when none.
-    env_repo: String,
 }
 
 impl Default for Judged {
@@ -2697,8 +2755,6 @@ impl Default for Judged {
         Self {
             seen: std::collections::HashSet::new(),
             env_host: default_host(),
-            // gh reads an inherited GH_REPO too; an empty one is unset.
-            env_repo: std::env::var("GH_REPO").unwrap_or_default(),
         }
     }
 }
@@ -2914,6 +2970,11 @@ fn peel_runners(segment: &str, dir: &str) -> (String, Vec<String>) {
 /// [`command_segments`] segment of the command the hook was given, which the
 /// fix reads ([`fix_keeps_repo_name`]); for a script read in a runner's
 /// directory, `command` is that script and `whole` is still the whole command.
+///
+/// `exported` is the `GH_REPO` gh inherits at the start of `segments`: the
+/// hook's own value at the top, and for a runner's script the value in force
+/// where the runner ran.
+#[allow(clippy::too_many_arguments)]
 fn judge_write_segments(
     command: &str,
     whole: &[String],
@@ -2922,12 +2983,25 @@ fn judge_write_segments(
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
     judged: &mut Judged,
+    exported: &[String],
 ) -> Option<CheckResult> {
     // `G=gh; $G pr create` runs gh: read a variable command word as the `gh`
     // the same command assigned it. Unreadable or unassigned stays as written.
     let mut word_variables = CommandWordVariables::for_command(command);
+    let mut exported = exported.to_vec();
+    // Only an `export` this shell runs moves what its later gh inherits: one
+    // inside `bash -c '…'`, `$(…)` or `( … )` ends with that child.
+    let top_level: std::collections::HashSet<String> =
+        split_segments(command).into_iter().collect();
     for (segment, dir) in segments {
         let segment = word_variables.resolve_gh(&segment).unwrap_or(segment);
+        // gh reads an exported `GH_REPO` as it reads the hook's own: a
+        // literal one names the target exactly, and replaces the value in
+        // force (cadence-ecosystem ADR-0046 rule 2).
+        if let Some(change) = gh_repo_export(&segment).filter(|_| top_level.contains(&segment)) {
+            exported = change.into_iter().collect();
+            continue;
+        }
         // A runner that changes directory and wraps a shell runs the script
         // there (`env -C DIR sh -c '…'`), while the script's own segments
         // arrive below in the directory the runner itself was in
@@ -2949,6 +3023,7 @@ fn judge_write_segments(
                     allowed_repos,
                     extra_hosts,
                     judged,
+                    &exported,
                 ) {
                     return Some(block);
                 }
@@ -3011,7 +3086,7 @@ fn judge_write_segments(
             allowed_repos,
             extra_hosts,
             &judged.env_host,
-            &judged.env_repo,
+            &exported,
         ) {
             return Some(block);
         }
@@ -4411,6 +4486,177 @@ mod tests {
                     true,
                 ),
             ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn an_expanded_host_or_owner_beside_a_literal_part_allows() {
+        // Not read exactly, so allowed (cadence-ecosystem ADR-0046 rule 3):
+        // a host only the shell knows paired with a literal unowned owner,
+        // and a command-substitution owner with a literal name, which the
+        // guard reads as the glob owner `*` (`-R "$(cat o)/x"` is `*/x`).
+        // The controls still block: a literal unowned owner with an expanded
+        // name, and the same owner with no expansion at all.
+        let owned = origin_checkout("https://github.com/cameronsjo/x.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            for (command, blocks_expected) in [
+                ("gh issue close 1 -R evil/x --hostname \"$h\"", false),
+                ("gh issue close 1 -R \"$(cat h)/evil/x\"", false),
+                ("gh issue close 1 -R \"$(cat o)/x\"", false),
+                ("gh repo edit \"$(cat o)/x\" --description d", false),
+                (
+                    "gh issue close 1 -R \"$(gh repo view --json owner -q .owner.login)/tool\"",
+                    false,
+                ),
+                ("gh issue close 1 -R \"evil/$(cat n)\"", true),
+                ("gh issue close 1 -R evil/x", true),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_literal_exported_gh_repo_is_judged() {
+        // gh reads an exported `GH_REPO` as it reads the hook's own, so a
+        // literal `export GH_REPO=owner/repo` earlier in the command names
+        // the target exactly and is judged. `-R` and an inline `GH_REPO=`
+        // outrank it, a read is never judged, and an expanded value with no
+        // literal owner is not read.
+        let owned = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let cwd = owned.path().to_str().expect("utf-8 path");
+        with_env(&owners_env(), || {
+            for (command, blocks_expected) in [
+                ("export GH_REPO=evil/x; gh issue comment 1 --body hi", true),
+                (
+                    "export GH_REPO=evil/x && gh issue comment 1 --body hi",
+                    true,
+                ),
+                (
+                    "export GH_REPO=\"evil/x\"; gh issue comment 1 --body hi",
+                    true,
+                ),
+                (
+                    "export GH_REPO=evil/x; bash -c 'gh issue comment 1 --body hi'",
+                    true,
+                ),
+                (
+                    "export GH_REPO=cameronsjo/x; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; gh issue comment 1 -R cameronsjo/tool --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; GH_REPO=cameronsjo/tool gh issue comment 1 --body hi",
+                    false,
+                ),
+                ("export GH_REPO=evil/x; gh pr view 1", false),
+                ("export GH_REPO=\"$R\"; gh issue comment 1 --body hi", false),
+                // The value in force replaces the one before it, and an
+                // export in a child shell never reaches this one.
+                (
+                    "export GH_REPO=evil/x; export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; unset GH_REPO; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; export -n GH_REPO; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; GH_REPO= gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "export GH_REPO=cameronsjo/tool; export GH_REPO=evil/x; gh issue comment 1 --body hi",
+                    true,
+                ),
+                (
+                    "bash -c 'export GH_REPO=evil/x'; gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "x=$(export GH_REPO=evil/x; echo); gh issue comment 1 --body hi",
+                    false,
+                ),
+                (
+                    "(export GH_REPO=evil/x); gh issue comment 1 --body hi",
+                    false,
+                ),
+                // A literal `gh api` path names its own repo; gh reads
+                // GH_REPO only to fill a placeholder.
+                (
+                    "export GH_REPO=evil/x; gh api -X POST repos/cameronsjo/tool/issues -f title=x",
+                    false,
+                ),
+                (
+                    "export GH_REPO=evil/x; gh api -X POST repos/{owner}/{repo}/issues -f title=x",
+                    true,
+                ),
+                ("gh issue comment 1 --body hi", false),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn colon_placeholders_are_judged_on_the_checkout() {
+        // gh fills `:owner` and `:repo` from the checkout, as it does the
+        // brace spellings. In an owned checkout they allow; in an unowned
+        // one, and with a literal unowned owner, they block.
+        let owned = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let unowned = origin_checkout("https://github.com/evil/up.git");
+        with_env(&owners_env(), || {
+            for (command, dir, blocks_expected) in [
+                (
+                    "gh api -X POST repos/:owner/:repo/issues -f title=x",
+                    &owned,
+                    false,
+                ),
+                (
+                    "gh api -X POST repos/:owner/other/issues -f title=x",
+                    &owned,
+                    false,
+                ),
+                (
+                    "gh api -X POST repos/:owner/:repo/issues -f title=x",
+                    &unowned,
+                    true,
+                ),
+                (
+                    "gh api -X POST repos/evil/:repo/issues -f title=x",
+                    &owned,
+                    true,
+                ),
+            ] {
+                let cwd = dir.path().to_str().expect("utf-8 path");
                 let result = GhWriteGuard.run(&input_with(command, cwd));
                 assert_eq!(
                     blocks(&result),

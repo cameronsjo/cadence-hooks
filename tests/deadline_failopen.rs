@@ -326,6 +326,85 @@ fn a_push_remote_probe_timeout_allows_silently() {
 }
 
 #[test]
+fn a_gh_write_probe_timeout_allows_and_records_the_suppressed_block() {
+    // `guard-gh-write` reads the target of an un-flagged write from the
+    // checkout's remotes. A probe past the git-probe deadline means it did
+    // not read them, so the write allows (the repo-ownership spec, "User-scoped
+    // gh writes"), and the dispatcher records a `deadline_block_suppressed`
+    // row so a bypassed block is told apart from slow git.
+    //
+    // One checkout whose `origin` is unowned, judged twice. With the real git
+    // the guard reads the remote and blocks: the positive control that shows
+    // the write reached the probe. With a git that outlives the budget, the
+    // only change, it allows.
+    let work = tempfile::tempdir().unwrap();
+    cadence_hooks_core::git_fixtures::init_repo(work.path());
+    git_in(
+        work.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/work-org/y.git",
+        ],
+    );
+    let shim = tempfile::tempdir().unwrap();
+    write_hanging_git(shim.path());
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "gh issue close 1" },
+        "cwd": work.path().to_string_lossy(),
+    })
+    .to_string();
+    let run = |hanging: bool, metrics: &std::path::Path| {
+        let mut cmd = cadence_hooks();
+        cmd.args(["guardrails", "guard-gh-write"]);
+        if hanging {
+            cmd.env("PATH", shim.path());
+        }
+        cmd.env("CADENCE_HOOK_DEADLINE_MS", "1000");
+        cmd.env("CADENCE_METRICS_DIR", metrics);
+        cmd.env("CADENCE_ALLOWED_OWNERS", "cameronsjo");
+        cmd.env_remove("CADENCE_ALLOWED_REPOS");
+        cmd.env_remove("GH_REPO");
+        cmd.env_remove("GH_HOST");
+        run_with_payload(&mut cmd, &payload)
+    };
+
+    let metrics = tempfile::tempdir().unwrap();
+    let out = run(false, metrics.path());
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "control: with a working git the unowned remote blocks: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let metrics = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let out = run(true, metrics.path());
+    let elapsed = started.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a probe timeout allows: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    cadence_hooks_core::test_builders::assert_elapsed_under(
+        &format!("guard must abandon the probe at its ~1s budget, took {elapsed:?}"),
+        elapsed,
+        Duration::from_secs(4),
+    );
+    let rows = failopen_rows(metrics.path());
+    assert!(
+        rows.iter()
+            .any(|r| r["reason"] == "deadline_block_suppressed"
+                && r["subcommand"] == "guard-gh-write"),
+        "the timeout is recorded as a suppressed block: {rows:?}"
+    );
+}
+
+#[test]
 fn enforce_worktree_edit_arm_spawns_no_git() {
     // Regression gate, sharpened by cadence-hooks#164: the Edit/Write arm's git
     // spawn count grew unnoticed from ~1 to 4-5 across releases, then #271

@@ -8,7 +8,8 @@
 - Every "cannot determine target" block becomes an allow: no readable remote, an unreadable or ambiguous `-R`, an expansion in the target or host (`$GH_HOST`, #1503), an unknown directory, a runner option the guard does not model, and a command too large or too deeply nested to read.
 - A `gh api` write to any endpoint other than `repos/<owner>/<repo>/…` and `orgs/<org>/…` (GraphQL, `user/…`) is allowed; the GraphQL mutation classifier goes. A `repos/…` or `orgs/…` path is read relative or behind one of these literal URL prefixes, each host compared whole: `https://api.github.com/`, `https://uploads.github.com/`, `https://<known host>/api/v3/`, `https://<known host>/api/uploads/`, and `https://api.<tenant>.ghe.com/` for a known `<tenant>.ghe.com`. gh's `{owner}`/`{repo}` placeholders are judged on the checkout's own repo, on the host the command names if it names one.
 - The loop gate goes, with `CADENCE_GH_STRICT_LOOPS`. Each write in a loop body is judged as a single command.
-- `export GH_HOST`/`export GH_REPO` earlier in the command, and a `GH_HOST=` on a wrapper in front of a shell, are no longer read. The hook's own `GH_HOST` and `GH_REPO` still are.
+- A `GH_HOST` the command sets other than inline on the gh word (`export GH_HOST`, a bare reassignment of an inherited one, `unset GH_HOST`, a `GH_HOST=` on a wrapper in front of a shell) is no longer read. The hook's own `GH_HOST` and `GH_REPO` still are, and so is a literal `export GH_REPO=owner/repo` the command runs in its own shell before the write: it names the target exactly and replaces the inherited value, and `unset GH_REPO` clears it. A `gh api` write with a literal path reads no inherited `GH_REPO`.
+- A command-substitution owner with a literal name (`-R "$(cat o)/x"`) is an expansion and allows. A `cd` to a leading `$HOME` bash expands is followed as `cd ~` is. gh's `:owner`/`:repo` placeholders are judged as `{owner}`/`{repo}` are.
 - A fork remote the guard cannot parse names no repo to judge; a parsed unowned remote still blocks.
 
 Surfaces: `guard-gh-write` (PreToolUse, Bash) exit codes (2 to 0 for the shapes above), the `gh-write-target-unresolvable`, `gh-write-api-unverifiable` and `gh-write-loop-missing-repo` rule ids (no longer emitted), the loop nudge, and `CADENCE_GH_STRICT_LOOPS` (removed). No hooks.json change in cameronsjo/cadence.
@@ -21,8 +22,8 @@ None.
 
 ### Modified Capabilities
 
-- `repo-ownership`: "gh writes the guard cannot place" now allows; the loop requirements and the strict-loops switch are removed; one requirement says loop writes are judged one by one.
+- `repo-ownership`: "gh writes the guard cannot place" now allows; the loop requirements and the strict-loops switch are removed; one requirement says loop writes are judged one by one; three say which `GH_REPO` and `GH_HOST` a write inherits and that a `$HOME` `cd` is followed.
 
 ## Impact
 
-`crates/guardrails/src/guard_gh_write.rs`, `docs/configuration.md`, `CHANGELOG.md`.
+`crates/guardrails/src/guard_gh_write.rs`, `crates/guardrails/src/lib.rs`, `crates/core/src/shell.rs` (the directory walk reads a `$HOME` `cd` target), `openspec/specs/repo-ownership/spec.md`, `tests/failopen_telemetry.rs`, `tests/gh_host_env.rs`, `tests/deadline_failopen.rs`, `docs/configuration.md`, `CHANGELOG.md`.

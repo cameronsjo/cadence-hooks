@@ -3,6 +3,10 @@
 ### Requirement: gh writes the guard cannot place
 `guard-gh-write` MUST allow a write whose target it cannot read exactly (cadence-ecosystem ADR-0046 rule 3): no readable `-R` or remote, `-R` readings that disagree, a target or host holding a shell expansion with no literal owner, a directory it cannot follow, a `gh api` write outside `repos/<owner>/<repo>/…` and `orgs/<org>/…`, and a command too large or nested to read. With no allowlist configured, a write MUST still block.
 
+#### Scenario: Substituted owner with a literal name
+- **WHEN** the command is `gh issue close 1 -R "$(cat o)/x"`
+- **THEN** the hook allows, because the substitution is an expansion in the owner
+
 #### Scenario: Write with no resolvable target
 - **WHEN** `gh issue create --title t` runs in a directory with no git remote
 - **THEN** the hook allows
@@ -36,7 +40,7 @@
 - **THEN** the hook exits 2 naming the owner `evil`
 
 #### Scenario: Placeholder owner
-- **WHEN** the command is `gh api -X POST repos/{owner}/{repo}/issues -f title=x` in a checkout of `cameronsjo/tool`
+- **WHEN** the command is `gh api -X POST repos/{owner}/{repo}/issues -f title=x` or `repos/:owner/:repo/issues` in a checkout of `cameronsjo/tool`
 - **THEN** the hook allows, because gh fills the placeholders from that checkout
 
 #### Scenario: Placeholder owner on a named host
@@ -139,3 +143,36 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 #### Scenario: Loop over a variable target
 - **WHEN** the command is `for r in a b; do gh issue close 1 -R "$o/$r"; done`
 - **THEN** the hook allows
+
+### Requirement: GH_REPO a gh write inherits
+`guard-gh-write` SHALL read `GH_REPO` from an inline `GH_REPO=` on the gh word, and otherwise from the `GH_REPO` in force: the hook process's, replaced by each literal `export GH_REPO=` and cleared by each `unset GH_REPO` the command runs in its own shell before the write. A `gh api` write whose endpoint holds no placeholder reads no inherited `GH_REPO`.
+
+#### Scenario: Export in a child shell
+- **WHEN** the command is `bash -c 'export GH_REPO=evil/x'; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: Exported GH_REPO
+- **WHEN** the command is `export GH_REPO=evil/x; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Hook process GH_REPO
+- **WHEN** the hook process has `GH_REPO=evil/x` and `gh issue comment 1 --body hi` runs in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2
+
+### Requirement: GH_HOST a gh write inherits
+`guard-gh-write` SHALL judge a write on the host it names (`--hostname`, an inline `GH_HOST=`), else the hook process's `GH_HOST`. A `GH_HOST` the command sets other than inline on the gh word (an `export`, a bare reassignment of an inherited one, an `unset`) MUST NOT be read.
+
+#### Scenario: Host the command exports
+- **WHEN** the command is `export GH_HOST=evil.example.com && gh pr create -R cameronsjo/x --title t`
+- **THEN** the hook allows, judging `cameronsjo/x` on the hook process's host
+
+### Requirement: Home directory in a gh write's cd
+`guard-gh-write` SHALL follow a `cd` or `pushd` to a leading `$HOME` or `${HOME}` that bash expands as it follows `cd ~/…`, unless the command may rebind `HOME`, and judge a write after it on that directory's remotes.
+
+#### Scenario: Home directory spelled with $HOME
+- **WHEN** `~/up` is a checkout of `evil/up` and the command is `cd "$HOME/up" && gh pr create --title t`
+- **THEN** the hook exits 2, as for `cd ~/up && gh pr create --title t`
+
+#### Scenario: HOME rebound first
+- **WHEN** the command is `HOME=/x; cd "$HOME/up" && gh pr create --title t`
+- **THEN** the hook allows, because it cannot follow the directory
