@@ -471,27 +471,27 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **THEN** the hook exits 0 with no output
 
 ### Requirement: GH_REPO replaces the checkout
-On a command gh reads `GH_REPO` for, `guard-gh-write` SHALL drop the checkout's remotes as a target (the fallback and a `repos/` placeholder fill) only when it shows the `GH_REPO` it read exactly is the value gh receives, by one of three rules: an inline prefix on the gh word itself; one plain top-level export before the write; or the hook process's value with no mention in the command. Otherwise the checkout MUST stay a target beside it.
+On a command gh reads `GH_REPO` for, `guard-gh-write` SHALL drop the checkout as a target only for three exact shapes, the `GH_REPO` read exactly: an inline `GH_REPO=` prefix on the gh word; a whole command of one top-level `export GH_REPO=<literal>`, then `;` or a newline, then only plain gh invocations; or a whole command of only plain gh invocations under the hook process's value. Any other command MUST keep the checkout a target.
 
 #### Scenario: Rule 1, an inline prefix on gh
-- **WHEN** the command is `GH_REPO=cameronsjo/tool gh issue comment 1 --body hi` or `GH_REPO=cameronsjo/tool gh api -X POST repos/{owner}/{repo}/issues -f title=x`, in a checkout of `evil/up` or a fork whose upstream is `evil/up`
-- **THEN** the hook allows, because every word before `gh` is an assignment and the last `GH_REPO=` there is a non-empty literal
+- **WHEN** the command is `GH_REPO=cameronsjo/tool gh issue comment 1 --body hi`, `GH_REPO=cameronsjo/tool gh api -X POST repos/{owner}/{repo}/issues -f title=x`, or `cd . && GH_REPO=cameronsjo/tool gh pr merge 5 --squash`, in a checkout of `evil/up` or a fork whose upstream is `evil/up`
+- **THEN** the hook allows: every word before `gh` is an assignment, the last `GH_REPO=` there is a non-empty literal, and the command names `GH_HOST` nowhere else, so the rule holds whatever else the command holds
 
-#### Scenario: Rule 2, one plain export
-- **WHEN** the command is `export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi` (or with a newline for `;`), in a checkout of `evil/up`
-- **THEN** the hook allows, because the export is a top-level segment before the write, joined by `;` or a newline, no group, subshell, keyword or substitution opens before it, gh is the plain command word, the command names `GH_REPO` nowhere else outside the write's own text, and, as in rule 3, the write's text occurs once and no segment sources a script or sets a variable through an expanded operand
+#### Scenario: Rule 2, one export then only gh
+- **WHEN** the command is `export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi`, or the same with a newline for `;`, or with `&& gh pr merge 5 --squash` after it, in a checkout of `evil/up`
+- **THEN** the hook allows, because the whole command is that export joined by `;` or a newline to plain gh invocations joined by `;`, a newline, `&&` or `||`, with no substitution, backtick, subshell, group, function, keyword, process substitution or here-document anywhere, and no `GH_HOST` outside an inline prefix
 
-#### Scenario: Rule 3, the hook process's value
-- **WHEN** the hook process has `GH_REPO=cameronsjo/tool` and the command is `gh issue comment 1 --body hi`, in a checkout of `evil/up`
-- **THEN** the hook allows, because the command never names `GH_REPO`, gh is a plain top-level command whose text occurs once, no segment sources a script or runs `eval` (behind a keyword, group, `builtin` or `command` too), and no `export`, `declare`, `typeset`, `local`, `readonly` or `unset` has an operand holding an expansion
+#### Scenario: Rule 3, only gh under the hook process's value
+- **WHEN** the hook process has `GH_REPO=cameronsjo/tool` and the command is `gh issue comment 1 --body hi` or `gh issue comment 1 --body hi; gh pr merge 5 --squash`, in a checkout of `evil/up`
+- **THEN** the hook allows, because the whole command is plain gh invocations, it never names `GH_REPO`, and it names `GH_HOST` nowhere outside an inline prefix
+
+#### Scenario: Any other shape keeps the checkout
+- **WHEN** the checkout is `evil/up` and, under an exported or hook-process `GH_REPO=cameronsjo/tool`, the command is `cd . && gh pr merge 5 --squash`, `gh issue comment 1 --body "$(cat body.md)"`, `export FOO=bar; gh …`, `export GH_REPO=cameronsjo/tool; GH_REPO=evil/up; gh …`, `export GH_REPO=cameronsjo/tool & gh …`, `[ -n "$X" ] && export GH_REPO=cameronsjo/tool; gh …`, `. ./x.sh; gh …`, `PR=$(source .env && gh pr create …)`, `case "$E" in prod) source .env;; esac; gh …`, `load_env() { source .env; }; load_env; gh …`, `env -u GH_REPO gh …`, `sudo gh …` or `export GH_HOST=ghe.example.com; gh …`
+- **THEN** the hook exits 2 on the checkout, as before this rule
 
 #### Scenario: Unowned GH_REPO from an owned checkout
-- **WHEN** the command is `GH_REPO=evil/x gh issue comment 1 --body hi` or `export GH_REPO=evil/x; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **WHEN** the command is `GH_REPO=evil/x gh issue comment 1 --body hi` or `export GH_REPO=evil/x; gh issue comment 1 --body hi`, or the hook process has `GH_REPO=evil/x` and the command is `gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
 - **THEN** the hook exits 2 naming `evil/x`
-
-#### Scenario: A value the guard cannot show reaches gh
-- **WHEN** the checkout is `evil/up` and the command is one of `export GH_REPO=cameronsjo/tool; GH_REPO=evil/up; gh issue comment 1 --body hi`, `export GH_REPO=cameronsjo/tool; declare -x GH_REPO=evil/up; gh …`, `export GH_REPO=cameronsjo/tool & gh …`, `export GH_REPO=cameronsjo/tool | cat; gh …`, `[ -n "$X" ] && export GH_REPO=cameronsjo/tool; gh …`, `GH_REPO=cameronsjo/tool sudo gh …`, or, with `GH_REPO=cameronsjo/tool` in the hook process, `GH_REPO=evil/up; gh …`, `. ./x.sh; gh …`, `if [ -f .env ]; then source .env; fi; gh …`, `export $(cat .env | xargs); gh …`, `env -i bash -c 'gh …'; gh …`, `env -u GH_REPO gh …` or `ssh box gh …`
-- **THEN** the hook exits 2 on the checkout, as before this rule
 
 #### Scenario: Unreadable GH_REPO from an unowned checkout
 - **WHEN** the command is `GH_REPO="$R" gh issue comment 1 --body hi`, in a checkout of `evil/up`
@@ -500,6 +500,13 @@ On a command gh reads `GH_REPO` for, `guard-gh-write` SHALL drop the checkout's 
 #### Scenario: Command that never reads GH_REPO from an unowned checkout
 - **WHEN** the command is `GH_REPO=cameronsjo/tool gh repo edit --description d`, in a checkout of `evil/up`
 - **THEN** the hook exits 2, because `gh repo edit` writes to the checkout's repository
+
+### Requirement: The hook process's GH_REPO is the command shell's
+For rule 3, `guard-gh-write` SHALL assume, as an accepted assumption, that the `GH_REPO` in the hook process's environment is the one the command's shell hands gh, though a shell profile or session environment file could export a different one.
+
+#### Scenario: Hook process value under rule 3
+- **WHEN** the hook process has `GH_REPO=cameronsjo/tool` and the command is `gh pr merge 5 --squash`, in a checkout of `evil/up`
+- **THEN** the hook allows on that value, without reading any profile or session environment file
 
 ### Requirement: Writes past their repository keep the checkout
 `guard-gh-write` MUST NOT let a `GH_REPO` replace the checkout on `gh secret` or `gh variable` `set` or `delete` with `--org` (`-o`), or on `gh issue transfer`, whose real target (the org, the destination repo) it does not read.
