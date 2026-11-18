@@ -4,12 +4,17 @@ When a `GH_REPO` is in force for a command gh reads it for, gh writes to the rep
 
 ## What Changes
 
-- When a `GH_REPO` gh reads is in force (inline, exported or the hook process's) and the guard read every value in force exactly, the checkout's remotes are no target: not as the fallback, and not to fill a `repos/{owner}/{repo}` or `repos/:owner/:repo` placeholder.
-- An exported or inherited `GH_REPO` replaces the checkout only when the command certainly hands it to gh: nothing in the command clears it (`unset GH_REPO` in any shell or compound command, `export -n GH_REPO`, `env -u GH_REPO`, `env -i`) and no export of it sits behind `&&` or `||`. Where either appears the checkout stays a target beside it, as before. An inline `GH_REPO=` on the gh word is always certain.
+- The checkout's remotes stop being a target (not the fallback, and not to fill a `repos/{owner}/{repo}` or `repos/:owner/:repo` placeholder) only when the guard can positively show that the `GH_REPO` it read exactly is the value gh receives. Three rules show it, and nothing else does:
+  1. **Inline on gh.** Every word before the `gh` word is an assignment, and the last `GH_REPO=` there is a non-empty literal. A prefix on a wrapper (`sudo`, `env`, `bash -c`, …) does not count.
+  2. **One plain export.** Outside the write's own text the command names `GH_REPO` exactly once, in a top-level `export GH_REPO=<literal>` before the write, joined to its neighbours by `;` or a newline, with no group, subshell, keyword or substitution opening before it; gh is the plain command word.
+  3. **The hook process's value.** The command never names `GH_REPO`, and gh is a plain top-level command.
+  In rules 2 and 3 the write's text occurs once in the command, no segment may source a script or run `eval` (also behind a keyword, group, `builtin` or `command`) or run `export`, `declare`, `typeset`, `local`, `readonly` or `unset` with an operand holding an expansion (`export $(cat .env | xargs)`), and the command may hold no here-document.
+- Every other case keeps the checkout beside the `GH_REPO`, as on `main`. A list of ways to lose the variable is never complete (a plain reassignment of an exported one, `declare -x`, an export in a pipeline or the background, `sudo`, `source`), and keeping the checkout can only restore a block `main` already had.
+- `gh secret` and `gh variable` `set` or `delete` with `--org`, and `gh issue transfer`, always keep the checkout: the guard does not read their real target, and on `main` the checkout is what blocks them.
 - The `orgs/{owner}/…` placeholder keeps its own rule from cameronsjo/cadence-hooks#1641 (any `GH_REPO` in force names the org); it is not changed here.
 - The commands this applies to are the ones the guard already judges `GH_REPO` on: every `-R` write outside the `gh repo` and `gh gist` groups, `gh repo rename|deploy-key|autolink`, and a `gh api` endpoint with a placeholder. Every other command keeps today's judgment.
 - Unchanged: an unowned `GH_REPO` blocks from any checkout; a `GH_REPO` the guard cannot read exactly (an expansion in it) keeps the checkout beside it, as before; `-R`, a PR or issue URL, a `gh repo` positional and a literal `gh api` owner are judged as before.
-- MODIFY "Deploy-key and autolink writes" and ADD "GH_REPO replaces the checkout" in `repo-ownership`.
+- MODIFY "Deploy-key and autolink writes" and ADD "GH_REPO replaces the checkout" and "Writes past their repository keep the checkout" in `repo-ownership`.
 
 ## Capabilities
 
@@ -19,7 +24,7 @@ None.
 
 ### Modified Capabilities
 
-- `repo-ownership`: one requirement modified, one added.
+- `repo-ownership`: one requirement modified, two added.
 
 ## Impact
 
