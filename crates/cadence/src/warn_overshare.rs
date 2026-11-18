@@ -15,7 +15,7 @@
 //! (vault primary, gitignored fallback), so retro paths no longer have a
 //! sanctioned repo destination to exempt.
 
-use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome};
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome, markers};
 
 /// Bash token sequences that surface about-to-ship content but are NOT
 /// external-posting verbs the shared [`is_external_post`] gate covers. Only
@@ -40,8 +40,92 @@ impl Check for WarnOvershare {
     fn run(&self, input: &HookInput) -> CheckResult {
         let bypass = std::env::var(BYPASS_ENV).ok();
         let vault = std::env::var("OBSIDIAN_VAULT").ok();
-        run_with_env(input, bypass.as_deref(), vault.as_deref())
+        run_quiet_period(input, bypass.as_deref(), vault.as_deref())
     }
+}
+
+/// Marker kind for the commit quiet period. One session-wide marker, no repo or
+/// agent part in the key, so it can only ever silence a later plain commit.
+const COMMIT_MARKER_KIND: &str = "overshare-commit-warned";
+
+/// [`run_with_env`] plus the quiet period for a plain `git commit`
+/// (cadence-hooks#1636): the first one in a session reminds, later ones in the
+/// same session are silent. Nothing else is ever silenced: a push, a post, a
+/// file edit and every commit that is not the exact plain form remind each time.
+///
+/// Fails toward reminding (ADR-0001): no session id, a marker directory that is
+/// not private, or an unwritable marker all leave the reminder in place.
+fn run_quiet_period(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) -> CheckResult {
+    let result = run_with_env(input, bypass, vault);
+    if result.outcome != Outcome::Nudge || input.normalized_tool_name() != Some("Bash") {
+        return result;
+    }
+    if !input.command().is_some_and(is_plain_commit) {
+        return result;
+    }
+    // `session_marker` falls back to a per-process id when the payload carries
+    // none, which would never match twice: require a real, non-empty id.
+    if !input.session_id().is_some_and(|sid| !sid.is_empty()) {
+        return result;
+    }
+    // A shared (unhardened) marker directory lets a co-tenant pre-plant the
+    // marker and mute the reminder; degrade toward reminding, as `claim_today`.
+    if !markers::marker_dir_is_private() {
+        return result;
+    }
+    let marker = markers::session_marker(input, COMMIT_MARKER_KIND, None);
+    if marker.exists() {
+        return CheckResult::allow();
+    }
+    let _ = markers::write_marker(&marker, "");
+    result
+}
+
+/// True only when the whole command is one plain `git commit` invocation: the
+/// text starts with `git commit` (so no global option, `cd`, variable prefix or
+/// wrapper comes before the subcommand) and every argument after it is built
+/// from an allowlist: bare words of `[A-Za-z0-9_./=:@+,%-]`, single-quoted text,
+/// and double-quoted text with no `$`, backtick, backslash or `!`. Whitespace
+/// between words is a space or tab. Anything else (a newline outside quotes, a
+/// `;`, `&`, `|`, `<`, `>`, `(`, `$`, a glob, a comment) makes it not plain, so a
+/// chain, a pipe, a substitution, a heredoc and a redirect all keep reminding.
+///
+/// This is an allowlist of one shape, not a list of shapes to exclude: a form
+/// nobody thought of is not plain.
+fn is_plain_commit(command: &str) -> bool {
+    let Some(rest) = command.trim().strip_prefix("git commit") else {
+        return false;
+    };
+    // `git commit-tree`, `git committer`: the subcommand name must end here.
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return false;
+    }
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => {}
+            '\'' => {
+                if !chars.by_ref().any(|q| q == '\'') {
+                    return false;
+                }
+            }
+            '"' => loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some('$' | '`' | '\\' | '!') | None => return false,
+                    Some(_) => {}
+                }
+            },
+            c if is_bare_word_char(c) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn is_bare_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '.' | '/' | '=' | ':' | '@' | '+' | ',' | '%' | '-')
 }
 
 /// Core decision logic with env values passed in.
@@ -142,11 +226,10 @@ fn path_is_exempt(path: &str, vault: Option<&str>) -> bool {
 }
 
 fn nudge_text() -> String {
-    "Pre-ship audit: scan the outgoing content (commit message, PR/issue body, changed files) \
-     for personal overshare — health/neurodivergence, relationships/family, non-technical \
-     biography. Keep the technical why/how; anything ambiguous, surface to the user first. \
-     Personal context routes to the Obsidian vault ($OBSIDIAN_VAULT), never a public repo. \
-     Exempt: vault paths. Silence for this session: CADENCE_SKIP_OVERSHARE_AUDIT=1"
+    "Pre-ship audit: check what is leaving (message, body, files) for personal overshare: \
+     health, relationships, non-technical biography. Keep the technical why; ask the user if \
+     unsure. Personal context goes to the Obsidian vault, not a repo. Skip this session: \
+     CADENCE_SKIP_OVERSHARE_AUDIT=1"
         .to_string()
 }
 
@@ -558,5 +641,293 @@ mod tests {
         // `cd foo && git commit ...` should still trigger.
         let result = run(&make_bash("cd foo && git commit -m bar"));
         assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    // --- Commit quiet period (cadence-hooks#1636) ---
+
+    fn in_session(command: &str, sid: &str) -> HookInput {
+        HookInput {
+            session_id: Some(sid.into()),
+            ..make_bash(command)
+        }
+    }
+
+    /// Run `f` with a scratch marker directory, so no test touches the real one.
+    fn quiet<T>(f: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(dir.path(), f)
+    }
+
+    fn outcome(input: &HookInput) -> Outcome {
+        run_quiet_period(input, None, None).outcome
+    }
+
+    /// Spend the session's one commit reminder, as the first plain commit does.
+    fn spend_commit_reminder(sid: &str) {
+        assert_eq!(
+            outcome(&in_session("git commit -m 'first'", sid)),
+            Outcome::Nudge
+        );
+        assert_eq!(
+            outcome(&in_session("git commit -m 'second'", sid)),
+            Outcome::Allow,
+            "the quiet period must be live before the rows that must not use it"
+        );
+    }
+
+    #[test]
+    fn first_plain_commit_reminds_and_later_ones_are_silent() {
+        for (n, cmd) in [
+            "git commit",
+            "git commit -m 'x'",
+            "git commit -m \"two words\"",
+            "git commit -F msg.txt -- a.rs b.rs",
+            "git commit --amend --no-edit",
+            "git commit -m 'a; b && c | d $(e)'",
+            "git commit --message=\"x y\"",
+            "  git commit -m x\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            quiet(|| {
+                let sid = format!("sid-plain-{n}");
+                assert_eq!(
+                    outcome(&in_session(cmd, &sid)),
+                    Outcome::Nudge,
+                    "first: {cmd}"
+                );
+                assert_eq!(
+                    outcome(&in_session(cmd, &sid)),
+                    Outcome::Allow,
+                    "second: {cmd}"
+                );
+                assert_eq!(
+                    outcome(&in_session(cmd, &sid)),
+                    Outcome::Allow,
+                    "third: {cmd}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_commit_that_is_not_the_exact_plain_form_reminds_every_time() {
+        for cmd in [
+            "git -C other commit -m x",
+            "git -c user.name=x commit -m x",
+            "git --git-dir=other/.git commit -m x",
+            "git --work-tree=other commit -m x",
+            "cd other && git commit -m x",
+            "cd other; git commit -m x",
+            "git commit -m x && git push",
+            "git commit -m x && gh pr create --title t",
+            "git commit -m x; git status",
+            "git commit -m x | tee out.txt",
+            "git commit -m x || true",
+            "git commit -m \"$(cat msg.txt)\"",
+            "git commit -m \"$(printf '%s' x)\"",
+            "git commit -m \"`cat msg.txt`\"",
+            "git commit -m \"a \\\"b\\\"\"",
+            "git commit -F - <<'EOF'\nmsg\nEOF",
+            "git commit -m x > out.txt",
+            "git commit -m x # note",
+            "git commit -m x\ngit push",
+            "git add -A && git commit -m x",
+            "FOO=1 git commit -m x",
+            "env FOO=1 git commit -m x",
+            "command git commit -m x",
+            "(git commit -m x)",
+            "git commit -m x &",
+            "git commit -a *.rs",
+            "git commit -m $MSG",
+        ] {
+            quiet(|| {
+                let sid = "sid-notplain";
+                spend_commit_reminder(sid);
+                assert_eq!(
+                    outcome(&in_session(cmd, sid)),
+                    Outcome::Nudge,
+                    "first: {cmd}"
+                );
+                assert_eq!(
+                    outcome(&in_session(cmd, sid)),
+                    Outcome::Nudge,
+                    "second: {cmd}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_commit_chained_with_a_push_or_post_reminds_even_before_the_quiet_period_is_spent() {
+        quiet(|| {
+            for _ in 0..3 {
+                assert_eq!(
+                    outcome(&in_session("git commit -m x && git push origin HEAD", "s")),
+                    Outcome::Nudge
+                );
+            }
+            // The chained forms never wrote the marker, so the first plain commit still reminds.
+            assert_eq!(outcome(&in_session("git commit -m x", "s")), Outcome::Nudge);
+        });
+    }
+
+    #[test]
+    fn a_push_or_post_reminds_every_time_after_a_silenced_commit() {
+        for cmd in [
+            "git push",
+            "git push origin main",
+            "git push --force-with-lease origin feat/x",
+            "gh pr create --title t --body b",
+            "gh pr edit 3 --body b",
+            "gh pr comment 3 --body b",
+            "gh pr review 3 --comment --body b",
+            "gh pr merge 3 --squash",
+            "gh issue create --title t --body b",
+            "gh issue comment 3 --body b",
+            "gh issue edit 3 --body b",
+            "gh release create v1 --notes n",
+            "gh gist create f.md",
+            "gh api repos/o/r/issues -f body=x",
+            "gh api repos/o/r/issues/3/comments -f body=x",
+            "gh repo create o/r --public",
+            "gh repo edit o/r -d text",
+            "tea pr create --title t",
+            "cd other && gh pr comment 1 --body b",
+            "gh pr create -R other/repo --title t",
+        ] {
+            quiet(|| {
+                let sid = "sid-posts";
+                spend_commit_reminder(sid);
+                for round in 1..=3 {
+                    assert_eq!(
+                        outcome(&in_session(cmd, sid)),
+                        Outcome::Nudge,
+                        "round {round}: {cmd}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_field_report_edit_reminds_every_time_after_a_silenced_commit() {
+        quiet(|| {
+            spend_commit_reminder("sid-edit");
+            for _ in 0..3 {
+                for input in [
+                    make_write("/p/docs/field-reports/a.md", "x"),
+                    make_edit("/p/docs/field-reports/a.md", "o", "n"),
+                ] {
+                    let input = HookInput {
+                        session_id: Some("sid-edit".into()),
+                        ..input
+                    };
+                    assert_eq!(outcome(&input), Outcome::Nudge);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_push_before_the_first_commit_does_not_spend_the_quiet_period() {
+        quiet(|| {
+            for _ in 0..3 {
+                assert_eq!(
+                    outcome(&in_session("git push", "sid-order")),
+                    Outcome::Nudge
+                );
+            }
+            assert_eq!(
+                outcome(&in_session("git commit -m x", "sid-order")),
+                Outcome::Nudge
+            );
+        });
+    }
+
+    #[test]
+    fn a_missing_or_empty_session_id_reminds_every_time() {
+        quiet(|| {
+            for _ in 0..3 {
+                assert_eq!(outcome(&make_bash("git commit -m x")), Outcome::Nudge);
+                assert_eq!(outcome(&in_session("git commit -m x", "")), Outcome::Nudge);
+            }
+        });
+    }
+
+    #[test]
+    fn a_different_session_id_reminds_again() {
+        quiet(|| {
+            spend_commit_reminder("sid-one");
+            assert_eq!(
+                outcome(&in_session("git commit -m x", "sid-two")),
+                Outcome::Nudge
+            );
+            assert_eq!(
+                outcome(&in_session("git commit -m x", "sid-two")),
+                Outcome::Allow
+            );
+            assert_eq!(
+                outcome(&in_session("git commit -m x", "sid-one")),
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn the_skip_switch_still_allows_and_does_not_spend_the_quiet_period() {
+        quiet(|| {
+            let input = in_session("git commit -m x", "sid-skip");
+            let ridden = run_quiet_period(&input, Some("1"), None);
+            assert_eq!(ridden.outcome, Outcome::Allow);
+            assert!(ridden.bypass.is_some());
+            assert_eq!(
+                outcome(&input),
+                Outcome::Nudge,
+                "the bypassed call wrote no marker"
+            );
+        });
+    }
+
+    #[test]
+    fn a_marker_of_another_kind_does_not_silence_the_commit_reminder() {
+        // The marker kind is this hook's own: a `warn-main-branch`-style marker for the
+        // same session and no repo must not silence the commit reminder.
+        quiet(|| {
+            let input = in_session("git commit -m x", "sid-kind");
+            let other = markers::session_marker(&input, "some-other-warned", None);
+            markers::write_marker(&other, "").unwrap();
+            assert_eq!(outcome(&input), Outcome::Nudge);
+        });
+    }
+
+    #[test]
+    fn the_reminder_keeps_its_prefix_and_its_skip_switch_and_stays_short() {
+        let text = nudge_text();
+        assert!(text.starts_with("Pre-ship audit:"));
+        assert!(text.contains("overshare"));
+        assert!(text.contains(BYPASS_ENV));
+        assert!(text.chars().count() < 300, "{} chars", text.chars().count());
+    }
+
+    #[test]
+    fn is_plain_commit_accepts_one_shape() {
+        for cmd in ["git commit", "git commit -m x", "git commit -m 'a b' -- f"] {
+            assert!(is_plain_commit(cmd), "{cmd}");
+        }
+        for cmd in [
+            "git commit-tree abc",
+            "git committer",
+            "git  -C x commit",
+            "git",
+            "",
+            "git status",
+            "echo git commit",
+            "git commit -m 'unterminated",
+            "git commit -m \"unterminated",
+        ] {
+            assert!(!is_plain_commit(cmd), "{cmd}");
+        }
     }
 }
