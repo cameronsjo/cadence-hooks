@@ -1229,7 +1229,17 @@ fn is_plain_path_name(name: &str) -> bool {
 /// hand are still plans. The result is `/`-joined plain components, safe to
 /// print: [`is_plain_relative`] already held each one to a narrow charset.
 pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
-    cadence_hooks_core::config::repo_env_flag(repo_root, PLANS_DIR_KEY)
+    // The writer reads the target checkout's settings, then the session
+    // root's (an untracked settings.local.json lives only where it was
+    // written). Mirror that for a linked worktree of the session's repo, so
+    // a reader there looks where the writer wrote.
+    let session_repo = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(|v| !v.is_empty())
+        .and_then(|v| crate::registry::repo_root(&PathBuf::from(v).to_string_lossy()))
+        .filter(|session| linked_worktree_of(repo_root, session).is_some());
+    std::iter::once(repo_root)
+        .chain(session_repo.as_deref())
+        .find_map(|d| cadence_hooks_core::config::repo_env_flag(d, PLANS_DIR_KEY))
         .filter(|rel| is_plain_relative(rel))
         .map(|rel| {
             Path::new(&rel)
@@ -1262,7 +1272,17 @@ pub(crate) fn plans_dir_path(repo_root: &Path, rel_dir: &str) -> std::path::Path
 pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
     let configured = scan_plans_dir(repo_root);
     let mut dirs = vec![configured];
-    if dirs[0] != DEFAULT_PLANS_DIR && repo_root.join(DEFAULT_PLANS_DIR).is_dir() {
+    let default = plans_dir_path(repo_root, DEFAULT_PLANS_DIR);
+    // Compared as resolved paths too, so a symlink or a case-insensitive
+    // spelling of docs/plans is not scanned (and counted) twice.
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if dirs[0] != DEFAULT_PLANS_DIR
+        && default.is_dir()
+        && !same(&plans_dir_path(repo_root, &dirs[0]), &default)
+    {
         dirs.push(DEFAULT_PLANS_DIR.to_string());
     }
     dirs
@@ -7327,6 +7347,15 @@ mod tests {
             write_settings_env(repo.path(), PLANS_DIR_KEY, value);
             assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR, "{value:?}");
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dirs_does_not_scan_docs_plans_twice_through_a_symlink() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
+        std::os::unix::fs::symlink("docs", repo.path().join("Docs")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Docs/plans");
+        assert_eq!(scan_plans_dirs(repo.path()), vec!["Docs/plans".to_string()]);
     }
 
     #[cfg(unix)]

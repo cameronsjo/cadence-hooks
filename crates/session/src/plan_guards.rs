@@ -513,12 +513,45 @@ fn claim_marker(path: &Path) -> bool {
 /// is a silent no-fire (the guard must not guess), and shared-main repos
 /// match naturally because both sides read `main`. First match wins in
 /// `plan_scan`'s deterministic path order.
+///
+/// A plan git ignores is skipped (cadence#2153): a repo can point
+/// `CADENCE_PLANS_DIR` at a gitignored folder, and these guards' advice is to
+/// commit the plan, which such a repo does not do.
 fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
-    let branch =
-        cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)?;
+    plans_for_current_branch(repo_root).into_iter().next()
+}
+
+/// Every committable in-flight plan bound to the current branch, in scan order.
+fn plans_for_current_branch(repo_root: &Path) -> Vec<InFlightPlan> {
+    let Some(branch) =
+        cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)
+    else {
+        return Vec::new();
+    };
+    let root_str = repo_root.to_string_lossy();
     plan_scan::in_flight_plans(repo_root)
         .into_iter()
-        .find(|plan| plan.branch.as_deref() == Some(branch.as_str()))
+        .filter(|plan| plan.branch.as_deref() == Some(branch.as_str()))
+        .filter(|plan| !git_ignores(&root_str, &plan.rel_path))
+        .collect()
+}
+
+/// Does git ignore `rel_path`? `check-ignore` prints the path only when it is
+/// ignored; empty output (or a failed spawn) reads as "not ignored", so the
+/// guard keeps its old behavior when git can't answer.
+fn git_ignores(repo_root: &str, rel_path: &str) -> bool {
+    cadence_hooks_core::shell::git_command(repo_root, &["check-ignore", "--", rel_path])
+        .is_some_and(|out| !out.trim().is_empty())
+}
+
+/// The plans folders a commit-time check should pass to `git status`,
+/// relative to `repo_root` and existing on disk: the repo's configured
+/// `CADENCE_PLANS_DIR` and `docs/plans` (cadence#2153).
+pub fn plan_status_pathspecs(repo_root: &Path) -> Vec<String> {
+    crate::persist_plan::scan_plans_dirs(repo_root)
+        .into_iter()
+        .filter(|d| crate::persist_plan::plans_dir_path(repo_root, d).is_dir())
+        .collect()
 }
 
 /// The commit-time pre-arm of the plan tick (cadence-hooks#691): the repo
@@ -543,20 +576,21 @@ fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
 pub fn unstaged_plan_at_commit(cwd: &str, porcelain: &str) -> Option<String> {
     let candidates: Vec<&str> = porcelain
         .lines()
-        .filter_map(|line| line.strip_prefix(" M docs/plans/"))
-        .filter(|name| name.ends_with(".md") && !name.contains('/'))
+        .filter_map(|line| line.strip_prefix(" M "))
+        .filter(|path| path.ends_with(".md"))
         .collect();
     if candidates.is_empty() {
         return None;
     }
     let repo_root = crate::registry::repo_root(cwd)?;
-    let plan = plan_for_current_branch(&repo_root)?;
-    let dirty_unstaged = candidates
-        .iter()
-        .any(|name| format!("docs/plans/{name}") == plan.rel_path);
-    dirty_unstaged.then(|| {
-        crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY)
-    })
+    // Every plan on the branch, not just the first: with a configured plans
+    // folder scanned first, a docs/plans plan must still be caught here.
+    plans_for_current_branch(&repo_root)
+        .into_iter()
+        .find(|plan| candidates.iter().any(|path| *path == plan.rel_path))
+        .map(|plan| {
+            crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY)
+        })
 }
 
 /// Does git's commit summary line (`[branch abc1234] subject`) appear in
@@ -1058,6 +1092,59 @@ mod tests {
         // Second qualifying commit in the same session: marker holds, silent.
         let r2 = run_nudge_plan_tick(&input);
         assert_eq!(r2.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn tick_nudge_skips_a_plan_in_a_gitignored_plans_folder() {
+        // cadence#2153: a repo whose CADENCE_PLANS_DIR is gitignored never
+        // commits its plans, so "commit the plan" is the wrong advice.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        fs::create_dir_all(tmp.path().join(".claude/plans")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), ".claude/plans/\n").unwrap();
+        fs::write(
+            tmp.path().join(".claude/settings.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":".claude/plans"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".claude/plans/2026-11-18-local.md"),
+            "---\nstatus: \"in-flight\"\nbranch: \"main\"\n---\n\n- [ ] build\n",
+        )
+        .unwrap();
+        commit_all(tmp.path(), "settings");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let input = bash_input(
+            "ignored-plan-session",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+
+        // Control: the same plan, once the folder is not ignored, does nudge.
+        fs::write(tmp.path().join(".gitignore"), "").unwrap();
+        commit_all(tmp.path(), "unignore");
+        for i in 3..6 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let control = bash_input(
+            "ignored-plan-control",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&control).outcome,
+            cadence_hooks_core::Outcome::Nudge
+        );
     }
 
     #[test]

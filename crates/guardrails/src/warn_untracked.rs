@@ -206,20 +206,21 @@ impl Check for WarnUntrackedFiles {
         // It needs `git status`, which refreshes the index and so can run a
         // repo's clean filter — so it runs only in the session's own checkout
         // (as it always has), never in a repo a `cd` moved to, and only over
-        // `docs/plans`.
+        // the plans folders (the configured one and `docs/plans`).
         let in_session_checkout = cwd
             .and_then(canonical_repo_root)
             .is_some_and(|session| session == repo_root);
-        if in_session_checkout
-            && commit_takes_only_staged(command)
-            && repo_root.join("docs/plans").is_dir()
-            && let Some(status) = run_advisory_git(hardened_git(&repo_root).args([
-                "status",
-                "--porcelain",
-                "--untracked-files=no",
-                "--",
-                "docs/plans",
-            ]))
+        let plan_dirs = if in_session_checkout && commit_takes_only_staged(command) {
+            cadence_hooks_session::plan_guards::plan_status_pathspecs(&repo_root)
+        } else {
+            Vec::new()
+        };
+        if !plan_dirs.is_empty()
+            && let Some(status) = run_advisory_git(
+                hardened_git(&repo_root)
+                    .args(["status", "--porcelain", "--untracked-files=no", "--"])
+                    .args(&plan_dirs),
+            )
             && let Some(plan) = cadence_hooks_session::plan_guards::unstaged_plan_at_commit(
                 &repo_root.to_string_lossy(),
                 &status,
@@ -444,6 +445,52 @@ mod tests {
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("docs/plans/2026-09-29-p.md"), "{msg}");
         assert!(msg.contains("not staged"), "{msg}");
+    }
+
+    #[test]
+    fn dirty_unstaged_plan_in_the_configured_plans_folder_nudges() {
+        // cadence#2153: a repo's CADENCE_PLANS_DIR plan gets the same check.
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let dir = plan_repo();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let plans = dir.path().join("Meta").join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/settings.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/plans"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plans.join("2026-11-18-v.md"),
+            "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [ ] a\n",
+        )
+        .unwrap();
+        git(&["add", ".claude/settings.json", "Meta/plans/2026-11-18-v.md"]);
+        git(&["commit", "-q", "-m", "vault plan"]);
+        std::fs::write(
+            plans.join("2026-11-18-v.md"),
+            "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [x] a\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("work2.rs"), "fn b() {}\n").unwrap();
+        git(&["add", "work2.rs"]);
+        let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
+            "git commit -m x",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(msg.contains("Meta/plans/2026-11-18-v.md"), "{msg}");
     }
 
     #[test]

@@ -293,7 +293,7 @@ fn worktree_posture_line(cwd: &str) -> Option<String> {
 }
 
 /// The in-flight/blocked plan disclosure for `cwd`'s repo, or `None` when
-/// `cwd` isn't inside a git repo, `docs/plans/` doesn't exist, or no plan
+/// `cwd` isn't inside a git repo, the repo's plans folder doesn't exist, or no plan
 /// there is `in-flight`/`blocked` — [`crate::plan_scan::scan_in_flight_plans`]
 /// carries the actual scan and fail-open behavior; this only resolves the
 /// repo root the same way [`crate::persist_plan`] does.
@@ -321,16 +321,12 @@ fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
     if plans.is_empty() {
         return None;
     }
-    let status = cadence_hooks_core::shell::git_command(
-        &repo_root.to_string_lossy(),
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            "docs/plans",
-        ],
-    )?;
+    // Every folder the scan read, so a plan in the repo's configured plans
+    // folder is flagged too (cadence#2153). An ignored folder never shows.
+    let dirs = crate::persist_plan::scan_plans_dirs(repo_root);
+    let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
+    args.extend(dirs.iter().map(String::as_str));
+    let status = cadence_hooks_core::shell::git_command(&repo_root.to_string_lossy(), &args)?;
     let dirty: Vec<&str> = status
         .lines()
         .filter_map(|line| line.get(3..))
@@ -1011,6 +1007,29 @@ mod tests {
 
         let line = uncommitted_plans_line(scratch.path());
         assert_eq!(line, None, "committed plan must not draw the line");
+    }
+
+    #[test]
+    fn uncommitted_plan_line_covers_the_configured_plans_folder() {
+        // cadence#2153: a plan in the repo's CADENCE_PLANS_DIR is flagged
+        // like one in docs/plans.
+        let scratch = scratch("plan-uncommitted-configured");
+        init_repo(scratch.path());
+        std::fs::create_dir_all(scratch.path().join(".claude")).unwrap();
+        std::fs::write(
+            scratch.path().join(".claude/settings.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/docs/plans"}}"#,
+        )
+        .unwrap();
+        let plans_dir = scratch.path().join("Meta").join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(
+            plans_dir.join("2026-11-18-v.md"),
+            "---\nstatus: in-flight\nnext: \"ship it\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        let line = uncommitted_plans_line(scratch.path()).expect("an uncommitted plan line");
+        assert!(line.contains("Meta/docs/plans/2026-11-18-v.md"), "{line}");
     }
 
     #[test]
