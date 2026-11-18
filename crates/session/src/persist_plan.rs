@@ -7435,8 +7435,8 @@ mod tests {
         assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/new/plans");
         // A real folder with a space (a vault named `Second Brain`) is read.
         std::fs::create_dir_all(repo.path().join("Second Brain/Meta/plans")).unwrap();
-        std::os::unix::fs::symlink("Second Brain/Meta", repo.path().join("Vault")).unwrap();
-        write_settings_env(repo.path(), PLANS_DIR_KEY, "Vault/plans");
+        std::os::unix::fs::symlink("Second Brain/Meta", repo.path().join("Brain")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Brain/plans");
         assert_eq!(scan_plans_dir(repo.path()), "Second Brain/Meta/plans");
         // A broken link is refused, not treated as a folder still to come.
         std::os::unix::fs::symlink("/nonexistent/elsewhere", repo.path().join("Gone")).unwrap();
