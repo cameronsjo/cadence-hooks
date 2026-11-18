@@ -111,6 +111,15 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
+It reminds once per session on a plain `git commit` (the whole command is one
+`git commit` with only bare-word or quoted arguments) and stays silent on later
+plain commits in that session. Every push, every post, every field-report edit
+and every other form of commit (a global option, a `cd`, a chain, a pipe, a
+substitution, a heredoc) reminds every time. The quiet period is keyed on the
+session id alone, so a subagent and its parent share it; with no session id it
+never applies. It is spent only when the reminder is emitted: a reminder the
+repo's `nudges` config suppresses does not use it.
+
 ## guardrails (git-guardrails)
 
 | Hook | Event | What it does | Remote |
@@ -341,7 +350,7 @@ during maintenance.
 | `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
 | `session status` | List live and stale sessions registered in this repo: the current checkout and every worktree `git worktree list` names, with a footer counting the worktrees checked (exit 1 outside a git repository) |
 | `session timer start\|lap\|stop [LABEL]` | Wall-clock stopwatch scoped to this session (`--session-id`, then `CLAUDE_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`, else a shared scope); `LABEL` defaults to `default`. `lap` prints the elapsed time; `stop` prints it and appends `{ts, sessionId, label, elapsedMs}` to `<metrics_dir>/timers.jsonl`. Exit 1, reason on stderr, when the timer is not running or the label or `--session-id` is invalid |
-| `session plans` | List every in-flight and blocked plan in `docs/plans/` with its next step, branch, and PR — the detail behind the SessionStart plan pointer, with no cap on the file count. Exit 2 outside a git repository, or when an entry in `docs/plans/` could not be listed or read (each named on stderr) |
+| `session plans` | List every in-flight and blocked plan in the repo's plans folder (`CADENCE_PLANS_DIR`, plus `docs/plans/` while it exists) with its next step, branch, and PR — the full list behind the SessionStart plan block, which names at most three, with no cap on the file count. Exit 2 outside a git repository, or when an entry there could not be listed or read (each named on stderr) |
 | `cadence record-scrub --file <path>` | Record that a runbook draft passed the secret scrub: writes a marker keyed on the SHA-256 of the file's bytes (line endings ignored: `\r\n` hashes as `\n`) into the private marker directory, which `guard-runbook-scrub` honors for a write of that same content. It trusts its caller — run it only after `scrub.py --apply` and a check-mode `scrub.py` exit 0. Exit 0 recorded, 1 nothing recorded (unreadable or non-regular file, non-private marker dir), 2 usage |
 | `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |
 | `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation |

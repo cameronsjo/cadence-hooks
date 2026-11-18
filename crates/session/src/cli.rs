@@ -370,12 +370,24 @@ pub fn run_status() -> u8 {
 fn plans_text(repo_root: &std::path::Path, scan: &crate::plan_scan::PlansReport) -> String {
     match &scan.report {
         Some(report) => report.clone(),
-        None if scan.problems.is_empty() => format!(
-            "no in-flight plans under {}",
-            repo_root.join("docs").join("plans").display()
-        ),
+        None if scan.problems.is_empty() => {
+            format!("no in-flight plans under {}", scanned_dirs(repo_root))
+        }
         None => String::new(),
     }
+}
+
+/// The absolute folders `session plans` scanned, joined for a message.
+fn scanned_dirs(repo_root: &std::path::Path) -> String {
+    crate::persist_plan::scan_plans_dirs(repo_root)
+        .iter()
+        .map(|d| {
+            crate::persist_plan::plans_dir_path(repo_root, d)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 /// Pure: the stderr text for a partial scan, or `None` when it was complete.
@@ -388,7 +400,7 @@ fn plans_problems_text(
     }
     let mut out = format!(
         "session plans: the scan of {} was incomplete; plans in these entries are missing from the list:",
-        repo_root.join("docs").join("plans").display()
+        scanned_dirs(repo_root)
     );
     for problem in &scan.problems {
         out.push_str("\n  ");
@@ -468,6 +480,33 @@ mod tests {
         // Built with `join`, not a literal: the separator is `\` on Windows.
         let scanned = std::path::Path::new("docs").join("plans");
         assert!(out.contains(&scanned.display().to_string()), "{out}");
+    }
+
+    #[test]
+    fn plans_text_reads_the_repos_configured_plans_folder() {
+        // cadence#2153: a repo that sets CADENCE_PLANS_DIR gets its plans
+        // persisted there, so `session plans` has to look there too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(
+            tmp.path().join(".claude/settings.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/docs/plans"}}"#,
+        )
+        .unwrap();
+        let dir = tmp.path().join("Meta").join("docs").join("plans");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-11-18-vault.md"),
+            "---\nstatus: in-flight\n---\n\nbody\n",
+        )
+        .unwrap();
+        let out = plans_text(tmp.path(), &crate::plan_scan::plans_report(tmp.path()));
+        assert!(
+            out.starts_with("1 in-flight plan in Meta/docs/plans/:"),
+            "{out}"
+        );
+        assert!(out.contains("2026-11-18-vault"), "{out}");
+        assert!(!tmp.path().join("docs").exists());
     }
 
     #[test]
