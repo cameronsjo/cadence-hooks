@@ -1229,10 +1229,10 @@ fn is_plain_path_name(name: &str) -> bool {
 /// hand are still plans. The result is `/`-joined plain components, safe to
 /// print: [`is_plain_relative`] already held each one to a narrow charset.
 ///
-/// The folder must be spelled as it is on disk: a path through a symlink, or
-/// in another letter case on a case-insensitive filesystem, falls back too.
-/// Git tracks a plan only by its real path, and the writer saves to the
-/// resolved folder, so the literal spelling would name a path neither uses.
+/// The folder is reported by its real path inside the checkout: a spelling
+/// through an in-repo symlink, or in another letter case on a
+/// case-insensitive filesystem, resolves to the folder the writer saves in
+/// and git tracks.
 ///
 /// Readers honor the setting in any repo, while the writer honors it only in
 /// an owned one; the value is held to the same narrow, printable charset
@@ -1276,7 +1276,7 @@ fn scan_plans_dir_with(repo_root: &Path, session_root: Option<&Path>) -> String 
                 .join("/")
         })
         .filter(|rel| rel.len() <= MAX_SCAN_PLANS_DIR_BYTES)
-        .filter(|rel| nests_without_creating(repo_root, rel))
+        .and_then(|rel| real_folder_in_checkout(repo_root, &rel))
         .unwrap_or_else(|| DEFAULT_PLANS_DIR.to_string())
 }
 
@@ -1314,6 +1314,11 @@ pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
         && default.is_dir()
         && !same(&plans_dir_path(repo_root, &dirs[0]), &default)
     {
+        // A configured folder that doesn't exist yet holds no plans, so
+        // naming it beside docs/plans would only mislead.
+        if !plans_dir_path(repo_root, &dirs[0]).is_dir() {
+            dirs.clear();
+        }
         dirs.push(DEFAULT_PLANS_DIR.to_string());
     }
     dirs
@@ -1325,25 +1330,29 @@ pub(crate) fn plans_dirs_label(dirs: &[String]) -> String {
     dirs.join("/ and ")
 }
 
-/// Does `<root>/<relative>` stay inside `root` once symlinks resolve? Checks
-/// the nearest existing ancestor, so a directory that does not exist yet
-/// still answers, and nothing is created.
-fn nests_without_creating(root: &Path, relative: &str) -> bool {
-    let Ok(canonical_root) = root.canonicalize() else {
-        return false;
-    };
+/// `<root>/<relative>` as the folder's real path relative to `root`, the
+/// path the writer saves under and git tracks: the nearest existing ancestor
+/// is resolved (symlinks, letter case) and the parts that don't exist yet are
+/// kept as written. `None` when it resolves outside `root`, or when the real
+/// path fails the same charset and length rules as the setting. Nothing is
+/// created.
+fn real_folder_in_checkout(root: &Path, relative: &str) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
     let target = root.join(relative);
-    let Some(existing) = target.ancestors().find(|a| a.exists()) else {
-        return false;
-    };
-    let Ok(rel_existing) = existing.strip_prefix(root) else {
-        return false;
-    };
-    // Spelled as on disk: the existing part resolves to exactly the same
-    // components under the resolved root, so no symlink or case change.
-    existing
-        .canonicalize()
-        .is_ok_and(|a| a == canonical_root.join(rel_existing))
+    let existing = target.ancestors().find(|a| a.exists())?;
+    let missing = target.strip_prefix(existing).ok()?.to_path_buf();
+    let real = existing.canonicalize().ok()?.join(missing);
+    let rel = real.strip_prefix(&canonical_root).ok()?;
+    let joined = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    (!joined.is_empty() && joined.len() <= MAX_SCAN_PLANS_DIR_BYTES && is_plain_relative(&joined))
+        .then_some(joined)
 }
 
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
@@ -7399,9 +7408,24 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn scan_plans_dir_reports_a_symlinked_folder_by_its_real_path() {
+        // The writer saves under the resolved folder, so the readers must read
+        // that folder: Meta -> vault/Meta makes Meta/plans vault/Meta/plans.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("vault/Meta/plans")).unwrap();
+        std::os::unix::fs::symlink("vault/Meta", repo.path().join("Meta")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/plans");
+        // A folder that doesn't exist yet keeps its missing tail as written.
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/new/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/new/plans");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scan_plans_dirs_reads_docs_plans_once_through_an_in_repo_symlink() {
         // Git tracks the plan at docs/plans/x.md and the writer saves there,
-        // so the symlinked spelling falls back to docs/plans, scanned once.
+        // so the symlinked spelling resolves to docs/plans, scanned once.
         let repo = TempDir::new().unwrap();
         std::fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
         // Not `Docs`: on a case-insensitive filesystem that name is `docs`.

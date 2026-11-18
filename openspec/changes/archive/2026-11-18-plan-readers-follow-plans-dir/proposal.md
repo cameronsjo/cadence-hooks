@@ -21,4 +21,4 @@ None.
 
 ## Impact
 
-- `cadence-hooks session start`, `cadence-hooks session plans`, and the plan guards' in-flight plan reads. Repos without `CADENCE_PLANS_DIR` see no change.
+- `cadence-hooks session start`, `cadence-hooks session plans`, the plan guards' in-flight plan reads, and `guardrails warn-untracked-files`' commit-time plan check. Repos without `CADENCE_PLANS_DIR` see no change.

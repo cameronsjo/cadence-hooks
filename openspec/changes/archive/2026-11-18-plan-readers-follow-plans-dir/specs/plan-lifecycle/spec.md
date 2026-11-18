@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: In-flight plans surfaced at session start
-`session start` SHALL add a fixed-size line when the repo's plans folder holds plans with frontmatter `status` `in-flight` or `blocked`, pointing at `cadence-hooks session plans`. Plans without a `status:` key MUST be skipped. The scan MUST be bounded to the newest files, skip symlinks, and say `At least` when cut. A second line SHALL name up to five in-flight plans that are uncommitted. Both MUST appear even when registration fails.
+`session start` SHALL add a bounded-size line when the repo's plans folder holds plans with frontmatter `status` `in-flight` or `blocked`, pointing at `cadence-hooks session plans`. Plans without a `status:` key MUST be skipped. The scan MUST be bounded to the newest files, skip symlinks, and say `At least` when cut. A second line SHALL name up to five in-flight plans that are uncommitted. Both MUST appear even when registration fails.
 
 #### Scenario: Resuming into in-flight work
 - **WHEN** a session starts in a repo with one in-flight plan in `docs/plans/`
@@ -48,7 +48,7 @@ The `session start` plan lines, `session plans`, and the plan guards SHALL read 
 - **THEN** the readers scan `docs/plans/`
 
 ### Requirement: Plans folder edge cases for readers
-A configured folder longer than 120 bytes, or spelled other than as it is on disk (through a symlink, or in another letter case), SHALL fall back to `docs/plans/`. In a linked worktree of the session's repo, the readers SHALL read the session checkout's settings after the worktree's, as the persist hook does. The tick nudge, the ready-flip warning, and the commit-time unstaged-plan check MUST skip a plan git ignores, since their advice is to commit it.
+A configured folder over 120 bytes SHALL fall back to `docs/plans/`. A folder spelled through an in-repo symlink or in another letter case SHALL be read at its real path in the checkout. A linked worktree SHALL also read the session checkout's settings, as the persist hook does. The tick nudge, ready-flip warning, and commit-time unstaged-plan check MUST skip a plan git ignores.
 
 #### Scenario: Gitignored plans folder
 - **WHEN** `CADENCE_PLANS_DIR` is a gitignored `.claude/plans` holding the branch's in-flight plan, and three commits land without touching it
@@ -57,6 +57,10 @@ A configured folder longer than 120 bytes, or spelled other than as it is on dis
 #### Scenario: Symlink to docs/plans
 - **WHEN** `CADENCE_PLANS_DIR` is `Notes/plans` and `Notes` is a symlink to `docs`
 - **THEN** the readers scan only `docs/plans`
+
+#### Scenario: Symlinked vault folder
+- **WHEN** `CADENCE_PLANS_DIR` is `Meta/plans` and `Meta` is a symlink to `vault/Meta`
+- **THEN** the readers scan `vault/Meta/plans`
 
 #### Scenario: Overlong folder name
 - **WHEN** `CADENCE_PLANS_DIR` is a plain-charset value of 1,000 bytes
