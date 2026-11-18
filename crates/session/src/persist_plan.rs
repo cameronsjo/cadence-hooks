@@ -7404,8 +7404,9 @@ mod tests {
         // so the symlinked spelling falls back to docs/plans, scanned once.
         let repo = TempDir::new().unwrap();
         std::fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
-        std::os::unix::fs::symlink("docs", repo.path().join("Docs")).unwrap();
-        write_settings_env(repo.path(), PLANS_DIR_KEY, "Docs/plans");
+        // Not `Docs`: on a case-insensitive filesystem that name is `docs`.
+        std::os::unix::fs::symlink("docs", repo.path().join("Notes")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Notes/plans");
         assert_eq!(
             scan_plans_dirs(repo.path()),
             vec![DEFAULT_PLANS_DIR.to_string()]

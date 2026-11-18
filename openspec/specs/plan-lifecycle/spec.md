@@ -217,7 +217,7 @@ A configured folder longer than 120 bytes, or spelled other than as it is on dis
 - **THEN** `session nudge-plan-tick` exits 0 with no output
 
 #### Scenario: Symlink to docs/plans
-- **WHEN** `CADENCE_PLANS_DIR` is `Docs/plans` and `Docs` is a symlink to `docs`
+- **WHEN** `CADENCE_PLANS_DIR` is `Notes/plans` and `Notes` is a symlink to `docs`
 - **THEN** the readers scan only `docs/plans`
 
 #### Scenario: Overlong folder name
