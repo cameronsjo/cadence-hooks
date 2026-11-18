@@ -1334,12 +1334,18 @@ pub(crate) fn plans_dirs_label(dirs: &[String]) -> String {
 /// path the writer saves under and git tracks: the nearest existing ancestor
 /// is resolved (symlinks, letter case) and the parts that don't exist yet are
 /// kept as written. `None` when it resolves outside `root`, or when the real
-/// path fails the same charset and length rules as the setting. Nothing is
-/// created.
+/// path is over the length cap or uses a character other than the setting's
+/// charset plus a space (a vault folder like `Second Brain` is common, and
+/// the writer saves there). Nothing is created.
 fn real_folder_in_checkout(root: &Path, relative: &str) -> Option<String> {
     let canonical_root = root.canonicalize().ok()?;
     let target = root.join(relative);
-    let existing = target.ancestors().find(|a| a.exists())?;
+    // `symlink_metadata`, not `exists`: a broken in-repo link counts as
+    // existing, so its canonicalize fails and the setting is refused rather
+    // than read through the link later.
+    let existing = target
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a).is_ok())?;
     let missing = target.strip_prefix(existing).ok()?.to_path_buf();
     let real = existing.canonicalize().ok()?.join(missing);
     let rel = real.strip_prefix(&canonical_root).ok()?;
@@ -1351,8 +1357,15 @@ fn real_folder_in_checkout(root: &Path, relative: &str) -> Option<String> {
         })
         .collect::<Option<Vec<_>>>()?
         .join("/");
-    (!joined.is_empty() && joined.len() <= MAX_SCAN_PLANS_DIR_BYTES && is_plain_relative(&joined))
-        .then_some(joined)
+    let printable = joined.split('/').all(|part| {
+        !part.is_empty()
+            && part != ".."
+            && !part.eq_ignore_ascii_case(".git")
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+    });
+    (printable && joined.len() <= MAX_SCAN_PLANS_DIR_BYTES).then_some(joined)
 }
 
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
@@ -7419,6 +7432,15 @@ mod tests {
         // A folder that doesn't exist yet keeps its missing tail as written.
         write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/new/plans");
         assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/new/plans");
+        // A real folder with a space (a vault named `Second Brain`) is read.
+        std::fs::create_dir_all(repo.path().join("Second Brain/Meta/plans")).unwrap();
+        std::os::unix::fs::symlink("Second Brain/Meta", repo.path().join("Vault")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Vault/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "Second Brain/Meta/plans");
+        // A broken link is refused, not treated as a folder still to come.
+        std::os::unix::fs::symlink("/nonexistent/elsewhere", repo.path().join("Gone")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Gone/plans");
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
     }
 
     #[cfg(unix)]

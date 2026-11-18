@@ -59,8 +59,8 @@ A configured folder over 120 bytes SHALL fall back to `docs/plans/`. A folder sp
 - **THEN** the readers scan only `docs/plans`
 
 #### Scenario: Symlinked vault folder
-- **WHEN** `CADENCE_PLANS_DIR` is `Meta/plans` and `Meta` is a symlink to `vault/Meta`
-- **THEN** the readers scan `vault/Meta/plans`
+- **WHEN** `CADENCE_PLANS_DIR` is `Meta/plans` and `Meta` is a symlink to `Second Brain/Meta`
+- **THEN** the readers scan `Second Brain/Meta/plans`
 
 #### Scenario: Overlong folder name
 - **WHEN** `CADENCE_PLANS_DIR` is a plain-charset value of 1,000 bytes
