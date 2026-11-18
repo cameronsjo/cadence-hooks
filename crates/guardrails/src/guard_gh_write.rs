@@ -762,10 +762,17 @@ fn resolve_target_repo_on(
     allowed_owners: &[AllowEntry],
     env_host: &str,
 ) -> RepoResolution {
-    resolve_target_repos_on(command, work_dir, allowed_owners, env_host, &[])
-        .into_iter()
-        .next()
-        .unwrap_or(RepoResolution::Unresolvable)
+    resolve_target_repos_on(
+        command,
+        work_dir,
+        allowed_owners,
+        env_host,
+        &[],
+        GhRepoDoubt::NONE,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or(RepoResolution::Unresolvable)
 }
 
 /// Every repo gh may write to for one segment, with the inherited `GH_HOST`
@@ -783,6 +790,11 @@ fn resolve_target_repo_on(
 ///   `export GH_REPO=` before it ([`gh_repo_export`]). Empty means none. A
 ///   `gh api` call with no placeholder in its endpoint reads none of them:
 ///   gh uses `GH_REPO` there only to fill `{owner}`/`{repo}`.
+/// - A `GH_REPO` in force that the guard read exactly replaces the checkout:
+///   gh takes the repository it writes to from `GH_REPO` then, not from the
+///   checkout's remotes, so they are no target (cameronsjo/cadence-hooks#1642).
+///   An unreadable one keeps them, and so does one the command may clear or
+///   never set ([`GhRepoDoubt`]).
 /// - A placeholder owner keeps the endpoint's literal name: gh writes
 ///   `repos/{owner}/other/…` to `<base owner>/other`, the base being the
 ///   `GH_REPO` value or each checkout remote ([`fill_placeholder_owner`]), and
@@ -800,6 +812,7 @@ fn resolve_target_repos_on(
     allowed_owners: &[AllowEntry],
     env_host: &str,
     env_repos: &[String],
+    doubt: GhRepoDoubt,
 ) -> Vec<RepoResolution> {
     let mut resolutions: Vec<RepoResolution> = selector_url_targets(command)
         .into_iter()
@@ -835,6 +848,13 @@ fn resolve_target_repos_on(
     // the `GH_REPO` owner when one is in force, else the checkout's.
     let org_placeholder = endpoint.as_deref().and_then(api_orgs_placeholder_host);
     let mut gh_repo_in_force = false;
+    // Whether gh takes the repo from `GH_REPO` instead of the checkout: a
+    // `GH_REPO` is in force for a command gh reads it for, the guard is
+    // certain gh receives it, and every value in force is one it read
+    // exactly. gh then takes its repository from `GH_REPO`, not from the
+    // checkout's remotes, so they are not a target. Otherwise the checkout
+    // stays beside it, as before.
+    let mut gh_repo_replaces_checkout = false;
     if segment_reads_gh_repo(command) {
         // gh fills a placeholder owner from `GH_REPO`, so the write goes to
         // the `GH_REPO` owner with the endpoint's literal name.
@@ -864,14 +884,27 @@ fn resolve_target_repos_on(
                 }
             })
         };
-        if let Some(repo) = inline_gh_repo(command) {
-            gh_repo_in_force = true;
-            resolutions.extend(gh_repo_resolution(&repo));
-        } else if !inline_gh_repo_unset(command) {
-            for repo in env_repos.iter().filter(|repo| !repo.is_empty()) {
-                gh_repo_in_force = true;
-                resolutions.extend(gh_repo_resolution(repo));
-            }
+        // A `GH_REPO` certainly reaches gh when nothing in the command
+        // clears it, and, for an exported or inherited one, when no export
+        // of it is conditional ([`GhRepoDoubt`]).
+        let (in_force, certain): (Vec<String>, bool) = match inline_gh_repo(command) {
+            Some(repo) => (vec![repo], !doubt.cleared),
+            None if inline_gh_repo_unset(command) => (Vec::new(), true),
+            None => (
+                env_repos
+                    .iter()
+                    .filter(|repo| !repo.is_empty())
+                    .cloned()
+                    .collect(),
+                !doubt.cleared && !doubt.conditional_export,
+            ),
+        };
+        gh_repo_in_force = !in_force.is_empty();
+        gh_repo_replaces_checkout = gh_repo_in_force
+            && certain
+            && in_force.iter().all(|repo| gh_repo_read_exactly(repo, &dh));
+        for repo in &in_force {
+            resolutions.extend(gh_repo_resolution(repo));
         }
     }
     if let Some(named) = org_placeholder {
@@ -883,13 +916,82 @@ fn resolve_target_repos_on(
         }
         return resolutions;
     }
-    resolutions.push(resolve_unflagged_target(
+    resolutions.extend(resolve_unflagged_target(
         command,
         work_dir,
         allowed_owners,
         &dh,
+        !gh_repo_replaces_checkout,
     ));
     resolutions
+}
+
+/// True when a `GH_REPO` value names a repo this guard reads exactly: gh
+/// splits it ([`parse_gh_repo_value`]) and neither its host nor its
+/// `owner/repo` holds an expansion.
+fn gh_repo_read_exactly(value: &str, dh: &str) -> bool {
+    matches!(
+        flag_value_resolution(value, dh),
+        Some(RepoResolution::Resolved { ref host, ref repo })
+            if is_read_exactly(host) && is_read_exactly(repo)
+    )
+}
+
+/// An `export … GH_REPO=` after `&&` or `||` in the same list: an export the
+/// guard reads as if it ran, which gh may never receive.
+static CONDITIONAL_GH_REPO_EXPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(&&|\|\|)\s*export\s[^;&|\n]*\bGH_REPO=").expect("pattern should compile")
+});
+
+/// What in the hook's whole command may keep a `GH_REPO` the guard tracked
+/// from reaching gh. The guard reads none of these exactly, so where one
+/// appears it keeps the checkout beside that `GH_REPO`
+/// ([`resolve_target_repos_on`]).
+#[derive(Clone, Copy)]
+struct GhRepoDoubt {
+    /// Something clears `GH_REPO`: `unset GH_REPO` in any shell or compound
+    /// command, `export -n GH_REPO`, `env -u GH_REPO`, `env -i`. This covers
+    /// every source, an inline `GH_REPO=` included.
+    cleared: bool,
+    /// An export of it sits behind `&&` or `||`, so it may never have run.
+    /// This covers only an exported or inherited `GH_REPO`.
+    conditional_export: bool,
+}
+
+impl GhRepoDoubt {
+    const NONE: Self = Self {
+        cleared: false,
+        conditional_export: false,
+    };
+
+    /// Read from the hook's `command` and every segment of it (`segments`,
+    /// child scripts included).
+    fn of(command: &str, segments: &[String]) -> Self {
+        Self {
+            cleared: segments_clear_gh_repo(segments),
+            conditional_export: CONDITIONAL_GH_REPO_EXPORT.is_match(command),
+        }
+    }
+}
+
+/// True when any segment names `GH_REPO` bare (`unset GH_REPO`, `export -n
+/// GH_REPO`, `env -u GH_REPO`) or runs `env` with an emptied environment.
+fn segments_clear_gh_repo(segments: &[String]) -> bool {
+    segments.iter().any(|segment| {
+        let tokens = tokenize(segment);
+        let names_it = tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "GH_REPO" | "--unset=GH_REPO" | "-uGH_REPO"));
+        let clears_env = tokens
+            .iter()
+            .position(|token| command_word(token) == "env")
+            .is_some_and(|at| {
+                tokens[at + 1..]
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "-i" | "--ignore-environment" | "-"))
+            });
+        names_it || clears_env
+    })
 }
 
 /// Judge-ready form of one `-R`/`--repo`/`GH_REPO` value, split the way gh
@@ -1060,17 +1162,21 @@ fn inline_gh_repo_unset(command: &str) -> bool {
 }
 
 /// Where a write goes when no `-R` names its target: a `gh repo` positional,
-/// a `gh api repos/…` endpoint, or the checkout's git remotes.
+/// a `gh api repos/…` endpoint, or the checkout's git remotes. With
+/// `checkout_is_target` false (a `GH_REPO` gh reads is in force) the
+/// checkout is no candidate, for the fallback or to fill a placeholder:
+/// `None` then means the command names no target beyond that `GH_REPO`.
 fn resolve_unflagged_target(
     command: &str,
     work_dir: &str,
     allowed_owners: &[AllowEntry],
     dh: &str,
-) -> RepoResolution {
+    checkout_is_target: bool,
+) -> Option<RepoResolution> {
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
     if let Some((subcommand, spec_host, first_arg)) = gh_repo_positional_target(command) {
         if first_arg.contains('/') {
-            return RepoResolution::Resolved {
+            return Some(RepoResolution::Resolved {
                 // A `HOST/OWNER/REPO` positional names its own host, and it is
                 // judged rather than assumed: `evil-host/cameronsjo/x` carries
                 // an allowed-looking owner to a forge the allowlist never
@@ -1078,7 +1184,7 @@ fn resolve_unflagged_target(
                 // the spec blocks unless that host was explicitly allowed.
                 host: spec_host.unwrap_or_else(|| dh.to_string()),
                 repo: first_arg,
-            };
+            });
         }
         // Only `create` can infer owner from a bare name (no `/`)
         if subcommand == "create" {
@@ -1087,10 +1193,10 @@ fn resolve_unflagged_target(
                 .find(|e| e.host.is_none() || e.host.as_deref() == Some(dh))
                 .map(|e| e.owner.as_str())
                 .unwrap_or("");
-            return RepoResolution::Resolved {
+            return Some(RepoResolution::Resolved {
                 host: dh.to_string(),
                 repo: format!("{default_owner}/{first_arg}"),
-            };
+            });
         }
     }
 
@@ -1107,8 +1213,11 @@ fn resolve_unflagged_target(
             // judged there, as the literal path would be.
             // gh fills the colon spellings (`:owner`, `:repo`) the same way.
             if let Some(name) = placeholder_owner_name(&repo) {
+                if !checkout_is_target {
+                    return None;
+                }
                 let named = host.or_else(|| selected_gh_host(command));
-                return match resolve_from_git_remotes(work_dir) {
+                return Some(match resolve_from_git_remotes(work_dir) {
                     RepoResolution::Resolved { host, repo: own } => RepoResolution::Resolved {
                         host: named.unwrap_or(host),
                         repo: fill_placeholder_owner(&own, name),
@@ -1125,24 +1234,24 @@ fn resolve_unflagged_target(
                         upstream: fill_placeholder_owner(&upstream, name),
                     },
                     resolution => resolution,
-                };
+                });
             }
-            return RepoResolution::Resolved {
+            return Some(RepoResolution::Resolved {
                 host: host.unwrap_or_else(|| dh.to_string()),
                 repo,
-            };
+            });
         }
         // An org-level write is judged on the org as its owner.
         if let Some((host, org)) = api_orgs_target(&endpoint) {
-            return RepoResolution::Org {
+            return Some(RepoResolution::Org {
                 host: host.unwrap_or_else(|| dh.to_string()),
                 org,
-            };
+            });
         }
     }
 
     // 4. Git remotes (with fork detection)
-    resolve_from_git_remotes(work_dir)
+    checkout_is_target.then(|| resolve_from_git_remotes(work_dir))
 }
 
 /// The repository name after a placeholder owner in a `gh api repos/…`
@@ -2526,19 +2635,27 @@ fn judge_write_segment(
     extra_hosts: &[String],
     env_host: &str,
     env_repos: &[String],
+    doubt: GhRepoDoubt,
 ) -> Option<CheckResult> {
-    resolve_target_repos_on(segment, work_dir, allowed_owners, env_host, env_repos)
-        .into_iter()
-        .find_map(|resolution| {
-            judge_resolution(
-                resolution,
-                segment,
-                whole,
-                allowed_owners,
-                allowed_repos,
-                extra_hosts,
-            )
-        })
+    resolve_target_repos_on(
+        segment,
+        work_dir,
+        allowed_owners,
+        env_host,
+        env_repos,
+        doubt,
+    )
+    .into_iter()
+    .find_map(|resolution| {
+        judge_resolution(
+            resolution,
+            segment,
+            whole,
+            allowed_owners,
+            allowed_repos,
+            extra_hosts,
+        )
+    })
 }
 
 /// How `segment` should name the repo `owner_repo` in a fix: `-R owner/repo`,
@@ -2875,7 +2992,10 @@ impl Check for GhWriteGuard {
         // bash)"`) is judged where the guard read the shell to be, unless it
         // read something in it that moves (cadence-ecosystem ADR-0046 rule 3).
         let own = || command_segments_with_dirs_reading(command, cwd, UnreadEval::StaysPut);
-        let mut judged = Judged::default();
+        let mut judged = Judged {
+            doubt: GhRepoDoubt::of(command, &whole_segments),
+            ..Judged::default()
+        };
         // gh reads an inherited GH_REPO too; an empty one is unset.
         let inherited = [std::env::var("GH_REPO").unwrap_or_default()];
         let readings: [&dyn Fn() -> Reading; 2] = [&whole, &own];
@@ -2917,6 +3037,9 @@ struct Judged {
     seen: std::collections::HashSet<(String, String, Vec<String>)>,
     /// The `GH_HOST` a gh process inherits from the hook's environment.
     env_host: String,
+    /// What may keep a `GH_REPO` the guard tracked from reaching each gh
+    /// in the hook's command.
+    doubt: GhRepoDoubt,
 }
 
 impl Default for Judged {
@@ -2924,6 +3047,7 @@ impl Default for Judged {
         Self {
             seen: std::collections::HashSet::new(),
             env_host: default_host(),
+            doubt: GhRepoDoubt::NONE,
         }
     }
 }
@@ -3260,6 +3384,7 @@ fn judge_write_segments(
             extra_hosts,
             &judged.env_host,
             &exported,
+            judged.doubt,
         ) {
             return Some(block);
         }
@@ -5233,6 +5358,188 @@ mod tests {
                     msg(&result)
                 );
             }
+        });
+    }
+
+    #[test]
+    fn a_gh_repo_gh_reads_replaces_the_checkout() {
+        // With a `GH_REPO` in force, gh writes to its repository, not the
+        // checkout's, on a command it reads `GH_REPO` for, so an owned one allows
+        // from an unowned checkout or fork (cameronsjo/cadence-hooks#1642).
+        // The safety direction holds: an unowned `GH_REPO` still blocks from
+        // an owned checkout, an unreadable one keeps the checkout as before,
+        // `-R` still wins, and a command gh does not read `GH_REPO` for is
+        // judged on the checkout.
+        let owned = origin_checkout("https://github.com/cameronsjo/tool.git");
+        let unowned = origin_checkout("https://github.com/evil/up.git");
+        let fork = origin_checkout("https://github.com/cameronsjo/up.git");
+        cadence_hooks_core::git_fixtures::git_in(
+            fork.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/evil/up.git",
+            ],
+        );
+        with_env(&owners_env(), || {
+            for (command, dir, blocks_expected) in [
+                // Owned GH_REPO, unowned checkout: allowed.
+                (
+                    "GH_REPO=cameronsjo/tool gh issue comment 1 --body hi",
+                    &unowned,
+                    false,
+                ),
+                (
+                    "export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi",
+                    &unowned,
+                    false,
+                ),
+                (
+                    "GH_REPO=cameronsjo/tool gh api -X POST repos/{owner}/{repo}/issues -f title=x",
+                    &unowned,
+                    false,
+                ),
+                (
+                    "GH_REPO=cameronsjo/tool gh api -X POST repos/:owner/:repo/issues -f title=x",
+                    &unowned,
+                    false,
+                ),
+                (
+                    "GH_REPO=cameronsjo/tool gh repo deploy-key add key.pub",
+                    &unowned,
+                    false,
+                ),
+                (
+                    "export GH_REPO=cameronsjo/tool; gh repo autolink delete 1",
+                    &unowned,
+                    false,
+                ),
+                (
+                    "GH_REPO=cameronsjo/tool gh pr merge 5 --squash",
+                    &fork,
+                    false,
+                ),
+                // Unowned GH_REPO from an owned checkout still blocks.
+                ("GH_REPO=evil/x gh issue comment 1 --body hi", &owned, true),
+                (
+                    "GH_REPO=evil/x gh api -X POST repos/{owner}/{repo}/issues -f title=x",
+                    &owned,
+                    true,
+                ),
+                (
+                    "export GH_REPO=evil/x; gh repo deploy-key add key.pub",
+                    &owned,
+                    true,
+                ),
+                // A literal owner beside a placeholder name is still judged.
+                (
+                    "GH_REPO=cameronsjo/tool gh api -X POST 'repos/evil/{repo}/issues' -f title=x",
+                    &unowned,
+                    true,
+                ),
+                // An unreadable GH_REPO keeps the checkout, as before.
+                (
+                    "GH_REPO=\"$R\" gh issue comment 1 --body hi",
+                    &unowned,
+                    true,
+                ),
+                ("GH_REPO=\"$R\" gh issue comment 1 --body hi", &owned, false),
+                (
+                    "GH_REPO=\"cameronsjo/$r\" gh repo deploy-key add key.pub",
+                    &unowned,
+                    true,
+                ),
+                // `-R` is unchanged: it names the target over GH_REPO.
+                (
+                    "GH_REPO=cameronsjo/tool gh issue comment 1 -R evil/x --body hi",
+                    &unowned,
+                    true,
+                ),
+                (
+                    "GH_REPO=evil/x gh issue comment 1 -R cameronsjo/tool --body hi",
+                    &unowned,
+                    false,
+                ),
+                // A command gh does not read GH_REPO for keeps the checkout.
+                (
+                    "GH_REPO=cameronsjo/tool gh repo edit --description d",
+                    &unowned,
+                    true,
+                ),
+                (
+                    "GH_REPO=cameronsjo/tool gh api -X POST repos/evil/up/issues -f title=x",
+                    &owned,
+                    true,
+                ),
+            ] {
+                let cwd = dir.path().to_str().expect("utf-8 path");
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+        // The hook process's own GH_REPO replaces the checkout the same way,
+        // unless the command may clear it before gh runs: then the checkout
+        // stays a target, as before.
+        let mut env = owners_env();
+        env.iter_mut()
+            .find(|(key, _)| *key == "GH_REPO")
+            .expect("owners_env pins GH_REPO")
+            .1 = Some("cameronsjo/tool");
+        with_env(&env, || {
+            let cwd = unowned.path().to_str().expect("utf-8 path");
+            for (command, blocks_expected) in [
+                ("gh issue comment 1 --body hi", false),
+                ("gh repo deploy-key add key.pub", false),
+                (
+                    "gh api -X POST repos/{owner}/{repo}/issues -f title=x",
+                    false,
+                ),
+                ("gh repo edit --description d", true),
+                ("env -u GH_REPO gh issue comment 1 --body hi", true),
+                ("env --unset=GH_REPO gh issue comment 1 --body hi", true),
+                ("env -i gh issue comment 1 --body hi", true),
+                ("( unset GH_REPO; gh issue comment 1 --body hi )", true),
+                (
+                    "bash -c 'unset GH_REPO; gh issue comment 1 --body hi'",
+                    true,
+                ),
+                ("export -n GH_REPO; gh issue comment 1 --body hi", true),
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert_eq!(
+                    blocks(&result),
+                    blocks_expected,
+                    "{command}: {}",
+                    msg(&result)
+                );
+            }
+        });
+        // An export the guard reads as if it ran, or one an unread `unset`
+        // may clear, keeps the checkout too.
+        with_env(&owners_env(), || {
+            let cwd = unowned.path().to_str().expect("utf-8 path");
+            for command in [
+                "[ -n \"$X\" ] && export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi",
+                "false || export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi",
+                "export GH_REPO=cameronsjo/tool; { unset GH_REPO; }; gh issue comment 1 --body hi",
+                "export GH_REPO=cameronsjo/tool; if true; then unset GH_REPO; fi; gh issue comment 1 --body hi",
+                // An inline value a runner then clears never reaches gh.
+                "GH_REPO=cameronsjo/tool env -u GH_REPO gh issue comment 1 --body hi",
+            ] {
+                let result = GhWriteGuard.run(&input_with(command, cwd));
+                assert!(blocks(&result), "{command}: {}", msg(&result));
+            }
+            // An inline value behind `&&` is still certain: it sits on the gh
+            // word, so it reaches gh whenever gh runs.
+            let command = "true && GH_REPO=cameronsjo/tool gh issue comment 1 --body hi";
+            let result = GhWriteGuard.run(&input_with(command, cwd));
+            assert!(!blocks(&result), "{command}: {}", msg(&result));
         });
     }
 
