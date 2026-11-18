@@ -30,10 +30,9 @@
 //! The rendered SessionStart block is bounded by construction — a count and
 //! at most three sanitized plan lines ([`render_start_block`]) — so the
 //! disclosure's size does not grow with the corpus. When the file cap cut the
-//! candidate list, the pointer says "at least N". The per-plan list
-//! ([`render_block`]) is reached only through `cadence-hooks session plans`,
-//! which an operator runs on purpose, and that command scans every file with
-//! no cap on their number ([`plans_report`]).
+//! candidate list, the block says "at least N". The full per-plan list
+//! ([`render_block`]) comes from `cadence-hooks session plans`, which scans
+//! every file with no cap on their number ([`plans_report`]).
 //!
 //! **Every interpolated field is sanitized at render time** — the frontmatter
 //! (`next`/`branch`/`pr`) and the filename-derived slug all originate from a
@@ -1047,7 +1046,10 @@ fn render_start_block(matches: &[(String, PlanFacts)], capped: bool, rel_dir: &s
         .collect();
     let more = match total.saturating_sub(shown.len()) {
         0 => String::new(),
-        n => format!("\n… {n} more not shown: `cadence-hooks session plans` lists every plan."),
+        n => format!(
+            "\n… {}{n} more not shown: `cadence-hooks session plans` lists every plan.",
+            if capped { "at least " } else { "" }
+        ),
     };
     format!(
         "{at_least}{total} in-flight plan{plural} in {rel_dir}/{blocked_note}. Each line \
@@ -1344,14 +1346,14 @@ mod tests {
         );
         assert!(
             line.contains(&format!(
-                "… {} more not shown: `cadence-hooks session plans` lists every plan.",
+                "… at least {} more not shown: `cadence-hooks session plans` lists every plan.",
                 PLAN_SCAN_MAX_FILES - SESSION_START_MAX_PLANS
             )),
             "{line}"
         );
         assert!(
-            line.contains("2026-01-01-old-blocked") || !line.contains("[blocked]"),
-            "a blocked plan in view is listed first: {line}"
+            !line.contains("[blocked]"),
+            "the cap dropped the only (oldest) blocked plan, so none is shown: {line}"
         );
     }
 
@@ -1844,7 +1846,7 @@ mod tests {
         assert!(block.starts_with("At least 6 in-flight plans"), "{block}");
         assert!(
             block.contains(
-                "\n… 3 more not shown: `cadence-hooks session plans` lists every plan.\n"
+                "\n… at least 3 more not shown: `cadence-hooks session plans` lists every plan.\n"
             ),
             "{block}"
         );
