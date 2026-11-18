@@ -1250,6 +1250,15 @@ pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
 /// another folder and `docs/plans` still exists. Plans written there before
 /// the repo set `CADENCE_PLANS_DIR` finish in place, so a reader that dropped
 /// them would hide live work (cadence-hooks keeps such a plan itself).
+/// `repo_root` joined with a `/`-separated folder from [`scan_plans_dirs`],
+/// one component at a time so the path uses the platform's separator.
+pub(crate) fn plans_dir_path(repo_root: &Path, rel_dir: &str) -> std::path::PathBuf {
+    rel_dir
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .fold(repo_root.to_path_buf(), |p, c| p.join(c))
+}
+
 pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
     let configured = scan_plans_dir(repo_root);
     let mut dirs = vec![configured];

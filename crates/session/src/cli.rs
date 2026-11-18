@@ -381,7 +381,11 @@ fn plans_text(repo_root: &std::path::Path, scan: &crate::plan_scan::PlansReport)
 fn scanned_dirs(repo_root: &std::path::Path) -> String {
     crate::persist_plan::scan_plans_dirs(repo_root)
         .iter()
-        .map(|d| repo_root.join(d).display().to_string())
+        .map(|d| {
+            crate::persist_plan::plans_dir_path(repo_root, d)
+                .display()
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join(" and ")
 }

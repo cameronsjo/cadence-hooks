@@ -535,7 +535,7 @@ pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
 }
 
 fn in_flight_plans_in(repo_root: &Path, rel_dir: &str) -> Vec<InFlightPlan> {
-    let plans_dir = repo_root.join(rel_dir);
+    let plans_dir = crate::persist_plan::plans_dir_path(repo_root, rel_dir);
     let Some((paths, _capped)) = list_markdown_files(&plans_dir) else {
         return Vec::new();
     };
@@ -570,7 +570,8 @@ fn matching_plans(repo_root: &Path) -> (Vec<(String, PlanFacts)>, bool) {
     let mut all = Vec::new();
     let mut any_capped = false;
     for rel_dir in crate::persist_plan::scan_plans_dirs(repo_root) {
-        let (matches, capped) = matching_plans_in(&repo_root.join(rel_dir));
+        let (matches, capped) =
+            matching_plans_in(&crate::persist_plan::plans_dir_path(repo_root, &rel_dir));
         all.extend(matches);
         any_capped |= capped;
     }
@@ -627,7 +628,10 @@ fn problem(path: &Path, err: &dyn std::fmt::Display) -> String {
 /// `pub` because `main.rs` dispatches the subcommand across the crate boundary.
 pub fn plans_report(repo_root: &Path) -> PlansReport {
     let rel_dirs = crate::persist_plan::scan_plans_dirs(repo_root);
-    let dirs: Vec<PathBuf> = rel_dirs.iter().map(|d| repo_root.join(d)).collect();
+    let dirs: Vec<PathBuf> = rel_dirs
+        .iter()
+        .map(|d| crate::persist_plan::plans_dir_path(repo_root, d))
+        .collect();
     let label = crate::persist_plan::plans_dirs_label(&rel_dirs);
     plans_report_with(&dirs, &label, &read_capped_strict)
 }
