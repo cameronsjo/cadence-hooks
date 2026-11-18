@@ -582,14 +582,16 @@ pub fn plan_status_pathspecs(repo_root: &Path) -> Vec<String> {
 /// (`M `, `MM`, `A `) is already in the commit's diff; an untracked plan is
 /// already named by the untracked-files warning. The scan is skipped unless a
 /// ` M docs/plans/*.md` line exists, so an ordinary commit pays nothing.
-/// Fails open on every input (no repo, no plan, a quoted path): `None`.
+/// Fails open on every input (no repo, no plan): `None`.
 ///
-/// `porcelain` is `git status --porcelain` output, whose paths are relative
-/// to the repo root.
+/// `porcelain` is `git status --porcelain -z` output, whose paths are
+/// relative to the repo root and never quoted (plain `--porcelain` puts a
+/// path with a space in double quotes, so a plans folder named
+/// `Second Brain/...` would never match).
 pub fn unstaged_plan_at_commit(cwd: &str, porcelain: &str) -> Option<String> {
-    let candidates: Vec<&str> = porcelain
-        .lines()
-        .filter_map(|line| line.strip_prefix(" M "))
+    let candidates: Vec<&str> = porcelain_z_entries(porcelain)
+        .into_iter()
+        .filter_map(|(code, path)| (code == " M").then_some(path))
         .filter(|path| path.ends_with(".md"))
         .collect();
     if candidates.is_empty() {
@@ -604,6 +606,37 @@ pub fn unstaged_plan_at_commit(cwd: &str, porcelain: &str) -> Option<String> {
         .map(|plan| {
             crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY)
         })
+}
+
+/// Split `git status --porcelain -z` output into `(XY, path)` pairs. Each
+/// entry is `XY path`, NUL-terminated; a rename or copy (`R`/`C` in either
+/// column) is followed by its source path as a bare entry, which is skipped.
+/// A caller whose git runner trimmed the output may have lost the first
+/// entry's leading space (` M x` → `M x`); that entry is read as ` M`.
+pub fn porcelain_z_entries(output: &str) -> Vec<(String, &str)> {
+    let mut entries = Vec::new();
+    let mut skip_next = false;
+    for (i, entry) in output.split('\0').enumerate() {
+        if std::mem::take(&mut skip_next) || entry.is_empty() {
+            continue;
+        }
+        let bytes = entry.as_bytes();
+        let parsed = if bytes.get(2) == Some(&b' ') {
+            entry.get(..2).map(str::to_string).zip(entry.get(3..))
+        } else if i == 0 && bytes.get(1) == Some(&b' ') {
+            entry.get(..1).map(|x| format!(" {x}")).zip(entry.get(2..))
+        } else {
+            None
+        };
+        let Some((code, path)) = parsed.filter(|(_, path)| !path.is_empty()) else {
+            continue;
+        };
+        if code.contains(['R', 'C']) {
+            skip_next = true;
+        }
+        entries.push((code, path));
+    }
+    entries
 }
 
 /// Does git's commit summary line (`[branch abc1234] subject`) appear in
@@ -701,6 +734,23 @@ mod tests {
     use tempfile::TempDir;
 
     // --- lint-plan-shape unjudged allows (cameronsjo/cadence-hooks#1256 M-3) ---
+
+    #[test]
+    fn porcelain_z_entries_reads_unquoted_paths() {
+        // A trimmed first entry, a space in a path, a rename's source skipped.
+        let out = "M Second Brain/p.md\0?? new dir/q.md\0R  a.md\0old.md\0 M b.md";
+        let entries = porcelain_z_entries(out);
+        let got: Vec<(&str, &str)> = entries.iter().map(|(c, p)| (c.as_str(), *p)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (" M", "Second Brain/p.md"),
+                ("??", "new dir/q.md"),
+                ("R ", "a.md"),
+                (" M", "b.md"),
+            ]
+        );
+    }
 
     #[test]
     fn plan_store_miss_table() {

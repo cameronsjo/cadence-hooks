@@ -218,7 +218,7 @@ impl Check for WarnUntrackedFiles {
         if !plan_dirs.is_empty()
             && let Some(status) = run_advisory_git(
                 hardened_git(&repo_root)
-                    .args(["status", "--porcelain", "--untracked-files=no", "--"])
+                    .args(["status", "--porcelain", "-z", "--untracked-files=no", "--"])
                     .args(&plan_dirs),
             )
             && let Some(plan) = cadence_hooks_session::plan_guards::unstaged_plan_at_commit(
@@ -449,48 +449,65 @@ mod tests {
 
     #[test]
     fn dirty_unstaged_plan_in_the_configured_plans_folder_nudges() {
-        // cadence#2153: a repo's CADENCE_PLANS_DIR plan gets the same check.
+        // cadence#2153: a repo's CADENCE_PLANS_DIR plan gets the same check,
+        // including in a folder with a space (git quotes such a path in plain
+        // porcelain output).
         use cadence_hooks_core::test_builders::make_bash_with_cwd;
-        let dir = plan_repo();
-        let git = |args: &[&str]| {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(dir.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        };
-        let plans = dir.path().join("Meta").join("plans");
-        std::fs::create_dir_all(&plans).unwrap();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(
-            dir.path().join(".claude/settings.json"),
-            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/plans"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            plans.join("2026-11-18-v.md"),
-            "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [ ] a\n",
-        )
-        .unwrap();
-        git(&["add", ".claude/settings.json", "Meta/plans/2026-11-18-v.md"]);
-        git(&["commit", "-q", "-m", "vault plan"]);
-        std::fs::write(
-            plans.join("2026-11-18-v.md"),
-            "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [x] a\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("work2.rs"), "fn b() {}\n").unwrap();
-        git(&["add", "work2.rs"]);
-        let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
-            "git commit -m x",
-            dir.path().to_str().unwrap(),
-        ));
-        assert_eq!(result.outcome, Outcome::Nudge);
-        let msg = result.message.unwrap_or_default();
-        assert!(msg.contains("Meta/plans/2026-11-18-v.md"), "{msg}");
+        // (CADENCE_PLANS_DIR, a symlink to make, the folder it resolves to)
+        let mut cases = vec![("Meta/plans", None, "Meta/plans")];
+        if cfg!(unix) {
+            cases.push((
+                "Vault/plans",
+                Some(("Vault", "Second Brain")),
+                "Second Brain/plans",
+            ));
+        }
+        for (configured, link, folder) in cases {
+            let dir = plan_repo();
+            let git = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(dir.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+            if let Some((_name, _target)) = link {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(_target, dir.path().join(_name)).unwrap();
+            }
+            std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+            std::fs::write(
+                dir.path().join(".claude/settings.json"),
+                format!(r#"{{"env":{{"CADENCE_PLANS_DIR":"{configured}"}}}}"#),
+            )
+            .unwrap();
+            let plan = format!("{folder}/2026-11-18-v.md");
+            std::fs::write(
+                dir.path().join(&plan),
+                "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [ ] a\n",
+            )
+            .unwrap();
+            git(&["add", ".claude/settings.json", &plan]);
+            git(&["commit", "-q", "-m", "vault plan"]);
+            std::fs::write(
+                dir.path().join(&plan),
+                "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [x] a\n",
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("work2.rs"), "fn b() {}\n").unwrap();
+            git(&["add", "work2.rs"]);
+            let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
+                "git commit -m x",
+                dir.path().to_str().unwrap(),
+            ));
+            assert_eq!(result.outcome, Outcome::Nudge, "{folder}");
+            let msg = result.message.unwrap_or_default();
+            assert!(msg.contains(&plan), "{folder}: {msg}");
+        }
     }
 
     #[test]

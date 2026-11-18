@@ -324,13 +324,14 @@ fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
     // Every folder the scan read, so a plan in the repo's configured plans
     // folder is flagged too (cadence#2153). An ignored folder never shows.
     let dirs = crate::persist_plan::scan_plans_dirs(repo_root);
-    let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
+    // `-z` keeps paths unquoted: plain `--porcelain` puts a path with a
+    // space or a non-ASCII byte in double quotes, which never matches.
+    let mut args = vec!["status", "--porcelain", "-z", "--untracked-files=all", "--"];
     args.extend(dirs.iter().map(String::as_str));
     let status = cadence_hooks_core::shell::git_command(&repo_root.to_string_lossy(), &args)?;
-    let dirty: Vec<&str> = status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(str::trim)
+    let dirty: Vec<&str> = crate::plan_guards::porcelain_z_entries(&status)
+        .into_iter()
+        .map(|(_, path)| path)
         .collect();
     let mut hits: Vec<String> = plans
         .iter()
@@ -1009,27 +1010,51 @@ mod tests {
         assert_eq!(line, None, "committed plan must not draw the line");
     }
 
+    /// A relative directory symlink (unix only; the callers skip it elsewhere).
+    fn symlink_dir(target: &str, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(not(unix))]
+        let _ = (target, link);
+    }
+
     #[test]
     fn uncommitted_plan_line_covers_the_configured_plans_folder() {
         // cadence#2153: a plan in the repo's CADENCE_PLANS_DIR is flagged
-        // like one in docs/plans.
-        let scratch = scratch("plan-uncommitted-configured");
-        init_repo(scratch.path());
-        std::fs::create_dir_all(scratch.path().join(".claude")).unwrap();
-        std::fs::write(
-            scratch.path().join(".claude/settings.json"),
-            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/docs/plans"}}"#,
-        )
-        .unwrap();
-        let plans_dir = scratch.path().join("Meta").join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir).unwrap();
-        std::fs::write(
-            plans_dir.join("2026-11-18-v.md"),
-            "---\nstatus: in-flight\nnext: \"ship it\"\n---\n\nbody\n",
-        )
-        .unwrap();
-        let line = uncommitted_plans_line(scratch.path()).expect("an uncommitted plan line");
-        assert!(line.contains("Meta/docs/plans/2026-11-18-v.md"), "{line}");
+        // like one in docs/plans, including in a folder with a space (git
+        // quotes such a path in plain porcelain output).
+        // (label, CADENCE_PLANS_DIR, a symlink to make, the folder it resolves to)
+        let mut cases = vec![("plain", "Meta/docs/plans", None, "Meta/docs/plans")];
+        if cfg!(unix) {
+            let link = Some(("Vault", "Second Brain"));
+            cases.push(("space", "Vault/plans", link, "Second Brain/plans"));
+        }
+        for (label, configured, link, folder) in cases {
+            let scratch = scratch(&format!("plan-uncommitted-configured-{label}"));
+            init_repo(scratch.path());
+            std::fs::create_dir_all(scratch.path().join(".claude")).unwrap();
+            std::fs::write(
+                scratch.path().join(".claude/settings.json"),
+                format!(r#"{{"env":{{"CADENCE_PLANS_DIR":"{configured}"}}}}"#),
+            )
+            .unwrap();
+            if let Some((name, target)) = link {
+                std::fs::create_dir_all(scratch.path().join(target)).unwrap();
+                symlink_dir(target, &scratch.path().join(name));
+            }
+            let plans_dir = scratch.path().join(folder);
+            std::fs::create_dir_all(&plans_dir).unwrap();
+            std::fs::write(
+                plans_dir.join("2026-11-18-v.md"),
+                "---\nstatus: in-flight\nnext: \"ship it\"\n---\n\nbody\n",
+            )
+            .unwrap();
+            let line = uncommitted_plans_line(scratch.path()).expect("an uncommitted plan line");
+            assert!(
+                line.contains(&format!("{folder}/2026-11-18-v.md")),
+                "{label}: {line}"
+            );
+        }
     }
 
     #[test]

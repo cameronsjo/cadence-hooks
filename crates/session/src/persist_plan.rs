@@ -1359,6 +1359,7 @@ fn real_folder_in_checkout(root: &Path, relative: &str) -> Option<String> {
         .join("/");
     let printable = joined.split('/').all(|part| {
         !part.is_empty()
+            && part.trim() == part
             && part != ".."
             && !part.eq_ignore_ascii_case(".git")
             && part
