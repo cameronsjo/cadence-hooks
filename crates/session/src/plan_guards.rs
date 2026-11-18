@@ -528,20 +528,33 @@ fn plans_for_current_branch(repo_root: &Path) -> Vec<InFlightPlan> {
     else {
         return Vec::new();
     };
-    let root_str = repo_root.to_string_lossy();
-    plan_scan::in_flight_plans(repo_root)
+    let plans: Vec<InFlightPlan> = plan_scan::in_flight_plans(repo_root)
         .into_iter()
         .filter(|plan| plan.branch.as_deref() == Some(branch.as_str()))
-        .filter(|plan| !git_ignores(&root_str, &plan.rel_path))
+        .collect();
+    if plans.is_empty() {
+        return plans;
+    }
+    let ignored = git_ignored(
+        &repo_root.to_string_lossy(),
+        plans.iter().map(|p| p.rel_path.as_str()),
+    );
+    plans
+        .into_iter()
+        .filter(|plan| !ignored.iter().any(|i| *i == plan.rel_path))
         .collect()
 }
 
-/// Does git ignore `rel_path`? `check-ignore` prints the path only when it is
-/// ignored; empty output (or a failed spawn) reads as "not ignored", so the
-/// guard keeps its old behavior when git can't answer.
-fn git_ignores(repo_root: &str, rel_path: &str) -> bool {
-    cadence_hooks_core::shell::git_command(repo_root, &["check-ignore", "--", rel_path])
-        .is_some_and(|out| !out.trim().is_empty())
+/// The subset of `rel_paths` git ignores, from one `git check-ignore` spawn,
+/// which prints each ignored path on its own line. No output (or a failed
+/// spawn) reads as "none ignored", so the guards keep their old behavior
+/// when git can't answer.
+fn git_ignored<'a>(repo_root: &str, rel_paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut args = vec!["-c", "core.quotePath=false", "check-ignore", "--"];
+    args.extend(rel_paths);
+    cadence_hooks_core::shell::git_command(repo_root, &args)
+        .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// The plans folders a commit-time check should pass to `git status`,

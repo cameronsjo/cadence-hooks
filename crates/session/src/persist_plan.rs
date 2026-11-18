@@ -1228,18 +1228,42 @@ fn is_plain_path_name(name: &str) -> bool {
 /// refused one both fall back to the default, since plans written there by
 /// hand are still plans. The result is `/`-joined plain components, safe to
 /// print: [`is_plain_relative`] already held each one to a narrow charset.
+///
+/// The folder must be spelled as it is on disk: a path through a symlink, or
+/// in another letter case on a case-insensitive filesystem, falls back too.
+/// Git tracks a plan only by its real path, and the writer saves to the
+/// resolved folder, so the literal spelling would name a path neither uses.
+///
+/// Readers honor the setting in any repo, while the writer honors it only in
+/// an owned one; the value is held to the same narrow, printable charset
+/// either way.
 pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
+    let session_root = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    scan_plans_dir_with(repo_root, session_root.as_deref())
+}
+
+/// [`scan_plans_dir`] with the session root passed in, for tests.
+fn scan_plans_dir_with(repo_root: &Path, session_root: Option<&Path>) -> String {
     // The writer reads the target checkout's settings, then the session
     // root's (an untracked settings.local.json lives only where it was
     // written). Mirror that for a linked worktree of the session's repo, so
-    // a reader there looks where the writer wrote.
-    let session_repo = std::env::var_os("CLAUDE_PROJECT_DIR")
-        .filter(|v| !v.is_empty())
-        .and_then(|v| crate::registry::repo_root(&PathBuf::from(v).to_string_lossy()))
-        .filter(|session| linked_worktree_of(repo_root, session).is_some());
-    std::iter::once(repo_root)
-        .chain(session_repo.as_deref())
-        .find_map(|d| cadence_hooks_core::config::repo_env_flag(d, PLANS_DIR_KEY))
+    // a reader there looks where the writer wrote. Resolved only when the
+    // repo's own settings don't answer.
+    std::iter::once(repo_root.to_path_buf())
+        .chain(std::iter::from_fn({
+            let mut done = false;
+            move || {
+                if std::mem::replace(&mut done, true) {
+                    return None;
+                }
+                session_root
+                    .and_then(|v| crate::registry::repo_root(&v.to_string_lossy()))
+                    .filter(|session| linked_worktree_of(repo_root, session).is_some())
+            }
+        }))
+        .find_map(|d| cadence_hooks_core::config::repo_env_flag(&d, PLANS_DIR_KEY))
         .filter(|rel| is_plain_relative(rel))
         .map(|rel| {
             Path::new(&rel)
@@ -1251,15 +1275,17 @@ pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
                 .collect::<Vec<_>>()
                 .join("/")
         })
+        .filter(|rel| rel.len() <= MAX_SCAN_PLANS_DIR_BYTES)
         .filter(|rel| nests_without_creating(repo_root, rel))
         .unwrap_or_else(|| DEFAULT_PLANS_DIR.to_string())
 }
 
-/// Every plans directory a reader scans, relative to `repo_root`, in order:
-/// [`scan_plans_dir`], then `docs/plans` as well when the repo configured
-/// another folder and `docs/plans` still exists. Plans written there before
-/// the repo set `CADENCE_PLANS_DIR` finish in place, so a reader that dropped
-/// them would hide live work (cadence-hooks keeps such a plan itself).
+/// The longest configured plans folder a reader accepts, in bytes. The name
+/// is repo-authored and lands in SessionStart context, which is kept to short
+/// lines, so a longer value falls back to `docs/plans` (the same 120 bytes
+/// `identity::MAX_FIELD_DISPLAY` allows any other repo-authored field).
+const MAX_SCAN_PLANS_DIR_BYTES: usize = 120;
+
 /// `repo_root` joined with a `/`-separated folder from [`scan_plans_dirs`],
 /// one component at a time so the path uses the platform's separator.
 pub(crate) fn plans_dir_path(repo_root: &Path, rel_dir: &str) -> std::path::PathBuf {
@@ -1269,6 +1295,11 @@ pub(crate) fn plans_dir_path(repo_root: &Path, rel_dir: &str) -> std::path::Path
         .fold(repo_root.to_path_buf(), |p, c| p.join(c))
 }
 
+/// Every plans directory a reader scans, relative to `repo_root`, in order:
+/// [`scan_plans_dir`], then `docs/plans` as well when the repo configured
+/// another folder and `docs/plans` still exists. Plans written there before
+/// the repo set `CADENCE_PLANS_DIR` finish in place, so a reader that dropped
+/// them would hide live work (cadence-hooks keeps such a plan itself).
 pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
     let configured = scan_plans_dir(repo_root);
     let mut dirs = vec![configured];
@@ -1302,11 +1333,17 @@ fn nests_without_creating(root: &Path, relative: &str) -> bool {
         return false;
     };
     let target = root.join(relative);
-    target
-        .ancestors()
-        .find(|a| a.exists())
-        .and_then(|a| a.canonicalize().ok())
-        .is_some_and(|a| a.starts_with(&canonical_root))
+    let Some(existing) = target.ancestors().find(|a| a.exists()) else {
+        return false;
+    };
+    let Ok(rel_existing) = existing.strip_prefix(root) else {
+        return false;
+    };
+    // Spelled as on disk: the existing part resolves to exactly the same
+    // components under the resolved root, so no symlink or case change.
+    existing
+        .canonicalize()
+        .is_ok_and(|a| a == canonical_root.join(rel_existing))
 }
 
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
@@ -7332,6 +7369,18 @@ mod tests {
             "a scan must never create the folder it reads"
         );
     }
+    #[test]
+    fn scan_plans_dir_falls_back_on_an_overlong_value() {
+        // A repo's settings could otherwise fill SessionStart context with a
+        // long, plain-charset folder name.
+        let repo = TempDir::new().unwrap();
+        let long = "Do-this-now.".repeat(100);
+        write_settings_env(repo.path(), PLANS_DIR_KEY, &long);
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+        let ok = "a".repeat(MAX_SCAN_PLANS_DIR_BYTES);
+        write_settings_env(repo.path(), PLANS_DIR_KEY, &ok);
+        assert_eq!(scan_plans_dir(repo.path()), ok);
+    }
 
     #[test]
     fn scan_plans_dir_falls_back_on_an_empty_or_refused_value() {
@@ -7350,12 +7399,70 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn scan_plans_dirs_does_not_scan_docs_plans_twice_through_a_symlink() {
+    fn scan_plans_dirs_reads_docs_plans_once_through_an_in_repo_symlink() {
+        // Git tracks the plan at docs/plans/x.md and the writer saves there,
+        // so the symlinked spelling falls back to docs/plans, scanned once.
         let repo = TempDir::new().unwrap();
         std::fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
         std::os::unix::fs::symlink("docs", repo.path().join("Docs")).unwrap();
         write_settings_env(repo.path(), PLANS_DIR_KEY, "Docs/plans");
-        assert_eq!(scan_plans_dirs(repo.path()), vec!["Docs/plans".to_string()]);
+        assert_eq!(
+            scan_plans_dirs(repo.path()),
+            vec![DEFAULT_PLANS_DIR.to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_plans_dir_reads_the_session_checkouts_settings_from_a_linked_worktree() {
+        // The writer reads an untracked settings.local.json in the session
+        // checkout when the worktree has none; the readers must too.
+        let primary = TempDir::new().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(primary.path(), &["init", "-q", "-b", "main"]);
+        git(
+            primary.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::create_dir_all(primary.path().join(".claude")).unwrap();
+        std::fs::write(
+            primary.path().join(".claude/settings.local.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/plans"}}"#,
+        )
+        .unwrap();
+        let holder = TempDir::new().unwrap();
+        let wt = holder.path().join("wt");
+        git(
+            primary.path(),
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        assert_eq!(scan_plans_dir_with(&wt, None), DEFAULT_PLANS_DIR);
+        assert_eq!(scan_plans_dir_with(&wt, Some(primary.path())), "Meta/plans");
+        // An unrelated session root is not evidence of anything.
+        let other = TempDir::new().unwrap();
+        git(other.path(), &["init", "-q"]);
+        assert_eq!(
+            scan_plans_dir_with(&wt, Some(other.path())),
+            DEFAULT_PLANS_DIR
+        );
     }
 
     #[cfg(unix)]

@@ -210,7 +210,7 @@ The `session start` plan lines, `session plans`, and the plan guards SHALL read 
 - **THEN** the readers scan `docs/plans/`
 
 ### Requirement: Plans folder edge cases for readers
-A configured folder that resolves to `docs/plans/` itself SHALL be read once. In a linked worktree of the session's repo, the readers SHALL read the session checkout's settings after the worktree's, as the persist hook does. The plan guards MUST skip a plan git ignores, since their advice is to commit it.
+A configured folder longer than 120 bytes, or spelled other than as it is on disk (through a symlink, or in another letter case), SHALL fall back to `docs/plans/`. In a linked worktree of the session's repo, the readers SHALL read the session checkout's settings after the worktree's, as the persist hook does. The tick nudge, the ready-flip warning, and the commit-time unstaged-plan check MUST skip a plan git ignores, since their advice is to commit it.
 
 #### Scenario: Gitignored plans folder
 - **WHEN** `CADENCE_PLANS_DIR` is a gitignored `.claude/plans` holding the branch's in-flight plan, and three commits land without touching it
@@ -218,7 +218,11 @@ A configured folder that resolves to `docs/plans/` itself SHALL be read once. In
 
 #### Scenario: Symlink to docs/plans
 - **WHEN** `CADENCE_PLANS_DIR` is `Docs/plans` and `Docs` is a symlink to `docs`
-- **THEN** the readers scan only `Docs/plans`
+- **THEN** the readers scan only `docs/plans`
+
+#### Scenario: Overlong folder name
+- **WHEN** `CADENCE_PLANS_DIR` is a plain-charset value of 1,000 bytes
+- **THEN** the readers scan `docs/plans/` and the SessionStart pointer does not contain the value
 
 ### Requirement: Untrusted plan text and cloud behavior
 Values from plan files, their names, or the ledger MUST have control characters flattened and length capped before reaching additionalContext. Under `CLAUDE_CODE_REMOTE=true`, `persist-plan-approval` SHALL exit 0 with no output, which also stops its liveness refresh, while the four plan guards run. None of these hooks MAY be silenced through `.claude/cadence.json` `nudges`.

@@ -46,3 +46,18 @@ The `session start` plan lines, `session plans`, and the plan guards SHALL read 
 #### Scenario: Refused folder
 - **WHEN** `CADENCE_PLANS_DIR` is `../outside` or names a symlink that resolves outside the checkout
 - **THEN** the readers scan `docs/plans/`
+
+### Requirement: Plans folder edge cases for readers
+A configured folder longer than 120 bytes, or spelled other than as it is on disk (through a symlink, or in another letter case), SHALL fall back to `docs/plans/`. In a linked worktree of the session's repo, the readers SHALL read the session checkout's settings after the worktree's, as the persist hook does. The tick nudge, the ready-flip warning, and the commit-time unstaged-plan check MUST skip a plan git ignores, since their advice is to commit it.
+
+#### Scenario: Gitignored plans folder
+- **WHEN** `CADENCE_PLANS_DIR` is a gitignored `.claude/plans` holding the branch's in-flight plan, and three commits land without touching it
+- **THEN** `session nudge-plan-tick` exits 0 with no output
+
+#### Scenario: Symlink to docs/plans
+- **WHEN** `CADENCE_PLANS_DIR` is `Docs/plans` and `Docs` is a symlink to `docs`
+- **THEN** the readers scan only `docs/plans`
+
+#### Scenario: Overlong folder name
+- **WHEN** `CADENCE_PLANS_DIR` is a plain-charset value of 1,000 bytes
+- **THEN** the readers scan `docs/plans/` and the SessionStart pointer does not contain the value
