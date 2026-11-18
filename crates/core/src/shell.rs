@@ -6400,6 +6400,9 @@ struct DirWalk {
     known_commands: std::cell::OnceCell<bool>,
     /// How an `eval` of text this walk cannot see is read.
     unread_eval: UnreadEval,
+    /// The home a leading `$HOME` in a directory verb's target expands to,
+    /// or `None` when the command may rebind `HOME` ([`verb_target`]).
+    home: Option<std::rc::Rc<str>>,
 }
 
 /// Most checkout-root lookups one walk makes (each reads the disk); past it a
@@ -6876,7 +6879,12 @@ fn toplevel_substitution(operand: &str) -> Option<Option<String>> {
 
 /// Read a `cd`/`pushd`/`popd`'s target from its words (the verb first).
 /// Mirrors the push walk's `resolve_directory_verb`.
-fn verb_target(words: &[MarkedToken]) -> VerbTarget {
+///
+/// A target opening with a `$HOME` or `${HOME}` bash expands is read against
+/// `home` ([`expand_leading_home`]), so `cd "$HOME/x"` lands where `cd ~/x`
+/// does. `home` is `None` when the command may rebind `HOME`
+/// ([`home_may_be_rebound`]); the target is then unreadable, as before.
+fn verb_target(words: &[MarkedToken], home: Option<&str>) -> VerbTarget {
     let verb = words[0].text.as_str();
     let verb = unescape_word(verb);
     let pop = verb == "popd";
@@ -6909,8 +6917,27 @@ fn verb_target(words: &[MarkedToken]) -> VerbTarget {
             }
             continue;
         }
-        operands.push(word.text.as_str());
+        operands.push(word);
     }
+    let home_target = match operands.as_slice() {
+        // An unquoted `$HOME` is split and globbed by bash after expansion;
+        // a home holding whitespace or a glob character then lands somewhere
+        // this walk does not model (`cd $HOME/x` with two words fails), so
+        // it stays unread. zsh neither splits nor globs it and lands in the
+        // directory; reading it there is an accepted gap (the repo-ownership
+        // spec, "Home directory in a gh write's cd").
+        [target]
+            if target.unquoted_prefix_len > 0
+                && home.is_some_and(|home| home.contains([' ', '\t', '\n', '*', '?', '['])) =>
+        {
+            None
+        }
+        [target] => home
+            .and_then(|home| expand_leading_home(target, home))
+            .filter(|expanded| !expanded.contains(['$', '`'])),
+        _ => None,
+    };
+    let operands: Vec<&str> = operands.iter().map(|word| word.text.as_str()).collect();
     if pop {
         // Any option or operand (`popd -n`, `popd +1`) is not read here.
         return if operands.is_empty() {
@@ -6924,6 +6951,9 @@ fn verb_target(words: &[MarkedToken]) -> VerbTarget {
         toplevel_substitution(&operands.join(" ")).filter(|_| !operands.is_empty())
     {
         return VerbTarget::RepoRoot(git_dir);
+    }
+    if let Some(expanded) = home_target {
+        return VerbTarget::To(expanded);
     }
     match operands.as_slice() {
         [] if !stack_verb => VerbTarget::To("~".to_string()),
@@ -7395,7 +7425,7 @@ impl DirWalk {
             "cd" | "pushd" | "popd" if !own_process => {
                 let maybe = context.conditional || ambiguous || command_prefixed;
                 let pushes = name == "pushd";
-                let mut target = verb_target(words);
+                let mut target = verb_target(words, self.home.as_deref());
                 // Only a live double-quoted or bare substitution is one: in
                 // single quotes or escaped it is a directory's name, and a
                 // `git` the command may have replaced names anything.
@@ -7711,6 +7741,20 @@ fn segment_work_dirs_with_cdpath(
         conditional: readings.len() > 1,
         looped: false,
     };
+    // [`home_may_be_rebound`] lets a plain `HOME=/x` through, since a
+    // placeholder can stand for it; an expansion cannot, so any
+    // `HOME=` anywhere in the command (not `XDG_CONFIG_HOME=`) leaves `$HOME`
+    // targets unread. The match is textual, so a `HOME=` inside quoted text
+    // counts too: that over-reads, and the target is then unread, never
+    // misread.
+    static HOME_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:^|[^A-Za-z0-9_])HOME=").expect("HOME assignment pattern compiles")
+    });
+    let home: Option<std::rc::Rc<str>> = (!home_may_be_rebound(command)
+        && !HOME_ASSIGNMENT.is_match(command))
+    .then(crate::paths::user_home_lossy_or_default)
+    .filter(|home| !home.is_empty())
+    .map(std::rc::Rc::from);
     let mut located = Vec::new();
     let mut seen: std::collections::HashSet<(String, std::rc::Rc<str>)> =
         std::collections::HashSet::new();
@@ -7719,6 +7763,7 @@ fn segment_work_dirs_with_cdpath(
             command: command.to_string(),
             env_cdpath,
             unread_eval,
+            home: home.clone(),
             ..DirWalk::default()
         };
         let mut dirs = DirSet::new(cwd);
@@ -25932,6 +25977,59 @@ mod tests {
             let want: std::collections::BTreeSet<String> =
                 want.into_iter().map(String::from).collect();
             assert_eq!(got, want, "CDPATH env {env_cdpath}: {command:?}");
+        }
+    }
+
+    /// A `cd` to a leading `$HOME` bash expands lands under the process home,
+    /// and any `HOME=` in the command leaves it unread: a later inline one,
+    /// one behind `env`, one on the `cd` itself, an `export`, and one inside
+    /// quoted text (over-reading, never a miss). Reads the live home and
+    /// never sets `HOME`, which other tests in this process read unlocked.
+    #[test]
+    fn segment_work_dirs_reads_a_home_target_unless_home_may_be_rebound() {
+        const X: &str = UNRESOLVABLE_DIR;
+        let home = crate::paths::user_home_lossy_or_default();
+        // An unquoted `$HOME` is unread for a home bash would split or glob,
+        // so the expected landing below holds only for a plain home.
+        if home.is_empty() || home.contains([' ', '\t', '\n', '*', '?', '[']) {
+            return;
+        }
+        let up = format!("{home}/up");
+        for (command, want) in [
+            ("cd \"$HOME/up\"; gh pr create", vec![up.as_str()]),
+            ("cd $HOME/up; gh pr create", vec![up.as_str()]),
+            ("cd \"${HOME}\"/up; gh pr create", vec![up.as_str()]),
+            (
+                "XDG_CONFIG_HOME=/x; cd \"$HOME/up\"; gh pr create",
+                vec![up.as_str()],
+            ),
+            ("cd \"$HOME/up\" && HOME=/x gh pr create", vec!["/cwd", X]),
+            (
+                "cd \"$HOME/up\" && env HOME=/x gh pr create",
+                vec!["/cwd", X],
+            ),
+            ("HOME=/x cd \"$HOME/up\"; gh pr create", vec!["/cwd", X]),
+            (
+                "export HOME=/x; cd \"$HOME/up\"; gh pr create",
+                vec!["/cwd", X],
+            ),
+            (
+                "git commit -m \"fix HOME=x\"; cd \"$HOME/up\"; gh pr create",
+                vec!["/cwd", X],
+            ),
+            ("cd '$HOME/up'; gh pr create", vec!["/cwd", X]),
+        ] {
+            let located =
+                segment_work_dirs_with_cdpath(command, "/cwd", false, UnreadEval::MayMove);
+            let last = located.last().map(|segment| segment.raw.clone());
+            let got: std::collections::BTreeSet<String> = located
+                .iter()
+                .filter(|segment| Some(&segment.raw) == last.as_ref())
+                .map(|segment| segment.dir.to_string())
+                .collect();
+            let want: std::collections::BTreeSet<String> =
+                want.into_iter().map(String::from).collect();
+            assert_eq!(got, want, "{command:?}");
         }
     }
 
