@@ -53,32 +53,53 @@ const COMMIT_MARKER_KIND: &str = "overshare-commit-warned";
 /// same session are silent. Nothing else is ever silenced: a push, a post, a
 /// file edit and every commit that is not the exact plain form remind each time.
 ///
-/// Fails toward reminding (ADR-0001): no session id, a marker directory that is
-/// not private, or an unwritable marker all leave the reminder in place.
+/// This only reads the marker. It is written by [`record_delivered`], which the
+/// dispatcher calls once the reminder has actually been emitted, so a reminder
+/// that repo configuration suppresses, or that a sibling process already
+/// delivered, never uses up the session's one reminder.
 fn run_quiet_period(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) -> CheckResult {
     let result = run_with_env(input, bypass, vault);
-    if result.outcome != Outcome::Nudge || input.normalized_tool_name() != Some("Bash") {
+    if result.outcome != Outcome::Nudge {
         return result;
     }
-    if !input.command().is_some_and(is_plain_commit) {
-        return result;
+    match quiet_marker(input) {
+        Some(marker) if marker.exists() => CheckResult::allow(),
+        _ => result,
+    }
+}
+
+/// Record that this payload's reminder was delivered, so later plain commits in
+/// the session are silent. A no-op for everything but a plain `git commit` that
+/// [`quiet_marker`] accepts. Called by the dispatcher after it emits a
+/// `warn-overshare` nudge (never after a suppressed or deduplicated one); a
+/// failed write leaves the reminder in place (ADR-0001).
+pub fn record_delivered(input: &HookInput) {
+    if let Some(marker) = quiet_marker(input) {
+        let _ = markers::write_marker(&marker, "");
+    }
+}
+
+/// The quiet-period marker for `input`, or `None` when this payload takes no
+/// part in the quiet period and must always remind: not a Bash call, not a plain
+/// commit, no usable session id, or a marker directory that is not private.
+///
+/// Fails toward reminding (ADR-0001).
+fn quiet_marker(input: &HookInput) -> Option<std::path::PathBuf> {
+    if input.normalized_tool_name() != Some("Bash") || !input.command().is_some_and(is_plain_commit)
+    {
+        return None;
     }
     // `session_marker` falls back to a per-process id when the payload carries
     // none, which would never match twice: require a real, non-empty id.
     if !input.session_id().is_some_and(|sid| !sid.is_empty()) {
-        return result;
+        return None;
     }
     // A shared (unhardened) marker directory lets a co-tenant pre-plant the
     // marker and mute the reminder; degrade toward reminding, as `claim_today`.
     if !markers::marker_dir_is_private() {
-        return result;
+        return None;
     }
-    let marker = markers::session_marker(input, COMMIT_MARKER_KIND, None);
-    if marker.exists() {
-        return CheckResult::allow();
-    }
-    let _ = markers::write_marker(&marker, "");
-    result
+    Some(markers::session_marker(input, COMMIT_MARKER_KIND, None))
 }
 
 /// True only when the whole command is one plain `git commit` invocation: the
@@ -658,8 +679,14 @@ mod tests {
         cadence_hooks_core::test_builders::with_marker_dir(dir.path(), f)
     }
 
+    /// The check's verdict, then the dispatcher's step for an emitted reminder:
+    /// a delivered nudge spends the quiet period.
     fn outcome(input: &HookInput) -> Outcome {
-        run_quiet_period(input, None, None).outcome
+        let result = run_quiet_period(input, None, None);
+        if result.outcome == Outcome::Nudge {
+            record_delivered(input);
+        }
+        result.outcome
     }
 
     /// Spend the session's one commit reminder, as the first plain commit does.
@@ -909,6 +936,90 @@ mod tests {
         assert!(text.contains("overshare"));
         assert!(text.contains(BYPASS_ENV));
         assert!(text.chars().count() < 300, "{} chars", text.chars().count());
+    }
+
+    #[test]
+    fn a_reminder_that_is_not_delivered_does_not_spend_the_quiet_period() {
+        quiet(|| {
+            let input = in_session("git commit -m x", "sid-undelivered");
+            // The check nudged, but the dispatcher never emitted it (repo
+            // configuration suppressed it, or a sibling delivered it).
+            for _ in 0..3 {
+                assert_eq!(run_quiet_period(&input, None, None).outcome, Outcome::Nudge);
+            }
+            // Delivering it for any other payload spends nothing for this one.
+            record_delivered(&in_session("git push", "sid-undelivered"));
+            record_delivered(&in_session(
+                "git commit -m x && git push",
+                "sid-undelivered",
+            ));
+            record_delivered(&in_session("git -C o commit -m x", "sid-undelivered"));
+            record_delivered(&in_session("git commit -m x", "another-session"));
+            assert_eq!(run_quiet_period(&input, None, None).outcome, Outcome::Nudge);
+            record_delivered(&input);
+            assert_eq!(run_quiet_period(&input, None, None).outcome, Outcome::Allow);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_directory_that_is_not_private_reminds_every_time() {
+        // A symlink squatting the per-user directory makes the hardening step
+        // refuse it, so the marker directory falls back to the shared base. The
+        // symlink API is unix-only here; the refusal itself is platform-neutral.
+        quiet(|| {
+            let private = markers::marker_dir();
+            assert!(markers::marker_dir_is_private(), "control: private first");
+            std::fs::remove_dir_all(&private).unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(elsewhere.path(), &private).unwrap();
+            assert!(!markers::marker_dir_is_private(), "precondition");
+            let input = in_session("git commit -m x", "sid-shared-dir");
+            for _ in 0..3 {
+                assert_eq!(outcome(&input), Outcome::Nudge);
+            }
+            let would_be = markers::session_marker(&input, COMMIT_MARKER_KIND, None);
+            assert!(
+                !would_be.exists(),
+                "nothing may be planted in the shared base"
+            );
+        });
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_reminds_every_time() {
+        quiet(|| {
+            let input = in_session("git commit -m x", "sid-unwritable");
+            let marker = markers::session_marker(&input, COMMIT_MARKER_KIND, None);
+            // `write_marker` stages through `.<name>.<pid>.tmp`; a directory
+            // squatting that name makes the staged write fail on every platform.
+            let name = marker.file_name().unwrap().to_string_lossy().into_owned();
+            let staged = marker
+                .parent()
+                .unwrap()
+                .join(format!(".{name}.{}.tmp", std::process::id()));
+            std::fs::create_dir(staged).unwrap();
+            assert!(markers::write_marker(&marker, "").is_err(), "precondition");
+            for _ in 0..3 {
+                assert_eq!(outcome(&input), Outcome::Nudge);
+            }
+            assert!(!marker.exists());
+            // Control: the same setup goes quiet for a session whose staged
+            // name is not squatted, so the nudges above come from the failed
+            // write and not from some other reason this payload never qualifies.
+            spend_commit_reminder("sid-writable");
+        });
+    }
+
+    #[test]
+    fn the_reminder_names_the_categories_the_spec_requires() {
+        // openspec/specs/external-content: the reminder asks the model to check
+        // for health, relationships and non-technical biography. A later
+        // shortening must not drop one unnoticed.
+        let text = nudge_text();
+        for word in ["health", "relationships", "non-technical biography"] {
+            assert!(text.contains(word), "reminder lost {word:?}: {text}");
+        }
     }
 
     #[test]

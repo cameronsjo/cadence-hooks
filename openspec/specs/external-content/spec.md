@@ -161,7 +161,11 @@ The `redaction` section of `.claude/cadence.json` SHALL tune the shaped tier onl
 - **THEN** the file is unchanged and the exit status is 0
 
 ### Requirement: Overshare audit triggers
-`cadence warn-overshare` SHALL nudge, never block, with a `Pre-ship audit:` message asking the model to check outgoing content for personal context, on a Bash command carrying `git push` or a posting segment as defined for `redact-external-content` (a `gh api` write that posts no prose field excepted), and on a Write, Edit or MultiEdit to a path containing `/docs/field-reports/`. Reads, views and listings MUST be allowed.
+`cadence warn-overshare` SHALL nudge, never block, with a `Pre-ship audit:` message asking the model to check outgoing content for personal context (health, relationships, non-technical biography), on a Bash command carrying `git commit`, `git push` or a posting segment as defined for `redact-external-content` (a `gh api` write that posts no prose field excepted), and on a Write, Edit or MultiEdit to a path containing `/docs/field-reports/`. Reads, views and listings MUST be allowed.
+
+#### Scenario: Commit nudges
+- **WHEN** a Bash call runs `git commit -m 'x'` as the first commit of a session
+- **THEN** the hook exits 0 with a nudge containing `overshare`
 
 #### Scenario: Push nudges
 - **WHEN** a Bash call runs `git push origin main`
@@ -302,6 +306,13 @@ In an MCP call, a string under an old-side key (`old_string`, `oldString`, `old_
 #### Scenario: Commit chained with a push
 - **WHEN** a session has spent its quiet period and runs `git commit -m 'x' && git push`
 - **THEN** the hook exits 0 with a nudge
+
+### Requirement: Overshare quiet period spending
+The quiet period SHALL be spent only when the reminder is emitted, and only by the process that emits it. A reminder that repo configuration suppresses SHALL NOT spend it.
+
+#### Scenario: Suppressed first commit
+- **WHEN** repo configuration suppresses the reminder for a session's first plain commit, and the same session then runs a plain commit in a repo that does not
+- **THEN** that second commit exits 0 with a nudge, and a third plain commit exits 0 with no output
 
 ### Requirement: Overshare plain commit shape
 A commit SHALL be plain only when the whole command is one `git commit` invocation: the trimmed text starts with `git commit` and a blank or the end, and everything after it is bare words of ASCII letters, digits and `_ . / = : @ + , % -`, single-quoted text, or double-quoted text with no `$`, backtick, backslash or `!`, separated by spaces or tabs. Any other text MUST NOT be plain.

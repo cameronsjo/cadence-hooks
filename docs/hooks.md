@@ -117,7 +117,8 @@ plain commits in that session. Every push, every post, every field-report edit
 and every other form of commit (a global option, a `cd`, a chain, a pipe, a
 substitution, a heredoc) reminds every time. The quiet period is keyed on the
 session id alone, so a subagent and its parent share it; with no session id it
-never applies.
+never applies. It is spent only when the reminder is emitted: a reminder the
+repo's `nudges` config suppresses does not use it.
 
 ## guardrails (git-guardrails)
 
