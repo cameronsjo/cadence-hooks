@@ -1216,6 +1216,159 @@ fn is_plain_path_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The plans directory, relative to `repo_root`, that a READER scans: the
+/// repo's `CADENCE_PLANS_DIR` when it passes the same [`is_plain_relative`]
+/// gate the writer applies and does not resolve outside the checkout, else
+/// [`DEFAULT_PLANS_DIR`] (cameronsjo/cadence#2153). Without this the writer
+/// honors the key and every reader keeps scanning `docs/plans`, so a repo that
+/// declares its own folder gets its plans persisted where no scan looks.
+///
+/// Read-only, unlike [`canonical_plans_dir`]: a scan must never create the
+/// directory it was asked to read. An empty value (the writer's opt-out) and a
+/// refused one both fall back to the default, since plans written there by
+/// hand are still plans. The result is `/`-joined plain components, safe to
+/// print: [`is_plain_relative`] already held each one to a narrow charset.
+///
+/// The folder is reported by its real path inside the checkout: a spelling
+/// through an in-repo symlink, or in another letter case on a
+/// case-insensitive filesystem, resolves to the folder the writer saves in
+/// and git tracks.
+///
+/// Readers honor the setting in any repo, while the writer honors it only in
+/// an owned one; the value is held to the same narrow, printable charset
+/// either way.
+pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
+    let session_root = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    scan_plans_dir_with(repo_root, session_root.as_deref())
+}
+
+/// [`scan_plans_dir`] with the session root passed in, for tests.
+fn scan_plans_dir_with(repo_root: &Path, session_root: Option<&Path>) -> String {
+    // The writer reads the target checkout's settings, then the session
+    // root's (an untracked settings.local.json lives only where it was
+    // written). Mirror that for a linked worktree of the session's repo, so
+    // a reader there looks where the writer wrote. Resolved only when the
+    // repo's own settings don't answer.
+    std::iter::once(repo_root.to_path_buf())
+        .chain(std::iter::from_fn({
+            let mut done = false;
+            move || {
+                if std::mem::replace(&mut done, true) {
+                    return None;
+                }
+                session_root
+                    .and_then(|v| crate::registry::repo_root(&v.to_string_lossy()))
+                    .filter(|session| linked_worktree_of(repo_root, session).is_some())
+            }
+        }))
+        .find_map(|d| cadence_hooks_core::config::repo_env_flag(&d, PLANS_DIR_KEY))
+        .filter(|rel| is_plain_relative(rel))
+        .map(|rel| {
+            Path::new(&rel)
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .filter(|rel| rel.len() <= MAX_SCAN_PLANS_DIR_BYTES)
+        .and_then(|rel| real_folder_in_checkout(repo_root, &rel))
+        .unwrap_or_else(|| DEFAULT_PLANS_DIR.to_string())
+}
+
+/// The longest configured plans folder a reader accepts, in bytes. The name
+/// is repo-authored and lands in SessionStart context, which is kept to short
+/// lines, so a longer value falls back to `docs/plans` (the same 120 bytes
+/// `identity::MAX_FIELD_DISPLAY` allows any other repo-authored field).
+const MAX_SCAN_PLANS_DIR_BYTES: usize = 120;
+
+/// `repo_root` joined with a `/`-separated folder from [`scan_plans_dirs`],
+/// one component at a time so the path uses the platform's separator.
+pub(crate) fn plans_dir_path(repo_root: &Path, rel_dir: &str) -> std::path::PathBuf {
+    rel_dir
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .fold(repo_root.to_path_buf(), |p, c| p.join(c))
+}
+
+/// Every plans directory a reader scans, relative to `repo_root`, in order:
+/// [`scan_plans_dir`], then `docs/plans` as well when the repo configured
+/// another folder and `docs/plans` still exists. Plans written there before
+/// the repo set `CADENCE_PLANS_DIR` finish in place, so a reader that dropped
+/// them would hide live work (cadence-hooks keeps such a plan itself).
+pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
+    let configured = scan_plans_dir(repo_root);
+    let mut dirs = vec![configured];
+    let default = plans_dir_path(repo_root, DEFAULT_PLANS_DIR);
+    // Compared as resolved paths too, so a symlink or a case-insensitive
+    // spelling of docs/plans is not scanned (and counted) twice.
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if dirs[0] != DEFAULT_PLANS_DIR
+        && default.is_dir()
+        && !same(&plans_dir_path(repo_root, &dirs[0]), &default)
+    {
+        // A configured folder that doesn't exist yet holds no plans, so
+        // naming it beside docs/plans would only mislead.
+        if !plans_dir_path(repo_root, &dirs[0]).is_dir() {
+            dirs.clear();
+        }
+        dirs.push(DEFAULT_PLANS_DIR.to_string());
+    }
+    dirs
+}
+
+/// How a reader names the folders it scanned, without the trailing `/` its
+/// messages add: `docs/plans`, or `Meta/docs/plans/ and docs/plans`.
+pub(crate) fn plans_dirs_label(dirs: &[String]) -> String {
+    dirs.join("/ and ")
+}
+
+/// `<root>/<relative>` as the folder's real path relative to `root`, the
+/// path the writer saves under and git tracks: the nearest existing ancestor
+/// is resolved (symlinks, letter case) and the parts that don't exist yet are
+/// kept as written. `None` when it resolves outside `root`, or when the real
+/// path is over the length cap or uses a character other than the setting's
+/// charset plus a space (a vault folder like `Second Brain` is common, and
+/// the writer saves there). Nothing is created.
+fn real_folder_in_checkout(root: &Path, relative: &str) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
+    let target = root.join(relative);
+    // `symlink_metadata`, not `exists`: a broken in-repo link counts as
+    // existing, so its canonicalize fails and the setting is refused rather
+    // than read through the link later.
+    let existing = target
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a).is_ok())?;
+    let missing = target.strip_prefix(existing).ok()?.to_path_buf();
+    let real = existing.canonicalize().ok()?.join(missing);
+    let rel = real.strip_prefix(&canonical_root).ok()?;
+    let joined = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    let printable = joined.split('/').all(|part| {
+        !part.is_empty()
+            && part.trim() == part
+            && part != ".."
+            && !part.eq_ignore_ascii_case(".git")
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+    });
+    (printable && joined.len() <= MAX_SCAN_PLANS_DIR_BYTES).then_some(joined)
+}
+
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
 /// needed, and return its canonical path alongside the canonical `root`. The
 /// result is used only when the canonical plans dir actually nests under the
@@ -7219,6 +7372,155 @@ mod tests {
             )],
             ..base_env(user_plans_dir)
         }
+    }
+
+    // --- scan_plans_dir: the readers' view of CADENCE_PLANS_DIR (cadence#2153) ---
+
+    #[test]
+    fn scan_plans_dir_defaults_without_a_setting() {
+        let repo = TempDir::new().unwrap();
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+    }
+
+    #[test]
+    fn scan_plans_dir_reads_the_configured_folder_without_creating_it() {
+        let repo = TempDir::new().unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "./Meta/docs/plans/");
+        assert_eq!(scan_plans_dir(repo.path()), "Meta/docs/plans");
+        assert!(
+            !repo.path().join("Meta").exists(),
+            "a scan must never create the folder it reads"
+        );
+    }
+    #[test]
+    fn scan_plans_dir_falls_back_on_an_overlong_value() {
+        // A repo's settings could otherwise fill SessionStart context with a
+        // long, plain-charset folder name.
+        let repo = TempDir::new().unwrap();
+        let long = "Do-this-now.".repeat(100);
+        write_settings_env(repo.path(), PLANS_DIR_KEY, &long);
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+        let ok = "a".repeat(MAX_SCAN_PLANS_DIR_BYTES);
+        write_settings_env(repo.path(), PLANS_DIR_KEY, &ok);
+        assert_eq!(scan_plans_dir(repo.path()), ok);
+    }
+
+    #[test]
+    fn scan_plans_dir_falls_back_on_an_empty_or_refused_value() {
+        for value in [
+            "",
+            "/etc",
+            "../outside",
+            "a\\b",
+            ".git/plans",
+            "docs/plans\nX",
+        ] {
+            let repo = TempDir::new().unwrap();
+            write_settings_env(repo.path(), PLANS_DIR_KEY, value);
+            assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR, "{value:?}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dir_reports_a_symlinked_folder_by_its_real_path() {
+        // The writer saves under the resolved folder, so the readers must read
+        // that folder: Meta -> vault/Meta makes Meta/plans vault/Meta/plans.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("vault/Meta/plans")).unwrap();
+        std::os::unix::fs::symlink("vault/Meta", repo.path().join("Meta")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/plans");
+        // A folder that doesn't exist yet keeps its missing tail as written.
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/new/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/new/plans");
+        // A real folder with a space (a vault named `Second Brain`) is read.
+        std::fs::create_dir_all(repo.path().join("Second Brain/Meta/plans")).unwrap();
+        std::os::unix::fs::symlink("Second Brain/Meta", repo.path().join("Brain")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Brain/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "Second Brain/Meta/plans");
+        // A broken link is refused, not treated as a folder still to come.
+        std::os::unix::fs::symlink("/nonexistent/elsewhere", repo.path().join("Gone")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Gone/plans");
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dirs_reads_docs_plans_once_through_an_in_repo_symlink() {
+        // Git tracks the plan at docs/plans/x.md and the writer saves there,
+        // so the symlinked spelling resolves to docs/plans, scanned once.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
+        // Not `Docs`: on a case-insensitive filesystem that name is `docs`.
+        std::os::unix::fs::symlink("docs", repo.path().join("Notes")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Notes/plans");
+        assert_eq!(
+            scan_plans_dirs(repo.path()),
+            vec![DEFAULT_PLANS_DIR.to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_plans_dir_reads_the_session_checkouts_settings_from_a_linked_worktree() {
+        // The writer reads an untracked settings.local.json in the session
+        // checkout when the worktree has none; the readers must too.
+        let primary = TempDir::new().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(primary.path(), &["init", "-q", "-b", "main"]);
+        git(
+            primary.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::create_dir_all(primary.path().join(".claude")).unwrap();
+        std::fs::write(
+            primary.path().join(".claude/settings.local.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/plans"}}"#,
+        )
+        .unwrap();
+        let holder = TempDir::new().unwrap();
+        let wt = holder.path().join("wt");
+        git(
+            primary.path(),
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        assert_eq!(scan_plans_dir_with(&wt, None), DEFAULT_PLANS_DIR);
+        assert_eq!(scan_plans_dir_with(&wt, Some(primary.path())), "Meta/plans");
+        // An unrelated session root is not evidence of anything.
+        let other = TempDir::new().unwrap();
+        git(other.path(), &["init", "-q"]);
+        assert_eq!(
+            scan_plans_dir_with(&wt, Some(other.path())),
+            DEFAULT_PLANS_DIR
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dir_refuses_a_folder_that_resolves_outside_the_checkout() {
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("Meta")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/plans");
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
     }
 
     #[test]
