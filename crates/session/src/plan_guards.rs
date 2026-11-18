@@ -541,7 +541,7 @@ fn plans_for_current_branch(repo_root: &Path) -> Vec<InFlightPlan> {
     );
     plans
         .into_iter()
-        .filter(|plan| !ignored.iter().any(|i| *i == plan.rel_path))
+        .filter(|plan| !ignored.contains(&plan.rel_path))
         .collect()
 }
 
