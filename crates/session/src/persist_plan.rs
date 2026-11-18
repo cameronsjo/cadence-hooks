@@ -1216,6 +1216,70 @@ fn is_plain_path_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The plans directory, relative to `repo_root`, that a READER scans: the
+/// repo's `CADENCE_PLANS_DIR` when it passes the same [`is_plain_relative`]
+/// gate the writer applies and does not resolve outside the checkout, else
+/// [`DEFAULT_PLANS_DIR`] (cameronsjo/cadence#2153). Without this the writer
+/// honors the key and every reader keeps scanning `docs/plans`, so a repo that
+/// declares its own folder gets its plans persisted where no scan looks.
+///
+/// Read-only, unlike [`canonical_plans_dir`]: a scan must never create the
+/// directory it was asked to read. An empty value (the writer's opt-out) and a
+/// refused one both fall back to the default, since plans written there by
+/// hand are still plans. The result is `/`-joined plain components, safe to
+/// print: [`is_plain_relative`] already held each one to a narrow charset.
+pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
+    cadence_hooks_core::config::repo_env_flag(repo_root, PLANS_DIR_KEY)
+        .filter(|rel| is_plain_relative(rel))
+        .map(|rel| {
+            Path::new(&rel)
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .filter(|rel| nests_without_creating(repo_root, rel))
+        .unwrap_or_else(|| DEFAULT_PLANS_DIR.to_string())
+}
+
+/// Every plans directory a reader scans, relative to `repo_root`, in order:
+/// [`scan_plans_dir`], then `docs/plans` as well when the repo configured
+/// another folder and `docs/plans` still exists. Plans written there before
+/// the repo set `CADENCE_PLANS_DIR` finish in place, so a reader that dropped
+/// them would hide live work (cadence-hooks keeps such a plan itself).
+pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
+    let configured = scan_plans_dir(repo_root);
+    let mut dirs = vec![configured];
+    if dirs[0] != DEFAULT_PLANS_DIR && repo_root.join(DEFAULT_PLANS_DIR).is_dir() {
+        dirs.push(DEFAULT_PLANS_DIR.to_string());
+    }
+    dirs
+}
+
+/// How a reader names the folders it scanned, without the trailing `/` its
+/// messages add: `docs/plans`, or `Meta/docs/plans/ and docs/plans`.
+pub(crate) fn plans_dirs_label(dirs: &[String]) -> String {
+    dirs.join("/ and ")
+}
+
+/// Does `<root>/<relative>` stay inside `root` once symlinks resolve? Checks
+/// the nearest existing ancestor, so a directory that does not exist yet
+/// still answers, and nothing is created.
+fn nests_without_creating(root: &Path, relative: &str) -> bool {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    let target = root.join(relative);
+    target
+        .ancestors()
+        .find(|a| a.exists())
+        .and_then(|a| a.canonicalize().ok())
+        .is_some_and(|a| a.starts_with(&canonical_root))
+}
+
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
 /// needed, and return its canonical path alongside the canonical `root`. The
 /// result is used only when the canonical plans dir actually nests under the
@@ -7219,6 +7283,51 @@ mod tests {
             )],
             ..base_env(user_plans_dir)
         }
+    }
+
+    // --- scan_plans_dir: the readers' view of CADENCE_PLANS_DIR (cadence#2153) ---
+
+    #[test]
+    fn scan_plans_dir_defaults_without_a_setting() {
+        let repo = TempDir::new().unwrap();
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+    }
+
+    #[test]
+    fn scan_plans_dir_reads_the_configured_folder_without_creating_it() {
+        let repo = TempDir::new().unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "./Meta/docs/plans/");
+        assert_eq!(scan_plans_dir(repo.path()), "Meta/docs/plans");
+        assert!(
+            !repo.path().join("Meta").exists(),
+            "a scan must never create the folder it reads"
+        );
+    }
+
+    #[test]
+    fn scan_plans_dir_falls_back_on_an_empty_or_refused_value() {
+        for value in [
+            "",
+            "/etc",
+            "../outside",
+            "a\\b",
+            ".git/plans",
+            "docs/plans\nX",
+        ] {
+            let repo = TempDir::new().unwrap();
+            write_settings_env(repo.path(), PLANS_DIR_KEY, value);
+            assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR, "{value:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dir_refuses_a_folder_that_resolves_outside_the_checkout() {
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("Meta")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/plans");
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
     }
 
     #[test]
