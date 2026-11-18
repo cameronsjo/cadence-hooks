@@ -111,6 +111,15 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
+It reminds once per session on a plain `git commit` (the whole command is one
+`git commit` with only bare-word or quoted arguments) and stays silent on later
+plain commits in that session. Every push, every post, every field-report edit
+and every other form of commit (a global option, a `cd`, a chain, a pipe, a
+substitution, a heredoc) reminds every time. The quiet period is keyed on the
+session id alone, so a subagent and its parent share it; with no session id it
+never applies. It is spent only when the reminder is emitted: a reminder the
+repo's `nudges` config suppresses does not use it.
+
 ## guardrails (git-guardrails)
 
 | Hook | Event | What it does | Remote |
