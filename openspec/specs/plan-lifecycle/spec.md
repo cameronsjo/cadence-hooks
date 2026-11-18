@@ -165,11 +165,15 @@ On PreModelSwitch, `session plan-driver` SHALL answer `ask` when the session's i
 - **THEN** the hook exits 0 with no output
 
 ### Requirement: In-flight plans surfaced at session start
-`session start` SHALL add a bounded-size line when the repo's plans folder holds plans with frontmatter `status` `in-flight` or `blocked`, pointing at `cadence-hooks session plans`. Plans without a `status:` key MUST be skipped. The scan MUST be bounded to the newest files, skip symlinks, and say `At least` when cut. A second line SHALL name up to five in-flight plans that are uncommitted. Both MUST appear even when registration fails.
+`session start` SHALL add a bounded block when the plans folder holds `in-flight` or `blocked` plans: the counts and up to three plans (blocked first, then newest) as `session plans` lines, marked as data. When it leaves plans out it SHALL say how many and name `cadence-hooks session plans`. Plans without `status:` MUST be skipped. The scan MUST be bounded, skip symlinks, and say `At least` when cut. A second line SHALL name up to five uncommitted plans. Both MUST survive a failed registration.
 
 #### Scenario: Resuming into in-flight work
 - **WHEN** a session starts in a repo with one in-flight plan in `docs/plans/`
-- **THEN** the start nudge contains `1 in-flight plan in docs/plans/` and names `cadence-hooks session plans`
+- **THEN** the start nudge contains `1 in-flight plan in docs/plans/` and that plan's slug and `next:` step
+
+#### Scenario: More plans than the block names
+- **WHEN** a session starts in a repo with six in-flight plans, one of them blocked
+- **THEN** the block names the blocked plan and the two newest others, and contains `… 3 more not shown: `cadence-hooks session plans` lists every plan.`
 
 #### Scenario: Plan without a status key
 - **WHEN** the only plan in `docs/plans/` has frontmatter with `date:` but no `status:`
