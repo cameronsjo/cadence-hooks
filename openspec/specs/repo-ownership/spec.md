@@ -514,3 +514,14 @@ For rule 3, `guard-gh-write` SHALL assume, as an accepted assumption, that the `
 #### Scenario: Org secret under an owned GH_REPO
 - **WHEN** the command is `GH_REPO=cameronsjo/tool gh secret set TOKEN --org evil --body x`, `GH_REPO=cameronsjo/tool gh secret delete TOKEN --org evil` or `GH_REPO=cameronsjo/tool gh issue transfer 1 evil/up`, in a checkout of `evil/up`
 - **THEN** the hook exits 2 on the checkout
+
+### Requirement: A GH_REPO-filled placeholder is judged on the host gh sends it to
+When `guard-gh-write` fills a `gh api` `repos/{owner}/…` placeholder from `GH_REPO`, it SHALL judge the filled repository on the endpoint URL's host, else the command's (`--hostname`, else `GH_HOST`, else the default host), and MUST NOT use a host the value names, with or without an exact shape: gh 2.104.0's `fillPlaceholders` (`pkg/cmd/api/api.go`) takes only `RepoOwner()` and `RepoName()`.
+
+#### Scenario: Host-qualified GH_REPO with a relative placeholder endpoint
+- **WHEN** `CADENCE_ALLOWED_OWNERS=github.com/cameronsjo`, `CADENCE_EXTRA_HOSTS=ghe.work.com`, and the command is `GH_REPO=ghe.work.com/cameronsjo/tool gh api -X POST repos/{owner}/{repo}/issues -f title=x`, in a checkout of `cameronsjo/tool` or `evil/up`
+- **THEN** the hook allows, because gh writes to `cameronsjo/tool` on github.com; before this rule the value's own host was judged and the write blocked
+
+#### Scenario: Placeholder sent to another host
+- **WHEN** the same allowlists hold and the command is `GH_REPO=cameronsjo/tool gh api -X POST https://ghe.work.com/api/v3/repos/{owner}/{repo}/issues -f title=x`, or `GH_REPO=github.com/cameronsjo/tool gh api --hostname ghe.work.com -X POST repos/{owner}/{repo}/issues -f title=x`
+- **THEN** the hook exits 2, because gh writes to `cameronsjo/tool` on `ghe.work.com`, which the allowlist does not cover

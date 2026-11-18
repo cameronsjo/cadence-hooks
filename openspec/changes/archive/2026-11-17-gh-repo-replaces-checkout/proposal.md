@@ -4,6 +4,8 @@ When a `GH_REPO` is in force for a command gh reads it for, gh writes to the rep
 
 ## What Changes
 
+Two behaviors change: the checkout is replaced as a target for three exact shapes (below), and a placeholder filled from `GH_REPO` is judged on the host gh sends the write to (last bullet of this list). The second also moves a verdict outside the three shapes.
+
 - The checkout's remotes stop being a target (not the fallback, and not to fill a `repos/{owner}/{repo}` or `repos/:owner/:repo` placeholder) only for three exact shapes, with the `GH_REPO` read exactly. No other shape replaces the checkout:
   1. **Inline on gh.** Every word before the `gh` word is an assignment, and the last `GH_REPO=` there is a non-empty literal. This holds whatever else the command contains, because the inline assignment is what that process receives. A prefix on a wrapper (`sudo`, `env`, `bash -c`, …) does not count.
   2. **One export, then only gh.** The whole command is one top-level `export GH_REPO=<literal>`, then `;` or a newline, then one or more plain gh invocations (each optionally with inline assignment prefixes) joined by `;`, a newline, `&&` or `||`.
@@ -15,7 +17,8 @@ When a `GH_REPO` is in force for a command gh reads it for, gh writes to the rep
 - The `orgs/{owner}/…` placeholder keeps its own rule from cameronsjo/cadence-hooks#1641 (any `GH_REPO` in force names the org); it is not changed here.
 - The commands this applies to are the ones the guard already judges `GH_REPO` on: every `-R` write outside the `gh repo` and `gh gist` groups, `gh repo rename|deploy-key|autolink`, and a `gh api` endpoint with a placeholder. Every other command keeps today's judgment.
 - Unchanged: an unowned `GH_REPO` blocks from any checkout; a `GH_REPO` the guard cannot read exactly (an expansion in it) keeps the checkout beside it, as before; `-R`, a PR or issue URL, a `gh repo` positional and a literal `gh api` owner are judged as before.
-- MODIFY "Deploy-key and autolink writes" and ADD "GH_REPO replaces the checkout", "The hook process's GH_REPO is the command shell's" and "Writes past their repository keep the checkout" in `repo-ownership`.
+- A `gh api` `repos/{owner}/…` placeholder filled from `GH_REPO` is judged on the endpoint URL's host, else the command's host (`--hostname`, else `GH_HOST`, else the default host), and never on a host the `GH_REPO` value names. gh 2.104.0's `fillPlaceholders` in `pkg/cmd/api/api.go` takes only `RepoOwner()` and `RepoName()` from the base repository, and `gh api` sends the request to `--hostname`, else the default host. This holds whether or not a shape above applies, so it moves one verdict outside them: `GH_REPO=<extra-host>/<owned-owner>/tool gh api -X POST repos/{owner}/{repo}/issues …` blocked on `main` (judged on the extra host) and allows now (gh writes to the owned repo on the default host), from an owned checkout too. The converse, a placeholder sent to an unowned host by an absolute URL or `--hostname`, blocks.
+- MODIFY "Deploy-key and autolink writes" and ADD "GH_REPO replaces the checkout", "The hook process's GH_REPO is the command shell's", "Writes past their repository keep the checkout" and "A GH_REPO-filled placeholder is judged on the host gh sends it to" in `repo-ownership`.
 
 ## Capabilities
 
@@ -25,10 +28,10 @@ None.
 
 ### Modified Capabilities
 
-- `repo-ownership`: one requirement modified, three added.
+- `repo-ownership`: one requirement modified, four added.
 
 ## Impact
 
-- `cadence-hooks guardrails guard-gh-write` (PreToolUse, Bash): a write under an owned `GH_REPO` from an unowned checkout or fork now allows. No verdict moves from allow to block.
+- `cadence-hooks guardrails guard-gh-write` (PreToolUse, Bash): a write under an owned `GH_REPO` from an unowned checkout or fork now allows in the three shapes, and a placeholder write under a host-qualified owned `GH_REPO` allows where gh sends it to the owned repo. One known verdict moves from allow to block: the guard's default host is `GH_HOST`, else github.com, while gh's is `GH_HOST`, else the only logged-in host. So on a GHE-only login with no `GH_HOST`, a placeholder filled from a host-qualified owned `GH_REPO` (`GH_REPO=ghe.work.com/cameronsjo/tool gh api … repos/{owner}/{repo}/…` from a checkout of that repo) is judged on github.com and blocks, where `main` allowed it through the checkout. This is recorded on the tracking issue, not fixed here.
 - `crates/guardrails/src/guard_gh_write.rs`, `docs/configuration.md`, `CHANGELOG.md`.
 - No hooks.json change in cameronsjo/cadence.

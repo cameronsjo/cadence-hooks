@@ -755,7 +755,10 @@ fn resolve_target_repo(
 }
 
 /// The first of [`resolve_target_repos_on`]'s resolutions — the one the
-/// command's own spelling names first.
+/// command's own spelling names first. Test-only: it passes
+/// [`GhRepoShown::INLINE_ONLY`] in place of the hook command production
+/// reads, so it skips the `GH_HOST` refusal; drive a row through
+/// [`GhWriteGuard`] to exercise that path.
 #[cfg(test)]
 fn resolve_target_repo_on(
     command: &str,
@@ -792,12 +795,17 @@ fn resolve_target_repo_on(
 ///   `gh api` call with no placeholder in its endpoint reads none of them:
 ///   gh uses `GH_REPO` there only to fill `{owner}`/`{repo}`.
 /// - A `GH_REPO` replaces the checkout only where the guard can show the
-///   value it read exactly is the one gh receives: an inline prefix on the gh
-///   word ([`gh_prefix_is_plain`], with no `GH_HOST` outside it), or an exported
-///   or inherited one in an exact whole-command shape (`shown`, [`env_gh_repo_shown`]). gh then writes to the
-///   `GH_REPO` repository, not the checkout's, so its remotes are no target
+///   value it read exactly is the one gh receives: an inline prefix on the
+///   gh word ([`gh_prefix_is_plain`], with no `GH_HOST` outside it), or an
+///   exported or inherited one in an exact whole-command shape (`shown`,
+///   [`env_gh_repo_shown`]). gh then writes to the `GH_REPO` repository, not
+///   the checkout's, so its remotes are no target
 ///   (cameronsjo/cadence-hooks#1642). Every other case keeps them, as does a
 ///   write past its repository ([`writes_past_its_repo`]).
+/// - A placeholder filled from `GH_REPO` is judged on the host gh sends the
+///   write to: the endpoint URL's host, else the command's (`--hostname`,
+///   `GH_HOST`), never a host the `GH_REPO` value names. gh 2.104.0's
+///   `fillPlaceholders` (`pkg/cmd/api/api.go`) takes only its owner and name.
 /// - A placeholder owner keeps the endpoint's literal name: gh writes
 ///   `repos/{owner}/other/…` to `<base owner>/other`, the base being the
 ///   `GH_REPO` value or each checkout remote ([`fill_placeholder_owner`]), and
@@ -970,6 +978,8 @@ fn writes_past_its_repo(segment: &str) -> bool {
         return false;
     };
     match gh_command_path(&argv, 2).as_slice() {
+        // Any word opening `-o` counts, a value or another cluster included:
+        // a false match only keeps the checkout, which errs toward the block.
         ["secret" | "variable", "set" | "delete"] => argv.iter().any(|word| {
             word == "--org"
                 || word.starts_with("--org=")
@@ -5727,6 +5737,38 @@ mod tests {
             expect(&[("gh issue comment 1 --body hi", &owned, true)]);
         });
 
+        // Rules 2 and 3 refuse a command that names `GH_HOST` outside the
+        // judged gh's inline prefix. Each row is a valid rule 2 or rule 3
+        // shape, so only that refusal keeps the checkout and blocks.
+        with_env(&with_hook_repo("cameronsjo/tool"), || {
+            expect(&[
+                (
+                    "gh issue comment 1 --body \"GH_HOST is set elsewhere\"",
+                    &unowned,
+                    true,
+                ),
+                (
+                    "gh pr merge 5 --squash; GH_HOST=github.com gh pr merge 6 --squash",
+                    &unowned,
+                    true,
+                ),
+            ]);
+        });
+        with_env(&owners_env(), || {
+            expect(&[
+                (
+                    "export GH_REPO=cameronsjo/tool; gh pr merge 5 --squash; GH_HOST=github.com gh pr merge 6 --squash",
+                    &unowned,
+                    true,
+                ),
+                (
+                    "export GH_REPO=cameronsjo/tool; gh issue comment 1 --body \"GH_HOST is set elsewhere\"",
+                    &unowned,
+                    true,
+                ),
+            ]);
+        });
+
         // The rest of the safety direction, unchanged.
         with_env(&owners_env(), || {
             expect(&[
@@ -5769,8 +5811,11 @@ mod tests {
             ]);
         });
 
-        // Every shape the reviews of cameronsjo/cadence-hooks#1646 found, from
-        // an unowned checkout: each blocks, as on `main`.
+        // A command that is not one of the exact shapes keeps the checkout:
+        // a reassignment, a sourced or `eval`ed script, a substitution, a
+        // group, function or `case` arm, a wrapper or a cleared environment
+        // before gh, a nested gh, or an exported `GH_HOST`. From an unowned
+        // checkout each blocks, as on `main`.
         with_env(&with_hook_repo("cameronsjo/tool"), || {
             for command in [
                 "GH_REPO=evil/up; gh issue comment 1 --body hi",
