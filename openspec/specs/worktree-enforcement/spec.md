@@ -183,3 +183,7 @@ A block about a command the guard could not read, a Bash command committing in m
 #### Scenario: A commit whose target is unread
 - **WHEN** from a primary checkout, `git commit -am x && git -C "$OTHER" commit -am y` is attempted twice
 - **THEN** both attempts block with `could not read` and the checkout is not snoozed
+
+#### Scenario: A submodule foreach commit
+- **WHEN** from a primary checkout, `git commit -am x && git submodule foreach 'git commit -am y'` is attempted twice
+- **THEN** both attempts block with `could not read`

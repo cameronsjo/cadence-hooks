@@ -5429,7 +5429,8 @@ fn run_enforce_with(input: &HookInput, cfg: &EnvConfig, probe: &mut GitProbe) ->
             probe.commit_unread = !guesses.guessed.is_empty()
                 || unresolved_cd.is_some()
                 || unresolved_commit.is_some()
-                || unreadable.is_some();
+                || unreadable.is_some()
+                || runs_submodule_foreach(command);
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
@@ -5596,12 +5597,35 @@ const MULTI_REPO_NOTE: &str = "This command commits in more than one checkout, s
      attempt cannot confirm it as one action and will be blocked too. Commit in each \
      checkout in its own command; each one can then be confirmed.";
 
-/// The line a block carries when its command holds a commit whose target the
+/// The line a block carries when its command holds a commit or a `cd` the
 /// guard could not read.
-const UNREAD_COMMIT_NOTE: &str = "This command also commits somewhere enforce-worktree could \
-     not read (a variable, a loop, or a `cd` it cannot follow), so a second attempt cannot \
-     confirm it and will be blocked too. Commit with a literal path, one checkout per \
-     command; each one can then be confirmed.";
+const UNREAD_COMMIT_NOTE: &str = "This command also holds a commit or a `cd` enforce-worktree \
+     could not read (a variable, a loop, `git submodule foreach`, or a `cd` it cannot follow), \
+     so a second attempt cannot confirm it and will be blocked too. Commit with a literal \
+     path, one checkout per command; each one can then be confirmed.";
+
+/// Does any segment of `command` run `git submodule … foreach`? The commit
+/// scan places such a command at the session cwd, but its body runs in every
+/// submodule, each a checkout of its own, so the confirm tier treats it as a
+/// commit it could not read. Token-level: `git`, then `submodule`, then
+/// `foreach` later in the same segment.
+fn runs_submodule_foreach(command: &str) -> bool {
+    cadence_hooks_core::shell::command_segments(command)
+        .iter()
+        .any(|segment| {
+            let tokens = tokenize(segment);
+            let Some(git) = tokens
+                .iter()
+                .position(|t| command_word(t).as_ref() == "git")
+            else {
+                return false;
+            };
+            let rest = &tokens[git + 1..];
+            rest.iter()
+                .position(|t| t == "submodule")
+                .is_some_and(|sub| rest[sub + 1..].iter().any(|t| t == "foreach"))
+        })
+}
 
 /// The primary-checkout roots a Bash command's commit targets land in, judged
 /// the way the commit loop judges them (a target not yet on disk by its
@@ -7479,6 +7503,9 @@ mod tests {
                 ),
                 "git commit -am x && git -C \"$OTHER\" commit -am y".to_string(),
                 "git commit -am x && cd \"$OTHER\" && git commit -am y".to_string(),
+                // The body runs in every submodule, each its own checkout.
+                "git commit -am x && git submodule foreach 'git commit -am y'".to_string(),
+                "git submodule --quiet foreach --recursive 'git commit -am y'".to_string(),
             ]
             .iter()
             .enumerate()
