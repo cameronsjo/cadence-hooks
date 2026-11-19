@@ -165,23 +165,51 @@ impl Check for OpVaultScanGuard {
 }
 
 /// The confirm-tier action for one segment: `op item list` or `op vault
-/// list`, plus the `--vault` it names when it names one, so a listing of
-/// another vault is another action.
+/// list`, plus the two things that choose what it lists, so a listing of
+/// another target is another action:
+///
+/// - the account: `--account x` or `--account=x`, else an `OP_ACCOUNT=x`
+///   word before the command (a shell prefix or an `env` operand). The flag
+///   wins, as it does for `op`.
+/// - the vault: `--vault x` or `--vault=x`.
+///
+/// Filters (`--categories`, `--tags`, `--favorite`) narrow a listing of the
+/// same target and stay out of the key.
 fn scan_action(segment: &str) -> Option<String> {
     let kw = vault_scan_keyword(segment)?;
     let tokens = tokenize(segment);
     let argv = executed_argv(&tokens);
-    let vault = argv.iter().enumerate().find_map(|(i, t)| {
-        if t == "--vault" {
+    // `argv` is a tail of `tokens`; what precedes it is the peeled prefix.
+    let prefix = &tokens[..tokens.len() - argv.len()];
+    let account = flag_value(argv, "--account").or_else(|| {
+        prefix.iter().rev().find_map(|t| {
+            unescape_word(t)
+                .strip_prefix("OP_ACCOUNT=")
+                .map(str::to_string)
+        })
+    });
+    let mut action = format!("op {kw} list");
+    if let Some(account) = account.filter(|a| !a.is_empty()) {
+        action.push_str(&format!(" --account {account}"));
+    }
+    if let Some(vault) = flag_value(argv, "--vault") {
+        action.push_str(&format!(" --vault {vault}"));
+    }
+    Some(action)
+}
+
+/// The value of `flag` in `argv`, as `flag value` or `flag=value`, unescaped
+/// the way the shell would hand it to `op`. The last occurrence counts, as
+/// it does for `op`'s flag parser.
+fn flag_value(argv: &[String], flag: &str) -> Option<String> {
+    let joined = format!("{flag}=");
+    argv.iter().enumerate().rev().find_map(|(i, t)| {
+        if t == flag {
             argv.get(i + 1).map(|v| unescape_word(v).into_owned())
         } else {
-            t.strip_prefix("--vault=")
+            t.strip_prefix(joined.as_str())
                 .map(|v| unescape_word(v).into_owned())
         }
-    });
-    Some(match vault {
-        Some(v) => format!("op {kw} list --vault {v}"),
-        None => format!("op {kw} list"),
     })
 }
 
@@ -532,6 +560,77 @@ mod tests {
                     .outcome,
                 Outcome::Allow,
                 "the same scan, spelled with `=`, is the same action"
+            );
+        });
+    }
+
+    #[test]
+    fn scan_action_keys_on_account_and_vault() {
+        let cases = [
+            ("op item list", "op item list"),
+            (
+                "op item list --account a.example",
+                "op item list --account a.example",
+            ),
+            (
+                "op item list --account=a.example",
+                "op item list --account a.example",
+            ),
+            (
+                "op --account a.example item list",
+                "op item list --account a.example",
+            ),
+            (
+                "OP_ACCOUNT=a.example op item list",
+                "op item list --account a.example",
+            ),
+            (
+                "env OP_ACCOUNT=a.example op item list",
+                "op item list --account a.example",
+            ),
+            (
+                "OP_ACCOUNT=b.example op item list --account a.example",
+                "op item list --account a.example",
+            ),
+            (
+                "op item list --vault Private --account 'a.example'",
+                "op item list --account a.example --vault Private",
+            ),
+            ("op item list --categories Login", "op item list"),
+            ("op item list --vault A --vault B", "op item list --vault B"),
+        ];
+        for (segment, want) in cases {
+            assert_eq!(scan_action(segment).as_deref(), Some(want), "{segment}");
+        }
+    }
+
+    #[test]
+    fn confirm_on_one_account_does_not_pass_another() {
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            let run = |cmd: &str, call: &str| {
+                OpVaultScanGuard
+                    .run(&attempt(cmd, Some("s1"), None, call))
+                    .outcome
+            };
+            assert_eq!(
+                run("op item list --account a.example", "t1"),
+                Outcome::Block
+            );
+            assert_eq!(
+                run("op item list --account b.example", "t2"),
+                Outcome::Block,
+                "another account must not inherit the pass"
+            );
+            assert_eq!(
+                run("op item list", "t3"),
+                Outcome::Block,
+                "no account is not the same action as an account"
+            );
+            assert_eq!(
+                run("OP_ACCOUNT=a.example op item list", "t4"),
+                Outcome::Allow,
+                "the same account, named through the environment, is the same action"
             );
         });
     }

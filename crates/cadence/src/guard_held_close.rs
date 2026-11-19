@@ -353,6 +353,14 @@ impl Check for GuardHeldClose {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        self.run_with(input, std::env::var("CADENCE_DRAIN_HELD").ok().as_deref())
+    }
+}
+
+impl GuardHeldClose {
+    /// [`Check::run`] with the `CADENCE_DRAIN_HELD` value passed in, so tests
+    /// do not depend on what the process environment carries.
+    fn run_with(&self, input: &HookInput, env_value: Option<&str>) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
@@ -363,12 +371,11 @@ impl Check for GuardHeldClose {
         if calls.is_empty() {
             return CheckResult::allow();
         }
-        let env_value = std::env::var("CADENCE_DRAIN_HELD").ok();
         let file_text = self
             .ledger_path
             .as_ref()
             .and_then(|p| cadence_hooks_core::paths::read_untrusted_config(&PathBuf::from(p)));
-        let Some(text) = ledger_text(env_value.as_deref(), file_text.as_deref()) else {
+        let Some(text) = ledger_text(env_value, file_text.as_deref()) else {
             return CheckResult::allow();
         };
         let ledger = parse_ledger(&text);
@@ -405,7 +412,7 @@ impl Check for GuardHeldClose {
             .join(" ");
         cadence_hooks_core::confirm::confirm_block(
             input,
-            self.name(),
+            Check::name(self),
             &action,
             &block_message(&hits),
             None,
@@ -417,6 +424,14 @@ impl Check for GuardHeldClose {
 mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
+
+    impl GuardHeldClose {
+        /// The check as if `CADENCE_DRAIN_HELD` were unset, whatever this
+        /// test process carries, so no assertion depends on the shell.
+        fn run_clean(&self, input: &HookInput) -> CheckResult {
+            self.run_with(input, None)
+        }
+    }
 
     const LEDGER: &str = "# relicense chain\n\
         cameronsjo/cadence#107 cameronsjo/cadence-hooks#127\n\
@@ -605,15 +620,10 @@ mod tests {
             "gh issue close 354 -R cameronsjo/cadence-ecosystem",
             dir.path().to_str().unwrap(),
         );
-        // `CADENCE_DRAIN_HELD` is read in `run`; these assertions hold only
-        // when it is unset, which is the default for the suite.
-        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
-            return;
-        }
         let guard = GuardHeldClose {
             ledger_path: Some(path.to_string_lossy().into_owned()),
         };
-        let result = guard.run(&input);
+        let result = guard.run_clean(&input);
         assert_eq!(result.outcome, Outcome::Block);
         assert!(
             result
@@ -622,11 +632,11 @@ mod tests {
                 .contains("cameronsjo/cadence-ecosystem#354")
         );
         let no_ledger = GuardHeldClose { ledger_path: None };
-        assert_eq!(no_ledger.run(&input).outcome, Outcome::Allow);
+        assert_eq!(no_ledger.run_clean(&input).outcome, Outcome::Allow);
         let missing = GuardHeldClose {
             ledger_path: Some(dir.path().join("absent").to_string_lossy().into_owned()),
         };
-        assert_eq!(missing.run(&input).outcome, Outcome::Allow);
+        assert_eq!(missing.run_clean(&input).outcome, Outcome::Allow);
     }
 
     // --- confirm tier (cameronsjo/cadence-hooks#1658) ---
@@ -644,12 +654,8 @@ mod tests {
         input
     }
 
-    /// Runs `f` with a ledger-file guard and a private marker dir, unless
-    /// `CADENCE_DRAIN_HELD` overrides the ledger in this process.
+    /// Runs `f` with a ledger-file guard and a private marker dir.
     fn with_confirm_guard(f: impl FnOnce(&GuardHeldClose)) {
-        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("held.txt");
         std::fs::write(&path, LEDGER).unwrap();
@@ -666,20 +672,20 @@ mod tests {
     #[test]
     fn confirm_first_blocks_second_passes_once_third_blocks() {
         with_confirm_guard(|guard| {
-            let first = guard.run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"));
+            let first = guard.run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"));
             assert_eq!(first.outcome, Outcome::Block);
             let msg = first.message.unwrap();
             assert!(msg.contains("is on the HELD ledger"), "{msg}");
             assert!(msg.contains("Are you sure?"), "{msg}");
             // A retry with a comment added closes the same held issue.
             let retry = format!("{HELD_CLOSE} --comment 'operator released it'");
-            let second = guard.run(&close_attempt(&retry, Some("s1"), None, "t2"));
+            let second = guard.run_clean(&close_attempt(&retry, Some("s1"), None, "t2"));
             assert_eq!(second.outcome, Outcome::Allow);
             assert_eq!(
                 second.bypass.unwrap().kind,
                 cadence_hooks_core::BypassKind::Confirmed
             );
-            let third = guard.run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t3"));
+            let third = guard.run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t3"));
             assert_eq!(third.outcome, Outcome::Block);
         });
     }
@@ -689,7 +695,7 @@ mod tests {
         with_confirm_guard(|guard| {
             assert_eq!(
                 guard
-                    .run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"))
+                    .run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"))
                     .outcome,
                 Outcome::Block
             );
@@ -713,7 +719,7 @@ mod tests {
                 ),
             ] {
                 assert_eq!(
-                    guard.run(&input).outcome,
+                    guard.run_clean(&input).outcome,
                     Outcome::Block,
                     "{label} must not inherit the pass"
                 );
@@ -725,7 +731,7 @@ mod tests {
     fn confirm_needs_a_session_id_and_expires() {
         with_confirm_guard(|guard| {
             for call in ["t1", "t2"] {
-                let r = guard.run(&close_attempt(HELD_CLOSE, None, None, call));
+                let r = guard.run_clean(&close_attempt(HELD_CLOSE, None, None, call));
                 assert_eq!(r.outcome, Outcome::Block);
                 assert!(
                     r.message
@@ -734,7 +740,7 @@ mod tests {
                 );
             }
             let input = close_attempt(HELD_CLOSE, Some("s1"), None, "t3");
-            assert_eq!(guard.run(&input).outcome, Outcome::Block);
+            assert_eq!(guard.run_clean(&input).outcome, Outcome::Block);
             assert!(cadence_hooks_core::confirm::backdate_for_tests(
                 &input,
                 "guard-held-close",
@@ -743,7 +749,7 @@ mod tests {
             ));
             assert_eq!(
                 guard
-                    .run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t4"))
+                    .run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t4"))
                     .outcome,
                 Outcome::Block
             );
@@ -764,9 +770,6 @@ mod tests {
     /// checkout whose origin carries a held number, `{F}` one that does not.
     #[test]
     fn bare_close_is_judged_where_its_own_segment_runs() {
-        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
-            return;
-        }
         let held = origin_checkout("https://github.com/cameronsjo/cadence-ecosystem.git");
         let free = origin_checkout("https://github.com/cameronsjo/free.git");
         let h = held.path().to_str().unwrap();
@@ -803,7 +806,7 @@ mod tests {
             let command = command.replace("{H}", h).replace("{F}", f);
             let cwd = if in_held { h } else { f };
             let input = cadence_hooks_core::test_builders::make_bash_with_cwd(&command, cwd);
-            let result = guard.run(&input);
+            let result = guard.run_clean(&input);
             assert_eq!(
                 result.outcome == Outcome::Block,
                 blocks,

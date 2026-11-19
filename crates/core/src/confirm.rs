@@ -37,6 +37,25 @@
 //! end in the same verdict for all of them. Single use falls out of the second
 //! state: after a pass, the next different call blocks again.
 //!
+//! The verdict is shared; the ledger row is not. Two processes of the passing
+//! call can both read `pending` and both write `consumed`, so the one that
+//! records the pass is picked by an exclusive create of a claim file named for
+//! the key and the call (`confirm-<digest>.row-<call digest>`). The winner
+//! returns [`Gate::Passed`], every other process [`Gate::PassedSibling`]. The
+//! next armed attempt removes the spent claim, so at most one claim file stays
+//! per key. One window is left: a sibling of the passing call that is still
+//! running after the next call has armed (and so removed the claim) records a
+//! second row. Hooks of one tool call finish before the next call starts, so
+//! this needs a sibling delayed past a whole tool call.
+//!
+//! # What a row does not say
+//!
+//! Each hook decides in its own process (or as one member of a `group`), so a
+//! confirm-tier guard cannot see what the other hooks on the same tool call
+//! decide. A `confirmed` row therefore means this guard let the action
+//! through, not that the action ran: another hook can still block the call,
+//! and the confirmation is spent either way.
+//!
 //! # Fail directions
 //!
 //! A pass needs a recorded decision, so every doubt blocks, and every block
@@ -56,7 +75,7 @@
 //! message instead names the failure and points at the guard's other route or
 //! the operator, and no write failure ever produces a pass.
 
-use crate::markers::{private_marker_dir, write_marker};
+use crate::markers::{create_exclusive, private_marker_dir, write_marker};
 use crate::{BypassKind, BypassProvenance, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -229,6 +248,15 @@ fn marker_path(dir: &Path, digest: &str) -> PathBuf {
     dir.join(format!("confirm-{digest}"))
 }
 
+/// The file whose exclusive creation decides which process of `call` writes
+/// the ledger row for a confirmation under `digest`. The call id is hashed so
+/// the name holds only hex whatever the id's characters.
+fn row_claim_path(dir: &Path, digest: &str, call: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let call_digest = format!("{:x}", Sha256::digest(call.as_bytes()));
+    dir.join(format!("confirm-{digest}.row-{}", &call_digest[..16]))
+}
+
 /// A tool-call id the record format can carry: non-empty, with no whitespace
 /// or control character (the record is line-based, so a newline in the id
 /// would leave a marker that never parses and a retry that never pairs).
@@ -284,28 +312,42 @@ fn gate_with(
     };
     match decide(record.as_ref(), call, now, ttl) {
         Step::SameCall => Gate::Armed,
-        Step::Arm => match write(State::Pending) {
-            Ok(()) => Gate::Armed,
-            Err(_) => Gate::Unavailable(Unavailable::WriteFailed),
-        },
+        Step::Arm => {
+            // The previous confirmation's row claim is spent: clear it so the
+            // directory holds at most one per key. Best effort; a leftover
+            // claim names an old call and never matches a new one.
+            if let Some(old) = record.as_ref().filter(|r| r.state == State::Consumed) {
+                let _ = std::fs::remove_file(row_claim_path(&dir, &digest, &old.call));
+            }
+            match write(State::Pending) {
+                Ok(()) => Gate::Armed,
+                Err(_) => Gate::Unavailable(Unavailable::WriteFailed),
+            }
+        }
         Step::Pass => {
             let consumed_by_this_call = |r: &Option<Record>| {
                 r.as_ref()
                     .is_some_and(|r| r.state == State::Consumed && r.call == call)
             };
-            // A sibling of this call already consumed the marker and recorded
-            // the pass; keep its record and write no second ledger row.
-            if consumed_by_this_call(&record) {
-                return Gate::PassedSibling;
+            // A failed consumption write still passes when a sibling of this
+            // call landed the same record first; otherwise it blocks.
+            if !consumed_by_this_call(&record)
+                && write(State::Consumed).is_err()
+                && !consumed_by_this_call(&read())
+            {
+                return Gate::Unavailable(Unavailable::WriteFailed);
             }
-            if write(State::Consumed).is_err() {
-                // A sibling may have won the write: if the marker now shows
-                // this call's consumption, agree with it rather than block.
-                return if consumed_by_this_call(&read()) {
-                    Gate::PassedSibling
-                } else {
-                    Gate::Unavailable(Unavailable::WriteFailed)
-                };
+            // Every process of this call passes; exactly one records it. Two
+            // siblings can both read `pending` and both write `consumed`, so
+            // the marker alone cannot pick one: the claim's exclusive create
+            // does. A claim that fails for any reason but a sibling holding it
+            // still records the row, since a pass with no row is the worse
+            // failure for an audit log.
+            if matches!(
+                create_exclusive(&row_claim_path(&dir, &digest, call)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+            ) {
+                return Gate::PassedSibling;
             }
             Gate::Passed(BypassProvenance {
                 kind: BypassKind::Confirmed,
@@ -335,18 +377,26 @@ pub fn backdate_for_tests(input: &HookInput, hook: &str, action: &str, secs: i64
     write_marker(&path, &render_record(&digest, &record)).is_ok()
 }
 
-/// The line an armed block carries. `pass_effect`, when given, names what the
-/// pass does beyond letting this one action through.
+/// The line an armed block carries. `pass_effect`, when given, is a sentence
+/// naming what the pass does beyond letting this one action through; a guard
+/// whose pass reaches further than the one action must give it, since the
+/// default closing sentence says the pass reaches nothing else.
 #[must_use]
 pub fn armed_note(pass_effect: Option<&str>) -> String {
     let minutes = CONFIRM_TTL.as_secs() / 60;
-    let effect = pass_effect.map(|e| format!(", {e},")).unwrap_or_default();
-    format!(
-        "Are you sure? If you have checked and this is what the operator asked for, run the \
-         same action again: the second attempt passes{effect} and is recorded in the bypass \
-         log. It counts only for this session and agent, for this exact action, once, within \
-         {minutes} minutes."
-    )
+    let opening = "Are you sure? If you have checked and this is what the operator asked for, \
+                   run the same action again: the second attempt passes and is recorded in \
+                   the bypass log.";
+    match pass_effect {
+        None => format!(
+            "{opening} It counts only for this session and agent, for this exact action, once, \
+             within {minutes} minutes."
+        ),
+        Some(effect) => format!(
+            "{opening} Only a retry from this session and agent, of this exact action, within \
+             {minutes} minutes, confirms it. {effect}"
+        ),
+    }
 }
 
 /// The line a block carries when it cannot be confirmed.
@@ -663,18 +713,46 @@ mod tests {
             assert_eq!(gate_at(&a("t1"), "h", "x", 1000), Gate::Armed);
             let digest = key_digest("h", "s1", "", "x");
             let path = marker_path(&private_marker_dir().unwrap(), &digest);
-            let winner = render_record(&digest, &rec(State::Consumed, "t2", 1001));
-            // The failing writer lands the sibling's record, then reports its
-            // own write failed.
-            let sibling_wins = |p: &Path, _: &str| {
-                std::fs::write(p, &winner).unwrap();
+            // The sibling runs to completion inside this process's write,
+            // then this process's own write fails.
+            let sibling_wins = |_: &Path, _: &str| {
+                assert!(matches!(gate_at(&a("t2"), "h", "x", 1001), Gate::Passed(_)));
                 Err(std::io::Error::other("lost the race"))
             };
             assert_eq!(
                 gate_with(&a("t2"), "h", "x", 1001, sibling_wins),
                 Gate::PassedSibling
             );
+            let winner = render_record(&digest, &rec(State::Consumed, "t2", 1001));
             assert_eq!(read_marker(&path).as_deref(), Some(winner.as_str()));
+        });
+    }
+
+    #[test]
+    fn two_siblings_that_both_read_pending_record_one_pass() {
+        // Both processes of call t2 read `pending t1` before either writes,
+        // and both writes succeed. The marker cannot tell them apart; the row
+        // claim must, so exactly one returns `Passed` (one ledger row).
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            let a = |call| input(Some("s1"), None, Some(call));
+            assert_eq!(gate_at(&a("t1"), "h", "x", 1000), Gate::Armed);
+            let sibling_first = |p: &Path, c: &str| {
+                assert!(matches!(gate_at(&a("t2"), "h", "x", 1001), Gate::Passed(_)));
+                write_marker(p, c)
+            };
+            assert_eq!(
+                gate_with(&a("t2"), "h", "x", 1001, sibling_first),
+                Gate::PassedSibling
+            );
+            // The next confirmation clears the spent claim and records again.
+            assert_eq!(gate_at(&a("t3"), "h", "x", 1002), Gate::Armed);
+            assert!(matches!(gate_at(&a("t4"), "h", "x", 1003), Gate::Passed(_)));
+            let claims: Vec<_> = walk_confirm_files(dir.path())
+                .into_iter()
+                .filter(|p| p.to_string_lossy().contains(".row-"))
+                .collect();
+            assert_eq!(claims.len(), 1, "{claims:?}");
         });
     }
 
@@ -701,12 +779,18 @@ mod tests {
                 "h",
                 "x",
                 "BLOCKED: reason",
-                Some("and unblocks this checkout"),
+                Some("It also unblocks this checkout."),
             );
             assert_eq!(first.outcome, Outcome::Block);
             let msg = first.message.unwrap();
             assert!(msg.starts_with("BLOCKED: reason\nAre you sure?"), "{msg}");
-            assert!(msg.contains("passes, and unblocks this checkout,"), "{msg}");
+            assert!(
+                msg.ends_with("confirms it. It also unblocks this checkout."),
+                "{msg}"
+            );
+            // A pass that reaches further never claims to count only here.
+            assert!(!msg.contains("counts only"), "{msg}");
+            assert!(armed_note(None).contains("It counts only for this session and agent"));
             let second = confirm_block(
                 &input(Some("s1"), None, Some("t2")),
                 "h",

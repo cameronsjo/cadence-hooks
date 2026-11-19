@@ -109,6 +109,53 @@ fn two_processes_of_one_call_agree() {
 }
 
 #[test]
+fn two_concurrent_processes_of_one_call_write_one_row() {
+    // Both processes of the passing call start together, so both can read the
+    // `pending` marker before either rewrites it. Each must still allow, and
+    // only one may record the confirmation. The race is not forced here; the
+    // deterministic pin is `two_siblings_that_both_read_pending_record_one_pass`
+    // in core. With the claim replaced by the earlier marker-only dedupe, this
+    // test went red (three rows after two confirmations), so 20 rounds do
+    // reach the race.
+    const ROUNDS: usize = 20;
+    let root = tempfile::tempdir().unwrap();
+    let cmd = "op item list";
+    for round in 0..ROUNDS {
+        let blocked = format!("arm-{round}");
+        let out = run(root.path(), &payload(cmd, Some("sess-c"), &blocked));
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        let passing = format!("pass-{round}");
+        let body = payload(cmd, Some("sess-c"), &passing).to_string();
+        let mut children: Vec<_> = (0..2)
+            .map(|_| {
+                cadence_hooks(root.path())
+                    .args(["guardrails", "guard-op-vault-scan"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn cadence-hooks")
+            })
+            .collect();
+        // Feed both before waiting on either, so they decide side by side.
+        for child in &mut children {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+        }
+        let outs: Vec<Output> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().expect("wait for cadence-hooks"))
+            .collect();
+        for out in &outs {
+            assert_eq!(out.status.code(), Some(0), "round {round}: {}", stderr(out));
+        }
+        let rows = bypass_rows(root.path());
+        assert_eq!(rows.len(), round + 1, "round {round}: {rows:?}");
+    }
+}
+
+#[test]
 fn no_session_id_never_passes_and_says_so() {
     let root = tempfile::tempdir().unwrap();
     for call in ["t1", "t2", "t3"] {

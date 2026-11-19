@@ -5607,8 +5607,8 @@ const UNREAD_COMMIT_NOTE: &str = "This command also holds a commit or a `cd` enf
 /// Does any segment of `command` run `git submodule … foreach`? The commit
 /// scan places such a command at the session cwd, but its body runs in every
 /// submodule, each a checkout of its own, so the confirm tier treats it as a
-/// commit it could not read. Token-level: `git`, then `submodule`, then
-/// `foreach` later in the same segment.
+/// commit it could not read. Matched on whole shell words: `git`, then
+/// `submodule`, then `foreach` later in the same segment.
 fn runs_submodule_foreach(command: &str) -> bool {
     cadence_hooks_core::shell::command_segments(command)
         .iter()
@@ -5696,8 +5696,8 @@ fn confirm_primary_block(
     };
     let action = format!("{}\u{1f}{target}", block.repo_root);
     let pass_effect = format!(
-        "unblocks this checkout for {} minutes (the snooze `dismiss-enforce-worktree --for \
-         30m` sets)",
+        "The confirmed retry switches enforce-worktree off for this checkout for {} minutes, \
+         for every session working in it (the snooze `dismiss-enforce-worktree --for 30m` sets).",
         CONFIRM_SNOOZE_SECS / 60
     );
     let confirmed = cadence_hooks_core::confirm::confirm_block(
@@ -7234,9 +7234,13 @@ mod tests {
             assert!(msg.contains("is a primary checkout"), "{msg}");
             assert!(msg.contains("Are you sure?"), "{msg}");
             assert!(
-                msg.contains("unblocks this checkout for 30 minutes"),
+                msg.contains(
+                    "switches enforce-worktree off for this checkout for 30 minutes, for every \
+                     session working in it"
+                ),
                 "{msg}"
             );
+            assert!(!msg.contains("counts only"), "{msg}");
             assert!(!snoozed(&primary), "a first attempt arms nothing");
 
             let second = run_confirmed(

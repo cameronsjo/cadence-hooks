@@ -1581,7 +1581,7 @@ fn claim_tool_event_nudge_within(
 
 /// Create `path` as a new, empty file, refusing to follow a symlink squatting
 /// the name (`O_EXCL`) and refusing to reuse an existing one.
-fn create_exclusive(path: &Path) -> io::Result<()> {
+pub(crate) fn create_exclusive(path: &Path) -> io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

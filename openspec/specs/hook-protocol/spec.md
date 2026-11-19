@@ -244,6 +244,17 @@ A confirm-tier guard SHALL block the first attempt at an action (exit 2) with it
 - **WHEN** a guard wired twice under one matcher runs twice for the blocked call, and twice for the retry
 - **THEN** both processes of the blocked call block, both processes of the retry allow, and `bypasses.jsonl` gains one row
 
+### Requirement: One confirmed row per confirmation
+A confirmation SHALL write exactly one `confirmed` row, however many processes of the hook run for the passing call. The row records that the confirm-tier guard let the action through, not that the call ran: another hook on the same call MAY still block it, and the confirmation is spent either way.
+
+#### Scenario: Two processes of the retry at once
+- **WHEN** two processes of the retry start together and both read the blocked attempt's marker before either records the pass
+- **THEN** both allow, and `bypasses.jsonl` gains one row
+
+#### Scenario: Another hook blocks the confirmed call
+- **WHEN** a confirm-tier guard passes a retry and another hook blocks the same tool call
+- **THEN** the `confirmed` row stays, and the next attempt at the action blocks with the `Are you sure?` line
+
 ### Requirement: Confirm tier fail directions
 A confirm-tier block SHALL NOT pass, and SHALL end with `A second attempt will be blocked too:` and the reason, when the payload has no `session_id` or no usable `tool_use_id`, when the marker directory is not private, or when the marker cannot be written. An unreadable, malformed, symlinked, expired or future-stamped marker MUST count as absent, never as a confirmation.
 

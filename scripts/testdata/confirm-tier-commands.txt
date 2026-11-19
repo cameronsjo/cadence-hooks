@@ -1,0 +1,139 @@
+# Everyday Bash commands for scripts/confirm-tier-compare.py (cadence-hooks#1658).
+# One command per line, run as written from a primary checkout and from a
+# linked worktree of a scratch repo. Blank lines and lines starting with `#`
+# are skipped. `../wt` and `../primary` name the two scratch checkouts.
+git status
+git status -sb
+git log --oneline -5
+git diff
+git diff --stat
+git diff --cached
+git add -A
+git add README.md
+git commit -m 'fix: x'
+git commit -am 'wip'
+git add -A && git commit -m x
+git commit --amend --no-edit
+git push
+git push -u origin feat
+git pull
+git fetch origin
+git fetch --all
+git checkout -b topic
+git switch main
+git branch -a
+git branch -d old
+git stash list
+git merge origin/main
+git merge --ff-only origin/main
+git rebase origin/main
+git reset --soft HEAD~1
+git reset --hard HEAD~1
+git restore README.md
+git restore --staged README.md
+git rm --cached x
+git worktree list
+git worktree add ../x -b x
+git tag
+git show HEAD
+git blame README.md
+git log -p -1
+git rev-parse HEAD
+git remote -v
+git clean -n
+git clean -fd
+git cherry-pick abc123
+git revert HEAD --no-edit
+git commit -F msg.txt -- README.md
+git -C ../wt status
+git -C ../primary commit -m x
+cd ../wt && git commit -m x
+cd ../primary && git commit -m x
+git commit -m "$(cat msg.txt)"
+git log --format='%H %s' -3
+op read op://Private/GitHub/token
+op item get 'GitHub Token' --fields label=token
+op whoami
+op signin
+op item list
+op vault list
+op item list --vault Private
+op item list --account a.example
+op item list --account=a.example --vault Private
+OP_ACCOUNT=a.example op item list
+op --format json item list | jq '.[].title'
+op item list | grep api
+op item create --category login --title x
+op document get doc1
+op account list
+echo 'op item list'
+op item get list
+op run -- ./deploy.sh
+gh issue close 354 -R cameronsjo/cadence-ecosystem
+gh issue close 12 -R cameronsjo/cadence-ecosystem
+gh issue close 107 -R cameronsjo/cadence
+gh issue close 354
+gh issue close 99
+gh issue view 354
+gh issue list
+gh issue comment 354 --body x
+gh pr list
+gh pr view 5
+gh pr create --draft --title t --body b
+gh pr checks 5
+gh run list --branch main
+gh issue close 354 -R cameronsjo/forgectl
+gh issue close https://github.com/cameronsjo/cadence-ecosystem/issues/354
+gh issue reopen 354
+gh api repos/cameronsjo/cadence-hooks/pulls/1
+ls
+ls -la
+cat README.md
+head -20 README.md
+tail -f log.txt
+wc -l README.md
+cargo test
+cargo build --release
+cargo clippy --all-targets -- -D warnings
+make ci
+make test
+npm test
+pnpm install
+uv run pytest
+python3 x.py
+echo hi
+echo hi > out.txt
+printf 'a\n' >> notes.md
+grep -rn foo .
+rg TODO
+sed -n 1,5p README.md
+find . -name '*.rs'
+jq . data.json
+curl -s https://example.com
+mkdir -p build
+rm -rf build
+cp a b
+mv a b
+touch new.txt
+chmod +x run.sh
+./run.sh
+bash scripts/x.sh
+docker ps
+kubectl get pods
+tree -L 2
+du -sh .
+df -h
+env | sort
+which cargo
+cat .env.example
+echo KEY=x > .env.example
+echo KEY=x > config.toml
+for f in *.md; do wc -l "$f"; done
+(cd ../wt && git status)
+git status && git diff --stat
+git add -A; git status
+sleep 1
+export FOO=bar && echo $FOO
+true || false
+date -u
+uname -a

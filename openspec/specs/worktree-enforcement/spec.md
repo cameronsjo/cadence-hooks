@@ -159,7 +159,7 @@ Both `dismiss-enforce-worktree` and `dismiss-main-branch-warn` SHALL default `--
 - **THEN** the hook exits 0 with no message
 
 ### Requirement: Confirmed retry snoozes enforce-worktree
-`enforce-worktree`'s primary-checkout block SHALL be in the confirm tier, keyed by the judged repo and the file (Edit, Write) or `git commit` (Bash), and its confirm line MUST say the pass unblocks the checkout for 30 minutes. A confirmed retry SHALL allow and write the same snooze marker and sidecar `dismiss-enforce-worktree --for 30m` writes.
+`enforce-worktree`'s primary-checkout block SHALL be in the confirm tier, keyed by the judged repo and the file (Edit, Write) or `git commit` (Bash). Its confirm line MUST say the confirmed retry switches enforce-worktree off for that checkout for 30 minutes, for every session working in it, and MUST NOT say the pass counts only for this session. A confirmed retry SHALL allow and write the same snooze marker and sidecar `dismiss-enforce-worktree --for 30m` writes.
 
 #### Scenario: Confirmed edit arms the snooze
 - **WHEN** an Edit in a primary checkout blocks in session S1 and S1 retries the same Edit
@@ -172,6 +172,10 @@ Both `dismiss-enforce-worktree` and `dismiss-main-branch-warn` SHALL default `--
 #### Scenario: Another file before a confirmation
 - **WHEN** an Edit of `a.rs` in a primary checkout blocks, and the next attempt edits `b.rs`
 - **THEN** the second attempt blocks
+
+#### Scenario: The confirm line names the checkout-wide snooze
+- **WHEN** an Edit in a primary checkout blocks with the `Are you sure?` line
+- **THEN** the line says the retry switches enforce-worktree off for this checkout for 30 minutes, for every session working in it
 
 ### Requirement: Commits enforce-worktree does not confirm
 A block about a command the guard could not read, a Bash command committing in more than one primary checkout, and a Bash command holding a commit whose target the guard could not read MUST NOT be confirmable: each attempt blocks with a line saying a retry will be blocked too.
