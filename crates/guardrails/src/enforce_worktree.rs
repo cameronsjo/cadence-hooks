@@ -291,6 +291,10 @@ struct GitProbe {
     /// The Bash arm's commit targets, kept so the confirm tier can tell a
     /// command that commits in one repo from one that commits in several.
     commit_targets: Vec<String>,
+    /// The Bash arm's scan met a commit whose target it could not read (a
+    /// guessed target, an unresolved `cd`, a substituted target, or an
+    /// unreadable runner), so it stood the session cwd in for it.
+    commit_unread: bool,
 }
 
 /// One primary-checkout block: the message [`assess_dir`] returned, the repo
@@ -5422,6 +5426,10 @@ fn run_enforce_with(input: &HookInput, cfg: &EnvConfig, probe: &mut GitProbe) ->
             // that does not exist yet is not "no repo".
             let creations = commit_gaps::creations_of(command, cwd, env, plain.as_ref());
             probe.commit_targets = commit_targets.clone();
+            probe.commit_unread = !guesses.guessed.is_empty()
+                || unresolved_cd.is_some()
+                || unresolved_commit.is_some()
+                || unreadable.is_some();
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
@@ -5588,9 +5596,18 @@ const MULTI_REPO_NOTE: &str = "This command commits in more than one checkout, s
      attempt cannot confirm it as one action and will be blocked too. Commit in each \
      checkout in its own command; each one can then be confirmed.";
 
-/// The repo roots a Bash command's commit targets land in, judged the way the
-/// commit loop judges them (a target not yet on disk by its nearest existing
-/// ancestor). Filesystem walks only, memoized in the probe, no git spawn.
+/// The line a block carries when its command holds a commit whose target the
+/// guard could not read.
+const UNREAD_COMMIT_NOTE: &str = "This command also commits somewhere enforce-worktree could \
+     not read (a variable, a loop, or a `cd` it cannot follow), so a second attempt cannot \
+     confirm it and will be blocked too. Commit with a literal path, one checkout per \
+     command; each one can then be confirmed.";
+
+/// The primary-checkout roots a Bash command's commit targets land in, judged
+/// the way the commit loop judges them (a target not yet on disk by its
+/// nearest existing ancestor). A linked worktree or a non-repo target is not
+/// counted, since the loop never blocks it. Memoized probe lookups, run only
+/// on the block path.
 fn commit_repo_roots(probe: &mut GitProbe) -> BTreeSet<String> {
     let targets = probe.commit_targets.clone();
     targets
@@ -5604,6 +5621,7 @@ fn commit_repo_roots(probe: &mut GitProbe) -> BTreeSet<String> {
             };
             probe.repo_root(&dir)
         })
+        .filter(|root| is_primary_checkout(root))
         .collect()
 }
 
@@ -5614,9 +5632,10 @@ fn commit_repo_roots(probe: &mut GitProbe) -> BTreeSet<String> {
 /// block about a command the guard could not read keeps blocking as before.
 /// The action is the judged repo plus what the tool touches there (the file
 /// for Edit and Write, the commit for Bash). A Bash command whose commits land
-/// in more than one repo is never confirmed: the commit loop stops at the
-/// first blocked repo, so the others were never judged, and a pass would carry
-/// them through unseen. A pass arms the same snooze `dismiss-enforce-worktree
+/// in more than one primary checkout, or that holds a commit whose target the
+/// scan could not read, is never confirmed: the commit loop stops at the first
+/// blocked repo, and an unread target collapses onto the session cwd, so a
+/// pass would carry the other commits through unjudged. A pass arms the same snooze `dismiss-enforce-worktree
 /// --for 30m` writes, so one confirmation covers the edits that follow; if
 /// that write fails, the confirmed action still passes, with a nudge saying
 /// the next one will ask again.
@@ -5640,6 +5659,9 @@ fn confirm_primary_block(
         return result;
     };
     let is_bash = input.normalized_tool_name() == Some("Bash");
+    if is_bash && probe.commit_unread {
+        return CheckResult::block(format!("{message}\n{UNREAD_COMMIT_NOTE}"));
+    }
     if is_bash && commit_repo_roots(probe).len() > 1 {
         return CheckResult::block(format!("{message}\n{MULTI_REPO_NOTE}"));
     }
@@ -7437,6 +7459,69 @@ mod tests {
             };
             assert_eq!(run("t4"), Outcome::Block);
             assert_eq!(run("t5"), Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn confirm_never_covers_a_commit_it_could_not_read() {
+        // The unread target collapses onto the session cwd, so a repo count
+        // alone would see one repo and let the retry carry it through.
+        let scratch_a = scratch("confirm-unread-a");
+        let scratch_b = scratch("confirm-unread-b");
+        let (a, _wt_a) = primary_and_worktree(&scratch_a);
+        let (b, _wt_b) = primary_and_worktree(&scratch_b);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            for (i, command) in [
+                format!(
+                    "git commit -am x; for d in {}; do git -C \"$d\" commit -am y; done",
+                    b.display()
+                ),
+                "git commit -am x && git -C \"$OTHER\" commit -am y".to_string(),
+                "git commit -am x && cd \"$OTHER\" && git commit -am y".to_string(),
+            ]
+            .iter()
+            .enumerate()
+            {
+                for attempt in 0..2 {
+                    let mut input = make_bash(command);
+                    input.cwd = Some(a.to_string_lossy().into_owned());
+                    let call = format!("t{i}-{attempt}");
+                    let r = run_confirmed(
+                        &confirm_attempt(input, Some("s1"), None, &call),
+                        &cfg(false, false),
+                    );
+                    assert_eq!(r.outcome, Outcome::Block, "{command} attempt {attempt}");
+                    let msg = r.message.unwrap();
+                    assert!(msg.contains("could not read"), "{command}: {msg}");
+                    assert!(!msg.contains("Are you sure"), "{command}: {msg}");
+                }
+            }
+            assert!(!snoozed(&a) && !snoozed(&b));
+        });
+    }
+
+    #[test]
+    fn confirm_counts_only_primary_checkouts() {
+        // A commit into the repo's own linked worktree never blocks, so it
+        // does not make the command a multi-checkout one.
+        let scratch = scratch("confirm-own-wt");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let command = format!("git commit -m x && git -C {} commit -m y", wt.display());
+            let run = |call| {
+                let mut input = make_bash(&command);
+                input.cwd = Some(primary.to_string_lossy().into_owned());
+                run_confirmed(
+                    &confirm_attempt(input, Some("s1"), None, call),
+                    &cfg(false, false),
+                )
+            };
+            let first = run("t1");
+            assert_eq!(first.outcome, Outcome::Block);
+            assert!(first.message.unwrap().contains("Are you sure"));
+            assert_eq!(run("t2").outcome, Outcome::Allow);
         });
     }
 

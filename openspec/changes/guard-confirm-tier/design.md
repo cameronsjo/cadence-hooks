@@ -54,7 +54,9 @@ Decision 3 of the owner's brief: a confirmed retry arms the existing snooze (the
 
 In a grouped dispatch (`group … guardrails/enforce-worktree`), another member can block the same retry. The confirmation is then consumed and the snooze armed for an action that did not run; that is accepted under the snooze decision, since the snooze is what a dismiss would have set.
 
-A Bash command whose commits land in more than one repo is never confirmed. The commit loop returns at the first blocked repo, so later targets are never judged, and a pass for the whole command would carry them through. Such a command blocks with a line saying a retry will be blocked too and to commit in each checkout in its own command.
+A Bash command whose commits land in more than one primary checkout is never confirmed. The commit loop returns at the first blocked repo, so later targets are never judged, and a pass for the whole command would carry them through. Such a command blocks with a line saying a retry will be blocked too and to commit in each checkout in its own command. A linked worktree or a non-repo target does not count, since the loop never blocks it.
+
+For the same reason, a Bash command holding a commit whose target the scan could not read (a guessed target, an unresolved `cd`, a substituted target, an unreadable runner: `for d in …; do git -C "$d" commit`, `git -C "$OTHER" commit`, `cd "$V" && git commit`) is never confirmed. The scan stands the session cwd in for such a target, so it collapses onto the first repo and a repo count alone would miss it. Each of these commands blocked on `main`, so this only withholds a pass the tier would have added.
 
 Only the block `assess_dir` returns for a primary checkout qualifies. The guard records each such block on its git probe, and the confirm step matches the final block's message against them by prefix (the cd and worktree hints are appended to it). Blocks about a command the guard could not read (a symlink created in the same command, an unresolved `cd`) keep blocking with no confirm line.
 
