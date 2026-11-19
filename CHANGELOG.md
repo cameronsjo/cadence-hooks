@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.134.0] - 2026-11-19
+
 ### Changed
 
 - **`session start` names up to three in-flight plans instead of only counting them.** The plan block lists the blocked plans first, then the newest, as the same sanitized line `session plans` prints (slug, `next:`, branch, PR), after a sentence that marks them as data, and ends by saying to read a plan the task touches before the first edit. It names `cadence-hooks session plans` only when it leaves plans out, with how many. The count-only pointer's command ran in 6 to 10% of sessions (cameronsjo/cadence#2145). Three lines with each field length-capped keep the block bounded.
