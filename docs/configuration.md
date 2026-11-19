@@ -345,6 +345,8 @@ The marker lives at `<repo>/.git/cadence-hooks/enforce-worktree-snoozed-until` �
 
 This dismissal is **repo-scoped** — on a shared checkout it lowers the guard for every session, not just yours — so `--reason` is **required over 1h** (nudged at or under). The reason, arming session, and expiry land in a provenance sidecar (`enforce-worktree-snoozed-meta.json`, next to the marker) and in the bypass log below.
 
+A confirmed retry of a blocked edit or commit writes this same snooze for 30 minutes, with the reason `confirmed retry of a blocked action (confirm tier)`; see [Confirming a blocked action](#confirming-a-blocked-action-the-confirm-tier).
+
 ## Confirming a blocked action (the confirm tier)
 
 Three guards ask "are you sure?" instead of stopping the session: `enforce-worktree` (its primary-checkout block), `guard-op-vault-scan`, and `guard-held-close` (its HELD-ledger block). The first attempt blocks with the guard's reason and a line beginning `Are you sure?`. If the action is what the operator asked for, the model runs the same action again: that second attempt passes, once, and writes a `used` row with `kind: "confirmed"` to the bypass log. Nothing to configure; it works from a phone, where a settings edit or a terminal command does not.
@@ -357,7 +359,7 @@ The pass counts only for:
 
 For `enforce-worktree`, the confirmed retry also arms the same 30-minute snooze `dismiss-enforce-worktree --for 30m` writes, with the reason `confirmed retry of a blocked action (confirm tier)`, so the edits that follow ride it as after a dismiss. Like a dismiss, that snooze covers every session in the checkout.
 
-A block that cannot be confirmed says so (`A second attempt will be blocked too: …`) and never passes: a payload with no session id or no tool-call id, a marker directory that fell back to the shared temp base, or a marker that could not be written. A confirmation marker is `confirm-<sha256>` in the private per-user marker directory (`CADENCE_MARKER_DIR` moves it, as for the other markers).
+A block that cannot be confirmed says so (`A second attempt will be blocked too: …`) and never passes: a Bash command that commits in more than one checkout (commit in each one in its own command), a payload with no session id or no usable tool-call id, a marker directory that fell back to the shared temp base, or a marker that could not be written. A confirmation marker is `confirm-<sha256>` in the private per-user marker directory (`CADENCE_MARKER_DIR` moves it, as for the other markers).
 
 Every other blocking guard keeps blocking. The ones whose escape needs a keyboard (`git-safety`, `prevent-secret-writes`, `prevent-secret-push`, `guard-sops-decrypt`, `guard-runbook-scrub`, `guard-gh-dangerous`'s repo delete, `guard-gh-write`'s URL-argument block) end with a line telling the model to stop and tell the operator in chat what was blocked, why, and what they can approve.
 

@@ -87,7 +87,7 @@
 //! `CADENCE_METRICS_DIR` relocates that ledger, so one `env` block setting
 //! both leaves no durable record where the operator's tooling reads
 //! (cadence-hooks#963 holds the design call). `CADENCE_ALLOW_MAIN` and
-//! `CADENCE_NO_ENFORCE_WORKTREE` disarm `enforce-worktree`; `CADENCE_MARKER_DIR`
+//! `CADENCE_NO_ENFORCE_WORKTREE` disarm `enforce-worktree`; `CADENCE_MARKER_DIR` (which also holds the confirm tier's confirmations)
 //! relocates the marker state other checks key on. `CADENCE_ALLOWED_OWNERS`,
 //! `CADENCE_ALLOWED_REPOS` and `CADENCE_EXTRA_HOSTS` widen what
 //! `guard-gh-write` accepts as the operator's own (and which pushes

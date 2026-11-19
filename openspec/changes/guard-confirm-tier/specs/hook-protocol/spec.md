@@ -17,10 +17,10 @@ A confirm-tier guard SHALL block the first attempt at an action (exit 2) with it
 
 #### Scenario: Several processes of one tool call
 - **WHEN** a guard wired twice under one matcher runs twice for the blocked call, and twice for the retry
-- **THEN** both processes of the blocked call block, and both processes of the retry allow
+- **THEN** both processes of the blocked call block, both processes of the retry allow, and `bypasses.jsonl` gains one row
 
 ### Requirement: Confirm tier fail directions
-A confirm-tier block SHALL NOT pass, and SHALL end with `A second attempt will be blocked too:` and the reason, when the payload has no `session_id` or no `tool_use_id`, when the marker directory is not private, or when the marker cannot be written. An unreadable, malformed, symlinked, expired or future-stamped marker MUST count as absent, never as a confirmation.
+A confirm-tier block SHALL NOT pass, and SHALL end with `A second attempt will be blocked too:` and the reason, when the payload has no `session_id` or no usable `tool_use_id`, when the marker directory is not private, or when the marker cannot be written. An unreadable, malformed, symlinked, expired or future-stamped marker MUST count as absent, never as a confirmation.
 
 #### Scenario: No session id
 - **WHEN** a confirm-tier guard blocks a payload with no `session_id`, and the same payload is sent again

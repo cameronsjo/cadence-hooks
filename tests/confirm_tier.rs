@@ -103,6 +103,9 @@ fn two_processes_of_one_call_agree() {
         let out = run(root.path(), &payload(cmd, Some("sess-b"), "t2"));
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     }
+    // One confirmation, one ledger row, however many processes ran.
+    let rows = bypass_rows(root.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
 #[test]

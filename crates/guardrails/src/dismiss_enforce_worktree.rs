@@ -18,6 +18,7 @@
 
 use crate::dismiss_main_branch_warn::{parse_duration, session_id_from_env};
 use crate::snooze_meta::{self, DismissArmed, SnoozeMeta};
+use cadence_hooks_core::markers::write_marker;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,7 +131,9 @@ pub fn arm_in_common_dir(
     }
     let armed_at = now_epoch();
     let until = armed_at.saturating_add(secs);
-    if let Err(e) = fs::write(&path, format!("{until}\n")) {
+    // Temp file plus rename: never follows a symlink squatting either name,
+    // now that a hook (a confirmed retry) writes here as well as the CLI.
+    if let Err(e) = write_marker(&path, &format!("{until}\n")) {
         return Err(SnoozeWriteError::Marker(path, e));
     }
     let meta = SnoozeMeta {
@@ -140,7 +143,7 @@ pub fn arm_in_common_dir(
         expires_at: Some(until as i64),
     };
     let sidecar = snooze_meta::sidecar_for(&path);
-    let sidecar_error = fs::write(&sidecar, meta.to_json())
+    let sidecar_error = write_marker(&sidecar, &meta.to_json())
         .err()
         .map(|e| (sidecar, e));
     Ok(ArmedSnooze {

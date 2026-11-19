@@ -200,7 +200,7 @@ use cadence_hooks_core::worktree::{
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -288,6 +288,9 @@ struct GitProbe {
     /// tier covers from one about a command it could not read
     /// (cameronsjo/cadence-hooks#1658).
     primary_blocks: Vec<PrimaryBlock>,
+    /// The Bash arm's commit targets, kept so the confirm tier can tell a
+    /// command that commits in one repo from one that commits in several.
+    commit_targets: Vec<String>,
 }
 
 /// One primary-checkout block: the message [`assess_dir`] returned, the repo
@@ -5418,6 +5421,7 @@ fn run_enforce_with(input: &HookInput, cfg: &EnvConfig, probe: &mut GitProbe) ->
             // What the command itself creates (cadence-hooks#1083): a target
             // that does not exist yet is not "no repo".
             let creations = commit_gaps::creations_of(command, cwd, env, plain.as_ref());
+            probe.commit_targets = commit_targets.clone();
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
@@ -5548,12 +5552,15 @@ fn run_enforce_with(input: &HookInput, cfg: &EnvConfig, probe: &mut GitProbe) ->
     }
 }
 
+/// The hook's registry name, also the confirm tier's key component.
+const HOOK_NAME: &str = "enforce-worktree";
+
 /// Block mutations in a primary checkout of a branch-mode repo.
 pub struct EnforceWorktree;
 
 impl Check for EnforceWorktree {
     fn name(&self) -> &str {
-        "enforce-worktree"
+        HOOK_NAME
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
@@ -5565,7 +5572,7 @@ impl Check for EnforceWorktree {
 fn run_confirmed(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
     let mut probe = GitProbe::default();
     let result = run_enforce_with(input, cfg, &mut probe);
-    confirm_primary_block(input, result, &probe.primary_blocks)
+    confirm_primary_block(input, result, &mut probe)
 }
 
 /// How long a confirmed retry snoozes the guard: the window the block message
@@ -5576,20 +5583,47 @@ const CONFIRM_SNOOZE_SECS: u64 = 30 * 60;
 /// The reason a confirmed retry records on the snooze it arms.
 const CONFIRM_SNOOZE_REASON: &str = "confirmed retry of a blocked action (confirm tier)";
 
+/// The line a block carries when its command commits in more than one repo.
+const MULTI_REPO_NOTE: &str = "This command commits in more than one checkout, so a second \
+     attempt cannot confirm it as one action and will be blocked too. Commit in each \
+     checkout in its own command; each one can then be confirmed.";
+
+/// The repo roots a Bash command's commit targets land in, judged the way the
+/// commit loop judges them (a target not yet on disk by its nearest existing
+/// ancestor). Filesystem walks only, memoized in the probe, no git spawn.
+fn commit_repo_roots(probe: &mut GitProbe) -> BTreeSet<String> {
+    let targets = probe.commit_targets.clone();
+    targets
+        .iter()
+        .filter_map(|target| {
+            let dir = PathBuf::from(target);
+            let dir = if std::fs::symlink_metadata(&dir).is_ok() {
+                dir
+            } else {
+                nearest_existing_ancestor(&dir)
+            };
+            probe.repo_root(&dir)
+        })
+        .collect()
+}
+
 /// Put a primary-checkout block through the confirm tier
 /// (cameronsjo/cadence-hooks#1658).
 ///
 /// Only a block [`assess_dir`] returned for a primary checkout qualifies; a
 /// block about a command the guard could not read keeps blocking as before.
 /// The action is the judged repo plus what the tool touches there (the file
-/// for Edit and Write, the commit for Bash). A pass arms the same snooze
-/// `dismiss-enforce-worktree --for 30m` writes, so one confirmation covers the
-/// edits that follow; if that write fails, the confirmed action still passes
-/// and the next one blocks again.
+/// for Edit and Write, the commit for Bash). A Bash command whose commits land
+/// in more than one repo is never confirmed: the commit loop stops at the
+/// first blocked repo, so the others were never judged, and a pass would carry
+/// them through unseen. A pass arms the same snooze `dismiss-enforce-worktree
+/// --for 30m` writes, so one confirmation covers the edits that follow; if
+/// that write fails, the confirmed action still passes, with a nudge saying
+/// the next one will ask again.
 fn confirm_primary_block(
     input: &HookInput,
     result: CheckResult,
-    primary_blocks: &[PrimaryBlock],
+    probe: &mut GitProbe,
 ) -> CheckResult {
     if result.outcome != Outcome::Block {
         return result;
@@ -5597,15 +5631,22 @@ fn confirm_primary_block(
     let Some(message) = result.message.as_deref() else {
         return result;
     };
-    let Some(block) = primary_blocks
+    let Some(block) = probe
+        .primary_blocks
         .iter()
         .find(|b| message.starts_with(b.message.as_str()))
+        .cloned()
     else {
         return result;
     };
-    let target = match input.normalized_tool_name() {
-        Some("Bash") => "git commit".to_string(),
-        _ => input.file_path().unwrap_or_default().to_string(),
+    let is_bash = input.normalized_tool_name() == Some("Bash");
+    if is_bash && commit_repo_roots(probe).len() > 1 {
+        return CheckResult::block(format!("{message}\n{MULTI_REPO_NOTE}"));
+    }
+    let target = if is_bash {
+        "git commit".to_string()
+    } else {
+        lexical_normalize(&input.file_path().unwrap_or_default())
     };
     let action = format!("{}\u{1f}{target}", block.repo_root);
     let pass_effect = format!(
@@ -5615,7 +5656,7 @@ fn confirm_primary_block(
     );
     let confirmed = cadence_hooks_core::confirm::confirm_block(
         input,
-        "enforce-worktree",
+        HOOK_NAME,
         &action,
         message,
         Some(&pass_effect),
@@ -5623,18 +5664,40 @@ fn confirm_primary_block(
     let Some(mut provenance) = confirmed.bypass.clone() else {
         return confirmed;
     };
-    if let Ok(armed) = dismiss_enforce_worktree::arm_in_common_dir(
+    let root = sanitize_field(&block.repo_root, MAX_PATH_DISPLAY);
+    let armed = dismiss_enforce_worktree::arm_in_common_dir(
         &block.common_dir,
         CONFIRM_SNOOZE_SECS,
         Some(CONFIRM_SNOOZE_REASON),
         input.session_id().map(str::to_string),
-    ) {
-        provenance.mechanism = format!(
-            "{} (dismiss-enforce-worktree {}m)",
-            cadence_hooks_core::confirm::MECHANISM,
-            CONFIRM_SNOOZE_SECS / 60
-        );
-        provenance.expires_at = i64::try_from(armed.until).ok();
+    );
+    let armed = match armed {
+        Ok(armed) => armed,
+        Err(e) => {
+            let why = match e {
+                dismiss_enforce_worktree::SnoozeWriteError::CreateDir(_, e)
+                | dismiss_enforce_worktree::SnoozeWriteError::Marker(_, e) => e.to_string(),
+            };
+            return CheckResult::nudge(format!(
+                "enforce-worktree: confirmed, but the 30-minute snooze for `{root}` could not \
+                 be written ({why}), so the next edit or commit there will ask again."
+            ))
+            .with_bypass(provenance);
+        }
+    };
+    provenance.mechanism = format!(
+        "{} (dismiss-enforce-worktree {}m)",
+        cadence_hooks_core::confirm::MECHANISM,
+        CONFIRM_SNOOZE_SECS / 60
+    );
+    provenance.expires_at = i64::try_from(armed.until).ok();
+    if let Some((_, e)) = armed.sidecar_error {
+        return CheckResult::nudge(format!(
+            "enforce-worktree: confirmed; the 30-minute snooze for `{root}` is set, but its \
+             provenance sidecar could not be written ({e}), so the bypass log will show no \
+             reason for the rides that follow."
+        ))
+        .with_bypass(provenance);
     }
     CheckResult::allow_bypassed(provenance)
 }
@@ -7293,18 +7356,120 @@ mod tests {
     fn confirm_leaves_an_unreadable_command_block_alone() {
         // A block about a command the guard cannot read is not a primary-
         // checkout block, so it gets no confirm line and never passes.
-        let blocks = [PrimaryBlock {
+        let mut probe = GitProbe::default();
+        probe.primary_blocks.push(PrimaryBlock {
             message: "Blocked: `/r` is a primary checkout".into(),
             repo_root: "/r".into(),
             common_dir: PathBuf::from("/r/.git"),
-        }];
+        });
         let mut input = make_bash("git commit -m x");
         input.session_id = Some("s1".into());
         input.tool_use_id = Some("t1".into());
         let other = CheckResult::block(created_symlink_block_message());
-        let r = confirm_primary_block(&input, other, &blocks);
+        let r = confirm_primary_block(&input, other, &mut probe);
         assert_eq!(r.outcome, Outcome::Block);
         assert!(!r.message.unwrap().contains("Are you sure"));
+    }
+
+    #[test]
+    fn confirm_never_passes_a_real_unreadable_command_block() {
+        // The same, through the real Bash path: a commit beneath a symlink the
+        // command itself creates blocks with no confirm line, on every try.
+        let scratch = scratch("confirm-symlink");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let link = wt.join("into-primary");
+            let command = format!(
+                "ln -s {} {} && git -C {} commit -m x",
+                primary.display(),
+                link.display(),
+                link.display()
+            );
+            for call in ["t1", "t2"] {
+                let mut input = make_bash(&command);
+                input.cwd = Some(wt.to_string_lossy().into_owned());
+                let r = run_confirmed(
+                    &confirm_attempt(input, Some("s1"), None, call),
+                    &cfg(false, false),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "{call}");
+                let msg = r.message.unwrap();
+                assert!(msg.contains("creates a symlink"), "{msg}");
+                assert!(!msg.contains("Are you sure"), "{msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn confirm_never_covers_a_commit_into_a_second_repo() {
+        // The commit loop stops at the first blocked repo, so a pass for the
+        // whole command would carry the second commit through unjudged.
+        let scratch_a = scratch("confirm-two-a");
+        let scratch_b = scratch("confirm-two-b");
+        let (a, _wt_a) = primary_and_worktree(&scratch_a);
+        let (b, _wt_b) = primary_and_worktree(&scratch_b);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let command = format!("git commit -m x && git -C {} commit -m y", b.display());
+            for call in ["t1", "t2", "t3"] {
+                let mut input = make_bash(&command);
+                input.cwd = Some(a.to_string_lossy().into_owned());
+                let r = run_confirmed(
+                    &confirm_attempt(input, Some("s1"), None, call),
+                    &cfg(false, false),
+                );
+                assert_eq!(r.outcome, Outcome::Block, "{call}");
+                let msg = r.message.unwrap();
+                assert!(msg.contains("commits in more than one checkout"), "{msg}");
+                assert!(!msg.contains("Are you sure"), "{msg}");
+            }
+            assert!(!snoozed(&a) && !snoozed(&b));
+            // Each commit on its own is still confirmable.
+            let mut alone = make_bash("git commit -m x");
+            alone.cwd = Some(a.to_string_lossy().into_owned());
+            let run = |call| {
+                run_confirmed(
+                    &confirm_attempt(alone.clone(), Some("s1"), None, call),
+                    &cfg(false, false),
+                )
+                .outcome
+            };
+            assert_eq!(run("t4"), Outcome::Block);
+            assert_eq!(run("t5"), Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn confirm_says_so_when_the_snooze_cannot_be_written() {
+        let scratch = scratch("confirm-snooze-fail");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            // A directory squatting the snooze directory's name makes the
+            // marker write fail.
+            let common = GitState::resolve(&primary).unwrap().git_common_dir;
+            std::fs::write(common.join("cadence-hooks"), "not a dir").unwrap();
+            let file = primary.join("src.rs");
+            let run = |call| {
+                run_confirmed(
+                    &confirm_attempt(edit_in(&primary, &file), Some("s1"), None, call),
+                    &cfg(false, false),
+                )
+            };
+            assert_eq!(run("t1").outcome, Outcome::Block);
+            let pass = run("t2");
+            assert_eq!(
+                pass.outcome,
+                Outcome::Nudge,
+                "the confirmed action still passes"
+            );
+            assert_eq!(pass.bypass.unwrap().kind, BypassKind::Confirmed);
+            let msg = pass.message.unwrap();
+            assert!(msg.contains("could not be written"), "{msg}");
+            assert!(msg.contains("will ask again"), "{msg}");
+            std::fs::remove_file(common.join("cadence-hooks")).unwrap();
+        });
     }
 
     /// cadence-hooks#1001: a file git ignores AND does not track can never live

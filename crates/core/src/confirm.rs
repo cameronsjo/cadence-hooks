@@ -56,7 +56,7 @@
 //! message instead names the failure and points at the guard's other route or
 //! the operator, and no write failure ever produces a pass.
 
-use crate::markers::{marker_dir, marker_dir_is_private, write_marker};
+use crate::markers::{private_marker_dir, write_marker};
 use crate::{BypassKind, BypassProvenance, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -114,6 +114,10 @@ impl Unavailable {
 pub enum Gate {
     /// A deliberate second attempt: allow, and record this provenance.
     Passed(BypassProvenance),
+    /// Another process of the tool call that already passed (a guard wired
+    /// twice under one matcher): allow, and record nothing, so one
+    /// confirmation writes one ledger row.
+    PassedSibling,
     /// A first attempt (or a sibling process of one): block, and say a retry
     /// will pass.
     Armed,
@@ -220,9 +224,16 @@ fn read_marker(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// The marker path for a key digest.
-fn marker_path(digest: &str) -> PathBuf {
-    marker_dir().join(format!("confirm-{digest}"))
+/// The marker path for a key digest in the private marker directory.
+fn marker_path(dir: &Path, digest: &str) -> PathBuf {
+    dir.join(format!("confirm-{digest}"))
+}
+
+/// A tool-call id the record format can carry: non-empty, with no whitespace
+/// or control character (the record is line-based, so a newline in the id
+/// would leave a marker that never parses and a retry that never pairs).
+fn usable_call_id(id: &str) -> bool {
+    !id.is_empty() && !id.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Judge one attempt at `action` for `hook`, reading and writing its marker.
@@ -251,16 +262,17 @@ fn gate_with(
     let Some(session) = input.session_id().filter(|s| !s.is_empty()) else {
         return Gate::Unavailable(Unavailable::NoSession);
     };
-    let Some(call) = input.tool_use_id() else {
+    let Some(call) = input.tool_use_id().filter(|id| usable_call_id(id)) else {
         return Gate::Unavailable(Unavailable::NoToolCallId);
     };
-    if !marker_dir_is_private() {
+    let Some(dir) = private_marker_dir() else {
         return Gate::Unavailable(Unavailable::SharedMarkerDir);
-    }
+    };
     let agent = input.agent_id().unwrap_or_default();
     let digest = key_digest(hook, session, agent, action);
-    let path = marker_path(&digest);
-    let record = read_marker(&path).and_then(|text| parse_record(&text, &digest));
+    let path = marker_path(&dir, &digest);
+    let read = || read_marker(&path).and_then(|text| parse_record(&text, &digest));
+    let record = read();
     let ttl = i64::try_from(CONFIRM_TTL.as_secs()).unwrap_or(i64::MAX);
     let write = |state: State| {
         let record = Record {
@@ -277,14 +289,23 @@ fn gate_with(
             Err(_) => Gate::Unavailable(Unavailable::WriteFailed),
         },
         Step::Pass => {
-            // A sibling of this call that already consumed the marker passed
-            // at the same stamp; keep it, so the consumed record stays the
-            // first pass's.
-            let already = record
-                .as_ref()
-                .is_some_and(|r| r.state == State::Consumed && r.call == call);
-            if !already && write(State::Consumed).is_err() {
-                return Gate::Unavailable(Unavailable::WriteFailed);
+            let consumed_by_this_call = |r: &Option<Record>| {
+                r.as_ref()
+                    .is_some_and(|r| r.state == State::Consumed && r.call == call)
+            };
+            // A sibling of this call already consumed the marker and recorded
+            // the pass; keep its record and write no second ledger row.
+            if consumed_by_this_call(&record) {
+                return Gate::PassedSibling;
+            }
+            if write(State::Consumed).is_err() {
+                // A sibling may have won the write: if the marker now shows
+                // this call's consumption, agree with it rather than block.
+                return if consumed_by_this_call(&read()) {
+                    Gate::PassedSibling
+                } else {
+                    Gate::Unavailable(Unavailable::WriteFailed)
+                };
             }
             Gate::Passed(BypassProvenance {
                 kind: BypassKind::Confirmed,
@@ -302,11 +323,11 @@ fn gate_with(
 /// well-formed marker to move.
 #[cfg(any(test, feature = "test-builders"))]
 pub fn backdate_for_tests(input: &HookInput, hook: &str, action: &str, secs: i64) -> bool {
-    let (Some(session), true) = (input.session_id(), marker_dir_is_private()) else {
+    let (Some(session), Some(dir)) = (input.session_id(), private_marker_dir()) else {
         return false;
     };
     let digest = key_digest(hook, session, input.agent_id().unwrap_or_default(), action);
-    let path = marker_path(&digest);
+    let path = marker_path(&dir, &digest);
     let Some(mut record) = read_marker(&path).and_then(|t| parse_record(&t, &digest)) else {
         return false;
     };
@@ -353,6 +374,7 @@ pub fn confirm_block(
 ) -> CheckResult {
     match gate(input, hook, action) {
         Gate::Passed(provenance) => CheckResult::allow_bypassed(provenance),
+        Gate::PassedSibling => CheckResult::allow(),
         Gate::Armed => CheckResult::block(format!("{message}\n{}", armed_note(pass_effect))),
         Gate::Unavailable(why) => {
             CheckResult::block(format!("{message}\n{}", unavailable_note(why)))
@@ -364,6 +386,7 @@ pub fn confirm_block(
 mod tests {
     use super::*;
     use crate::Outcome;
+    use crate::markers::{marker_dir, marker_dir_is_private};
     use crate::test_builders::{make_bash, with_marker_dir};
 
     const TTL: i64 = 600;
@@ -461,8 +484,8 @@ mod tests {
             assert_eq!(p.kind, BypassKind::Confirmed);
             assert_eq!(p.mechanism, MECHANISM);
             assert_eq!(p.armed_by_session.as_deref(), Some("s1"));
-            // A sibling of the passing call passes too.
-            assert!(matches!(gate_at(&a("t2"), "h", "x", 1001), Gate::Passed(_)));
+            // A sibling of the passing call passes too, recording nothing.
+            assert_eq!(gate_at(&a("t2"), "h", "x", 1001), Gate::PassedSibling);
             // The pass is single use.
             assert_eq!(gate_at(&a("t3"), "h", "x", 1002), Gate::Armed);
             assert!(matches!(gate_at(&a("t4"), "h", "x", 1003), Gate::Passed(_)));
@@ -549,7 +572,7 @@ mod tests {
         with_marker_dir(dir.path(), || {
             let a = input(Some("s1"), None, Some("t2"));
             let digest = key_digest("h", "s1", "", "x");
-            let path = marker_path(&digest);
+            let path = marker_path(&private_marker_dir().unwrap(), &digest);
             // Junk under the right name.
             std::fs::write(&path, "pending\n").unwrap();
             assert_eq!(gate_at(&a, "h", "x", 1000), Gate::Armed);
@@ -626,6 +649,46 @@ mod tests {
             );
             // The pending marker is untouched, so a working retry still passes.
             assert!(matches!(gate_at(&a("t3"), "h", "x", 1002), Gate::Passed(_)));
+        });
+    }
+
+    #[test]
+    fn a_sibling_whose_write_fails_agrees_with_the_one_that_passed() {
+        // Two processes of call t2 read `pending t1`; one records the pass,
+        // the other's write fails. It re-reads, sees t2's consumption, and
+        // allows instead of telling the model a retry will be blocked.
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            let a = |call| input(Some("s1"), None, Some(call));
+            assert_eq!(gate_at(&a("t1"), "h", "x", 1000), Gate::Armed);
+            let digest = key_digest("h", "s1", "", "x");
+            let path = marker_path(&private_marker_dir().unwrap(), &digest);
+            let winner = render_record(&digest, &rec(State::Consumed, "t2", 1001));
+            // The failing writer lands the sibling's record, then reports its
+            // own write failed.
+            let sibling_wins = |p: &Path, _: &str| {
+                std::fs::write(p, &winner).unwrap();
+                Err(std::io::Error::other("lost the race"))
+            };
+            assert_eq!(
+                gate_with(&a("t2"), "h", "x", 1001, sibling_wins),
+                Gate::PassedSibling
+            );
+            assert_eq!(read_marker(&path).as_deref(), Some(winner.as_str()));
+        });
+    }
+
+    #[test]
+    fn a_call_id_the_record_cannot_carry_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            for id in ["toolu_1\ntoolu_2", "toolu 1", "toolu_\u{7}"] {
+                assert_eq!(
+                    gate_at(&input(Some("s1"), None, Some(id)), "h", "x", 1000),
+                    Gate::Unavailable(Unavailable::NoToolCallId),
+                    "{id:?}"
+                );
+            }
         });
     }
 

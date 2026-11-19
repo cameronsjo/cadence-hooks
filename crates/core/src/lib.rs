@@ -1682,7 +1682,8 @@ impl BypassKind {
 /// never a command, path, or edited content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BypassProvenance {
-    /// Dismissal vs env-switch.
+    /// Which kind of bypass: a dismissal, an env switch, a confirmed retry,
+    /// or one of the other [`BypassKind`] variants.
     pub kind: BypassKind,
     /// The concrete mechanism, e.g. `dismiss-enforce-worktree` or
     /// `CADENCE_ALLOW_MAIN`.

@@ -23,7 +23,7 @@ A hook wired twice under one matcher (`guard-op-vault-scan` is, for `Bash(*op it
 - `pending <call>`: a process of the same call blocks and writes nothing; a process of a later call passes and rewrites the marker as `consumed <its call>`.
 - `consumed <call>`: a process of the same call passes (it is the same retry); a later call writes a new `pending` and blocks.
 
-Every write is idempotent for the processes of one call, so sibling races end in the same verdict for all of them. Single use falls out of the second state.
+Every write is idempotent for the processes of one call, so sibling races end in the same verdict for all of them. Single use falls out of the second state. Only the process that writes `consumed` returns the provenance; a sibling that finds the marker already consumed by its own call allows with nothing to record, so one confirmation writes one ledger row. A sibling whose own `consumed` write fails re-reads the marker and allows if it now shows its call's consumption. A `tool_use_id` with whitespace or a control character counts as absent, since the record is line-based.
 
 ### Lifetime
 
@@ -50,7 +50,11 @@ The failed write is the case that could loop: told to retry, the model retries, 
 
 ### enforce-worktree arms the dismiss snooze
 
-Decision 3 of the owner's brief: a confirmed retry arms the existing snooze (the marker and sidecar `dismiss-enforce-worktree --for 30m` writes), through one shared writer, so there is no second mechanism. Consequence: after the confirmed edit, later edits and commits in that checkout ride the snooze for 30 minutes and are recorded as `dismissal` bypasses, exactly as after a dismiss; and the snooze is per checkout, so it covers every session in that checkout, as a dismiss does. The confirm pass itself is still per session, agent and action. If the snooze write fails, the confirmed action passes and the next one blocks again.
+Decision 3 of the owner's brief: a confirmed retry arms the existing snooze (the marker and sidecar `dismiss-enforce-worktree --for 30m` writes), through one shared writer, so there is no second mechanism. Consequence: after the confirmed edit, later edits and commits in that checkout ride the snooze for 30 minutes and are recorded as `dismissal` bypasses, exactly as after a dismiss; and the snooze is per checkout, so it covers every session in that checkout, as a dismiss does. The confirm pass itself is still per session, agent and action. The snooze files are written through `write_marker` (temp file plus rename), so a symlink squatting either name is replaced, never followed. If the snooze write fails, the confirmed action passes with a nudge saying the next edit or commit will ask again; a failed provenance sidecar gets a nudge too.
+
+In a grouped dispatch (`group … guardrails/enforce-worktree`), another member can block the same retry. The confirmation is then consumed and the snooze armed for an action that did not run; that is accepted under the snooze decision, since the snooze is what a dismiss would have set.
+
+A Bash command whose commits land in more than one repo is never confirmed. The commit loop returns at the first blocked repo, so later targets are never judged, and a pass for the whole command would carry them through. Such a command blocks with a line saying a retry will be blocked too and to commit in each checkout in its own command.
 
 Only the block `assess_dir` returns for a primary checkout qualifies. The guard records each such block on its git probe, and the confirm step matches the final block's message against them by prefix (the cd and worktree hints are appended to it). Blocks about a command the guard could not read (a symlink created in the same command, an unresolved `cd`) keep blocking with no confirm line.
 
