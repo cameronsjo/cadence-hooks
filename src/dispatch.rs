@@ -493,13 +493,6 @@ fn decide_member(
             if !claim_emission(&result, input, event, hook_name) {
                 return MemberVerdict::Silent;
             }
-            // Only now is the reminder going out: the repo config did not
-            // silence it and no sibling process emitted it first. This is where
-            // the commit quiet period is spent (cadence-hooks#1636), so a
-            // suppressed or deduplicated reminder never uses it up.
-            if hook_name == "warn-overshare" && result.outcome == Outcome::Nudge {
-                cadence_hooks_cadence::warn_overshare::record_delivered(input);
-            }
             MemberVerdict::Emit(Box::new(result), event)
         }
     }

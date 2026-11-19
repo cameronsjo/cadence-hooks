@@ -105,20 +105,43 @@ Rules for wiring:
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) | run |
 | `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable | run |
 
-`warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
+`warn-overshare` does path triage only — it fires on push/PR/issue/post Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
 judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
-It reminds once per session on a plain `git commit` (the whole command is one
-`git commit` with only bare-word or quoted arguments) and stays silent on later
-plain commits in that session. Every push, every post, every field-report edit
-and every other form of commit (a global option, a `cd`, a chain, a pipe, a
-substitution, a heredoc) reminds every time. The quiet period is keyed on the
-session id alone, so a subagent and its parent share it; with no session id it
-never applies. It is spent only when the reminder is emitted: a reminder the
-repo's `nudges` config suppresses does not use it.
+A command fires `warn-overshare` when any of four things holds:
+
+1. It is a `gh` or `tea` post, as above.
+2. The parsed push reader sees a push: a `git` command whose subcommand is
+   `push`, past git's global options (`git -C dir push`, `git -c k=v push`,
+   `git --no-pager push`), before a separator or a `)` (`git push;`,
+   `git push|cat`), and inside a subshell, a group, a `sh -c` script, an `eval`
+   or a command substitution (`(cd x && git push)`, `bash -c 'git push'`).
+3. The two words `git push` stand side by side in the whitespace-split command,
+   exactly as the hook always matched them, with no trimming: behind a runner
+   the parsed reader does not know (`ssh host git push`, `docker exec c git push`,
+   `parallel git push ::: a b`), in a heredoc body, or in an unquoted
+   `echo git push`.
+4. The command is a commit and its text contains the substring `push` anywhere
+   (case-sensitive, raw text, no parsing).
+
+The fourth is the guarantee. A `git commit` leaves the machine only when it is
+pushed, so a commit that never contains `push` no longer fires, in any form (a
+`cd`, a `git -C`, a chain, a substitution, a heredoc). Every command that
+reminded through its commit before and holds a push in any shape that spells the
+word still reminds: `ssh host 'git push'`, `docker exec c git -C d push`,
+`time -p git -C d push`, `make push`. So does a commit whose message or path
+contains `push`, as before. The one boundary: a push that never spells the word
+(a make target with another name, a script file) after a commit is silent. A
+word that only starts with `push` (`git push-hook`) and `push` as an argument to
+another subcommand (`git stash push`) do not fire through arms 2 and 3.
+
+The `cadence` plugin starts the hook only for commands that contain `git push`,
+`git commit`, `gh ` or `tea ` (its `if:` filters), so a push spelled
+`git -C dir push`, with none of those, does not reach the hook until those
+filters are widened (cameronsjo/cadence#2211).
 
 ## guardrails (git-guardrails)
 

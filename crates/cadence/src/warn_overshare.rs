@@ -1,8 +1,16 @@
 //! Nudge to audit about-to-ship content for personal-context overshare.
 //!
-//! Fires on commit/push/PR/issue Bash commands and on Write/Edit to
+//! Fires on push/PR/issue/post Bash commands and on Write/Edit to
 //! `docs/field-reports/` paths. The hook does the path triage; the model
 //! does the content judgment from the nudge text.
+//!
+//! A `git commit` whose text never contains `push` does not fire
+//! (cadence-hooks#1636): a commit leaves the machine only when it is pushed,
+//! and the push reminds. A command that holds a commit and also a push or a
+//! post still fires, for the push or the post. A commit whose command text
+//! contains the substring `push` anywhere fires, as it did before: that is
+//! what keeps a push in any shape (a quoted remote command, a runner, a
+//! heredoc) from going silent.
 //!
 //! Skips:
 //! - `CADENCE_SKIP_OVERSHARE_AUDIT=1` — session-scoped bypass for repos
@@ -15,21 +23,12 @@
 //! (vault primary, gitignored fallback), so retro paths no longer have a
 //! sanctioned repo destination to exempt.
 
-use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome, markers};
-
-/// Bash token sequences that surface about-to-ship content but are NOT
-/// external-posting verbs the shared [`is_external_post`] gate covers. Only
-/// `git push` qualifies — the former `git commit` and four `gh` sequences
-/// were strict subsets of the gate and were pruned when it was adopted
-/// (#385): a second hand-kept list is exactly the drift this change kills.
-///
-/// [`is_external_post`]: crate::redact_external_content::is_external_post
-const BASH_TWO_TOKEN_TRIGGERS: &[[&str; 2]] = &[["git", "push"]];
+use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome};
 
 const FIELD_REPORTS_MARKER: &str = "/docs/field-reports/";
 
 /// Nudges the model to audit about-to-ship content for overshare before
-/// commits, pushes, PRs/issues, or field-report writes ship.
+/// pushes, posts (PRs, issues, comments, releases), or field-report writes ship.
 pub struct WarnOvershare;
 
 impl Check for WarnOvershare {
@@ -40,113 +39,8 @@ impl Check for WarnOvershare {
     fn run(&self, input: &HookInput) -> CheckResult {
         let bypass = std::env::var(BYPASS_ENV).ok();
         let vault = std::env::var("OBSIDIAN_VAULT").ok();
-        run_quiet_period(input, bypass.as_deref(), vault.as_deref())
+        run_with_env(input, bypass.as_deref(), vault.as_deref())
     }
-}
-
-/// Marker kind for the commit quiet period. One session-wide marker, no repo or
-/// agent part in the key, so it can only ever silence a later plain commit.
-const COMMIT_MARKER_KIND: &str = "overshare-commit-warned";
-
-/// [`run_with_env`] plus the quiet period for a plain `git commit`
-/// (cadence-hooks#1636): the first one in a session reminds, later ones in the
-/// same session are silent. Nothing else is ever silenced: a push, a post, a
-/// file edit and every commit that is not the exact plain form remind each time.
-///
-/// This only reads the marker. It is written by [`record_delivered`], which the
-/// dispatcher calls once the reminder has actually been emitted, so a reminder
-/// that repo configuration suppresses, or that a sibling process already
-/// delivered, never uses up the session's one reminder.
-fn run_quiet_period(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) -> CheckResult {
-    let result = run_with_env(input, bypass, vault);
-    if result.outcome != Outcome::Nudge {
-        return result;
-    }
-    match quiet_marker(input) {
-        Some(marker) if marker.exists() => CheckResult::allow(),
-        _ => result,
-    }
-}
-
-/// Record that this payload's reminder was delivered, so later plain commits in
-/// the session are silent. A no-op for everything but a plain `git commit` that
-/// [`quiet_marker`] accepts. Called by the dispatcher after it emits a
-/// `warn-overshare` nudge (never after a suppressed or deduplicated one); a
-/// failed write leaves the reminder in place (ADR-0001).
-pub fn record_delivered(input: &HookInput) {
-    if let Some(marker) = quiet_marker(input) {
-        let _ = markers::write_marker(&marker, "");
-    }
-}
-
-/// The quiet-period marker for `input`, or `None` when this payload takes no
-/// part in the quiet period and must always remind: not a Bash call, not a plain
-/// commit, no usable session id, or a marker directory that is not private.
-///
-/// Fails toward reminding (ADR-0001).
-fn quiet_marker(input: &HookInput) -> Option<std::path::PathBuf> {
-    if input.normalized_tool_name() != Some("Bash") || !input.command().is_some_and(is_plain_commit)
-    {
-        return None;
-    }
-    // `session_marker` falls back to a per-process id when the payload carries
-    // none, which would never match twice: require a real, non-empty id.
-    if !input.session_id().is_some_and(|sid| !sid.is_empty()) {
-        return None;
-    }
-    // A shared (unhardened) marker directory lets a co-tenant pre-plant the
-    // marker and mute the reminder; degrade toward reminding, as `claim_today`.
-    if !markers::marker_dir_is_private() {
-        return None;
-    }
-    Some(markers::session_marker(input, COMMIT_MARKER_KIND, None))
-}
-
-/// True only when the whole command is one plain `git commit` invocation: the
-/// text starts with `git commit` (so no global option, `cd`, variable prefix or
-/// wrapper comes before the subcommand) and every argument after it is built
-/// from an allowlist: bare words of `[A-Za-z0-9_./=:@+,%-]`, single-quoted text,
-/// and double-quoted text with no `$`, backtick, backslash or `!`. Whitespace
-/// between words is a space or tab. Anything else (a newline outside quotes, a
-/// `;`, `&`, `|`, `<`, `>`, `(`, `$`, a glob, a comment) makes it not plain, so a
-/// chain, a pipe, a substitution, a heredoc and a redirect all keep reminding.
-///
-/// This is an allowlist of one shape, not a list of shapes to exclude: a form
-/// nobody thought of is not plain.
-fn is_plain_commit(command: &str) -> bool {
-    let Some(rest) = command.trim().strip_prefix("git commit") else {
-        return false;
-    };
-    // `git commit-tree`, `git committer`: the subcommand name must end here.
-    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
-        return false;
-    }
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            ' ' | '\t' => {}
-            '\'' => {
-                if !chars.by_ref().any(|q| q == '\'') {
-                    return false;
-                }
-            }
-            '"' => loop {
-                match chars.next() {
-                    Some('"') => break,
-                    Some('$' | '`' | '\\' | '!') | None => return false,
-                    Some(_) => {}
-                }
-            },
-            c if is_bare_word_char(c) => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn is_bare_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(c, '_' | '.' | '/' | '=' | ':' | '@' | '+' | ',' | '%' | '-')
 }
 
 /// Core decision logic with env values passed in.
@@ -204,39 +98,88 @@ fn is_bypass_set(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
-/// True when `command` carries `git push`, or any segment matches the redact
-/// engine's [`is_external_post`] gate (cadence-hooks#385: overshare's hand-kept
-/// six-command list missed `gh pr comment`, `gh pr review`, `gh issue edit`,
-/// `gh release/gist/discussion`, and `tea` — every one an external-posting
-/// surface the leak scanner already gated). One gate, two consumers: a new
-/// posting verb added there is covered here for free.
+/// Arm 3, the word pair: the two words `git` and `push` stand side by side in
+/// the whitespace-split command, `main`'s exact match with no trimming. It
+/// reads a push wherever the words appear unquoted: behind a runner the parsed
+/// reader does not know (`ssh host git push`, `docker exec c git push`,
+/// `parallel git push ::: a b`) and in a heredoc body. The price is a reminder
+/// on text that is not a push: an unquoted `echo git push`.
+fn carries_git_push_word_pair(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words
+        .windows(2)
+        .any(|pair| pair[0] == "git" && pair[1] == "push")
+}
+
+/// Arm 4, a commit that spells `push`: a segment that `main`'s own posting
+/// gate reads (`is_external_post` and not a `gh api` write with no prose field,
+/// which on `main` is how a `git commit` reminded) AND the raw command text
+/// contains the substring `push`, case-sensitive, no parsing. It is a
+/// guarantee more than a feature: any command that reminded on `main` through
+/// its commit and holds a push in any spelling that includes the substring
+/// still reminds, whatever the shape (a quoted remote command, a runner, a
+/// heredoc, `make push`). The gate half is the same per-segment match `main`
+/// used, not `is_external_post` on the whole command, which reads only the
+/// first command of a chain. A `gh`/`tea` post also passes the gate, but arm 1
+/// already reminds on those.
+fn is_commit_that_spells_push(command: &str, segments: &[String]) -> bool {
+    command.contains("push")
+        && segments.iter().any(|seg| {
+            crate::redact_external_content::is_external_post(seg)
+                && !crate::redact_external_content::api_posts_no_prose(seg)
+        })
+}
+
+/// A Bash command reminds when any of four arms holds (cadence-hooks#1636):
+/// (1) a segment is a `gh`/`tea` post, the redact engine's posting gate minus
+/// `git commit` ([`is_external_post_beyond_commit`]), as before
+/// (cadence-hooks#385: one gate, two consumers, so a new posting verb there is
+/// covered here); (2) the parsed push reader sees a push
+/// ([`carries_parsed_git_push`]); (3) the two words `git push` stand side by
+/// side ([`carries_git_push_word_pair`]); (4) a commit whose command text
+/// contains the substring `push` ([`is_commit_that_spells_push`]).
 ///
-/// [`is_external_post`]: crate::redact_external_content::is_external_post
+/// The guarantee: every command that reminds on `main` and is silent here is a
+/// commit, as `main` read it, whose text never contains `push`. A commit alone
+/// leaves the machine only when pushed, so it no longer reminds; a push that
+/// spells the substring still does, in any shape. A push that never spells it
+/// (a make target with another name, a script file) after a commit is silent:
+/// that is the whole documented boundary. The shared reader is not widened: it
+/// serves blocking guards, and this nudge must not change them.
+///
+/// [`is_external_post_beyond_commit`]: crate::redact_external_content::is_external_post_beyond_commit
 ///
 /// Precision caveat, accepted: quote-stripping each segment keeps a QUOTED
-/// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an
-/// unquoted prose mention (`echo run gh pr comment 5 later`) still nudges —
-/// same over-trigger the old token arm had for `echo git commit foo`. This
-/// is an advisory nudge; false-fire costs a line of noise, and the extraction
-/// step that gives the redact hook full mention-immunity has no meaning here
-/// (there is no body to extract — the command shape IS the signal).
+/// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an unquoted
+/// prose mention (`echo run gh pr comment 5 later`) still nudges. This is an
+/// advisory nudge; a false fire costs a line of noise, and the extraction step
+/// that gives the redact hook full mention-immunity has no meaning here (there
+/// is no body to extract; the command shape IS the signal).
 fn is_bash_overshare_trigger(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    use cadence_hooks_core::shell::command_segments;
 
-    let push_hit = tokens.windows(2).any(|w| {
-        BASH_TWO_TOKEN_TRIGGERS
-            .iter()
-            .any(|t| w[0] == t[0] && w[1] == t[1])
-    });
-    if push_hit {
+    if carries_git_push_word_pair(command) {
         return true;
     }
 
-    use cadence_hooks_core::shell::command_segments;
-    command_segments(command).iter().any(|seg| {
-        crate::redact_external_content::is_external_post(seg)
-            && !crate::redact_external_content::api_posts_no_prose(seg)
-    })
+    let segments = command_segments(command);
+    carries_parsed_git_push(&segments)
+        || segments.iter().any(|seg| {
+            crate::redact_external_content::is_external_post_beyond_commit(seg)
+                && !crate::redact_external_content::api_posts_no_prose(seg)
+        })
+        || is_commit_that_spells_push(command, &segments)
+}
+
+/// The parsed arm of the push trigger: the shared push reader finds a `git`
+/// invocation whose subcommand is `push` in any of the segments
+/// `command_segments` yields (so inside `sh -c`, `eval` and substitutions too).
+fn carries_parsed_git_push(segments: &[String]) -> bool {
+    use cadence_hooks_core::shell::git_push_segments;
+
+    segments
+        .iter()
+        .any(|seg| !git_push_segments(seg).is_empty())
 }
 
 /// True when `path` is under the Obsidian vault.
@@ -341,9 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn git_commit_nudges() {
+    fn git_commit_alone_is_silent() {
+        // Was `git_commit_nudges`: a commit stays on the machine until a push
+        // (cadence-hooks#1636), and the push reminds.
         let result = run(&make_bash("git commit -m 'add feature'"));
-        assert_eq!(result.outcome, Outcome::Nudge);
+        assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
@@ -624,9 +569,10 @@ mod tests {
 
     #[test]
     fn quoted_git_push_in_echo_allowed() {
-        // split_whitespace on `echo 'git push'` yields tokens including the
-        // quote characters, so the literal tokens "git" and "push" don't
-        // appear adjacent — the window check correctly returns false.
+        // `echo 'git push'`: split on whitespace the tokens keep their quote
+        // characters, so the two words are not side by side (word-pair arm), and
+        // the quoted text is one argument of `echo`, never a command word, so
+        // the parsed reader finds no push either.
         let result = run(&make_bash("echo 'git push' >> notes.txt"));
         assert_eq!(result.outcome, Outcome::Allow);
     }
@@ -658,275 +604,387 @@ mod tests {
     }
 
     #[test]
-    fn compound_command_with_git_commit_nudges() {
-        // `cd foo && git commit ...` should still trigger.
+    fn compound_command_with_git_commit_alone_is_silent() {
+        // Was `compound_command_with_git_commit_nudges`: `cd foo && git commit`
+        // holds no push and no post (cadence-hooks#1636).
         let result = run(&make_bash("cd foo && git commit -m bar"));
-        assert_eq!(result.outcome, Outcome::Nudge);
+        assert_eq!(result.outcome, Outcome::Allow);
     }
 
-    // --- Commit quiet period (cadence-hooks#1636) ---
-
-    fn in_session(command: &str, sid: &str) -> HookInput {
-        HookInput {
-            session_id: Some(sid.into()),
-            ..make_bash(command)
-        }
-    }
-
-    /// Run `f` with a scratch marker directory, so no test touches the real one.
-    fn quiet<T>(f: impl FnOnce() -> T) -> T {
-        let dir = tempfile::tempdir().unwrap();
-        cadence_hooks_core::test_builders::with_marker_dir(dir.path(), f)
-    }
-
-    /// The check's verdict, then the dispatcher's step for an emitted reminder:
-    /// a delivered nudge spends the quiet period.
-    fn outcome(input: &HookInput) -> Outcome {
-        let result = run_quiet_period(input, None, None);
-        if result.outcome == Outcome::Nudge {
-            record_delivered(input);
-        }
-        result.outcome
-    }
-
-    /// Spend the session's one commit reminder, as the first plain commit does.
-    fn spend_commit_reminder(sid: &str) {
-        assert_eq!(
-            outcome(&in_session("git commit -m 'first'", sid)),
-            Outcome::Nudge
-        );
-        assert_eq!(
-            outcome(&in_session("git commit -m 'second'", sid)),
-            Outcome::Allow,
-            "the quiet period must be live before the rows that must not use it"
-        );
-    }
+    // --- A commit never reminds; the push or post in the same command does
+    // (cadence-hooks#1636) ---
 
     #[test]
-    fn first_plain_commit_reminds_and_later_ones_are_silent() {
-        for (n, cmd) in [
+    fn a_commit_that_never_spells_push_is_silent() {
+        for cmd in [
             "git commit",
-            "git commit -m 'x'",
+            "git commit -m x",
+            "git commit -m 'add feature'",
             "git commit -m \"two words\"",
             "git commit -F msg.txt -- a.rs b.rs",
             "git commit --amend --no-edit",
-            "git commit -m 'a; b && c | d $(e)'",
-            "git commit --message=\"x y\"",
-            "  git commit -m x\n",
-        ]
-        .iter()
-        .enumerate()
-        {
-            quiet(|| {
-                let sid = format!("sid-plain-{n}");
-                assert_eq!(
-                    outcome(&in_session(cmd, &sid)),
-                    Outcome::Nudge,
-                    "first: {cmd}"
-                );
-                assert_eq!(
-                    outcome(&in_session(cmd, &sid)),
-                    Outcome::Allow,
-                    "second: {cmd}"
-                );
-                assert_eq!(
-                    outcome(&in_session(cmd, &sid)),
-                    Outcome::Allow,
-                    "third: {cmd}"
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn a_commit_that_is_not_the_exact_plain_form_reminds_every_time() {
-        for cmd in [
+            "git commit -am 'wip'",
+            "cd other && git commit -m x",
+            "cd other; git commit -m x",
+            "git add -A && git commit -m x",
+            "git add a.rs && git commit -m x && git status",
             "git -C other commit -m x",
             "git -c user.name=x commit -m x",
             "git --git-dir=other/.git commit -m x",
             "git --work-tree=other commit -m x",
-            "cd other && git commit -m x",
-            "cd other; git commit -m x",
-            "git commit -m x && git push",
-            "git commit -m x && gh pr create --title t",
-            "git commit -m x; git status",
-            "git commit -m x | tee out.txt",
-            "git commit -m x || true",
             "git commit -m \"$(cat msg.txt)\"",
             "git commit -m \"$(printf '%s' x)\"",
             "git commit -m \"`cat msg.txt`\"",
             "git commit -m \"a \\\"b\\\"\"",
             "git commit -F - <<'EOF'\nmsg\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nsubject\n\nbody\nEOF\n)\"",
             "git commit -m x > out.txt",
             "git commit -m x # note",
-            "git commit -m x\ngit push",
-            "git add -A && git commit -m x",
+            "git commit -m x | tee out.txt",
+            "git commit -m x || true",
+            "git commit -m x; git status",
+            "git commit -m x &",
+            "git commit -m $MSG",
             "FOO=1 git commit -m x",
             "env FOO=1 git commit -m x",
             "command git commit -m x",
             "(git commit -m x)",
-            "git commit -m x &",
-            "git commit -a *.rs",
-            "git commit -m $MSG",
+            "git \"commit\" -m x",
+            "git commit -m x && make deploy",
+            "git commit -m x && echo done",
         ] {
-            quiet(|| {
-                let sid = "sid-notplain";
-                spend_commit_reminder(sid);
-                assert_eq!(
-                    outcome(&in_session(cmd, sid)),
-                    Outcome::Nudge,
-                    "first: {cmd}"
-                );
-                assert_eq!(
-                    outcome(&in_session(cmd, sid)),
-                    Outcome::Nudge,
-                    "second: {cmd}"
-                );
-            });
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
         }
     }
 
     #[test]
-    fn a_commit_chained_with_a_push_or_post_reminds_even_before_the_quiet_period_is_spent() {
-        quiet(|| {
-            for _ in 0..3 {
-                assert_eq!(
-                    outcome(&in_session("git commit -m x && git push origin HEAD", "s")),
-                    Outcome::Nudge
-                );
-            }
-            // The chained forms never wrote the marker, so the first plain commit still reminds.
-            assert_eq!(outcome(&in_session("git commit -m x", "s")), Outcome::Nudge);
-        });
-    }
-
-    #[test]
-    fn a_push_or_post_reminds_every_time_after_a_silenced_commit() {
+    fn an_unquoted_git_push_mention_still_reminds_accepted_imprecision() {
+        // Arm 3 is `main`'s exact word pair, so the two words side by side remind
+        // wherever they sit unquoted, as on `main`: after an `echo`, in a comment.
+        // A tripwire if anyone later removes the over-trigger without meaning to.
         for cmd in [
-            "git push",
-            "git push origin main",
-            "git push --force-with-lease origin feat/x",
-            "gh pr create --title t --body b",
-            "gh pr edit 3 --body b",
-            "gh pr comment 3 --body b",
-            "gh pr review 3 --comment --body b",
-            "gh pr merge 3 --squash",
-            "gh issue create --title t --body b",
-            "gh issue comment 3 --body b",
-            "gh issue edit 3 --body b",
-            "gh release create v1 --notes n",
-            "gh gist create f.md",
-            "gh api repos/o/r/issues -f body=x",
-            "gh api repos/o/r/issues/3/comments -f body=x",
-            "gh repo create o/r --public",
-            "gh repo edit o/r -d text",
-            "tea pr create --title t",
-            "cd other && gh pr comment 1 --body b",
-            "gh pr create -R other/repo --title t",
+            "echo git push",
+            "echo run git push later",
+            "git commit -m x # git push",
         ] {
-            quiet(|| {
-                let sid = "sid-posts";
-                spend_commit_reminder(sid);
-                for round in 1..=3 {
-                    assert_eq!(
-                        outcome(&in_session(cmd, sid)),
-                        Outcome::Nudge,
-                        "round {round}: {cmd}"
-                    );
-                }
-            });
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Nudge, "{cmd}");
+        }
+    }
+
+    /// Spellings of a push (and one commit that merely mentions the word) that
+    /// no parser has to read: a commit reminds whenever its command text
+    /// contains `push` (arm 4). Collected from three review rounds: a quoted
+    /// remote push, with `&&echo ok`, a pipe or a redirect glued to `push`
+    /// inside the quotes, an unquoted `git push>/dev/null`, a container exec, a
+    /// remote shell and `time -p` carrying a git global option, `parallel`, a
+    /// heredoc body, `make push`, an interpreter one-liner.
+    const PUSH_SPELLINGS_AFTER_A_COMMIT: &[&str] = &[
+        "git commit -m x && ssh host 'git push'",
+        "git commit -m x && ssh host \"git push origin main\"",
+        "git commit -m x && ssh host 'git push&&echo ok'",
+        "git commit -m x && ssh host 'git push|cat'",
+        "git commit -m x && ssh host \"git push>/dev/null\"",
+        "git commit -m x && ssh host 'cd r;git push'",
+        "git commit -m x && git push>/dev/null",
+        "git commit -m x && docker exec c git -C d push",
+        "git commit -m x && ssh host git -C d push",
+        "git commit -m x && time -p git -C d push",
+        "git commit -m x && parallel git -C {} push ::: a b",
+        "git commit -m x && bash <<'EOF'\ngit -C d push\nEOF",
+        "git commit -m x && make push",
+        "git commit -m x && ruby -e 'system \"git push\"'",
+        "git commit -m \"fix: push hangs\"",
+        "git commit -m x -m \"push the button\"",
+        "cd sub && git -C d commit -m y && make push",
+    ];
+
+    #[test]
+    fn a_commit_with_the_word_push_anywhere_reminds() {
+        for cmd in PUSH_SPELLINGS_AFTER_A_COMMIT {
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Nudge, "{cmd}");
         }
     }
 
     #[test]
-    fn a_field_report_edit_reminds_every_time_after_a_silenced_commit() {
-        quiet(|| {
-            spend_commit_reminder("sid-edit");
-            for _ in 0..3 {
-                for input in [
-                    make_write("/p/docs/field-reports/a.md", "x"),
-                    make_edit("/p/docs/field-reports/a.md", "o", "n"),
-                ] {
-                    let input = HookInput {
-                        session_id: Some("sid-edit".into()),
-                        ..input
-                    };
-                    assert_eq!(outcome(&input), Outcome::Nudge);
+    fn each_arm_of_the_push_trigger_carries_pushes_the_others_miss() {
+        use cadence_hooks_core::shell::command_segments;
+        let parsed = |cmd: &str| carries_parsed_git_push(&command_segments(cmd));
+        // Only the parsed reader sees these: a git global option sits between the
+        // two words, or `push` is fused to a separator, a quote or a `$(`.
+        for cmd in [
+            "git -C dir push",
+            "git -c k=v push",
+            "git --no-pager push",
+            "git push;",
+            "(git push)",
+            "git push|cat",
+            "git push&&true",
+            "{ git push; }",
+            "bash -c 'git push'",
+            "eval 'git push'",
+            "echo $(git push)",
+        ] {
+            assert!(parsed(cmd), "parsed arm: {cmd}");
+            assert!(!carries_git_push_word_pair(cmd), "word pair: {cmd}");
+        }
+        // Only the word pair sees these: the parsed reader does not know the
+        // runner, the quoted remote command or the heredoc body.
+        for cmd in [
+            "time -p git push",
+            "ssh host git push",
+            "ssh host 'cd /srv/r && git push origin main'",
+            "docker exec c git push",
+            "parallel git push ::: a b",
+            "bash <<'EOF'\ngit push\nEOF",
+            "echo git push",
+        ] {
+            assert!(carries_git_push_word_pair(cmd), "word pair: {cmd}");
+            assert!(!parsed(cmd), "parsed arm: {cmd}");
+        }
+        // Arm 4 holds for every spelling in the commit table, whatever the other
+        // arms read of it (it is the one arm that needs no parser).
+        for cmd in PUSH_SPELLINGS_AFTER_A_COMMIT {
+            let segments = command_segments(cmd);
+            assert!(is_commit_that_spells_push(cmd, &segments), "arm 4: {cmd}");
+        }
+        // And it holds for no command that never spells the word.
+        for cmd in ["git commit -m x", "git commit -m x && make deploy"] {
+            let segments = command_segments(cmd);
+            assert!(!is_commit_that_spells_push(cmd, &segments), "arm 4: {cmd}");
+        }
+    }
+
+    /// `main`'s trigger, copied from `b4dfd75b`, as the reference the guarantee
+    /// is measured against: the two-word match, or any segment the redact
+    /// engine's full posting gate reads (a commit among them) that is not a
+    /// `gh api` write with no prose field.
+    fn main_trigger(command: &str) -> bool {
+        use cadence_hooks_core::shell::command_segments;
+
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let push_hit = tokens.windows(2).any(|w| w[0] == "git" && w[1] == "push");
+        if push_hit {
+            return true;
+        }
+        command_segments(command).iter().any(|seg| {
+            crate::redact_external_content::is_external_post(seg)
+                && !crate::redact_external_content::api_posts_no_prose(seg)
+        })
+    }
+
+    #[test]
+    fn every_command_that_reminded_on_main_and_is_silent_now_is_a_commit_without_push() {
+        use cadence_hooks_core::shell::command_segments;
+
+        let prefixes = [
+            "",
+            "cd sub && ",
+            "git add -A && ",
+            "FOO=1 ",
+            "cd /r; ",
+            "true && ",
+            "git status && ",
+            "make test && ",
+            "echo go; ",
+            "ls | wc -l && ",
+        ];
+        let commits = [
+            "git commit -m x",
+            "git -C d commit -m x",
+            "git commit -F m.txt -- a b",
+            "git commit --amend --no-edit",
+            "git commit -m \"$(cat m)\"",
+            "git -c user.name=x commit -m x",
+            "git --git-dir=d/.git commit -m x",
+            "git commit -am wip",
+            "git commit -m 'a b'",
+            "command git commit -m x",
+            // Not commits: `main` reminds on these only through a push or a post,
+            // so they are where the parsed reader can add reminders.
+            "git status",
+            "make build",
+        ];
+        let tails = [
+            "",
+            " && git push",
+            " && git -C d push",
+            " && ssh host 'git push'",
+            " && ssh host 'git push&&echo ok'",
+            " && ssh host \"git push>/dev/null\"",
+            " && git push>/dev/null",
+            " && docker exec c git -C d push",
+            " && make push",
+            " && make deploy",
+            " && echo done",
+            " && gh pr create -t t",
+            " && time -p git -C d push",
+            " && parallel git -C {} push ::: a b",
+            " | tee log",
+        ];
+
+        let (mut went_silent, mut gained, mut total) = (0, 0, 0);
+        for prefix in prefixes {
+            for commit in commits {
+                for tail in tails {
+                    let cmd = format!("{prefix}{commit}{tail}");
+                    total += 1;
+                    let (old, new) = (main_trigger(&cmd), is_bash_overshare_trigger(&cmd));
+                    if old && !new {
+                        went_silent += 1;
+                        // The guarantee: main read it as a commit, and it never
+                        // spells `push`.
+                        assert!(
+                            command_segments(&cmd)
+                                .iter()
+                                .any(|s| crate::redact_external_content::is_external_post(s)),
+                            "silent now but not a commit on main: {cmd}"
+                        );
+                        assert!(!cmd.contains("push"), "silent now but spells push: {cmd}");
+                    }
+                    if new && !old {
+                        gained += 1;
+                        // Only the parsed reader adds reminders.
+                        assert!(
+                            carries_parsed_git_push(&command_segments(&cmd)),
+                            "reminds now but main did not, and no parsed push: {cmd}"
+                        );
+                    }
                 }
             }
-        });
+        }
+        assert_eq!(total, 1800);
+        // Not vacuous: the list holds commands that went silent and commands
+        // that started reminding.
+        assert!(went_silent > 100, "went silent: {went_silent}");
+        assert!(gained >= 10, "gained: {gained}");
     }
 
-    #[test]
-    fn a_push_before_the_first_commit_does_not_spend_the_quiet_period() {
-        quiet(|| {
-            for _ in 0..3 {
-                assert_eq!(
-                    outcome(&in_session("git push", "sid-order")),
-                    Outcome::Nudge
-                );
-            }
-            assert_eq!(
-                outcome(&in_session("git commit -m x", "sid-order")),
-                Outcome::Nudge
-            );
-        });
-    }
+    /// Every spelling of a push the hook must read. The parsed reader's: git's
+    /// global options between `git` and `push`, `push` ending at a separator or
+    /// a `)`, a push inside a subshell, a group, a `sh -c` script, an `eval` or a
+    /// substitution, and the runner prefixes it peels. The word pair's, which
+    /// `main` matched and the parsed reader does not read: a runner it does not
+    /// know, an unquoted pair inside a quoted remote command, a heredoc body.
+    const PUSH_FORMS: &[&str] = &[
+        "git push",
+        "git push origin main",
+        "git push --force-with-lease origin feat/x",
+        "git -C dir push",
+        "git -C dir push origin main",
+        "git -c k=v push",
+        "git -c color.ui=false push origin main",
+        "git --git-dir=x push",
+        "git --git-dir x push",
+        "git --work-tree=x push",
+        "git --no-pager push",
+        "git --no-pager -C dir push origin main",
+        "git\tpush origin main",
+        "git push;",
+        "git push; git status",
+        "(git push)",
+        "git push&&true",
+        "git push && git status",
+        "git push|cat",
+        "git push || true",
+        "git push\ngit status",
+        "git push &",
+        "(cd x && git commit -m y && git push)",
+        "{ git push; }",
+        "{ cd x && git push; }",
+        "cd sub && git push",
+        "sudo git push",
+        "env FOO=1 git push",
+        "command git push",
+        "time git push",
+        "if true; then git push; fi",
+        "for d in a b; do git -C $d push; done",
+        "git commit -m x&&git push",
+        "bash -c 'git push'",
+        "bash -c 'cd repo && git push origin main'",
+        "sh -c \"git -C d push\"",
+        "bash -lc 'cd ~/repo && git push origin main'",
+        "eval 'git push'",
+        "echo $(git push)",
+        "echo `git push`",
+        "time -p git push",
+        "ssh host git push",
+        "ssh host 'cd /srv/r && git push origin main'",
+        "docker exec c git push",
+        "parallel git push ::: a b",
+        "bash <<'EOF'\ngit push\nEOF",
+    ];
 
     #[test]
-    fn a_missing_or_empty_session_id_reminds_every_time() {
-        quiet(|| {
-            for _ in 0..3 {
-                assert_eq!(outcome(&make_bash("git commit -m x")), Outcome::Nudge);
-                assert_eq!(outcome(&in_session("git commit -m x", "")), Outcome::Nudge);
-            }
-        });
-    }
-
-    #[test]
-    fn a_different_session_id_reminds_again() {
-        quiet(|| {
-            spend_commit_reminder("sid-one");
+    fn every_spelling_of_a_push_reminds_alone_and_after_a_commit() {
+        for form in PUSH_FORMS {
             assert_eq!(
-                outcome(&in_session("git commit -m x", "sid-two")),
-                Outcome::Nudge
-            );
-            assert_eq!(
-                outcome(&in_session("git commit -m x", "sid-two")),
-                Outcome::Allow
-            );
-            assert_eq!(
-                outcome(&in_session("git commit -m x", "sid-one")),
-                Outcome::Allow
-            );
-        });
-    }
-
-    #[test]
-    fn the_skip_switch_still_allows_and_does_not_spend_the_quiet_period() {
-        quiet(|| {
-            let input = in_session("git commit -m x", "sid-skip");
-            let ridden = run_quiet_period(&input, Some("1"), None);
-            assert_eq!(ridden.outcome, Outcome::Allow);
-            assert!(ridden.bypass.is_some());
-            assert_eq!(
-                outcome(&input),
+                run(&make_bash(form)).outcome,
                 Outcome::Nudge,
-                "the bypassed call wrote no marker"
+                "alone: {form}"
             );
-        });
+            let with_commit = format!("git commit -m x && {form}");
+            assert_eq!(
+                run(&make_bash(&with_commit)).outcome,
+                Outcome::Nudge,
+                "after a commit: {with_commit}"
+            );
+        }
     }
 
     #[test]
-    fn a_marker_of_another_kind_does_not_silence_the_commit_reminder() {
-        // The marker kind is this hook's own: a `warn-main-branch`-style marker for the
-        // same session and no repo must not silence the commit reminder.
-        quiet(|| {
-            let input = in_session("git commit -m x", "sid-kind");
-            let other = markers::session_marker(&input, "some-other-warned", None);
-            markers::write_marker(&other, "").unwrap();
-            assert_eq!(outcome(&input), Outcome::Nudge);
-        });
+    fn a_word_that_is_not_the_push_subcommand_stays_silent() {
+        for cmd in [
+            "git push-something",
+            "git push-something origin",
+            "git pushd",
+            "git pusher",
+            "git stash push",
+            "git stash push -m wip",
+            "git log push",
+            "git log --oneline push..HEAD",
+            "git branch push",
+            "git checkout push",
+            "git remote set-url --push origin https://example.test/r.git",
+            "git config remote.pushDefault origin",
+            "git config --get remote.origin.push",
+            "git -C dir stash push",
+            "git -c k=v log push",
+            "git pull && git push-hook-test",
+            "bash -c 'git stash push'",
+            "echo 'git push'",
+            "echo \"git push\" >> notes.txt",
+            "grep -rn 'git push' docs",
+            "bash -c 'echo \"git push\"'",
+            // A `gh api` write with no prose field is silent on `main`, and
+            // must stay so when `push` sits in its path: arm 4 keeps main's
+            // `api_posts_no_prose` exclusion.
+            "gh api -X PATCH repos/o/r/branches/push-fix -f state=x",
+        ] {
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_commit_with_a_push_or_a_post_reminds() {
+        for cmd in [
+            "git commit -m x && git push",
+            "git commit -m x && git push origin HEAD",
+            "git add -A && git commit -m x && git push -u origin feat/x",
+            "cd other && git commit -m x && git push",
+            "git commit -m x; git push",
+            "git commit -m x\ngit push",
+            "git push && git commit -m x",
+            "git commit -m x && gh pr create --title t --body b",
+            "git commit -m x && gh pr comment 3 --body b",
+            "git commit -m x && gh issue create --title t",
+            "git commit -m x && gh pr edit 3 --body b",
+            "git commit -m x && gh release create v1 --notes n",
+            "git commit -m x && gh api repos/o/r/issues -f body=x",
+            "git commit -m x && tea pr create --title t",
+            "git commit -m \"$(cat msg.txt)\" && git push",
+        ] {
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Nudge, "{cmd}");
+        }
     }
 
     #[test]
@@ -939,79 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reminder_that_is_not_delivered_does_not_spend_the_quiet_period() {
-        quiet(|| {
-            let input = in_session("git commit -m x", "sid-undelivered");
-            // The check nudged, but the dispatcher never emitted it (repo
-            // configuration suppressed it, or a sibling delivered it).
-            for _ in 0..3 {
-                assert_eq!(run_quiet_period(&input, None, None).outcome, Outcome::Nudge);
-            }
-            // Delivering it for any other payload spends nothing for this one.
-            record_delivered(&in_session("git push", "sid-undelivered"));
-            record_delivered(&in_session(
-                "git commit -m x && git push",
-                "sid-undelivered",
-            ));
-            record_delivered(&in_session("git -C o commit -m x", "sid-undelivered"));
-            record_delivered(&in_session("git commit -m x", "another-session"));
-            assert_eq!(run_quiet_period(&input, None, None).outcome, Outcome::Nudge);
-            record_delivered(&input);
-            assert_eq!(run_quiet_period(&input, None, None).outcome, Outcome::Allow);
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_marker_directory_that_is_not_private_reminds_every_time() {
-        // A symlink squatting the per-user directory makes the hardening step
-        // refuse it, so the marker directory falls back to the shared base. The
-        // symlink API is unix-only here; the refusal itself is platform-neutral.
-        quiet(|| {
-            let private = markers::marker_dir();
-            assert!(markers::marker_dir_is_private(), "control: private first");
-            std::fs::remove_dir_all(&private).unwrap();
-            let elsewhere = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(elsewhere.path(), &private).unwrap();
-            assert!(!markers::marker_dir_is_private(), "precondition");
-            let input = in_session("git commit -m x", "sid-shared-dir");
-            for _ in 0..3 {
-                assert_eq!(outcome(&input), Outcome::Nudge);
-            }
-            let would_be = markers::session_marker(&input, COMMIT_MARKER_KIND, None);
-            assert!(
-                !would_be.exists(),
-                "nothing may be planted in the shared base"
-            );
-        });
-    }
-
-    #[test]
-    fn a_marker_that_cannot_be_written_reminds_every_time() {
-        quiet(|| {
-            let input = in_session("git commit -m x", "sid-unwritable");
-            let marker = markers::session_marker(&input, COMMIT_MARKER_KIND, None);
-            // `write_marker` stages through `.<name>.<pid>.tmp`; a directory
-            // squatting that name makes the staged write fail on every platform.
-            let name = marker.file_name().unwrap().to_string_lossy().into_owned();
-            let staged = marker
-                .parent()
-                .unwrap()
-                .join(format!(".{name}.{}.tmp", std::process::id()));
-            std::fs::create_dir(staged).unwrap();
-            assert!(markers::write_marker(&marker, "").is_err(), "precondition");
-            for _ in 0..3 {
-                assert_eq!(outcome(&input), Outcome::Nudge);
-            }
-            assert!(!marker.exists());
-            // Control: the same setup goes quiet for a session whose staged
-            // name is not squatted, so the nudges above come from the failed
-            // write and not from some other reason this payload never qualifies.
-            spend_commit_reminder("sid-writable");
-        });
-    }
-
-    #[test]
     fn the_reminder_names_the_categories_the_spec_requires() {
         // openspec/specs/external-content: the reminder asks the model to check
         // for health, relationships and non-technical biography. A later
@@ -1019,26 +1004,6 @@ mod tests {
         let text = nudge_text();
         for word in ["health", "relationships", "non-technical biography"] {
             assert!(text.contains(word), "reminder lost {word:?}: {text}");
-        }
-    }
-
-    #[test]
-    fn is_plain_commit_accepts_one_shape() {
-        for cmd in ["git commit", "git commit -m x", "git commit -m 'a b' -- f"] {
-            assert!(is_plain_commit(cmd), "{cmd}");
-        }
-        for cmd in [
-            "git commit-tree abc",
-            "git committer",
-            "git  -C x commit",
-            "git",
-            "",
-            "git status",
-            "echo git commit",
-            "git commit -m 'unterminated",
-            "git commit -m \"unterminated",
-        ] {
-            assert!(!is_plain_commit(cmd), "{cmd}");
         }
     }
 }
