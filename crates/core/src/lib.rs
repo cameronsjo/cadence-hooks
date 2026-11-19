@@ -13,6 +13,7 @@ pub mod branch_diff;
 pub mod bypass;
 pub mod capability;
 pub mod config;
+pub mod confirm;
 pub mod deadline;
 pub mod dir_variables;
 pub mod display;
@@ -333,6 +334,15 @@ pub struct HookInput {
     /// on payloads that omit it. Carried so the denial audit log can attribute a
     /// guard fire to the subagent that triggered it.
     pub agent_id: Option<String>,
+    /// The id of the tool call this event belongs to (`toolu_…`), sent on
+    /// `PreToolUse` and `PostToolUse`. Every hook process one tool call spawns
+    /// sees the same value, and a retry of the call gets a new one, which is
+    /// what lets the confirm tier ([`confirm`]) tell a sibling process of the
+    /// blocked call from a deliberate second attempt. Lenient: an absent or
+    /// wrong-typed value degrades to `None`, and the confirm tier then blocks
+    /// as a plain guard does.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub tool_use_id: Option<String>,
     /// The submitted prompt text — present on `UserPromptSubmit`, absent on
     /// every other event. Deserializes to `None` when absent, so existing
     /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
@@ -1434,6 +1444,11 @@ impl HookInput {
         self.agent_id.as_deref()
     }
 
+    /// The tool call id, if the payload carried a non-empty one.
+    pub fn tool_use_id(&self) -> Option<&str> {
+        self.tool_use_id.as_deref().filter(|id| !id.is_empty())
+    }
+
     /// The submitted prompt text, if present (`UserPromptSubmit` only).
     pub fn prompt(&self) -> Option<&str> {
         self.prompt.as_deref()
@@ -1636,6 +1651,10 @@ pub enum BypassKind {
     /// differently, and the guard nudged instead of blocking
     /// (cameronsjo/cadence-hooks#225).
     ConfigDisagreement,
+    /// A confirm-tier guard blocked an action, and a deliberate second attempt
+    /// at the same action in the same session and agent passed
+    /// (cameronsjo/cadence-hooks#1658, [`confirm`]).
+    Confirmed,
 }
 
 impl BypassKind {
@@ -1648,6 +1667,7 @@ impl BypassKind {
             BypassKind::GlobalBypass => "global_bypass",
             BypassKind::GlobalDisable => "global_disable",
             BypassKind::ConfigDisagreement => "config_disagreement",
+            BypassKind::Confirmed => "confirmed",
         }
     }
 }

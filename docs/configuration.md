@@ -165,7 +165,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_READ_MODEL_GUARD_MODE` | `guard-read-model` | `allow` treats the list as an allowlist; anything else denies the listed models |
 | `CADENCE_READ_MODEL_GUARD_ON_UNKNOWN` | `guard-read-model` | `block` refuses reads when the session model is unknown; anything else allows |
 | `CADENCE_HOOK_DEADLINE_MS` | every guard that runs git | Time budget for a guard's git probes, clamped to 1000–4500; `0` disables the deadline. A probe that times out fails open |
-| `CADENCE_MARKER_DIR` | marker-keyed checks, `guard-browser-device` | Where one-time markers live. Pointing it at a directory that already holds a marker makes `guard-browser-device` allow without its first-use block. **Weakens a protected guard** |
+| `CADENCE_MARKER_DIR` | marker-keyed checks, `guard-browser-device`, the confirm tier | Where one-time markers live, confirmation markers included. Pointing it at a directory that already holds a marker makes `guard-browser-device` allow without its first-use block. **Weakens a protected guard** |
 | `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` | `warn-subagent-worktree` | Set to `1`/`true`/`yes` to silence the nudge for a repo |
 | `CADENCE_ALLOW_BRANCH_INTENT` | `warn-branch-intent` | Set to `1`/`true`/`yes` to silence the stale-branch nudge |
 | `CADENCE_GOING_PUBLIC_TERMS` / `CADENCE_GOING_PUBLIC_IGNORE` | `warn-going-public` | Extra terms to flag, and terms to ignore, when a repo is created or made public. The work-identifiable terms in `~/.config/cadence/redaction.toml` are flagged here too, without being listed again; the ignore list cannot relieve those, only the term source's own `allow` entries can. Both are read from the session environment; an inline `VAR=… gh repo create` prefix reaches `gh`, not the hook |
@@ -345,6 +345,22 @@ The marker lives at `<repo>/.git/cadence-hooks/enforce-worktree-snoozed-until` �
 
 This dismissal is **repo-scoped** — on a shared checkout it lowers the guard for every session, not just yours — so `--reason` is **required over 1h** (nudged at or under). The reason, arming session, and expiry land in a provenance sidecar (`enforce-worktree-snoozed-meta.json`, next to the marker) and in the bypass log below.
 
+## Confirming a blocked action (the confirm tier)
+
+Three guards ask "are you sure?" instead of stopping the session: `enforce-worktree` (its primary-checkout block), `guard-op-vault-scan`, and `guard-held-close` (its HELD-ledger block). The first attempt blocks with the guard's reason and a line beginning `Are you sure?`. If the action is what the operator asked for, the model runs the same action again: that second attempt passes, once, and writes a `used` row with `kind: "confirmed"` to the bypass log. Nothing to configure; it works from a phone, where a settings edit or a terminal command does not.
+
+The pass counts only for:
+
+- the same session (`session_id`) and the same agent (`agent_id`; a subagent shares its parent's session id, so its pass stays its own);
+- the same action, as the guard reads it: for `enforce-worktree` the judged repo plus the edited file or the commit; for `guard-op-vault-scan` the `op item list`/`op vault list` scans and the `--vault` each names; for `guard-held-close` the held issues the close would hit. The raw command can differ (another pipe, a reworded commit message);
+- ten minutes from the blocked attempt.
+
+For `enforce-worktree`, the confirmed retry also arms the same 30-minute snooze `dismiss-enforce-worktree --for 30m` writes, with the reason `confirmed retry of a blocked action (confirm tier)`, so the edits that follow ride it as after a dismiss. Like a dismiss, that snooze covers every session in the checkout.
+
+A block that cannot be confirmed says so (`A second attempt will be blocked too: …`) and never passes: a payload with no session id or no tool-call id, a marker directory that fell back to the shared temp base, or a marker that could not be written. A confirmation marker is `confirm-<sha256>` in the private per-user marker directory (`CADENCE_MARKER_DIR` moves it, as for the other markers).
+
+Every other blocking guard keeps blocking. The ones whose escape needs a keyboard (`git-safety`, `prevent-secret-writes`, `prevent-secret-push`, `guard-sops-decrypt`, `guard-runbook-scrub`, `guard-gh-dangerous`'s repo delete, `guard-gh-write`'s URL-argument block) end with a line telling the model to stop and tell the operator in chat what was blocked, why, and what they can approve.
+
 ## Metrics ledgers and archives
 
 Every metrics file lives under the metrics directory (`CADENCE_METRICS_DIR`, else `<config_dir>/cadence/metrics`, or the legacy `<config_dir>/metrics` while only it exists):
@@ -398,6 +414,6 @@ Read a ledger's whole history, archives included, with `cadence-hooks metrics ca
 
 Every guard bypass — a `dismiss-*` snooze being **armed**, and an operation later **riding through** an active dismissal or env switch — is recorded to `<metrics_dir>/bypasses.jsonl`, one JSON line per event. `CADENCE_ALLOW_MAIN` stays set for the whole session, so its `used` row (and `CADENCE_NO_ENFORCE_WORKTREE`'s) is written once per session, guard, mechanism, working-directory repo, and agent; every other env switch and every dismissal use is still a row. This answers *who / why / how long / which guard* for the times a guardrail was stepped outside of, which the denial log (`denials.jsonl`) can't see because a bypass is an allow.
 
-Each line carries `event` (`armed` | `used`), the `hook` (guard) and `mechanism` (`dismiss-enforce-worktree`, `CADENCE_ALLOW_MAIN`, …), the `kind` (`dismissal` | `env_switch`), the `sessionId`, the repo **basename**, the user-authored `reason`, and the expiry. Following the denial log's **privacy-by-construction** contract, it never records a command, file path, or edited content — only which guard was bypassed, how, and why.
+Each line carries `event` (`armed` | `used`), the `hook` (guard) and `mechanism` (`dismiss-enforce-worktree`, `CADENCE_ALLOW_MAIN`, `confirm-retry`, …), the `kind` (`dismissal` | `env_switch` | `confirmed`), the `sessionId`, the repo **basename**, the user-authored `reason`, and the expiry. Following the denial log's **privacy-by-construction** contract, it never records a command, file path, or edited content — only which guard was bypassed, how, and why.
 
 Writes are fully fail-open (ADR-0001): an unwritable metrics dir degrades to a no-op and never perturbs the operation or its exit code. The log lives under the metrics directory (`CADENCE_METRICS_DIR`, else `<config_dir>/metrics`).

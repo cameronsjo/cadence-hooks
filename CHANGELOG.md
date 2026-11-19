@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A confirm tier: `enforce-worktree`, `guard-op-vault-scan` and `guard-held-close` block the first attempt and pass a deliberate second one.** The first attempt blocks with the guard's reason and a line beginning `Are you sure?`; the next attempt at the same action from the same session and agent within ten minutes passes once and writes a `bypasses.jsonl` `used` row with `kind: "confirmed"` and mechanism `confirm-retry`. The action is what the guard read, not the command text: the judged repo plus the edited file or the commit, the vault scans and their `--vault`, the held issues a close would hit. Another session, another agent or a different action does not inherit a pass. For `enforce-worktree`, the confirmed retry arms the same 30-minute snooze `dismiss-enforce-worktree --for 30m` writes, so the edits that follow ride it. A payload with no session id or no tool-call id, a shared marker directory, or a failed marker write blocks with `A second attempt will be blocked too`, so a retry never loops. `guard-browser-device` keeps its own once-per-session handshake. Hook payloads' `tool_use_id` is now read (cameronsjo/cadence-hooks#1658).
+- **Hard blocks whose escape needs a keyboard end with a line for an operator on a phone.** `git-safety`, `prevent-secret-writes`, `prevent-secret-push` (a found secret), `guard-sops-decrypt`, `guard-runbook-scrub`, `guard-gh-dangerous` (repo delete) and `guard-gh-write` (an unowned URL argument) now end by telling the model to stop and tell the operator in chat what was blocked, why, and what they can approve. What they block is unchanged (cameronsjo/cadence-hooks#1658).
+
 ## [0.134.0] - 2026-11-19
 
 ### Changed

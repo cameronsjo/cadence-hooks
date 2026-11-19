@@ -392,10 +392,24 @@ impl Check for GuardHeldClose {
             .flat_map(|c| held_targets(c, command, &ledger, &cwd_repos))
             .collect();
         if hits.is_empty() {
-            CheckResult::allow()
-        } else {
-            CheckResult::block(block_message(&hits))
+            return CheckResult::allow();
         }
+        // Confirm tier (cameronsjo/cadence-hooks#1658): a closed issue can be
+        // reopened, so a deliberate second attempt at closing the same held
+        // issues passes once. The action is the set of held entries the
+        // close would hit, not the command text.
+        let action = hits
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        cadence_hooks_core::confirm::confirm_block(
+            input,
+            self.name(),
+            &action,
+            &block_message(&hits),
+            None,
+        )
     }
 }
 
@@ -613,6 +627,127 @@ mod tests {
             ledger_path: Some(dir.path().join("absent").to_string_lossy().into_owned()),
         };
         assert_eq!(missing.run(&input).outcome, Outcome::Allow);
+    }
+
+    // --- confirm tier (cameronsjo/cadence-hooks#1658) ---
+
+    fn close_attempt(
+        command: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        call: &str,
+    ) -> HookInput {
+        let mut input = cadence_hooks_core::test_builders::make_bash_with_cwd(command, "/");
+        input.session_id = session.map(String::from);
+        input.agent_id = agent.map(String::from);
+        input.tool_use_id = Some(call.into());
+        input
+    }
+
+    /// Runs `f` with a ledger-file guard and a private marker dir, unless
+    /// `CADENCE_DRAIN_HELD` overrides the ledger in this process.
+    fn with_confirm_guard(f: impl FnOnce(&GuardHeldClose)) {
+        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.txt");
+        std::fs::write(&path, LEDGER).unwrap();
+        let guard = GuardHeldClose {
+            ledger_path: Some(path.to_string_lossy().into_owned()),
+        };
+        let markers = dir.path().join("markers");
+        std::fs::create_dir(&markers).unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(&markers, || f(&guard));
+    }
+
+    const HELD_CLOSE: &str = "gh issue close 354 -R cameronsjo/cadence-ecosystem";
+
+    #[test]
+    fn confirm_first_blocks_second_passes_once_third_blocks() {
+        with_confirm_guard(|guard| {
+            let first = guard.run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"));
+            assert_eq!(first.outcome, Outcome::Block);
+            let msg = first.message.unwrap();
+            assert!(msg.contains("is on the HELD ledger"), "{msg}");
+            assert!(msg.contains("Are you sure?"), "{msg}");
+            // A retry with a comment added closes the same held issue.
+            let retry = format!("{HELD_CLOSE} --comment 'operator released it'");
+            let second = guard.run(&close_attempt(&retry, Some("s1"), None, "t2"));
+            assert_eq!(second.outcome, Outcome::Allow);
+            assert_eq!(
+                second.bypass.unwrap().kind,
+                cadence_hooks_core::BypassKind::Confirmed
+            );
+            let third = guard.run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t3"));
+            assert_eq!(third.outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn confirm_does_not_reach_another_session_agent_or_issue() {
+        with_confirm_guard(|guard| {
+            assert_eq!(
+                guard
+                    .run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"))
+                    .outcome,
+                Outcome::Block
+            );
+            for (label, input) in [
+                (
+                    "another session",
+                    close_attempt(HELD_CLOSE, Some("s2"), None, "t2"),
+                ),
+                (
+                    "another agent",
+                    close_attempt(HELD_CLOSE, Some("s1"), Some("ag1"), "t3"),
+                ),
+                (
+                    "another held issue",
+                    close_attempt(
+                        "gh issue close 107 -R cameronsjo/cadence",
+                        Some("s1"),
+                        None,
+                        "t4",
+                    ),
+                ),
+            ] {
+                assert_eq!(
+                    guard.run(&input).outcome,
+                    Outcome::Block,
+                    "{label} must not inherit the pass"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn confirm_needs_a_session_id_and_expires() {
+        with_confirm_guard(|guard| {
+            for call in ["t1", "t2"] {
+                let r = guard.run(&close_attempt(HELD_CLOSE, None, None, call));
+                assert_eq!(r.outcome, Outcome::Block);
+                assert!(
+                    r.message
+                        .unwrap()
+                        .contains("A second attempt will be blocked too")
+                );
+            }
+            let input = close_attempt(HELD_CLOSE, Some("s1"), None, "t3");
+            assert_eq!(guard.run(&input).outcome, Outcome::Block);
+            assert!(cadence_hooks_core::confirm::backdate_for_tests(
+                &input,
+                "guard-held-close",
+                "cameronsjo/cadence-ecosystem#354",
+                11 * 60
+            ));
+            assert_eq!(
+                guard
+                    .run(&close_attempt(HELD_CLOSE, Some("s1"), None, "t4"))
+                    .outcome,
+                Outcome::Block
+            );
+        });
     }
 
     /// A hermetic checkout whose `origin` is `url`.

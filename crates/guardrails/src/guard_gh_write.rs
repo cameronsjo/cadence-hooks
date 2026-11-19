@@ -3017,7 +3017,10 @@ fn judge_resolution(
                 disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
                 BlockMetadata {
                     rule_id: "gh-write-unauthorized-target".to_string(),
-                    fix: SELECTOR_URL_FIX.to_string(),
+                    fix: format!(
+                        "{SELECTOR_URL_FIX}. {}",
+                        cadence_hooks_core::confirm::OPERATOR_HANDOFF
+                    ),
                     allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
                     severity: "error",
                 },
@@ -11117,6 +11120,14 @@ mod tests {
                 // repo, so the fix names no target to retry on.
                 assert!(meta.fix.contains("ask the user"), "{}", meta.fix);
                 assert!(!meta.fix.contains("cameronsjo/"), "{}", meta.fix);
+                // cameronsjo/cadence-hooks#1658 part 3: and what to do when
+                // the user is on a phone.
+                assert!(
+                    meta.fix
+                        .ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+                    "{}",
+                    meta.fix
+                );
             }
         });
     }

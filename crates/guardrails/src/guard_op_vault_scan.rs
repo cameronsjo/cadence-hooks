@@ -140,14 +140,49 @@ impl Check for OpVaultScanGuard {
 
         // `command_segments` splits chains/pipes AND expands shell wrappers
         // (`bash -c '…'`), so the wrapper case is structural — no separate pass.
-        for segment in command_segments(command) {
-            if let Some(kw) = vault_scan_keyword(&segment) {
-                return CheckResult::block(block_message(&format!("op {kw} list")));
-            }
-        }
-
-        CheckResult::allow()
+        let mut scans: Vec<String> = command_segments(command)
+            .iter()
+            .filter_map(|segment| scan_action(segment))
+            .collect();
+        let Some(first) = scans.first().cloned() else {
+            return CheckResult::allow();
+        };
+        scans.sort();
+        scans.dedup();
+        let found = first.split(" --vault").next().unwrap_or(&first).to_string();
+        // Confirm tier (cameronsjo/cadence-hooks#1658): a vault listing is a
+        // metadata read, so a deliberate second attempt at the same scans
+        // passes once. The action is the scans the guard read, not the raw
+        // command, so a retry with a different `| grep` still pairs up.
+        cadence_hooks_core::confirm::confirm_block(
+            input,
+            self.name(),
+            &scans.join("\n"),
+            &block_message(&found),
+            None,
+        )
     }
+}
+
+/// The confirm-tier action for one segment: `op item list` or `op vault
+/// list`, plus the `--vault` it names when it names one, so a listing of
+/// another vault is another action.
+fn scan_action(segment: &str) -> Option<String> {
+    let kw = vault_scan_keyword(segment)?;
+    let tokens = tokenize(segment);
+    let argv = executed_argv(&tokens);
+    let vault = argv.iter().enumerate().find_map(|(i, t)| {
+        if t == "--vault" {
+            argv.get(i + 1).map(|v| unescape_word(v).into_owned())
+        } else {
+            t.strip_prefix("--vault=")
+                .map(|v| unescape_word(v).into_owned())
+        }
+    });
+    Some(match vault {
+        Some(v) => format!("op {kw} list --vault {v}"),
+        None => format!("op {kw} list"),
+    })
 }
 
 #[cfg(test)]
@@ -423,5 +458,118 @@ mod tests {
         // `$(…)` executes; hiding the scan inside one changes nothing.
         let result = OpVaultScanGuard.run(&make_bash(r#"echo "$(op item list)""#));
         assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    // --- confirm tier (cameronsjo/cadence-hooks#1658) ---
+
+    use cadence_hooks_core::BypassKind;
+    use cadence_hooks_core::test_builders::with_marker_dir;
+
+    fn attempt(command: &str, session: Option<&str>, agent: Option<&str>, call: &str) -> HookInput {
+        let mut input = make_bash(command);
+        input.session_id = session.map(String::from);
+        input.agent_id = agent.map(String::from);
+        input.tool_use_id = Some(call.into());
+        input
+    }
+
+    #[test]
+    fn confirm_first_blocks_second_passes_once_third_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            let first = OpVaultScanGuard.run(&attempt("op item list", Some("s1"), None, "t1"));
+            assert_eq!(first.outcome, Outcome::Block);
+            let msg = first.message.unwrap();
+            assert!(msg.contains("vault enumeration blocked"), "{msg}");
+            assert!(msg.contains("Are you sure?"), "{msg}");
+            // The retry need not be byte-identical: another pipe still pairs up.
+            let second =
+                OpVaultScanGuard.run(&attempt("op item list | grep api", Some("s1"), None, "t2"));
+            assert_eq!(second.outcome, Outcome::Allow);
+            assert_eq!(second.bypass.unwrap().kind, BypassKind::Confirmed);
+            let third = OpVaultScanGuard.run(&attempt("op item list", Some("s1"), None, "t3"));
+            assert_eq!(third.outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn confirm_does_not_reach_another_session_agent_or_target() {
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            let cmd = "op item list --vault Private";
+            assert_eq!(
+                OpVaultScanGuard
+                    .run(&attempt(cmd, Some("s1"), None, "t1"))
+                    .outcome,
+                Outcome::Block
+            );
+            for (label, input) in [
+                ("another session", attempt(cmd, Some("s2"), None, "t2")),
+                ("another agent", attempt(cmd, Some("s1"), Some("ag1"), "t3")),
+                (
+                    "another vault",
+                    attempt("op item list --vault Work", Some("s1"), None, "t4"),
+                ),
+                (
+                    "another subcommand",
+                    attempt("op vault list", Some("s1"), None, "t5"),
+                ),
+            ] {
+                assert_eq!(
+                    OpVaultScanGuard.run(&input).outcome,
+                    Outcome::Block,
+                    "{label} must not inherit the pass"
+                );
+            }
+            assert_eq!(
+                OpVaultScanGuard
+                    .run(&attempt(
+                        "op item list --vault=Private",
+                        Some("s1"),
+                        None,
+                        "t6"
+                    ))
+                    .outcome,
+                Outcome::Allow,
+                "the same scan, spelled with `=`, is the same action"
+            );
+        });
+    }
+
+    #[test]
+    fn confirm_needs_a_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            for call in ["t1", "t2"] {
+                let r = OpVaultScanGuard.run(&attempt("op item list", None, None, call));
+                assert_eq!(r.outcome, Outcome::Block);
+                let msg = r.message.unwrap();
+                assert!(
+                    msg.contains("A second attempt will be blocked too"),
+                    "{msg}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn confirm_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        with_marker_dir(dir.path(), || {
+            let input = attempt("op item list", Some("s1"), None, "t1");
+            assert_eq!(OpVaultScanGuard.run(&input).outcome, Outcome::Block);
+            assert!(cadence_hooks_core::confirm::backdate_for_tests(
+                &input,
+                "guard-op-vault-scan",
+                "op item list",
+                11 * 60
+            ));
+            assert_eq!(
+                OpVaultScanGuard
+                    .run(&attempt("op item list", Some("s1"), None, "t2"))
+                    .outcome,
+                Outcome::Block
+            );
+        });
     }
 }

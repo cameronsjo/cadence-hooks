@@ -69,6 +69,8 @@ pub fn repo_delete_blocked_message(found: &str) -> String {
     format!(
         "🚫 git-guardrails: gh repo delete is blocked\n   \
          Found: `{found}`\n   \
-         Fix: delete manually via github.com — this is irreversible"
+         Fix: delete manually via github.com — this is irreversible\n   \
+         {}",
+        cadence_hooks_core::confirm::OPERATOR_HANDOFF
     )
 }

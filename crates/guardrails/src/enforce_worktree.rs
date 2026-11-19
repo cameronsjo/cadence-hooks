@@ -283,6 +283,20 @@ struct GitProbe {
     /// passed in. `true` = commitless (unborn-HEAD bootstrap). Populated lazily
     /// on the would-block path only (see [`GitProbe::is_commitless`]).
     commitless: HashMap<PathBuf, bool>,
+    /// Every primary-checkout block [`assess_dir`] returned during this
+    /// invocation, so [`EnforceWorktree::run`] can tell a block the confirm
+    /// tier covers from one about a command it could not read
+    /// (cameronsjo/cadence-hooks#1658).
+    primary_blocks: Vec<PrimaryBlock>,
+}
+
+/// One primary-checkout block: the message [`assess_dir`] returned, the repo
+/// it judged, and that repo's git common dir (where the snooze lives).
+#[derive(Debug, Clone)]
+struct PrimaryBlock {
+    message: String,
+    repo_root: String,
+    common_dir: PathBuf,
 }
 
 impl GitProbe {
@@ -5071,7 +5085,13 @@ fn assess_dir(
         if probe.is_commitless(Path::new(&repo_root)) {
             return CheckResult::allow();
         }
-        return CheckResult::block(block_message(&repo_root, origin_repo));
+        let message = block_message(&repo_root, origin_repo);
+        probe.primary_blocks.push(PrimaryBlock {
+            message: message.clone(),
+            repo_root,
+            common_dir,
+        });
+        return CheckResult::block(message);
     }
 
     // Allowed. Attribute *why* only when the guard WOULD have blocked absent a
@@ -5278,9 +5298,15 @@ fn is_ignored_untracked(dir: &Path, input: &HookInput, cwd: &str) -> bool {
 }
 
 /// Testable core: assess the hook input under the given environment.
+#[cfg(test)]
 fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
+    run_enforce_with(input, cfg, &mut GitProbe::default())
+}
+
+/// [`run_enforce`] against a caller's probe, so the caller can read which
+/// primary-checkout blocks it recorded.
+fn run_enforce_with(input: &HookInput, cfg: &EnvConfig, probe: &mut GitProbe) -> CheckResult {
     let mut repo_allow = RepoAllowMain::default();
-    let mut probe = GitProbe::default();
     match input.normalized_tool_name() {
         Some("Edit") | Some("Write") | Some("MultiEdit") => {
             if input.file_path().is_none() {
@@ -5331,7 +5357,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 probe.common_dir(Path::new(cwd)),
             ) {
                 (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
-                    let result = assess_dir(&target_dir, cfg, None, &mut repo_allow, &mut probe);
+                    let result = assess_dir(&target_dir, cfg, None, &mut repo_allow, probe);
                     if result.outcome == Outcome::Block
                         && is_ignored_untracked(&target_dir, input, cwd)
                     {
@@ -5417,13 +5443,8 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 } else {
                     nearest_existing_ancestor(&dir)
                 };
-                let result = assess_dir(
-                    &dir,
-                    cfg,
-                    cwd_repo_root.as_deref(),
-                    &mut repo_allow,
-                    &mut probe,
-                );
+                let result =
+                    assess_dir(&dir, cfg, cwd_repo_root.as_deref(), &mut repo_allow, probe);
                 if result.outcome != Outcome::Allow {
                     // A leading in-chain dismiss for this same repo converts the
                     // block into a recorded bypass — never a bare allow, so the
@@ -5441,7 +5462,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                         continue;
                     }
                     let result = with_unresolved_cd_hint(result, unresolved_cd.as_deref());
-                    let result = with_union_worktree_hint(result, &union_cd_dirs, &mut probe);
+                    let result = with_union_worktree_hint(result, &union_cd_dirs, probe);
                     // The session cwd is a target here only because the walk
                     // could not follow a `cd` in a non-plain command: that is a
                     // guess, so it warns instead of blocking
@@ -5469,7 +5490,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                                 unresolved_cd.as_deref(),
                             ),
                             &union_cd_dirs,
-                            &mut probe,
+                            probe,
                         ),
                         None => result,
                     };
@@ -5506,7 +5527,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 return as_guess(with_union_worktree_hint(
                     CheckResult::block(message),
                     &union_cd_dirs,
-                    &mut probe,
+                    probe,
                 ));
             }
             // No commit blocked. The mutation nudge fires ONLY IF no commit
@@ -5517,7 +5538,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // enforce-worktree's first nudge branch.
             if bypassed.is_none()
                 && let Some(nudge) =
-                    mutation_nudge(&mutation_targets, cwd, cfg, &mut repo_allow, &mut probe)
+                    mutation_nudge(&mutation_targets, cwd, cfg, &mut repo_allow, probe)
             {
                 return nudge;
             }
@@ -5536,8 +5557,86 @@ impl Check for EnforceWorktree {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        run_enforce(input, &EnvConfig::from_env())
+        run_confirmed(input, &EnvConfig::from_env())
     }
+}
+
+/// [`run_enforce`] with the confirm tier applied: what the hook returns.
+fn run_confirmed(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
+    let mut probe = GitProbe::default();
+    let result = run_enforce_with(input, cfg, &mut probe);
+    confirm_primary_block(input, result, &probe.primary_blocks)
+}
+
+/// How long a confirmed retry snoozes the guard: the window the block message
+/// already suggests for `dismiss-enforce-worktree`, and under the one hour past
+/// which a dismissal needs a reason.
+const CONFIRM_SNOOZE_SECS: u64 = 30 * 60;
+
+/// The reason a confirmed retry records on the snooze it arms.
+const CONFIRM_SNOOZE_REASON: &str = "confirmed retry of a blocked action (confirm tier)";
+
+/// Put a primary-checkout block through the confirm tier
+/// (cameronsjo/cadence-hooks#1658).
+///
+/// Only a block [`assess_dir`] returned for a primary checkout qualifies; a
+/// block about a command the guard could not read keeps blocking as before.
+/// The action is the judged repo plus what the tool touches there (the file
+/// for Edit and Write, the commit for Bash). A pass arms the same snooze
+/// `dismiss-enforce-worktree --for 30m` writes, so one confirmation covers the
+/// edits that follow; if that write fails, the confirmed action still passes
+/// and the next one blocks again.
+fn confirm_primary_block(
+    input: &HookInput,
+    result: CheckResult,
+    primary_blocks: &[PrimaryBlock],
+) -> CheckResult {
+    if result.outcome != Outcome::Block {
+        return result;
+    }
+    let Some(message) = result.message.as_deref() else {
+        return result;
+    };
+    let Some(block) = primary_blocks
+        .iter()
+        .find(|b| message.starts_with(b.message.as_str()))
+    else {
+        return result;
+    };
+    let target = match input.normalized_tool_name() {
+        Some("Bash") => "git commit".to_string(),
+        _ => input.file_path().unwrap_or_default().to_string(),
+    };
+    let action = format!("{}\u{1f}{target}", block.repo_root);
+    let pass_effect = format!(
+        "unblocks this checkout for {} minutes (the snooze `dismiss-enforce-worktree --for \
+         30m` sets)",
+        CONFIRM_SNOOZE_SECS / 60
+    );
+    let confirmed = cadence_hooks_core::confirm::confirm_block(
+        input,
+        "enforce-worktree",
+        &action,
+        message,
+        Some(&pass_effect),
+    );
+    let Some(mut provenance) = confirmed.bypass.clone() else {
+        return confirmed;
+    };
+    if let Ok(armed) = dismiss_enforce_worktree::arm_in_common_dir(
+        &block.common_dir,
+        CONFIRM_SNOOZE_SECS,
+        Some(CONFIRM_SNOOZE_REASON),
+        input.session_id().map(str::to_string),
+    ) {
+        provenance.mechanism = format!(
+            "{} (dismiss-enforce-worktree {}m)",
+            cadence_hooks_core::confirm::MECHANISM,
+            CONFIRM_SNOOZE_SECS / 60
+        );
+        provenance.expires_at = i64::try_from(armed.until).ok();
+    }
+    CheckResult::allow_bypassed(provenance)
 }
 
 #[cfg(test)]
@@ -6990,6 +7089,222 @@ mod tests {
         let input = edit_in(&wt, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "linked worktree must pass");
+    }
+
+    // --- confirm tier (cameronsjo/cadence-hooks#1658) ---
+
+    fn confirm_attempt(
+        mut input: HookInput,
+        session: Option<&str>,
+        agent: Option<&str>,
+        call: &str,
+    ) -> HookInput {
+        input.session_id = session.map(String::from);
+        input.agent_id = agent.map(String::from);
+        input.tool_use_id = Some(call.into());
+        input
+    }
+
+    fn snoozed(primary: &Path) -> bool {
+        cadence_hooks_core::worktree::is_snoozed_now(primary)
+    }
+
+    #[test]
+    fn confirm_edit_retry_passes_and_arms_the_snooze() {
+        let scratch = scratch("confirm-edit");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let file = primary.join("src.rs");
+            let first = run_confirmed(
+                &confirm_attempt(edit_in(&primary, &file), Some("s1"), None, "t1"),
+                &cfg(false, false),
+            );
+            assert_eq!(first.outcome, Outcome::Block);
+            let msg = first.message.unwrap();
+            assert!(msg.contains("is a primary checkout"), "{msg}");
+            assert!(msg.contains("Are you sure?"), "{msg}");
+            assert!(
+                msg.contains("unblocks this checkout for 30 minutes"),
+                "{msg}"
+            );
+            assert!(!snoozed(&primary), "a first attempt arms nothing");
+
+            let second = run_confirmed(
+                &confirm_attempt(edit_in(&primary, &file), Some("s1"), None, "t2"),
+                &cfg(false, false),
+            );
+            assert_eq!(second.outcome, Outcome::Allow);
+            let prov = second.bypass.expect("a confirmed pass is recorded");
+            assert_eq!(prov.kind, BypassKind::Confirmed);
+            assert_eq!(
+                prov.mechanism,
+                "confirm-retry (dismiss-enforce-worktree 30m)"
+            );
+            assert!(prov.expires_at.is_some());
+            assert!(snoozed(&primary), "the pass arms the dismiss snooze");
+            let meta = dismiss_enforce_worktree::read_meta(&primary).expect("sidecar");
+            assert_eq!(meta.session_id.as_deref(), Some("s1"));
+            assert_eq!(meta.reason.as_deref(), Some(CONFIRM_SNOOZE_REASON));
+
+            // Decision 3: the third attempt rides the snooze, as after a
+            // dismiss, rather than blocking again.
+            let other = primary.join("other.rs");
+            let third = run_confirmed(
+                &confirm_attempt(edit_in(&primary, &other), Some("s1"), None, "t3"),
+                &cfg(false, false),
+            );
+            assert_eq!(third.outcome, Outcome::Allow);
+            assert_eq!(third.bypass.unwrap().kind, BypassKind::Dismissal);
+        });
+    }
+
+    #[test]
+    fn confirm_single_use_once_the_snooze_is_gone() {
+        let scratch = scratch("confirm-single");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let file = primary.join("src.rs");
+            let run = |call| {
+                run_confirmed(
+                    &confirm_attempt(edit_in(&primary, &file), Some("s1"), None, call),
+                    &cfg(false, false),
+                )
+                .outcome
+            };
+            assert_eq!(run("t1"), Outcome::Block);
+            assert_eq!(run("t2"), Outcome::Allow);
+            // Lift the snooze: the consumed confirmation does not pass again.
+            std::fs::remove_file(dismiss_enforce_worktree::marker_path_for(&primary).unwrap())
+                .unwrap();
+            assert_eq!(run("t3"), Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn confirm_does_not_reach_another_session_agent_or_file() {
+        let scratch = scratch("confirm-scope");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let file = primary.join("src.rs");
+            let edit = |path: &Path, session, agent, call| {
+                run_confirmed(
+                    &confirm_attempt(edit_in(&primary, path), session, agent, call),
+                    &cfg(false, false),
+                )
+                .outcome
+            };
+            assert_eq!(edit(&file, Some("s1"), None, "t1"), Outcome::Block);
+            assert_eq!(
+                edit(&file, Some("s2"), None, "t2"),
+                Outcome::Block,
+                "session"
+            );
+            assert_eq!(
+                edit(&file, Some("s1"), Some("ag"), "t3"),
+                Outcome::Block,
+                "agent"
+            );
+            assert_eq!(
+                edit(&primary.join("other.rs"), Some("s1"), None, "t4"),
+                Outcome::Block,
+                "another file"
+            );
+            let mut commit = make_bash("git commit -m x");
+            commit.cwd = Some(primary.to_string_lossy().into_owned());
+            assert_eq!(
+                run_confirmed(
+                    &confirm_attempt(commit, Some("s1"), None, "t5"),
+                    &cfg(false, false)
+                )
+                .outcome,
+                Outcome::Block,
+                "a commit is another action than the edit"
+            );
+            assert!(!snoozed(&primary), "nothing inherited a pass");
+        });
+    }
+
+    #[test]
+    fn confirm_commit_retry_passes() {
+        let scratch = scratch("confirm-commit");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let commit = |command: &str, call| {
+                let mut input = make_bash(command);
+                input.cwd = Some(primary.to_string_lossy().into_owned());
+                run_confirmed(
+                    &confirm_attempt(input, Some("s1"), None, call),
+                    &cfg(false, false),
+                )
+            };
+            assert_eq!(commit("git commit -m x", "t1").outcome, Outcome::Block);
+            let second = commit("git commit -m 'x, reworded'", "t2");
+            assert_eq!(second.outcome, Outcome::Allow);
+            assert_eq!(second.bypass.unwrap().kind, BypassKind::Confirmed);
+        });
+    }
+
+    #[test]
+    fn confirm_needs_a_session_id_and_expires() {
+        let scratch = scratch("confirm-nosession");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let file = primary.join("src.rs");
+            for call in ["t1", "t2"] {
+                let r = run_confirmed(
+                    &confirm_attempt(edit_in(&primary, &file), None, None, call),
+                    &cfg(false, false),
+                );
+                assert_eq!(r.outcome, Outcome::Block);
+                let msg = r.message.unwrap();
+                assert!(
+                    msg.contains("A second attempt will be blocked too"),
+                    "{msg}"
+                );
+            }
+            let first = confirm_attempt(edit_in(&primary, &file), Some("s1"), None, "t3");
+            assert_eq!(
+                run_confirmed(&first, &cfg(false, false)).outcome,
+                Outcome::Block
+            );
+            let root = GitState::resolve(&primary).unwrap().repo_root;
+            let action = format!("{}\u{1f}{}", root.to_string_lossy(), file.to_string_lossy());
+            assert!(cadence_hooks_core::confirm::backdate_for_tests(
+                &first,
+                "enforce-worktree",
+                &action,
+                11 * 60
+            ));
+            let retry = confirm_attempt(edit_in(&primary, &file), Some("s1"), None, "t4");
+            assert_eq!(
+                run_confirmed(&retry, &cfg(false, false)).outcome,
+                Outcome::Block
+            );
+            assert!(!snoozed(&primary));
+        });
+    }
+
+    #[test]
+    fn confirm_leaves_an_unreadable_command_block_alone() {
+        // A block about a command the guard cannot read is not a primary-
+        // checkout block, so it gets no confirm line and never passes.
+        let blocks = [PrimaryBlock {
+            message: "Blocked: `/r` is a primary checkout".into(),
+            repo_root: "/r".into(),
+            common_dir: PathBuf::from("/r/.git"),
+        }];
+        let mut input = make_bash("git commit -m x");
+        input.session_id = Some("s1".into());
+        input.tool_use_id = Some("t1".into());
+        let other = CheckResult::block(created_symlink_block_message());
+        let r = confirm_primary_block(&input, other, &blocks);
+        assert_eq!(r.outcome, Outcome::Block);
+        assert!(!r.message.unwrap().contains("Are you sure"));
     }
 
     /// cadence-hooks#1001: a file git ignores AND does not track can never live

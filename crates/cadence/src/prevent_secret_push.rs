@@ -1932,6 +1932,8 @@ fn render_found(hits: &[Hit]) -> String {
          removing it in a later commit does not help, the history is what is published.\n",
     );
     out.push_str(ACK);
+    out.push('\n');
+    out.push_str(cadence_hooks_core::confirm::OPERATOR_HANDOFF);
     out
 }
 
@@ -2015,6 +2017,17 @@ mod tests {
     use cadence_hooks_core::git_fixtures::Scratch;
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn found_block_tells_a_phone_operator_what_to_do() {
+        // cameronsjo/cadence-hooks#1658 part 3: the false-positive escape is
+        // a settings edit, so the block names the step that works without one.
+        let msg = render_found(&[]);
+        assert!(
+            msg.ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+            "{msg}"
+        );
+    }
 
     // Built by concatenation so this file carries no live-shaped literal.
     fn aws_key() -> String {

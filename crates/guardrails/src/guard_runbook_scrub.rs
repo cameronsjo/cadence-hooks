@@ -515,8 +515,10 @@ fn write_block(path: &str, why: &str) -> String {
          Found:  {}\n   \
          Why:    runbooks under $CADENCE_RUNBOOKS_DIR are promoted from transcript-derived \
          text into a vault that is backed up off-machine; the secret scrub is the gate.\n   \
-         {FIX_AND_ESCAPE}",
-        echo(path)
+         {FIX_AND_ESCAPE}\n   \
+         {}",
+        echo(path),
+        cadence_hooks_core::confirm::OPERATOR_HANDOFF
     )
 }
 
@@ -526,8 +528,10 @@ fn marker_block(target: &str) -> String {
          Scrub markers are recorded only by `cadence-hooks cadence record-scrub`, never \
          written directly.\n   \
          Found:  {}\n   \
-         {FIX_AND_ESCAPE}",
-        echo(target)
+         {FIX_AND_ESCAPE}\n   \
+         {}",
+        echo(target),
+        cadence_hooks_core::confirm::OPERATOR_HANDOFF
     )
 }
 
@@ -658,6 +662,18 @@ mod tests {
         make_bash_with_cwd, make_edit, make_multi_edit, make_write,
     };
     use std::cell::RefCell;
+
+    #[test]
+    fn blocks_tell_a_phone_operator_what_to_do() {
+        // cameronsjo/cadence-hooks#1658 part 3: the escape is a settings
+        // edit, so both blocks name the step that works without one.
+        for msg in [write_block("/r/x.md", "unscrubbed"), marker_block("/r/m")] {
+            assert!(
+                msg.ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+                "{msg}"
+            );
+        }
+    }
 
     /// A fixture tree outside `/tmp` and every carve-out ([`Scratch`]):
     /// `<root>/vault/Runbooks` is the protected dir, `<root>/work` a sibling,
