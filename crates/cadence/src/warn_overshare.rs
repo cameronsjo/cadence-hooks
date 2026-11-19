@@ -6,7 +6,10 @@
 //!
 //! A `git commit` alone never fires (cadence-hooks#1636): a commit leaves the
 //! machine only when it is pushed, and the push reminds. A command that holds a
-//! commit and also a push or a post still fires, for the push or the post.
+//! commit and also a push or a post still fires, for the push or the post. One
+//! exception remains: the word-pair arm of the push trigger reads the two words
+//! `git push` side by side anywhere in the command, so a commit message that
+//! spells them fires, as it did before.
 //!
 //! Skips:
 //! - `CADENCE_SKIP_OVERSHARE_AUDIT=1` — session-scoped bypass for repos
@@ -94,41 +97,85 @@ fn is_bypass_set(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
-/// True when `command` carries `git push`, or any segment matches the redact
-/// engine's posting gate minus `git commit`, [`is_external_post_beyond_commit`]
-/// (cadence-hooks#385: overshare's
+/// Bash token sequences that surface about-to-ship content and are NOT
+/// external-posting verbs the shared posting gate covers. Only `git push`
+/// qualifies: four `gh` sequences were strict subsets of the gate and were
+/// pruned when it was adopted (#385), since a second hand-kept list is exactly
+/// the drift that change killed. `git commit` is deliberately absent (#1636).
+const WORD_PAIR_PUSH_TRIGGERS: &[[&str; 2]] = &[["git", "push"]];
+
+/// The word-pair arm of the push trigger: the two words `git push` stand side
+/// by side in the whitespace-split command, in `main`'s exact logic from before
+/// cadence-hooks#1636. It sees a push wherever the words appear, in a quoted
+/// remote command (`ssh host 'cd r && git push'`), behind a runner the parsed
+/// reader does not know (`ssh host git push`, `docker exec c git push`,
+/// `parallel git push ::: a b`) and in a heredoc body. The price is the
+/// over-triggers it always had: an unquoted `echo git push`, or a commit
+/// message that spells the pair, remind.
+fn carries_git_push_word_pair(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.windows(2).any(|pair| {
+        WORD_PAIR_PUSH_TRIGGERS
+            .iter()
+            .any(|trigger| pair[0] == trigger[0] && pair[1] == trigger[1])
+    })
+}
+
+/// True when `command` carries a push, or any segment matches the redact
+/// engine's posting gate minus `git commit`,
+/// [`is_external_post_beyond_commit`].
+///
+/// The push has two arms, and both stay (cadence-hooks#1636). The word pair
+/// ([`carries_git_push_word_pair`]) is what `main` matched, so a push that
+/// reminded there still reminds. The parsed reader (`git_push_segments`, the
+/// one the push guards use, run on each segment `command_segments` yields) adds
+/// the pushes the word pair never saw: past git's global options
+/// (`git -C dir push`), before a separator or a `)` (`git push;`), and inside a
+/// group, a subshell, a `sh -c` script, an `eval` or a command substitution.
+/// With the commit trigger gone nothing else catches those, so a missed push is
+/// a missed reminder. The shared reader itself is not widened: it serves
+/// blocking guards, and this nudge must not change them.
+///
+/// The post arm is the redact engine's gate (cadence-hooks#385: overshare's
 /// hand-kept six-command list missed `gh pr comment`, `gh pr review`,
-/// `gh issue edit`, `gh release/gist/discussion`, and `tea` — every one an
+/// `gh issue edit`, `gh release/gist/discussion` and `tea`, every one an
 /// external-posting surface the leak scanner already gated). One gate, two
 /// consumers: a new posting verb added there is covered here for free. The
-/// commit arm is the one thing left out (#1636): a commit that is never pushed
-/// or posted publishes nothing, and the push or post reminds.
+/// commit arm is the one thing left out: a commit that is never pushed or
+/// posted publishes nothing, and the push or post reminds.
 ///
 /// [`is_external_post_beyond_commit`]: crate::redact_external_content::is_external_post_beyond_commit
 ///
 /// Precision caveat, accepted: quote-stripping each segment keeps a QUOTED
-/// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an
-/// unquoted prose mention (`echo run gh pr comment 5 later`) still nudges.
-/// This is an advisory nudge; false-fire costs a line of noise, and the extraction
-/// step that gives the redact hook full mention-immunity has no meaning here
-/// (there is no body to extract — the command shape IS the signal).
+/// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an unquoted
+/// prose mention (`echo run gh pr comment 5 later`) still nudges. This is an
+/// advisory nudge; a false fire costs a line of noise, and the extraction step
+/// that gives the redact hook full mention-immunity has no meaning here (there
+/// is no body to extract; the command shape IS the signal).
 fn is_bash_overshare_trigger(command: &str) -> bool {
-    use cadence_hooks_core::shell::{command_segments, git_push_segments};
+    use cadence_hooks_core::shell::command_segments;
 
-    // The push is read as a parsed command, not as two adjacent words
-    // (cadence-hooks#1636): git's global options sit between `git` and `push`,
-    // and `push` can end at a separator or a `)`. Reading it as words hid those
-    // pushes until now, because the commit in the same command reminded for
-    // them. The shared reader skips global options, splits segments, sees into
-    // groups and subshells, and never reads a quoted or `echo`ed `git push`.
-    // It runs on each segment `command_segments` yields, so a push inside a
-    // `sh -c` script, an `eval` or a command substitution is read too, as the
-    // push guards read it.
-    command_segments(command).iter().any(|seg| {
-        !git_push_segments(seg).is_empty()
-            || (crate::redact_external_content::is_external_post_beyond_commit(seg)
-                && !crate::redact_external_content::api_posts_no_prose(seg))
-    })
+    if carries_git_push_word_pair(command) {
+        return true;
+    }
+
+    let segments = command_segments(command);
+    carries_parsed_git_push(&segments)
+        || segments.iter().any(|seg| {
+            crate::redact_external_content::is_external_post_beyond_commit(seg)
+                && !crate::redact_external_content::api_posts_no_prose(seg)
+        })
+}
+
+/// The parsed arm of the push trigger: the shared push reader finds a `git`
+/// invocation whose subcommand is `push` in any of the segments
+/// `command_segments` yields (so inside `sh -c`, `eval` and substitutions too).
+fn carries_parsed_git_push(segments: &[String]) -> bool {
+    use cadence_hooks_core::shell::git_push_segments;
+
+    segments
+        .iter()
+        .any(|seg| !git_push_segments(seg).is_empty())
 }
 
 /// True when `path` is under the Obsidian vault.
@@ -518,8 +565,10 @@ mod tests {
 
     #[test]
     fn quoted_git_push_in_echo_allowed() {
-        // `echo 'git push'`: the quoted words are one argument of `echo`, never
-        // a command word, so the push reader finds no push.
+        // `echo 'git push'`: split on whitespace the tokens keep their quote
+        // characters, so the two words are not side by side (word-pair arm), and
+        // the quoted text is one argument of `echo`, never a command word, so
+        // the parsed reader finds no push either.
         let result = run(&make_bash("echo 'git push' >> notes.txt"));
         assert_eq!(result.outcome, Outcome::Allow);
     }
@@ -562,7 +611,7 @@ mod tests {
     // (cadence-hooks#1636) ---
 
     #[test]
-    fn a_commit_only_command_is_silent_in_every_form() {
+    fn a_commit_only_command_is_silent_unless_its_text_spells_git_push() {
         for cmd in [
             "git commit",
             "git commit -m x",
@@ -597,28 +646,86 @@ mod tests {
             "command git commit -m x",
             "(git commit -m x)",
             "git \"commit\" -m x",
+            // `push` as an argument of a commit: silent here, though `main`
+            // reminded them through its commit trigger.
+            "git commit -m push",
+            "git commit -m 'push'",
+            "git commit -m \"git push\"",
         ] {
             assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
         }
     }
 
     #[test]
-    fn a_commit_message_that_spells_git_push_is_silent() {
-        // The push is read as a parsed command (cadence-hooks#1636), so the
-        // words `git push` inside a quoted message are text, not a push. The raw
-        // two-word match this replaced reminded on the first of these.
+    fn text_that_spells_git_push_still_reminds_accepted_imprecision() {
+        // The word-pair arm is `main`'s match, kept beside the parsed reader
+        // (cadence-hooks#1636), so the two words `git push` side by side read as
+        // a push wherever they sit, as on `main`: in a commit message, after an
+        // `echo`, in a comment. The only way a commit-only command can still
+        // fire; a tripwire if anyone later claims the commit exemption is
+        // absolute or removes the over-trigger without meaning to.
         for cmd in [
             "git commit -m \"fix: git push hangs on a big pack\"",
             "git commit -m 'fix: git push hangs on a big pack'",
-            "git commit -m \"fix: pushing hangs on a big pack\"",
+            "git commit -m \"$(cat <<'EOF'\nfix: git push hangs\n\nbody\nEOF\n)\"",
+            "echo git push",
+            "echo run git push later",
+            "git commit -m x # git push",
         ] {
-            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Nudge, "{cmd}");
+        }
+        // Control: a message that does not spell the pair stays silent.
+        assert_eq!(
+            run(&make_bash(
+                "git commit -m \"fix: pushing hangs on a big pack\""
+            ))
+            .outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn each_arm_of_the_push_trigger_carries_pushes_the_other_misses() {
+        use cadence_hooks_core::shell::command_segments;
+        let parsed = |cmd: &str| carries_parsed_git_push(&command_segments(cmd));
+        // Only the parsed reader sees these: the two words are not side by side.
+        for cmd in [
+            "git -C dir push",
+            "git -c k=v push",
+            "git --no-pager push",
+            "git push;",
+            "(git push)",
+            "git push|cat",
+            "{ git push; }",
+            "bash -c 'git push'",
+            "eval 'git push'",
+            "echo $(git push)",
+        ] {
+            assert!(parsed(cmd), "parsed arm: {cmd}");
+            assert!(!carries_git_push_word_pair(cmd), "word pair: {cmd}");
+        }
+        // Only the word pair sees these: the parsed reader does not know the
+        // runner, the quoted remote command or the heredoc body.
+        for cmd in [
+            "time -p git push",
+            "ssh host git push",
+            "ssh host 'cd /srv/r && git push origin main'",
+            "docker exec c git push",
+            "parallel git push ::: a b",
+            "bash <<'EOF'\ngit push\nEOF",
+            "echo git push",
+        ] {
+            assert!(carries_git_push_word_pair(cmd), "word pair: {cmd}");
+            assert!(!parsed(cmd), "parsed arm: {cmd}");
         }
     }
 
-    /// Every spelling of a push the hook must read: git's global options between
-    /// `git` and `push`, `push` ending at a separator or a `)`, a push inside a
-    /// subshell or a group, and the runner prefixes the shared reader peels.
+    /// Every spelling of a push the hook must read. The parsed reader's: git's
+    /// global options between `git` and `push`, `push` ending at a separator or
+    /// a `)`, a push inside a subshell, a group, a `sh -c` script, an `eval` or a
+    /// substitution, and the runner prefixes it peels. The word pair's, which
+    /// `main` matched and the parsed reader does not read: a runner it does not
+    /// know, a quoted remote command, a heredoc body.
     const PUSH_FORMS: &[&str] = &[
         "git push",
         "git push origin main",
@@ -660,6 +767,12 @@ mod tests {
         "eval 'git push'",
         "echo $(git push)",
         "echo `git push`",
+        "time -p git push",
+        "ssh host git push",
+        "ssh host 'cd /srv/r && git push origin main'",
+        "docker exec c git push",
+        "parallel git push ::: a b",
+        "bash <<'EOF'\ngit push\nEOF",
     ];
 
     #[test]
@@ -688,9 +801,6 @@ mod tests {
             "git pusher",
             "git stash push",
             "git stash push -m wip",
-            "git commit -m push",
-            "git commit -m 'push'",
-            "git commit -m \"git push\"",
             "git log push",
             "git log --oneline push..HEAD",
             "git branch push",
@@ -704,9 +814,6 @@ mod tests {
             "echo \"git push\" >> notes.txt",
             "grep -rn 'git push' docs",
             "git pull && git push-hook-test",
-            "echo git push",
-            "echo run git push later",
-            "git commit -m x # git push",
             "bash -c 'git stash push'",
             "bash -c 'echo \"git push\"'",
         ] {

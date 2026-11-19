@@ -30,14 +30,14 @@
 ## ADDED Requirements
 
 ### Requirement: Overshare commit exemption
-A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, after a `cd` or `git add`, with `git -C` or another global option, or with a message built by substitution. A command that also carries a push or a posting segment SHALL still trigger it, for the push or the post.
+A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, after a `cd` or `git add`, with `git -C` or another global option, or with a message built by substitution. A command that also carries a push or a posting segment SHALL still trigger it, for the push or the post. The one exception runs the other way: a commit whose text spells the two words `git push` side by side triggers it, as the push recognition requirement reads them.
 
 #### Scenario: Commit alone is silent
 - **WHEN** a Bash call runs `git commit -m 'x'`, `cd other && git commit -m 'x'`, `git -C other commit -m 'x'` or `git commit -m "$(cat msg.txt)"`
 - **THEN** the hook exits 0 with no output
 
 ### Requirement: Overshare push recognition
-`warn-overshare` SHALL read a push as a `git` invocation whose subcommand is `push`: past git's global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--no-pager`), before a separator, a pipe or a `)`, at the end of the command, and inside a subshell, a group, a loop body, a `sh -c` script, an `eval` or a command substitution. It MUST NOT read as a push a word that only starts with `push`, `push` as an argument to another subcommand, or the words `git push` inside quoted or echoed text.
+`warn-overshare` SHALL read a push two ways, and either SHALL trigger it: a `git` invocation whose subcommand is `push` (past git's global options, before a separator or a `)`, inside a subshell, group, `sh -c` script, `eval` or command substitution), and the two words `git push` side by side, the match it always had. A word that only starts with `push`, `push` as another subcommand's argument, and a quoted `'git push'` with nothing else inside the quotes MUST NOT trigger it.
 
 #### Scenario: Push past a global option
 - **WHEN** a Bash call runs `git -C dir push`, `git -c k=v push` or `git --no-pager push`
@@ -47,8 +47,16 @@ A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, afte
 - **WHEN** a Bash call runs `git push;`, `git push|cat`, `{ git push; }`, `(cd x && git commit -m y && git push)` or `bash -c 'cd x && git push'`
 - **THEN** the hook exits 0 with a nudge containing `overshare`
 
+#### Scenario: Wrapped push
+- **WHEN** a Bash call runs `time -p git push`, `ssh host git push`, `docker exec c git push` or `ssh host 'cd r && git push origin main'`
+- **THEN** the hook exits 0 with a nudge containing `overshare`
+
+#### Scenario: Words that spell the pair
+- **WHEN** a Bash call runs `echo git push` or `git commit -m "fix: git push hangs"`, which carry the two words side by side but are not a push
+- **THEN** the hook exits 0 with a nudge containing `overshare`
+
 #### Scenario: Not a push
-- **WHEN** a Bash call runs `git push-something`, `git stash push`, `git commit -m push` or `git commit -m "fix: git push hangs"`
+- **WHEN** a Bash call runs `git push-something`, `git stash push`, `git commit -m push` or `echo 'git push'`
 - **THEN** the hook exits 0 with no output
 
 ## REMOVED Requirements

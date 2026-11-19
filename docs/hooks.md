@@ -113,21 +113,32 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 
 A `git commit` never fires it: a commit leaves the machine only when it is
 pushed, and the push reminds. That holds for every form of commit (a `cd`, a
-`git -C`, a chain, a substitution, a heredoc). A command that holds a commit
+`git -C`, a chain, a substitution, a heredoc), unless the command's text spells
+the two words `git push` side by side (below). A command that holds a commit
 and also a push or a post still reminds, for the push or the post. Every push,
 every post and every field-report edit reminds every time.
 
-A push is a `git` command whose subcommand is `push`, read past git's global
+A push is recognised two ways, and either one fires the reminder. The first
+reads the command: a `git` command whose subcommand is `push`, past git's global
 options (`git -C dir push`, `git -c k=v push`, `git --no-pager push`), before a
 separator or a `)` (`git push;`, `git push|cat`), and inside a subshell, a
 group, a `sh -c` script, an `eval` or a command substitution
-(`(cd x && git push)`, `{ git push; }`, `bash -c 'git push'`). The `cadence`
-plugin starts the hook only for commands that contain `git push`, `git commit`,
-`gh ` or `tea ` (its `if:` filters), so a push spelled `git -C dir push`, with
-none of those, does not reach the hook until those filters are widened. A word that only starts with
-`push` (`git push-hook`), `push` as an argument to another subcommand
-(`git stash push`, `git commit -m push`) and the words `git push` inside quoted
-or echoed text are not pushes.
+(`(cd x && git push)`, `{ git push; }`, `bash -c 'git push'`). The second is the
+match the hook always had: the two words `git push` side by side in the
+command, wherever they appear. It catches a push behind a runner the first does
+not know (`ssh host git push`, `docker exec c git push`,
+`parallel git push ::: a b`), in a quoted remote command
+(`ssh host 'cd r && git push origin main'`) and in a heredoc body. It also
+fires on some text that is not a push: an unquoted `echo git push`, or a commit
+message that spells the two words (`git commit -m "fix: git push hangs"`). A
+word that only starts with `push` (`git push-hook`), `push` as an argument to
+another subcommand (`git stash push`, `git commit -m push`) and a quoted
+`'git push'` with nothing else inside the quotes do not fire.
+
+The `cadence` plugin starts the hook only for commands that contain `git push`,
+`git commit`, `gh ` or `tea ` (its `if:` filters), so a push spelled
+`git -C dir push`, with none of those, does not reach the hook until those
+filters are widened (cameronsjo/cadence#2211).
 
 ## guardrails (git-guardrails)
 
