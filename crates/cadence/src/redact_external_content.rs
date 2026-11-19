@@ -177,11 +177,25 @@ pub const NAMESPACES: &[&str] = &[
 /// overshare nudge covers exactly the posting surfaces the leak scan covers —
 /// one gate, no second hand-kept command list to drift.
 pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\bgh\s+(pr|issue|release|gist|discussion)\s+(create|new|comment|edit|review|reopen)\b|\bgit\s+commit\b|\btea\s+(pr|issue)\s+(create|comment|edit)\b",
-    )
+    Regex::new(&format!(
+        "{POST_PATTERN_GH}|{POST_PATTERN_COMMIT}|{POST_PATTERN_TEA}"
+    ))
     .expect("external-post pattern should compile")
 });
+
+/// [`EXTERNAL_POST`] without its `git commit` arm, for the overshare nudge: a
+/// commit stays on the machine until a push, and the push reminds
+/// (cadence-hooks#1636). Built from the same pattern pieces, so the two cannot
+/// drift apart.
+static EXTERNAL_POST_BEYOND_COMMIT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!("{POST_PATTERN_GH}|{POST_PATTERN_TEA}"))
+        .expect("external-post pattern should compile")
+});
+
+const POST_PATTERN_GH: &str =
+    r"\bgh\s+(pr|issue|release|gist|discussion)\s+(create|new|comment|edit|review|reopen)\b";
+const POST_PATTERN_COMMIT: &str = r"\bgit\s+commit\b";
+const POST_PATTERN_TEA: &str = r"\btea\s+(pr|issue)\s+(create|comment|edit)\b";
 
 /// `gh` command groups and verbs the posting gate covers — the same set
 /// [`EXTERNAL_POST`] spells as text, read here from the parsed argv.
@@ -216,7 +230,24 @@ const TEA_POST_VERBS: &[&str] = &["create", "comment", "edit"];
 /// Mention immunity holds on both arms: a quoted `"gh pr create"` is one
 /// token, never a command word, and an `echo gh pr create` resolves to `echo`.
 pub(crate) fn is_external_post(segment: &str) -> bool {
-    if EXTERNAL_POST.is_match(&strip_quotes(segment)) {
+    is_post_segment(segment, true)
+}
+
+/// [`is_external_post`] minus `git commit`: every other posting command it
+/// matches, and nothing else changes. The overshare nudge asks this, because a
+/// commit leaves the machine only when it is pushed, and the push reminds
+/// (cadence-hooks#1636). The leak scan keeps asking [`is_external_post`].
+pub(crate) fn is_external_post_beyond_commit(segment: &str) -> bool {
+    is_post_segment(segment, false)
+}
+
+fn is_post_segment(segment: &str, commit_counts: bool) -> bool {
+    let text_gate = if commit_counts {
+        &EXTERNAL_POST
+    } else {
+        &EXTERNAL_POST_BEYOND_COMMIT
+    };
+    if text_gate.is_match(&strip_quotes(segment)) {
         return true;
     }
     let tokens = executable_tokens(segment);
@@ -240,9 +271,12 @@ pub(crate) fn is_external_post(segment: &str) -> bool {
                     in_set(path.first(), &[group]) && in_set(path.get(1), verbs)
                 })
         }
-        "git" => skip_git_global_options(&argv[1..])
-            .first()
-            .is_some_and(|sub| unescape_word(sub) == "commit"),
+        "git" => {
+            commit_counts
+                && skip_git_global_options(&argv[1..])
+                    .first()
+                    .is_some_and(|sub| unescape_word(sub) == "commit")
+        }
         "tea" => {
             let words: Vec<&str> = argv[1..].iter().take(2).map(String::as_str).collect();
             in_set(words.first(), TEA_POST_GROUPS) && in_set(words.get(1), TEA_POST_VERBS)
@@ -5962,6 +5996,46 @@ term = "acmecorp"
         ];
         for (cmd, want) in cases {
             assert_eq!(is_external_post(cmd), *want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn the_beyond_commit_gate_drops_the_commit_and_nothing_else() {
+        // The overshare nudge reads this variant (cadence-hooks#1636); the leak
+        // scan keeps the full gate. Every commit form the full gate sees, the
+        // variant does not; every other posting command both see alike.
+        for cmd in [
+            "git commit -m x",
+            "git -C o commit -m x",
+            "git -c user.name=x commit -m x",
+            "git \"commit\" -m x",
+            "git c\\ommit -m x",
+            "env FOO=1 git commit -m x",
+            "echo run git commit later",
+        ] {
+            assert!(is_external_post(cmd), "control, full gate: {cmd}");
+            assert!(!is_external_post_beyond_commit(cmd), "{cmd}");
+        }
+        for cmd in [
+            "gh pr create --title t",
+            "gh pr comment 3 --body b",
+            "gh -R o/r issue create -t x",
+            "gh issue \"edit\" 4 --body b",
+            "gh api repos/o/r/issues -f body=x",
+            "gh pr merge 3 --squash",
+            "gh repo create o/r -d x",
+            "tea pr create --title t",
+            "env FOO=1 gh pr create -t x",
+        ] {
+            assert!(is_external_post(cmd), "control, full gate: {cmd}");
+            assert!(is_external_post_beyond_commit(cmd), "{cmd}");
+        }
+        for cmd in ["git status", "git push", "gh pr view 3", "ls"] {
+            assert_eq!(
+                is_external_post_beyond_commit(cmd),
+                is_external_post(cmd),
+                "{cmd}"
+            );
         }
     }
 

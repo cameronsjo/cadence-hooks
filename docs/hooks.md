@@ -105,20 +105,19 @@ Rules for wiring:
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) | run |
 | `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable | run |
 
-`warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
+`warn-overshare` does path triage only — it fires on push/PR/issue/post Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
 judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
-It reminds once per session on a plain `git commit` (the whole command is one
-`git commit` with only bare-word or quoted arguments) and stays silent on later
-plain commits in that session. Every push, every post, every field-report edit
-and every other form of commit (a global option, a `cd`, a chain, a pipe, a
-substitution, a heredoc) reminds every time. The quiet period is keyed on the
-session id alone, so a subagent and its parent share it; with no session id it
-never applies. It is spent only when the reminder is emitted: a reminder the
-repo's `nudges` config suppresses does not use it.
+A `git commit` never fires it: a commit leaves the machine only when it is
+pushed, and the push reminds. That holds for every form of commit (a `cd`, a
+`git -C`, a chain, a substitution, a heredoc), with one exception: a commit
+message that itself spells `git push` as two separate words is read as a push,
+as before. A command that holds a commit and also a push or a post still
+reminds, for the push or the post. Every push, every post and every
+field-report edit reminds every time.
 
 ## guardrails (git-guardrails)
 
