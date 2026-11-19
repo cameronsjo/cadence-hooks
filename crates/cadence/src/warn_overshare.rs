@@ -97,28 +97,32 @@ fn is_bypass_set(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
-/// Bash token sequences that surface about-to-ship content and are NOT
-/// external-posting verbs the shared posting gate covers. Only `git push`
-/// qualifies: four `gh` sequences were strict subsets of the gate and were
-/// pruned when it was adopted (#385), since a second hand-kept list is exactly
-/// the drift that change killed. `git commit` is deliberately absent (#1636).
-const WORD_PAIR_PUSH_TRIGGERS: &[[&str; 2]] = &[["git", "push"]];
+/// The characters trimmed from both ends of a word before the word-pair arm
+/// compares it: a quote, a backtick, a parenthesis and a semicolon. They are
+/// what touches `git` or `push` when the pair sits inside a quoted remote
+/// command (`ssh host 'git push'`), a group or a statement (`(git push)`,
+/// `git push;`). Nothing else is trimmed, so `git push-hook`, `git pushd` and
+/// `--push` stay different words.
+const WORD_EDGE_PUNCTUATION: &[char] = &['\'', '"', '`', '(', ')', ';'];
 
-/// The word-pair arm of the push trigger: the two words `git push` stand side
-/// by side in the whitespace-split command, in `main`'s exact logic from before
-/// cadence-hooks#1636. It sees a push wherever the words appear, in a quoted
-/// remote command (`ssh host 'cd r && git push'`), behind a runner the parsed
+/// The word-pair arm of the push trigger: the two words `git` and `push` stand
+/// side by side in the whitespace-split command, ignoring a quote, backtick,
+/// parenthesis or semicolon touching either of them. It reads a push wherever
+/// the words appear: in a quoted remote command, behind a runner the parsed
 /// reader does not know (`ssh host git push`, `docker exec c git push`,
-/// `parallel git push ::: a b`) and in a heredoc body. The price is the
-/// over-triggers it always had: an unquoted `echo git push`, or a commit
-/// message that spells the pair, remind.
+/// `parallel git push ::: a b`), in a heredoc body. It reads nothing that
+/// keeps a git global option between the words, or never spells them (a make
+/// target, a script file). The price is a reminder on text that is not a push:
+/// an `echo git push`, a quoted `'git push'`, a commit message that spells the
+/// pair.
 fn carries_git_push_word_pair(command: &str) -> bool {
-    let words: Vec<&str> = command.split_whitespace().collect();
-    words.windows(2).any(|pair| {
-        WORD_PAIR_PUSH_TRIGGERS
-            .iter()
-            .any(|trigger| pair[0] == trigger[0] && pair[1] == trigger[1])
-    })
+    let words: Vec<&str> = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(WORD_EDGE_PUNCTUATION))
+        .collect();
+    words
+        .windows(2)
+        .any(|pair| pair[0] == "git" && pair[1] == "push")
 }
 
 /// True when `command` carries a push, or any segment matches the redact
@@ -126,15 +130,18 @@ fn carries_git_push_word_pair(command: &str) -> bool {
 /// [`is_external_post_beyond_commit`].
 ///
 /// The push has two arms, and both stay (cadence-hooks#1636). The word pair
-/// ([`carries_git_push_word_pair`]) is what `main` matched, so a push that
-/// reminded there still reminds. The parsed reader (`git_push_segments`, the
-/// one the push guards use, run on each segment `command_segments` yields) adds
-/// the pushes the word pair never saw: past git's global options
-/// (`git -C dir push`), before a separator or a `)` (`git push;`), and inside a
-/// group, a subshell, a `sh -c` script, an `eval` or a command substitution.
-/// With the commit trigger gone nothing else catches those, so a missed push is
-/// a missed reminder. The shared reader itself is not widened: it serves
-/// blocking guards, and this nudge must not change them.
+/// ([`carries_git_push_word_pair`]) is `main`'s match, widened to ignore a
+/// quote, backtick, parenthesis or semicolon touching a word, so a push that
+/// reminded on `main` still reminds, and so does one inside a quoted remote
+/// command. The parsed reader (`git_push_segments`, the one the push guards
+/// use, run on each segment `command_segments` yields) adds what the word pair
+/// cannot see: a git global option between the words (`git -C dir push`,
+/// `git -c k=v push`), a push fused to `|` or `&&` (`git push|cat`), and one
+/// inside a command substitution (`$(git push)`). The two overlap on the rest
+/// (`git push;`, a subshell, a `sh -c` script, an `eval`). With the commit
+/// trigger gone nothing else catches a push, so a missed push is a missed
+/// reminder. The shared reader itself is not widened: it serves blocking
+/// guards, and this nudge must not change them.
 ///
 /// The post arm is the redact engine's gate (cadence-hooks#385: overshare's
 /// hand-kept six-command list missed `gh pr comment`, `gh pr review`,
@@ -564,13 +571,16 @@ mod tests {
     // --- Edge cases ---
 
     #[test]
-    fn quoted_git_push_in_echo_allowed() {
-        // `echo 'git push'`: split on whitespace the tokens keep their quote
-        // characters, so the two words are not side by side (word-pair arm), and
-        // the quoted text is one argument of `echo`, never a command word, so
-        // the parsed reader finds no push either.
+    fn quoted_git_push_in_echo_now_reminds_accepted_imprecision() {
+        // Was `quoted_git_push_in_echo_allowed`. The word-pair arm ignores a
+        // quote touching either word, so that a quoted remote command
+        // (`ssh host 'git push'`) is read as a push; the same trim makes the
+        // quoted text `echo 'git push'` read as one too. The parsed reader
+        // alone would stay silent here (the quoted text is one argument of
+        // `echo`). An advisory reminder on text that is not a push is the
+        // accepted price of reading the quoted remote command.
         let result = run(&make_bash("echo 'git push' >> notes.txt"));
-        assert_eq!(result.outcome, Outcome::Allow);
+        assert_eq!(result.outcome, Outcome::Nudge);
     }
 
     #[test]
@@ -650,7 +660,6 @@ mod tests {
             // reminded them through its commit trigger.
             "git commit -m push",
             "git commit -m 'push'",
-            "git commit -m \"git push\"",
         ] {
             assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
         }
@@ -671,6 +680,12 @@ mod tests {
             "echo git push",
             "echo run git push later",
             "git commit -m x # git push",
+            // A quote touching a word is trimmed, so quoted text reads as a push.
+            "git commit -m \"git push\"",
+            "echo 'git push'",
+            "echo \"git push\" >> notes.txt",
+            "grep -rn 'git push' docs",
+            "bash -c 'echo \"git push\"'",
         ] {
             assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Nudge, "{cmd}");
         }
@@ -688,17 +703,14 @@ mod tests {
     fn each_arm_of_the_push_trigger_carries_pushes_the_other_misses() {
         use cadence_hooks_core::shell::command_segments;
         let parsed = |cmd: &str| carries_parsed_git_push(&command_segments(cmd));
-        // Only the parsed reader sees these: the two words are not side by side.
+        // Only the parsed reader sees these: a git global option sits between
+        // the two words, or `push` is fused to something the trim leaves alone.
         for cmd in [
             "git -C dir push",
             "git -c k=v push",
             "git --no-pager push",
-            "git push;",
-            "(git push)",
             "git push|cat",
-            "{ git push; }",
-            "bash -c 'git push'",
-            "eval 'git push'",
+            "git push&&true",
             "echo $(git push)",
         ] {
             assert!(parsed(cmd), "parsed arm: {cmd}");
@@ -714,9 +726,95 @@ mod tests {
             "parallel git push ::: a b",
             "bash <<'EOF'\ngit push\nEOF",
             "echo git push",
+            "ssh host 'git push'",
+            "ssh host \"git push origin main\"",
+            "ssh host '(cd /srv/r && git push)'",
+            "ssh host 'git push; git status'",
+            "ruby -e 'system \"git push\"'",
+            "echo 'git push'",
         ] {
             assert!(carries_git_push_word_pair(cmd), "word pair: {cmd}");
             assert!(!parsed(cmd), "parsed arm: {cmd}");
+        }
+    }
+
+    #[test]
+    fn the_parsed_reader_still_reads_the_pushes_both_arms_share() {
+        use cadence_hooks_core::shell::command_segments;
+        // The word pair reads these too, so the combined tests would pass if the
+        // parsed reader regressed on them; pin the reader on its own.
+        for cmd in [
+            "git push;",
+            "(git push)",
+            "{ git push; }",
+            "(cd x && git commit -m y && git push)",
+            "if true; then git push; fi",
+            "bash -c 'git push'",
+            "eval 'git push'",
+            "echo `git push`",
+        ] {
+            assert!(
+                carries_parsed_git_push(&command_segments(cmd)),
+                "parsed arm: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_word_pair_trims_only_quotes_backticks_parentheses_and_semicolons() {
+        // Touching punctuation off the list keeps a word a different word.
+        for cmd in [
+            "git push-hook",
+            "git pushd",
+            "git stash push",
+            "git remote set-url --push origin u",
+            "git push|cat",
+            "git push&&true",
+            "git push,",
+            "git -C d push",
+        ] {
+            assert!(!carries_git_push_word_pair(cmd), "must not match: {cmd}");
+        }
+        for cmd in [
+            "git push",
+            "'git push'",
+            "\"git push\"",
+            "`git push`",
+            "(git push)",
+            "git push;",
+            "('git push';)",
+        ] {
+            assert!(carries_git_push_word_pair(cmd), "must match: {cmd}");
+        }
+    }
+
+    /// Pushes the hook knowingly does not recognise: the documented boundary of
+    /// the word-pair arm. Each keeps a git global option between `git` and
+    /// `push` behind a runner the parsed reader does not know, glue the first
+    /// word to a statement inside a quote (`'cd r;git push'`), or never spell
+    /// the two words (a make target, a script file). `main` reminded none of
+    /// them on its own, only through a commit in the same command; with the
+    /// commit trigger gone they are silent, alone and after a commit.
+    const NOT_RECOGNISED_PUSHES: &[&str] = &[
+        "docker exec c git -C d push",
+        "ssh host git -C d push",
+        "time -p git -C d push",
+        "parallel git -C {} push ::: a b",
+        "bash <<'EOF'\ngit -C d push\nEOF",
+        "make push",
+        "ssh host 'cd r;git push'",
+    ];
+
+    #[test]
+    fn a_push_the_hook_knowingly_does_not_recognise_stays_silent() {
+        for cmd in NOT_RECOGNISED_PUSHES {
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "alone: {cmd}");
+            let with_commit = format!("git commit -m x && {cmd}");
+            assert_eq!(
+                run(&make_bash(&with_commit)).outcome,
+                Outcome::Allow,
+                "after a commit: {with_commit}"
+            );
         }
     }
 
@@ -773,6 +871,11 @@ mod tests {
         "docker exec c git push",
         "parallel git push ::: a b",
         "bash <<'EOF'\ngit push\nEOF",
+        "ssh host 'git push'",
+        "ssh host \"git push origin main\"",
+        "ssh host '(cd /srv/r && git push)'",
+        "ssh host 'git push; git status'",
+        "ruby -e 'system \"git push\"'",
     ];
 
     #[test]
@@ -810,12 +913,8 @@ mod tests {
             "git config --get remote.origin.push",
             "git -C dir stash push",
             "git -c k=v log push",
-            "echo 'git push'",
-            "echo \"git push\" >> notes.txt",
-            "grep -rn 'git push' docs",
             "git pull && git push-hook-test",
             "bash -c 'git stash push'",
-            "bash -c 'echo \"git push\"'",
         ] {
             assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
         }

@@ -37,7 +37,7 @@ A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, afte
 - **THEN** the hook exits 0 with no output
 
 ### Requirement: Overshare push recognition
-`warn-overshare` SHALL read a push two ways, and either SHALL trigger it: a `git` invocation whose subcommand is `push` (past git's global options, before a separator or a `)`, inside a subshell, group, `sh -c` script, `eval` or command substitution), and the two words `git push` side by side, the match it always had. A word that only starts with `push`, `push` as another subcommand's argument, and a quoted `'git push'` with nothing else inside the quotes MUST NOT trigger it.
+`warn-overshare` SHALL read a push two ways, and either SHALL trigger it: a `git` invocation whose subcommand is `push` (past git's global options, before a separator or a `)`, inside a subshell, group, `sh -c` script, `eval` or command substitution), and the two words `git push` side by side, ignoring a quote, backtick, parenthesis or semicolon touching either word. A word that only starts with `push`, and `push` as another subcommand's argument, MUST NOT trigger it.
 
 #### Scenario: Push past a global option
 - **WHEN** a Bash call runs `git -C dir push`, `git -c k=v push` or `git --no-pager push`
@@ -48,15 +48,22 @@ A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, afte
 - **THEN** the hook exits 0 with a nudge containing `overshare`
 
 #### Scenario: Wrapped push
-- **WHEN** a Bash call runs `time -p git push`, `ssh host git push`, `docker exec c git push` or `ssh host 'cd r && git push origin main'`
+- **WHEN** a Bash call runs `time -p git push`, `ssh host git push`, `docker exec c git push`, `ssh host 'git push'` or `ssh host "git push origin main"`
 - **THEN** the hook exits 0 with a nudge containing `overshare`
 
 #### Scenario: Words that spell the pair
-- **WHEN** a Bash call runs `echo git push` or `git commit -m "fix: git push hangs"`, which carry the two words side by side but are not a push
+- **WHEN** a Bash call runs `echo git push`, `echo 'git push'` or `git commit -m "fix: git push hangs"`, which carry the two words side by side but are not a push
 - **THEN** the hook exits 0 with a nudge containing `overshare`
 
 #### Scenario: Not a push
-- **WHEN** a Bash call runs `git push-something`, `git stash push`, `git commit -m push` or `echo 'git push'`
+- **WHEN** a Bash call runs `git push-something`, `git stash push` or `git commit -m push`
+- **THEN** the hook exits 0 with no output
+
+### Requirement: Overshare push boundary
+`warn-overshare` SHALL NOT trigger on a push it does not recognise: one that keeps a git global option between `git` and `push` behind a runner the parsed reading does not know, and one whose `git` is glued to the word before it inside a quote, and one that never spells the two words (a make target, a script file). With the commit trigger gone such a push is silent, alone or after a commit.
+
+#### Scenario: Push not recognised
+- **WHEN** a Bash call runs `docker exec c git -C d push`, `ssh host git -C d push`, `time -p git -C d push`, `ssh host 'cd r;git push'` or `make push`, alone or after `git commit -m x &&`
 - **THEN** the hook exits 0 with no output
 
 ## REMOVED Requirements

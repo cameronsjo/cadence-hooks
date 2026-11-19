@@ -124,16 +124,28 @@ options (`git -C dir push`, `git -c k=v push`, `git --no-pager push`), before a
 separator or a `)` (`git push;`, `git push|cat`), and inside a subshell, a
 group, a `sh -c` script, an `eval` or a command substitution
 (`(cd x && git push)`, `{ git push; }`, `bash -c 'git push'`). The second is the
-match the hook always had: the two words `git push` side by side in the
-command, wherever they appear. It catches a push behind a runner the first does
-not know (`ssh host git push`, `docker exec c git push`,
+match the hook always had, widened slightly: the two words `git push` side by
+side in the command, ignoring a quote, a backtick, a parenthesis or a semicolon
+touching either word, wherever they appear. It catches a push behind a runner
+the first does not know (`ssh host git push`, `docker exec c git push`,
 `parallel git push ::: a b`), in a quoted remote command
-(`ssh host 'cd r && git push origin main'`) and in a heredoc body. It also
-fires on some text that is not a push: an unquoted `echo git push`, or a commit
-message that spells the two words (`git commit -m "fix: git push hangs"`). A
-word that only starts with `push` (`git push-hook`), `push` as an argument to
-another subcommand (`git stash push`, `git commit -m push`) and a quoted
-`'git push'` with nothing else inside the quotes do not fire.
+(`ssh host 'git push'`, `ssh host "git push origin main"`,
+`ssh host '(cd r && git push)'`, `ruby -e 'system "git push"'`) and in a heredoc
+body. It also fires on some text that is not a push: an `echo git push`, a
+quoted `'git push'`, or a commit message that spells the two words
+(`git commit -m "fix: git push hangs"`). A word that only starts with `push`
+(`git push-hook`) and `push` as an argument to another subcommand
+(`git stash push`, `git commit -m push`) do not fire.
+
+Not recognised: a push that carries a git global option behind a runner the
+first reading does not know (`ssh host git -C d push`,
+`docker exec c git -C d push`, `time -p git -C d push`,
+`parallel git -C {} push ::: a b`, or a heredoc body holding `git -C d push`),
+a push whose `git` is glued to the word before it inside a quote
+(`ssh host 'cd r;git push'`), and a push that never spells the two words
+(`make push`, a script file). These
+fire only through a commit in the same command, and a commit no longer fires,
+so they are silent.
 
 The `cadence` plugin starts the hook only for commands that contain `git push`,
 `git commit`, `gh ` or `tea ` (its `if:` filters), so a push spelled
