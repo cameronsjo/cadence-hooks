@@ -21,13 +21,6 @@
 
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, Outcome};
 
-/// Bash token sequences that surface about-to-ship content but are NOT
-/// external-posting verbs the shared posting gate covers. Only `git push`
-/// qualifies — four `gh` sequences were strict subsets of the gate and were
-/// pruned when it was adopted (#385): a second hand-kept list is exactly the
-/// drift this change kills. `git commit` is deliberately absent (#1636).
-const BASH_TWO_TOKEN_TRIGGERS: &[[&str; 2]] = &[["git", "push"]];
-
 const FIELD_REPORTS_MARKER: &str = "/docs/field-reports/";
 
 /// Nudges the model to audit about-to-ship content for overshare before
@@ -115,27 +108,26 @@ fn is_bypass_set(value: Option<&str>) -> bool {
 ///
 /// Precision caveat, accepted: quote-stripping each segment keeps a QUOTED
 /// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an
-/// unquoted prose mention (`echo run gh pr comment 5 later`) still nudges —
-/// same over-trigger the old token arm had for `echo git commit foo`. This
-/// is an advisory nudge; false-fire costs a line of noise, and the extraction
+/// unquoted prose mention (`echo run gh pr comment 5 later`) still nudges.
+/// This is an advisory nudge; false-fire costs a line of noise, and the extraction
 /// step that gives the redact hook full mention-immunity has no meaning here
 /// (there is no body to extract — the command shape IS the signal).
 fn is_bash_overshare_trigger(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    use cadence_hooks_core::shell::{command_segments, git_push_segments};
 
-    let push_hit = tokens.windows(2).any(|w| {
-        BASH_TWO_TOKEN_TRIGGERS
-            .iter()
-            .any(|t| w[0] == t[0] && w[1] == t[1])
-    });
-    if push_hit {
-        return true;
-    }
-
-    use cadence_hooks_core::shell::command_segments;
+    // The push is read as a parsed command, not as two adjacent words
+    // (cadence-hooks#1636): git's global options sit between `git` and `push`,
+    // and `push` can end at a separator or a `)`. Reading it as words hid those
+    // pushes until now, because the commit in the same command reminded for
+    // them. The shared reader skips global options, splits segments, sees into
+    // groups and subshells, and never reads a quoted or `echo`ed `git push`.
+    // It runs on each segment `command_segments` yields, so a push inside a
+    // `sh -c` script, an `eval` or a command substitution is read too, as the
+    // push guards read it.
     command_segments(command).iter().any(|seg| {
-        crate::redact_external_content::is_external_post_beyond_commit(seg)
-            && !crate::redact_external_content::api_posts_no_prose(seg)
+        !git_push_segments(seg).is_empty()
+            || (crate::redact_external_content::is_external_post_beyond_commit(seg)
+                && !crate::redact_external_content::api_posts_no_prose(seg))
     })
 }
 
@@ -526,9 +518,8 @@ mod tests {
 
     #[test]
     fn quoted_git_push_in_echo_allowed() {
-        // split_whitespace on `echo 'git push'` yields tokens including the
-        // quote characters, so the literal tokens "git" and "push" don't
-        // appear adjacent — the window check correctly returns false.
+        // `echo 'git push'`: the quoted words are one argument of `echo`, never
+        // a command word, so the push reader finds no push.
         let result = run(&make_bash("echo 'git push' >> notes.txt"));
         assert_eq!(result.outcome, Outcome::Allow);
     }
@@ -612,27 +603,115 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_message_that_spells_git_push_still_reminds_accepted_imprecision() {
-        // The push match is a raw whitespace-token window, unchanged by
-        // cadence-hooks#1636 (the brief leaves push matching alone), so the two
-        // words `git push` inside a message read as a push. The only way a
-        // commit-only command can still fire; a tripwire if anyone later claims
-        // the commit exemption is absolute.
-        assert_eq!(
-            run(&make_bash(
-                "git commit -m \"fix: git push hangs on a big pack\""
-            ))
-            .outcome,
-            Outcome::Nudge
-        );
-        // Control: a message that does not spell it stays silent.
-        assert_eq!(
-            run(&make_bash(
-                "git commit -m \"fix: pushing hangs on a big pack\""
-            ))
-            .outcome,
-            Outcome::Allow
-        );
+    fn a_commit_message_that_spells_git_push_is_silent() {
+        // The push is read as a parsed command (cadence-hooks#1636), so the
+        // words `git push` inside a quoted message are text, not a push. The raw
+        // two-word match this replaced reminded on the first of these.
+        for cmd in [
+            "git commit -m \"fix: git push hangs on a big pack\"",
+            "git commit -m 'fix: git push hangs on a big pack'",
+            "git commit -m \"fix: pushing hangs on a big pack\"",
+        ] {
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
+        }
+    }
+
+    /// Every spelling of a push the hook must read: git's global options between
+    /// `git` and `push`, `push` ending at a separator or a `)`, a push inside a
+    /// subshell or a group, and the runner prefixes the shared reader peels.
+    const PUSH_FORMS: &[&str] = &[
+        "git push",
+        "git push origin main",
+        "git push --force-with-lease origin feat/x",
+        "git -C dir push",
+        "git -C dir push origin main",
+        "git -c k=v push",
+        "git -c color.ui=false push origin main",
+        "git --git-dir=x push",
+        "git --git-dir x push",
+        "git --work-tree=x push",
+        "git --no-pager push",
+        "git --no-pager -C dir push origin main",
+        "git\tpush origin main",
+        "git push;",
+        "git push; git status",
+        "(git push)",
+        "git push&&true",
+        "git push && git status",
+        "git push|cat",
+        "git push || true",
+        "git push\ngit status",
+        "git push &",
+        "(cd x && git commit -m y && git push)",
+        "{ git push; }",
+        "{ cd x && git push; }",
+        "cd sub && git push",
+        "sudo git push",
+        "env FOO=1 git push",
+        "command git push",
+        "time git push",
+        "if true; then git push; fi",
+        "for d in a b; do git -C $d push; done",
+        "git commit -m x&&git push",
+        "bash -c 'git push'",
+        "bash -c 'cd repo && git push origin main'",
+        "sh -c \"git -C d push\"",
+        "bash -lc 'cd ~/repo && git push origin main'",
+        "eval 'git push'",
+        "echo $(git push)",
+        "echo `git push`",
+    ];
+
+    #[test]
+    fn every_spelling_of_a_push_reminds_alone_and_after_a_commit() {
+        for form in PUSH_FORMS {
+            assert_eq!(
+                run(&make_bash(form)).outcome,
+                Outcome::Nudge,
+                "alone: {form}"
+            );
+            let with_commit = format!("git commit -m x && {form}");
+            assert_eq!(
+                run(&make_bash(&with_commit)).outcome,
+                Outcome::Nudge,
+                "after a commit: {with_commit}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_that_is_not_the_push_subcommand_stays_silent() {
+        for cmd in [
+            "git push-something",
+            "git push-something origin",
+            "git pushd",
+            "git pusher",
+            "git stash push",
+            "git stash push -m wip",
+            "git commit -m push",
+            "git commit -m 'push'",
+            "git commit -m \"git push\"",
+            "git log push",
+            "git log --oneline push..HEAD",
+            "git branch push",
+            "git checkout push",
+            "git remote set-url --push origin https://example.test/r.git",
+            "git config remote.pushDefault origin",
+            "git config --get remote.origin.push",
+            "git -C dir stash push",
+            "git -c k=v log push",
+            "echo 'git push'",
+            "echo \"git push\" >> notes.txt",
+            "grep -rn 'git push' docs",
+            "git pull && git push-hook-test",
+            "echo git push",
+            "echo run git push later",
+            "git commit -m x # git push",
+            "bash -c 'git stash push'",
+            "bash -c 'echo \"git push\"'",
+        ] {
+            assert_eq!(run(&make_bash(cmd)).outcome, Outcome::Allow, "{cmd}");
+        }
     }
 
     #[test]

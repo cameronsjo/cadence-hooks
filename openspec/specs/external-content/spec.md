@@ -301,8 +301,23 @@ In an MCP call, a string under an old-side key (`old_string`, `oldString`, `old_
 - **THEN** the hook exits 2
 
 ### Requirement: Overshare commit exemption
-A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, after a `cd` or `git add`, with `git -C` or another global option, or with a message built by substitution, except that a message spelling `git push` as two words is read as a push. A command that also carries a push or a posting segment SHALL still trigger it, for the push or the post.
+A `git commit` SHALL NOT trigger the overshare reminder in any form: plain, after a `cd` or `git add`, with `git -C` or another global option, or with a message built by substitution. A command that also carries a push or a posting segment SHALL still trigger it, for the push or the post.
 
 #### Scenario: Commit alone is silent
 - **WHEN** a Bash call runs `git commit -m 'x'`, `cd other && git commit -m 'x'`, `git -C other commit -m 'x'` or `git commit -m "$(cat msg.txt)"`
+- **THEN** the hook exits 0 with no output
+
+### Requirement: Overshare push recognition
+`warn-overshare` SHALL read a push as a `git` invocation whose subcommand is `push`: past git's global options (`-C`, `-c`, `--git-dir`, `--work-tree`, `--no-pager`), before a separator, a pipe or a `)`, at the end of the command, and inside a subshell, a group, a loop body, a `sh -c` script, an `eval` or a command substitution. It MUST NOT read as a push a word that only starts with `push`, `push` as an argument to another subcommand, or the words `git push` inside quoted or echoed text.
+
+#### Scenario: Push past a global option
+- **WHEN** a Bash call runs `git -C dir push`, `git -c k=v push` or `git --no-pager push`
+- **THEN** the hook exits 0 with a nudge containing `overshare`
+
+#### Scenario: Push ended by a separator or inside a group
+- **WHEN** a Bash call runs `git push;`, `git push|cat`, `{ git push; }`, `(cd x && git commit -m y && git push)` or `bash -c 'cd x && git push'`
+- **THEN** the hook exits 0 with a nudge containing `overshare`
+
+#### Scenario: Not a push
+- **WHEN** a Bash call runs `git push-something`, `git stash push`, `git commit -m push` or `git commit -m "fix: git push hangs"`
 - **THEN** the hook exits 0 with no output

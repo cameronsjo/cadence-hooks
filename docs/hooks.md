@@ -113,11 +113,21 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 
 A `git commit` never fires it: a commit leaves the machine only when it is
 pushed, and the push reminds. That holds for every form of commit (a `cd`, a
-`git -C`, a chain, a substitution, a heredoc), with one exception: a commit
-message that itself spells `git push` as two separate words is read as a push,
-as before. A command that holds a commit and also a push or a post still
-reminds, for the push or the post. Every push, every post and every
-field-report edit reminds every time.
+`git -C`, a chain, a substitution, a heredoc). A command that holds a commit
+and also a push or a post still reminds, for the push or the post. Every push,
+every post and every field-report edit reminds every time.
+
+A push is a `git` command whose subcommand is `push`, read past git's global
+options (`git -C dir push`, `git -c k=v push`, `git --no-pager push`), before a
+separator or a `)` (`git push;`, `git push|cat`), and inside a subshell, a
+group, a `sh -c` script, an `eval` or a command substitution
+(`(cd x && git push)`, `{ git push; }`, `bash -c 'git push'`). The `cadence`
+plugin starts the hook only for commands that contain `git push`, `git commit`,
+`gh ` or `tea ` (its `if:` filters), so a push spelled `git -C dir push`, with
+none of those, does not reach the hook until those filters are widened. A word that only starts with
+`push` (`git push-hook`), `push` as an argument to another subcommand
+(`git stash push`, `git commit -m push`) and the words `git push` inside quoted
+or echoed text are not pushes.
 
 ## guardrails (git-guardrails)
 

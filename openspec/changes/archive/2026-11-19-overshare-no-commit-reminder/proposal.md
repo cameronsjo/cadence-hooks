@@ -6,8 +6,9 @@ cameronsjo/cadence-hooks#1636: `warn-overshare` fires too often. The quiet perio
 
 - MODIFY "Overshare audit triggers": a `git commit` is no longer a trigger. A Bash command that holds a commit and also a push or a post still reminds, for the push or the post. The requirement text stays under the strict validator's 500-character limit, so the commit rule itself sits in a new requirement. OpenSpec refuses a MODIFIED block that drops a scenario, so the old "Commit nudges" scenario stays by name and now describes a commit chained with a push.
 - ADD "Overshare commit exemption": a commit alone stays silent in every form; with a push or a post it still reminds.
+- ADD "Overshare push recognition": the push trigger is read as a parsed `git` command whose subcommand is `push`, past git's global options, separators, groups and subshells, using the shared reader the push guards use. It replaces a match on the two words `git push` side by side, which never saw `git -C dir push`, `git push;` or a push inside a subshell. On `main` those pushes still reminded through the commit in the same command; with the commit trigger gone the push match has to stand on its own. This widens which pushes remind, a decision recorded on the pull request.
 - REMOVE the four quiet-period requirements from #1648 (the quiet period, its spending, the plain-commit shape, its key). A commit that never reminds has no reminder to spend.
-- No change to which pushes, posts or file edits remind. No change to the reminder text. The leak scan (`redact-external-content`) keeps treating `git commit` as a posting command.
+- No change to which posts or file edits remind. No change to the reminder text. The leak scan (`redact-external-content`) keeps treating `git commit` as a posting command.
 
 ## Capabilities
 
@@ -17,7 +18,7 @@ None.
 
 ### Modified Capabilities
 
-- `external-content`: one requirement modified, one added, four removed.
+- `external-content`: one requirement modified, two added, four removed.
 
 ## Impact
 
