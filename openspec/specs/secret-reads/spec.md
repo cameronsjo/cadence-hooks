@@ -295,11 +295,23 @@ On PreToolUse for Bash, `guard-op-vault-scan` SHALL block when a segment's comma
 - **THEN** each PreToolUse hook here allows
 
 ### Requirement: Confirmed vault listing
-`guard-op-vault-scan` SHALL be in the confirm tier, keyed by the scans it read: `op item list` or `op vault list`, each with the account and the `--vault` value it names. A retry that differs only outside those (another pipe, `--vault=X` for `--vault X`) SHALL pair with the blocked attempt; a listing of another vault or another account, or one naming an account where the blocked attempt named none, MUST NOT.
+`guard-op-vault-scan` SHALL be in the confirm tier, keyed by the whole command (every segment, spaces and tabs collapsed, ends trimmed) beside the scans it holds. A retry of the same command SHALL pair; any other difference MUST NOT. An identity set by an earlier, separate command (an exported variable, a prior sign-in) is not part of the key. Neither is one carried by a token in the environment.
+
+#### Scenario: The same command again
+- **WHEN** `op item list | grep api` blocks in session S1 and S1 then runs the same command
+- **THEN** the second command is allowed with a `confirmed` bypass row
+
+#### Scenario: Spacing only
+- **WHEN** `op item list --vault Private` blocks and the next attempt is `op  item list   --vault Private`
+- **THEN** the second command is allowed with a `confirmed` bypass row
+
+#### Scenario: Another identity in the same command
+- **WHEN** `op item list` blocks and the next attempt is `export OP_ACCOUNT=b; op item list`, `op signin --account b && op item list`, or `eval $(op signin --account b) && op item list`
+- **THEN** the second command blocks with the `Are you sure?` line
 
 #### Scenario: Retry with another pipe
 - **WHEN** `op item list` blocks in session S1 and S1 then runs `op item list | grep api`
-- **THEN** the second command is allowed with a `confirmed` bypass row
+- **THEN** the second command blocks with the `Are you sure?` line
 
 #### Scenario: Another vault
 - **WHEN** `op item list --vault Private` blocks and the next attempt is `op item list --vault Work`
@@ -309,13 +321,6 @@ On PreToolUse for Bash, `guard-op-vault-scan` SHALL block when a segment's comma
 - **WHEN** `op item list --account a.example` blocks and the next attempt is `op item list --account b.example`
 - **THEN** the second command blocks
 
-### Requirement: Vault listing account
-The account in a vault listing's confirm key SHALL be the value of `--account x` or `--account=x`, else of an `OP_ACCOUNT=x` word before the command (a shell prefix or an `env` operand). The flag MUST win over the environment word, as it does for `op`. An `OP_ACCOUNT` exported earlier or set in the session environment is not read.
-
-#### Scenario: Same account through the environment
-- **WHEN** `op item list --account a.example` blocks and the next attempt is `OP_ACCOUNT=a.example op item list`
-- **THEN** the second command is allowed with a `confirmed` bypass row
-
-#### Scenario: The flag wins
-- **WHEN** `op item list --account a.example` blocks and the next attempt is `OP_ACCOUNT=b.example op item list --account a.example`
-- **THEN** the second command is allowed with a `confirmed` bypass row
+#### Scenario: Another session token
+- **WHEN** `op item list --session tok1` blocks and the next attempt is `op item list --session tok2`
+- **THEN** the second command blocks

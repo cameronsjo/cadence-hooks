@@ -14,13 +14,18 @@ tool calls of one session per binary, and holds two rules:
 The payloads are the Bash commands in scripts/testdata/confirm-tier-commands.txt
 (each run from a primary checkout and from a linked worktree) plus Edit and
 Write calls on a fixed set of paths. Hooks only judge a payload; nothing is
-executed, and nothing touches the network. The script builds its own scratch
-repository (a primary checkout and one linked worktree) in WORKDIR (default
-~/.cache/cadence-hooks/confirm-tier-compare). It deletes and recreates WORKDIR
-only when WORKDIR is new or holds the `.confirm-tier-compare` sentinel an
-earlier run wrote; any other existing directory is refused. WORKDIR must not
-sit under a temp root or a `.claude` directory: enforce-worktree exempts both,
-so every row there would be an allow on both binaries and prove nothing.
+executed, and nothing touches the network.
+
+Hermetic: everything happens in a fresh temp directory with a neutral name,
+removed at the end (`--keep` leaves it and prints its path). Setup runs `git`
+with no global or system config, hooks off and signing off, under a throwaway
+identity. The hooks run with HOME, TMPDIR, the marker and the metrics
+directories all inside the temp directory, no inherited `CADENCE_*` or
+`CLAUDE_*` variable, and no global or system git config. TMPDIR points at a
+subdirectory that holds no repository, because enforce-worktree exempts any
+repo under `$TMPDIR` and every row there would prove nothing; for the same
+reason the script refuses a temp root under `/tmp` (set TMPDIR to another
+directory first).
 
 Usage, from the repository root:
 
@@ -40,17 +45,29 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 CONFIRM_HOOKS = {"enforce-worktree", "guard-op-vault-scan", "guard-held-close"}
 COMMANDS = Path(__file__).resolve().parent / "testdata" / "confirm-tier-commands.txt"
-DEFAULT_WORKDIR = Path.home() / ".cache" / "cadence-hooks" / "confirm-tier-compare"
 HELD_LEDGER = "cameronsjo/cadence-ecosystem#354 cameronsjo/cadence#107\n"
 ORIGIN = "https://github.com/cameronsjo/cadence-ecosystem.git"
-EXEMPT_ROOTS = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
-SENTINEL = ".confirm-tier-compare"
+# Path components a guard treats specially: `.claude` exempts enforce-worktree,
+# `cadence-hooks` exempts the secret guards' content checks.
+SPECIAL_COMPONENTS = {".claude", "cadence-hooks"}
+SHARED_TMP = ("/tmp", "/private/tmp")
 # enforce-worktree's snooze marker and its provenance sidecar, in the common dir.
 SNOOZE_PREFIX = "enforce-worktree-snoozed-until"
+# No global or system git config reaches setup or the hooks.
+GIT_ISOLATION = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+GIT = [
+    "git",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "commit.gpgsign=false",
+    "-c", "tag.gpgsign=false",
+    "-c", "user.name=confirm-tier-compare",
+    "-c", "user.email=compare@example.invalid",
+]
 
 
 class HarnessError(Exception):
@@ -58,43 +75,37 @@ class HarnessError(Exception):
 
 
 def git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+    # An inherited GIT_DIR or GIT_WORK_TREE would point setup at another repo.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | GIT_ISOLATION
+    subprocess.run([*GIT, "-C", str(cwd), *args], check=True, capture_output=True, env=env)
 
 
-def check_workdir(work: Path) -> None:
-    resolved = str(work.resolve())
-    tmpdir = os.environ.get("TMPDIR", "").rstrip("/")
-    roots = EXEMPT_ROOTS + ((tmpdir,) if tmpdir else ())
-    if any(resolved == r or resolved.startswith(r + "/") for r in roots):
-        raise HarnessError(f"WORKDIR {resolved} is under a temp root, which enforce-worktree exempts")
-    if ".claude" in work.resolve().parts:
-        raise HarnessError(f"WORKDIR {resolved} is under a .claude directory, which enforce-worktree exempts")
+def check_root(root: Path) -> None:
+    resolved = root.resolve()
+    if SPECIAL_COMPONENTS & set(resolved.parts):
+        raise HarnessError(f"temp root {resolved} has a path component a guard treats specially")
+    text = str(resolved)
+    if any(text == r or text.startswith(r + "/") for r in SHARED_TMP):
+        raise HarnessError(
+            f"temp root {resolved} is under /tmp, which enforce-worktree exempts; "
+            "set TMPDIR to another directory"
+        )
 
 
-def setup(work: Path) -> tuple[Path, Path, Path]:
-    # Delete only a directory this script made: one that holds its sentinel.
-    if work.exists():
-        if not (work / SENTINEL).is_file():
-            raise HarnessError(
-                f"WORKDIR {work} exists and was not made by this script (no {SENTINEL}); "
-                "pass a new path or remove it yourself"
-            )
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
-    (work / SENTINEL).write_text("scratch dir of scripts/confirm-tier-compare.py\n")
-    primary = work / "primary"
+def setup(root: Path) -> tuple[Path, Path, Path]:
+    primary = root / "primary"
     primary.mkdir()
     git(primary, "init", "-q", "-b", "main")
-    git(primary, "config", "user.email", "t@example.invalid")
-    git(primary, "config", "user.name", "t")
     git(primary, "remote", "add", "origin", ORIGIN)
     (primary / "README.md").write_text("x\n")
     git(primary, "add", "README.md")
     git(primary, "commit", "-q", "-m", "init")
-    wt = work / "wt"
+    wt = root / "wt"
     git(primary, "worktree", "add", "-q", "-b", "feat", str(wt))
-    ledger = work / "held.txt"
+    ledger = root / "held.txt"
     ledger.write_text(HELD_LEDGER)
+    for sub in ("home", "tmpdir"):
+        (root / sub).mkdir()
     return primary, wt, ledger
 
 
@@ -140,28 +151,23 @@ def verdict(binary: str, hook_args: list[str], payload: dict, env: dict[str, str
     return "BLOCK" if p.returncode == 2 else "ALLOW"
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) not in (2, 3):
-        print(__doc__)
-        return 2
-    base_bin, head_bin = argv[0], argv[1]
-    work = Path(argv[2]) if len(argv) == 3 else DEFAULT_WORKDIR
-    for binary in (base_bin, head_bin):
-        if not os.access(binary, os.X_OK):
-            raise HarnessError(f"{binary} is not an executable (build it first)")
-    check_workdir(work)
-    primary, wt, ledger = setup(work)
-    # No inherited CADENCE_* switch may exempt a guard, and every marker and
-    # ledger row lands in the scratch dir, never the real metrics.
-    clean = {k: v for k, v in os.environ.items() if not k.startswith("CADENCE_")}
-    envs = {
-        name: clean
-        | {
-            "CADENCE_MARKER_DIR": str(work / f"markers-{name}"),
-            "CADENCE_METRICS_DIR": str(work / f"metrics-{name}"),
-        }
-        for name in ("base", "head")
+def hook_env(root: Path, name: str) -> dict[str, str]:
+    keep = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("CADENCE_", "CLAUDE_", "GIT_")) and k not in ("HOME", "TMPDIR")
     }
+    return keep | GIT_ISOLATION | {
+        "HOME": str(root / "home"),
+        "TMPDIR": str(root / "tmpdir"),
+        "CADENCE_MARKER_DIR": str(root / f"markers-{name}"),
+        "CADENCE_METRICS_DIR": str(root / f"metrics-{name}"),
+    }
+
+
+def compare(base_bin: str, head_bin: str, root: Path) -> int:
+    primary, wt, ledger = setup(root)
+    envs = {name: hook_env(root, name) for name in ("base", "head")}
     bash_hooks = [
         ("enforce-worktree", ["guardrails", "enforce-worktree"]),
         ("guard-op-vault-scan", ["guardrails", "guard-op-vault-scan"]),
@@ -227,6 +233,28 @@ def main(argv: list[str]) -> int:
         print("NOT EVIDENCE: the run produced no block or no confirmed pass")
         return 1
     return 0 if not first_moves and not other_moves else 1
+
+
+def main(argv: list[str]) -> int:
+    keep = "--keep" in argv
+    args = [a for a in argv if a != "--keep"]
+    if len(args) != 2:
+        print(__doc__)
+        return 2
+    base_bin, head_bin = (str(Path(a).resolve()) for a in args)
+    for binary in (base_bin, head_bin):
+        if not os.access(binary, os.X_OK):
+            raise HarnessError(f"{binary} is not an executable (build it first)")
+    root = Path(tempfile.mkdtemp(prefix="confirm-tier-compare-"))
+    try:
+        check_root(root)
+        return compare(base_bin, head_bin, root)
+    finally:
+        if keep:
+            print(f"kept {root}", file=sys.stderr)
+        else:
+            # A cleanup failure must not replace the run's own result.
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

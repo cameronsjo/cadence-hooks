@@ -5705,6 +5705,12 @@ fn confirm_primary_block(
         HOOK_NAME,
         &action,
         message,
+        // The key is the judged repo plus the file or the commit, not the
+        // command text: every way a command can move a commit to another
+        // checkout either changes the judged repo or makes the target unread,
+        // which is never confirmed (cameronsjo/cadence-hooks#1659 round 2
+        // probes: `cd`, `git -C`, `GIT_DIR=`, `export GIT_DIR`, `--git-dir`).
+        cadence_hooks_core::confirm::Retry::SameAction,
         Some(&pass_effect),
     );
     let Some(mut provenance) = confirmed.bypass.clone() else {
@@ -7529,6 +7535,57 @@ mod tests {
                 }
             }
             assert!(!snoozed(&a) && !snoozed(&b));
+        });
+    }
+
+    /// The enforce-worktree key is the judged repo, not the command text, so
+    /// every ordinary way of moving the retry's commit into another primary
+    /// checkout must change the judged repo or make the target unread
+    /// (cameronsjo/cadence-hooks#1659 round 2). Each variant follows a
+    /// confirm of the plain commit in `a` and must not pass; the control, a
+    /// reworded message in `a`, does.
+    #[test]
+    fn confirm_does_not_follow_a_commit_moved_to_another_checkout() {
+        let scratch_a = scratch("confirm-moved-a");
+        let scratch_b = scratch("confirm-moved-b");
+        let (a, _wt_a) = primary_and_worktree(&scratch_a);
+        let (b, _wt_b) = primary_and_worktree(&scratch_b);
+        let b = b.display().to_string();
+        let attempt = |command: &str, call: &str| {
+            let mut input = make_bash(command);
+            input.cwd = Some(a.to_string_lossy().into_owned());
+            run_confirmed(
+                &confirm_attempt(input, Some("s1"), None, call),
+                &cfg(false, false),
+            )
+        };
+        let mut inherited: Vec<String> = Vec::new();
+        for variant in [
+            format!("cd {b} && git commit -am x"),
+            format!("git -C {b} commit -am x"),
+            format!("GIT_DIR={b}/.git git commit -am x"),
+            format!("export GIT_DIR={b}/.git; git commit -am x"),
+            format!("git --git-dir={b}/.git --work-tree={b} commit -am x"),
+        ] {
+            let markers = tempfile::tempdir().unwrap();
+            cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+                assert_eq!(attempt("git commit -am x", "t1").outcome, Outcome::Block);
+                if attempt(&variant, "t2").outcome != Outcome::Block {
+                    inherited.push(variant.clone());
+                }
+            });
+            assert!(!snoozed(&a), "{variant} armed a snooze");
+        }
+        assert!(
+            inherited.is_empty(),
+            "inherited a confirmation: {inherited:#?}"
+        );
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            assert_eq!(attempt("git commit -am x", "t1").outcome, Outcome::Block);
+            let control = attempt("git commit -am 'reworded'", "t2");
+            assert_eq!(control.outcome, Outcome::Allow, "{:?}", control.message);
+            assert_eq!(control.bypass.unwrap().kind, BypassKind::Confirmed);
         });
     }
 

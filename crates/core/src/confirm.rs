@@ -16,10 +16,18 @@
 //! `hook`, `session_id`, `agent_id` (empty on the main thread) and a
 //! normalized action the guard supplies, joined with U+001F and hashed with
 //! SHA-256. The digest names the marker file and is repeated inside it, so a
-//! file left under another key never counts. The action is what the guard
-//! already extracted (a repo and a file, a set of held issues, a vault
-//! subcommand), never the raw command text, which is rarely byte-identical on
-//! a retry.
+//! file left under another key never counts. The action takes one of two
+//! forms, and [`Retry`] tells the armed line which:
+//!
+//! - what the guard read ([`Retry::SameAction`]): `enforce-worktree` keys on
+//!   the judged repo and the file or the commit, because every way a command
+//!   moves a commit elsewhere changes the judged repo or makes the target
+//!   unread, which is never confirmed;
+//! - the whole command, normalized only for spaces and tabs
+//!   ([`whole_command_action`], [`Retry::SameCommand`]), beside what the
+//!   guard read: `guard-op-vault-scan` and `guard-held-close`, where an
+//!   earlier segment (an `export`, a sign-in) can change the target without
+//!   changing what the guard reads, so no list of selectors is complete.
 //!
 //! # One tool call, several processes
 //!
@@ -382,21 +390,66 @@ pub fn backdate_for_tests(input: &HookInput, hook: &str, action: &str, secs: i64
 /// whose pass reaches further than the one action must give it, since the
 /// default closing sentence says the pass reaches nothing else.
 #[must_use]
-pub fn armed_note(pass_effect: Option<&str>) -> String {
+pub fn armed_note(retry: Retry, pass_effect: Option<&str>) -> String {
     let minutes = CONFIRM_TTL.as_secs() / 60;
-    let opening = "Are you sure? If you have checked and this is what the operator asked for, \
-                   run the same action again: the second attempt passes and is recorded in \
-                   the bypass log.";
+    let (again, exact) = match retry {
+        Retry::SameAction => ("the same action again", "this exact action"),
+        Retry::SameCommand => (
+            "the identical command again (extra spaces or tabs between words are ignored)",
+            "this exact command",
+        ),
+    };
+    let opening = format!(
+        "Are you sure? If you have checked and this is what the operator asked for, run \
+         {again}: the second attempt passes and is recorded in the bypass log."
+    );
     match pass_effect {
         None => format!(
-            "{opening} It counts only for this session and agent, for this exact action, once, \
-             within {minutes} minutes."
+            "{opening} It counts only for this session and agent, for {exact}, once, within \
+             {minutes} minutes."
         ),
         Some(effect) => format!(
-            "{opening} Only a retry from this session and agent, of this exact action, within \
-             {minutes} minutes, confirms it. {effect}"
+            "{opening} Only a retry from this session and agent, of {exact}, within {minutes} \
+             minutes, confirms it. {effect}"
         ),
     }
+}
+
+/// What a retry must repeat to pair with the blocked attempt, which decides
+/// how the armed line tells the model to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// The action the guard read (a file, a commit in a repo): the command
+    /// text around it may change.
+    SameAction,
+    /// The whole command, as [`whole_command_action`] normalizes it.
+    SameCommand,
+}
+
+/// The whole command as a confirm-tier action: every segment, with each run
+/// of spaces and tabs collapsed to one space and the ends trimmed. Nothing
+/// else is normalized, so anything a command could use to choose its target
+/// (an earlier `export`, a sign-in, a flag, a prefix) is part of the key
+/// without the guard having to recognize it. Spaces inside quotes collapse
+/// too, so `"My  Vault"` pairs with `"My Vault"`: two targets whose names
+/// differ only by inner spacing are not a mistake a cooperative model makes.
+/// Adding a space where there was none (`a|b` against `a | b`) is a new key.
+#[must_use]
+pub fn whole_command_action(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut in_blank = false;
+    for c in command.trim().chars() {
+        if c == ' ' || c == '\t' {
+            if !in_blank {
+                out.push(' ');
+            }
+            in_blank = true;
+        } else {
+            out.push(c);
+            in_blank = false;
+        }
+    }
+    out
 }
 
 /// The line a block carries when it cannot be confirmed.
@@ -420,12 +473,13 @@ pub fn confirm_block(
     hook: &str,
     action: &str,
     message: &str,
+    retry: Retry,
     pass_effect: Option<&str>,
 ) -> CheckResult {
     match gate(input, hook, action) {
         Gate::Passed(provenance) => CheckResult::allow_bypassed(provenance),
         Gate::PassedSibling => CheckResult::allow(),
-        Gate::Armed => CheckResult::block(format!("{message}\n{}", armed_note(pass_effect))),
+        Gate::Armed => CheckResult::block(format!("{message}\n{}", armed_note(retry, pass_effect))),
         Gate::Unavailable(why) => {
             CheckResult::block(format!("{message}\n{}", unavailable_note(why)))
         }
@@ -779,23 +833,38 @@ mod tests {
                 "h",
                 "x",
                 "BLOCKED: reason",
+                Retry::SameAction,
                 Some("It also unblocks this checkout."),
             );
             assert_eq!(first.outcome, Outcome::Block);
             let msg = first.message.unwrap();
             assert!(msg.starts_with("BLOCKED: reason\nAre you sure?"), "{msg}");
+            assert!(msg.contains("run the same action again"), "{msg}");
             assert!(
                 msg.ends_with("confirms it. It also unblocks this checkout."),
                 "{msg}"
             );
             // A pass that reaches further never claims to count only here.
             assert!(!msg.contains("counts only"), "{msg}");
-            assert!(armed_note(None).contains("It counts only for this session and agent"));
+            assert!(
+                armed_note(Retry::SameAction, None)
+                    .contains("It counts only for this session and agent")
+            );
+            let command = armed_note(Retry::SameCommand, None);
+            assert!(
+                command.contains("run the identical command again (extra spaces or tabs between words are ignored)"),
+                "{command}"
+            );
+            assert!(
+                command.contains("for this exact command, once"),
+                "{command}"
+            );
             let second = confirm_block(
                 &input(Some("s1"), None, Some("t2")),
                 "h",
                 "x",
                 "BLOCKED: reason",
+                Retry::SameAction,
                 None,
             );
             assert_eq!(second.outcome, Outcome::Allow);
@@ -805,6 +874,7 @@ mod tests {
                 "h",
                 "x",
                 "BLOCKED: reason",
+                Retry::SameAction,
                 None,
             );
             assert_eq!(none.outcome, Outcome::Block);
@@ -815,6 +885,26 @@ mod tests {
             );
             assert!(!msg.contains("Are you sure"), "{msg}");
         });
+    }
+
+    #[test]
+    fn whole_command_action_collapses_only_spaces_and_tabs() {
+        assert_eq!(whole_command_action("  op  item\tlist  "), "op item list");
+        assert_eq!(
+            whole_command_action("op item list"),
+            whole_command_action("op \t item   list")
+        );
+        // Every other difference is part of the action.
+        for other in [
+            "export OP_ACCOUNT=b; op item list",
+            "op item list --session tok2",
+            "op item list | grep api",
+            "OP item list",
+        ] {
+            assert_ne!(whole_command_action(other), "op item list", "{other}");
+        }
+        // A newline is a command separator, not spacing.
+        assert_eq!(whole_command_action("a\n  b"), "a\n b");
     }
 
     fn walk_confirm_files(root: &Path) -> Vec<PathBuf> {

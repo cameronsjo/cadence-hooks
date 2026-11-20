@@ -60,7 +60,10 @@ fn stderr(out: &Output) -> String {
 #[test]
 fn second_attempt_passes_once_and_writes_a_confirmed_row() {
     let root = tempfile::tempdir().unwrap();
-    let first = run(root.path(), &payload("op item list", Some("sess-a"), "t1"));
+    let first = run(
+        root.path(),
+        &payload("op item list | grep api", Some("sess-a"), "t1"),
+    );
     assert_eq!(first.status.code(), Some(2), "{}", stderr(&first));
     assert!(
         stderr(&first).contains("Are you sure?"),
@@ -85,7 +88,11 @@ fn second_attempt_passes_once_and_writes_a_confirmed_row() {
     // Ledger privacy: no command text.
     assert!(!row.to_string().contains("op item"), "{row}");
 
-    let third = run(root.path(), &payload("op item list", Some("sess-a"), "t3"));
+    // Single use: the identical command blocks again.
+    let third = run(
+        root.path(),
+        &payload("op item list | grep api", Some("sess-a"), "t3"),
+    );
     assert_eq!(third.status.code(), Some(2));
 }
 

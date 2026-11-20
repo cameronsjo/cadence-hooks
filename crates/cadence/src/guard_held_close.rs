@@ -402,19 +402,26 @@ impl GuardHeldClose {
             return CheckResult::allow();
         }
         // Confirm tier (cameronsjo/cadence-hooks#1658): a closed issue can be
-        // reopened, so a deliberate second attempt at closing the same held
-        // issues passes once. The action is the set of held entries the
-        // close would hit, not the command text.
-        let action = hits
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
+        // reopened, so a deliberate second attempt passes once. The key is
+        // the held entries hit beside the whole command, whitespace-
+        // normalized: an earlier `export GH_REPO=…` in the same command moves
+        // a bare close to another repo without changing the entries the guard
+        // reads (cameronsjo/cadence-hooks#1659 round 2), so the entries alone
+        // would let a confirmation reach a close it never judged.
+        let action = format!(
+            "{}\u{1f}{}",
+            hits.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+            cadence_hooks_core::confirm::whole_command_action(command)
+        );
         cadence_hooks_core::confirm::confirm_block(
             input,
             Check::name(self),
             &action,
             &block_message(&hits),
+            cadence_hooks_core::confirm::Retry::SameCommand,
             None,
         )
     }
@@ -676,9 +683,12 @@ mod tests {
             assert_eq!(first.outcome, Outcome::Block);
             let msg = first.message.unwrap();
             assert!(msg.contains("is on the HELD ledger"), "{msg}");
-            assert!(msg.contains("Are you sure?"), "{msg}");
-            // A retry with a comment added closes the same held issue.
-            let retry = format!("{HELD_CLOSE} --comment 'operator released it'");
+            assert!(
+                msg.contains("run the identical command again (extra spaces or tabs between words are ignored)"),
+                "{msg}"
+            );
+            // The identical command, spaced differently, is the same retry.
+            let retry = format!("  {}  ", HELD_CLOSE.replace(' ', "  "));
             let second = guard.run_clean(&close_attempt(&retry, Some("s1"), None, "t2"));
             assert_eq!(second.outcome, Outcome::Allow);
             assert_eq!(
@@ -717,12 +727,36 @@ mod tests {
                         "t4",
                     ),
                 ),
+                (
+                    // The guard reads the same held entry, but `gh` closes
+                    // in the exported repo: a different target.
+                    "an earlier export of GH_REPO",
+                    close_attempt(
+                        &format!("export GH_REPO=cameronsjo/free; {HELD_CLOSE}"),
+                        Some("s1"),
+                        None,
+                        "t5",
+                    ),
+                ),
+                (
+                    "the same issue with a comment added",
+                    close_attempt(
+                        &format!("{HELD_CLOSE} --comment 'operator released it'"),
+                        Some("s1"),
+                        None,
+                        "t6",
+                    ),
+                ),
             ] {
+                // A re-armed block, not a block for some other reason.
+                let r = guard.run_clean(&input);
                 assert_eq!(
-                    guard.run_clean(&input).outcome,
+                    r.outcome,
                     Outcome::Block,
                     "{label} must not inherit the pass"
                 );
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("Are you sure?"), "{label}: {msg}");
             }
         });
     }
@@ -741,10 +775,14 @@ mod tests {
             }
             let input = close_attempt(HELD_CLOSE, Some("s1"), None, "t3");
             assert_eq!(guard.run_clean(&input).outcome, Outcome::Block);
+            let action = format!(
+                "cameronsjo/cadence-ecosystem#354\u{1f}{}",
+                cadence_hooks_core::confirm::whole_command_action(HELD_CLOSE)
+            );
             assert!(cadence_hooks_core::confirm::backdate_for_tests(
                 &input,
                 "guard-held-close",
-                "cameronsjo/cadence-ecosystem#354",
+                &action,
                 11 * 60
             ));
             assert_eq!(

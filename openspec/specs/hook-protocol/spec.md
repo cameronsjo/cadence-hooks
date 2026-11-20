@@ -226,7 +226,7 @@ A group SHALL merge member verdicts as separate processes would: any block exits
 - **THEN** the group emits the other members' verdicts, logs `group_deadline` for the slow one, and adds a notice that it did not block
 
 ### Requirement: Confirm tier
-A confirm-tier guard SHALL block the first attempt at an action (exit 2) with its reason and a line beginning `Are you sure?`, and SHALL allow the next attempt at the same action from the same `session_id` and `agent_id` within ten minutes, once. The pair is keyed by hook and a normalized action the guard names, never raw command text. A pass MUST write a `bypasses.jsonl` `used` row with kind `confirmed` and mechanism `confirm-retry`.
+A confirm-tier guard SHALL block the first attempt at an action (exit 2) with its reason and a line beginning `Are you sure?`, and SHALL allow the next attempt at the same action from the same `session_id` and `agent_id` within ten minutes, once. The pair is keyed by hook and an action the guard names: what it read, or the whole command normalized for spacing. A pass MUST write a `bypasses.jsonl` `used` row with kind `confirmed` and mechanism `confirm-retry`.
 
 #### Scenario: Second attempt passes once
 - **WHEN** a confirm-tier guard blocks an action in session S1, and S1 attempts the same action again in a new tool call within ten minutes
@@ -244,8 +244,12 @@ A confirm-tier guard SHALL block the first attempt at an action (exit 2) with it
 - **WHEN** a guard wired twice under one matcher runs twice for the blocked call, and twice for the retry
 - **THEN** both processes of the blocked call block, both processes of the retry allow, and `bypasses.jsonl` gains one row
 
+#### Scenario: A whole-command guard names the retry
+- **WHEN** a guard keyed on the whole command arms a confirmation
+- **THEN** its armed line says to run the identical command again, and that extra spaces or tabs between words are ignored
+
 ### Requirement: One confirmed row per confirmation
-A confirmation SHALL write exactly one `confirmed` row, however many processes of the hook run for the passing call. The row records that the confirm-tier guard let the action through, not that the call ran: another hook on the same call MAY still block it, and the confirmation is spent either way.
+A confirmation SHALL write exactly one `confirmed` row, however many processes of the hook run for the passing call. The row records that the confirm-tier guard let the action through, not that the call ran: another hook on the same call MAY still block it, and the confirmation is spent either way; for `enforce-worktree` the 30-minute snooze is armed by then too.
 
 #### Scenario: Two processes of the retry at once
 - **WHEN** two processes of the retry start together and both read the blocked attempt's marker before either records the pass
@@ -254,6 +258,10 @@ A confirmation SHALL write exactly one `confirmed` row, however many processes o
 #### Scenario: Another hook blocks the confirmed call
 - **WHEN** a confirm-tier guard passes a retry and another hook blocks the same tool call
 - **THEN** the `confirmed` row stays, and the next attempt at the action blocks with the `Are you sure?` line
+
+#### Scenario: Another hook blocks a confirmed enforce-worktree retry
+- **WHEN** `enforce-worktree` passes a confirmed retry and another hook blocks the same tool call
+- **THEN** the checkout's 30-minute snooze stays armed
 
 ### Requirement: Confirm tier fail directions
 A confirm-tier block SHALL NOT pass, and SHALL end with `A second attempt will be blocked too:` and the reason, when the payload has no `session_id` or no usable `tool_use_id`, when the marker directory is not private, or when the marker cannot be written. An unreadable, malformed, symlinked, expired or future-stamped marker MUST count as absent, never as a confirmation.
