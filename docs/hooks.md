@@ -154,7 +154,7 @@ filters are widened (cameronsjo/cadence#2211).
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) | run |
 | `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` | run |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch | run |
-| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths). Confirm tier: a second attempt at the same edit or commit in the same session passes and arms the 30-minute dismiss snooze ([confirm tier](configuration.md#confirming-a-blocked-action-the-confirm-tier)) | self-disable |
+| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths). Confirm tier: a second attempt at the same edit, or the identical Bash command, in the same session passes and arms the 30-minute dismiss snooze ([confirm tier](configuration.md#confirming-a-blocked-action-the-confirm-tier)) | self-disable |
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base | run |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs | run |
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit | run |

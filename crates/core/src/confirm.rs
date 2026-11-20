@@ -19,15 +19,16 @@
 //! file left under another key never counts. The action takes one of two
 //! forms, and [`Retry`] tells the armed line which:
 //!
-//! - what the guard read ([`Retry::SameAction`]): `enforce-worktree` keys on
-//!   the judged repo and the file or the commit, because every way a command
-//!   moves a commit elsewhere changes the judged repo or makes the target
-//!   unread, which is never confirmed;
+//! - what the guard read ([`Retry::SameAction`]): an `enforce-worktree` Edit
+//!   or Write keys on the judged repo and the file, which the payload names
+//!   directly;
 //! - the whole command, normalized only for spaces and tabs
 //!   ([`whole_command_action`], [`Retry::SameCommand`]), beside what the
-//!   guard read: `guard-op-vault-scan` and `guard-held-close`, where an
-//!   earlier segment (an `export`, a sign-in) can change the target without
-//!   changing what the guard reads, so no list of selectors is complete.
+//!   guard read: `guard-op-vault-scan`, `guard-held-close`, and an
+//!   `enforce-worktree` Bash commit. An earlier segment (an `export`, a
+//!   sign-in, a link) can change the target without changing what the guard
+//!   reads, so no list of selectors is complete (cameronsjo/cadence-hooks
+//!   #1659 rounds 1, 2 and review 4).
 //!
 //! # One tool call, several processes
 //!

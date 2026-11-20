@@ -2995,11 +2995,18 @@ fn git_exports(command: &str) -> GitExports {
                 let exporting = head == "export"
                     || (head != "readonly" && flags.iter().any(|f| f[1..].contains('x')));
                 for word in &argv[1 + flags.len()..] {
-                    let word = unescape_word(word);
-                    let (name, value) = match word.split_once('=') {
+                    // Only the NAME is unescaped. The value goes on raw, as
+                    // the `GIT_DIR=` prefix reader passes it, so
+                    // `shell_dir_value` reads both the same way: unescaping
+                    // here turned a double-quoted native path into a
+                    // relative one that resolved to the session cwd
+                    // (cameronsjo/cadence-hooks#1659 review 4).
+                    let (raw_name, value) = match word.split_once('=') {
                         Some((name, value)) => (name, Some(value)),
-                        None => (word.as_ref(), None),
+                        None => (word.as_str(), None),
                     };
+                    let name = unescape_word(raw_name);
+                    let name = name.as_ref();
                     // A name built by an expansion (`export ${v}_DIR=…`)
                     // may be a git variable.
                     if name.contains(['$', '`', '{']) && seen.unreadable.is_none() {
@@ -5584,6 +5591,35 @@ fn run_confirmed(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
     confirm_primary_block(input, result, &mut probe)
 }
 
+/// The confirm-tier action for a primary-checkout block in `repo_root`, and
+/// the retry it asks for.
+///
+/// - Edit and Write: the repo and the edited file, as the guard read them.
+/// - Bash: the repo and the whole command, whitespace-normalized as for the
+///   other two confirm-tier guards. An earlier part of a command can move the
+///   commit's real target without the scan seeing it (a quoted native-path
+///   `export GIT_DIR`, a link made in the same command; cameronsjo/cadence-
+///   hooks#1659 review 4, after rounds 1 and 2 found the same class in the
+///   other guards), so only the identical command pairs. No path reader has
+///   to be right for the confirmation to stay in its checkout.
+fn confirm_action(
+    input: &HookInput,
+    repo_root: &str,
+    is_bash: bool,
+) -> (String, cadence_hooks_core::confirm::Retry) {
+    use cadence_hooks_core::confirm::{Retry, whole_command_action};
+    if is_bash {
+        let command = whole_command_action(input.command().unwrap_or_default());
+        (
+            format!("{repo_root}\u{1f}git commit\u{1f}{command}"),
+            Retry::SameCommand,
+        )
+    } else {
+        let file = lexical_normalize(&input.file_path().unwrap_or_default());
+        (format!("{repo_root}\u{1f}{file}"), Retry::SameAction)
+    }
+}
+
 /// How long a confirmed retry snoozes the guard: the window the block message
 /// already suggests for `dismiss-enforce-worktree`, and under the one hour past
 /// which a dismissal needs a reason.
@@ -5654,8 +5690,8 @@ fn commit_repo_roots(probe: &mut GitProbe) -> BTreeSet<String> {
 ///
 /// Only a block [`assess_dir`] returned for a primary checkout qualifies; a
 /// block about a command the guard could not read keeps blocking as before.
-/// The action is the judged repo plus what the tool touches there (the file
-/// for Edit and Write, the commit for Bash). A Bash command whose commits land
+/// The action is the judged repo plus the file for Edit and Write, or the
+/// whole command, whitespace-normalized, for Bash ([`confirm_action`]). A Bash command whose commits land
 /// in more than one primary checkout, or that holds a commit whose target the
 /// scan could not read, is never confirmed: the commit loop stops at the first
 /// blocked repo, and an unread target collapses onto the session cwd, so a
@@ -5689,12 +5725,7 @@ fn confirm_primary_block(
     if is_bash && commit_repo_roots(probe).len() > 1 {
         return CheckResult::block(format!("{message}\n{MULTI_REPO_NOTE}"));
     }
-    let target = if is_bash {
-        "git commit".to_string()
-    } else {
-        lexical_normalize(&input.file_path().unwrap_or_default())
-    };
-    let action = format!("{}\u{1f}{target}", block.repo_root);
+    let (action, retry) = confirm_action(input, &block.repo_root, is_bash);
     let pass_effect = format!(
         "The confirmed retry switches enforce-worktree off for this checkout for {} minutes, \
          for every session working in it (the snooze `dismiss-enforce-worktree --for 30m` sets).",
@@ -5705,12 +5736,7 @@ fn confirm_primary_block(
         HOOK_NAME,
         &action,
         message,
-        // The key is the judged repo plus the file or the commit, not the
-        // command text: every way a command can move a commit to another
-        // checkout either changes the judged repo or makes the target unread,
-        // which is never confirmed (cameronsjo/cadence-hooks#1659 round 2
-        // probes: `cd`, `git -C`, `GIT_DIR=`, `export GIT_DIR`, `--git-dir`).
-        cadence_hooks_core::confirm::Retry::SameAction,
+        retry,
         Some(&pass_effect),
     );
     let Some(mut provenance) = confirmed.bypass.clone() else {
@@ -7224,10 +7250,11 @@ mod tests {
         cadence_hooks_core::worktree::is_snoozed_now(primary)
     }
 
-    /// `path` as it must be written in Bash command text to name `path`. On
-    /// Windows a native `D:\a\b` pasted into a command is shell escapes, and
-    /// bash (and the guard's export and `ln` readings, which follow bash)
-    /// sees `D:ab`; the forward-slash spelling survives. Unchanged on Unix.
+    /// `path` as it can be written unquoted in Bash command text and still
+    /// name `path`. On Windows an unquoted native `D:\a\b` is shell escapes,
+    /// so Bash sees `D:ab`; the forward-slash spelling survives. Unchanged on
+    /// Unix. A test that means the quoted native spelling writes it quoted
+    /// (`confirm_does_not_carry_through_a_quoted_native_export`).
     fn sh(path: &Path) -> String {
         path.display().to_string().replace('\\', "/")
     }
@@ -7368,10 +7395,29 @@ mod tests {
                     &cfg(false, false),
                 )
             };
-            assert_eq!(commit("git commit -m x", "t1").outcome, Outcome::Block);
-            let second = commit("git commit -m 'x, reworded'", "t2");
-            assert_eq!(second.outcome, Outcome::Allow);
+            let first = commit("git commit -m x", "t1");
+            assert_eq!(first.outcome, Outcome::Block);
+            let msg = first.message.unwrap();
+            assert!(msg.contains("run the identical command again"), "{msg}");
+            // The identical command, spaced differently, is the same retry.
+            let second = commit("  git  commit\t-m x ", "t2");
+            assert_eq!(second.outcome, Outcome::Allow, "{:?}", second.message);
             assert_eq!(second.bypass.unwrap().kind, BypassKind::Confirmed);
+        });
+    }
+
+    /// The Bash key is the whole command, so a changed commit message is a
+    /// new first attempt (cameronsjo/cadence-hooks#1659 review 4).
+    #[test]
+    fn confirm_commit_with_another_message_blocks_again() {
+        let scratch = scratch("confirm-commit-msg");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let r = retry_after_plain_commit(&primary, "git commit -am 'x, reworded'");
+            assert_eq!(r.outcome, Outcome::Block);
+            assert!(r.message.unwrap().contains("Are you sure?"));
+            assert!(!snoozed(&primary));
         });
     }
 
@@ -7556,12 +7602,12 @@ mod tests {
         });
     }
 
-    /// The enforce-worktree key is the judged repo, not the command text, so
-    /// every ordinary way of moving the retry's commit into another primary
-    /// checkout must change the judged repo or make the target unread
-    /// (cameronsjo/cadence-hooks#1659 round 2). Each variant follows a
-    /// confirm of the plain commit in `a` and must not pass; the control, a
-    /// reworded message in `a`, does.
+    /// Every ordinary way of moving the retry's commit into another primary
+    /// checkout must not pass (cameronsjo/cadence-hooks#1659 round 2). Since
+    /// review 4 the Bash key holds the whole command, so each variant is a new
+    /// first attempt; the judged repo or an unread target would block most of
+    /// them as well. Each follows a confirm of the plain commit in `a`; the
+    /// control, the identical command in `a`, passes.
     #[test]
     fn confirm_does_not_follow_a_commit_moved_to_another_checkout() {
         let scratch_a = scratch("confirm-moved-a");
@@ -7601,9 +7647,130 @@ mod tests {
         let markers = tempfile::tempdir().unwrap();
         cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
             assert_eq!(attempt("git commit -am x", "t1").outcome, Outcome::Block);
-            let control = attempt("git commit -am 'reworded'", "t2");
+            let control = attempt("git commit -am x", "t2");
             assert_eq!(control.outcome, Outcome::Allow, "{:?}", control.message);
             assert_eq!(control.bypass.unwrap().kind, BypassKind::Confirmed);
+        });
+    }
+
+    /// A primary checkout `b` beside `a`, and the command text that moves a
+    /// commit into `b` with a double-quoted `export GIT_DIR`: Git Bash keeps
+    /// backslashes inside double quotes, so `git` really opens `b`.
+    fn quoted_export_into(b: &Path) -> String {
+        format!(
+            "export GIT_DIR=\"{}\"; git commit -am x",
+            b.join(".git").display()
+        )
+    }
+
+    /// Block a plain commit in `a`, then run `retry` from `a` in the same
+    /// session; what the retry gets.
+    fn retry_after_plain_commit(a: &Path, retry: &str) -> CheckResult {
+        let attempt = |command: &str, call: &str| {
+            let mut input = make_bash(command);
+            input.cwd = Some(a.to_string_lossy().into_owned());
+            run_confirmed(
+                &confirm_attempt(input, Some("s1"), None, call),
+                &cfg(false, false),
+            )
+        };
+        assert_eq!(attempt("git commit -am x", "t1").outcome, Outcome::Block);
+        attempt(retry, "t2")
+    }
+
+    /// cameronsjo/cadence-hooks#1659 review 4: a confirmation in `a` must not
+    /// carry into `b` through a double-quoted native-path export. On Unix a
+    /// directory whose name holds a literal backslash stands in for a
+    /// Windows path, since the export reader is plain string logic. Two
+    /// fixes each stop it alone (the whole-command key, and `git_exports`
+    /// passing the value raw), so this pins them together; the key on its
+    /// own is pinned by `confirm_commit_with_another_message_blocks_again`.
+    #[cfg(unix)]
+    #[test]
+    fn confirm_does_not_carry_through_a_quoted_backslash_export() {
+        let scratch_a = scratch("confirm-carry-a");
+        let scratch_b = scratch("confirm-carry-b");
+        let (a, _wt_a) = primary_and_worktree(&scratch_a);
+        let b = scratch_b.path().join("back\\slash");
+        std::fs::create_dir(&b).unwrap();
+        init_repo(&b);
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let r = retry_after_plain_commit(&a, &quoted_export_into(&b));
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+            assert!(!snoozed(&a), "the carry armed a's snooze");
+        });
+    }
+
+    /// The same, with a real Windows path: native backslashes, double quoted.
+    #[cfg(windows)]
+    #[test]
+    fn confirm_does_not_carry_through_a_quoted_native_export() {
+        let scratch_a = scratch("confirm-carry-a");
+        let scratch_b = scratch("confirm-carry-b");
+        let (a, _wt_a) = primary_and_worktree(&scratch_a);
+        let (b, _wt_b) = primary_and_worktree(&scratch_b);
+        assert!(
+            b.display().to_string().contains('\\'),
+            "a native path, or this proves nothing"
+        );
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let r = retry_after_plain_commit(&a, &quoted_export_into(&b));
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+            assert!(!snoozed(&a), "the carry armed a's snooze");
+        });
+    }
+
+    /// The reader half of review 4, on a first attempt: from another repo's
+    /// linked worktree, a double-quoted export into a primary must not read
+    /// as the worktree. `git_exports` now passes the value raw, so
+    /// `shell_dir_value` judges it like the `GIT_DIR=` prefix (on Unix the
+    /// backslash-named stand-in is ambiguous and fails closed; on Windows the
+    /// native path names the primary).
+    #[test]
+    fn a_quoted_export_from_a_worktree_into_a_primary_blocks() {
+        let scratch_a = scratch("export-first-a");
+        let scratch_b = scratch("export-first-b");
+        let (_a, wt) = primary_and_worktree(&scratch_a);
+        #[cfg(unix)]
+        let b = {
+            let b = scratch_b.path().join("back\\slash");
+            std::fs::create_dir(&b).unwrap();
+            init_repo(&b);
+            b
+        };
+        #[cfg(not(unix))]
+        let (b, _wt_b) = primary_and_worktree(&scratch_b);
+        let mut input = make_bash(&quoted_export_into(&b));
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+    }
+
+    /// A link the retry itself makes, from `a` into `b`, then a commit
+    /// through it, both quoted native paths on Windows. On Unix `note_ln`
+    /// reads the link and the command differs, so either stops it; on
+    /// Windows `note_ln` misreads the quoted native link, so only the
+    /// whole-command key does.
+    #[test]
+    fn confirm_does_not_carry_through_a_link_made_in_the_command() {
+        let scratch_a = scratch("confirm-link-a");
+        let scratch_b = scratch("confirm-link-b");
+        let (a, _wt_a) = primary_and_worktree(&scratch_a);
+        let (b, _wt_b) = primary_and_worktree(&scratch_b);
+        let link = a.join("into-b");
+        let retry = format!(
+            "ln -s \"{}\" \"{}\" && git -C \"{}\" commit -am x",
+            b.display(),
+            link.display(),
+            link.display()
+        );
+        let markers = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
+            let r = retry_after_plain_commit(&a, &retry);
+            assert_eq!(r.outcome, Outcome::Block, "{:?}", r.message);
+            assert!(!snoozed(&a), "the carry armed a's snooze");
         });
     }
 
@@ -7615,7 +7782,7 @@ mod tests {
         let (primary, wt) = primary_and_worktree(&scratch);
         let markers = tempfile::tempdir().unwrap();
         cadence_hooks_core::test_builders::with_marker_dir(markers.path(), || {
-            let command = format!("git commit -m x && git -C {} commit -m y", wt.display());
+            let command = format!("git commit -m x && git -C {} commit -m y", sh(&wt));
             let run = |call| {
                 let mut input = make_bash(&command);
                 input.cwd = Some(primary.to_string_lossy().into_owned());
