@@ -43,3 +43,14 @@ No new escape. The guard is not in `PROTECTED_GUARDS`, so `CADENCE_DISABLE=guard
 ## Measurement
 
 `scripts/secret-dump-compare.py` scores the four secret hooks on a base and a head binary over the everyday commands of `scripts/testdata/confirm-tier-commands.txt` and the classed shapes of `scripts/testdata/secret-value-commands.txt` (P printed, C consumer, Q quiet). Only ASK to BLOCK by `guard-secret-dump` may move, on a P row or on an unclassed row listed for a person to read.
+
+## Review round 1 (cameronsjo/cadence-hooks#1663)
+
+The PR's review moved these decisions into `openspec/specs/secret-reads/spec.md` directly, in the same PR, since this change was archived there:
+
+- A pass-through table (`cat`, `tee`, `head`, `tail`, `base64`, `xxd`, `od`, `jq`, `yq`, `gojq`, `jaq`, `tr`, `sed`, `cut`): a pipeline whose later stages are all in it prints the value, and so does a value fed to one by a here-string, `<(…)` or heredoc body. A stage outside the table keeps the ask.
+- A clipboard flag on `pass`, `gopass`, `lpass` is a consumer.
+- One rule for structured output: a form blocks when its value reaches the context unmasked. A test proves `redact-secret-output` masks the default JSON of `az account get-access-token` and `aws secretsmanager get-secret-value`, so those keep the ask; `aws ssm get-parameter --with-decryption`, `az keyvault secret show` and `op item get --reveal` are not masked and block.
+- `op inject` with no output file, and a producer behind the `perl -e 'alarm N; exec @ARGV'` runner, block when printed and otherwise keep main's verdict.
+- A closed stdout and a stdout sent after a stderr already in a file keep the ask; zsh `print` is an argument printer.
+- The comparison fails on any everyday move without an `A` line, and gains an `L` class for stated limits.

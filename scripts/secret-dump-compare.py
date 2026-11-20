@@ -9,23 +9,26 @@ binaries and reads each verdict as ALLOW, ASK or BLOCK:
 - scripts/testdata/confirm-tier-commands.txt: everyday commands, which must
   not move;
 - scripts/testdata/secret-value-commands.txt: secret-value shapes, each
-  classed P (the value lands in the output), C (the value goes to a consumer)
-  or Q (nothing reaches the output).
+  classed P (the value lands in the output), C (the value goes to a consumer),
+  Q (nothing reaches the output) or L (a stated limit: a later or remote
+  command the guard does not read prints it), plus A lines that accept a move
+  on a named everyday row, each with a one-line reason.
 
 The rules:
 
-1. the only move allowed is ASK on base to BLOCK on head, by
-   guard-secret-dump, on a P row, or on an unclassed row (everyday or
-   --extra), which is then listed for a person to read: an everyday command
-   can be a printed-value shape too;
-2. every P row the base asks about blocks on head (the change is complete);
-3. the run produced at least one such move and one ASK on head (a run that
-   could not have gone red is not evidence; printed as NOT EVIDENCE).
+1. the only moves allowed are to BLOCK on head, by guard-secret-dump: from ASK
+   or ALLOW on a P row, or from ASK on an everyday row an A line names. Any
+   other move fails, on any row and any hook, an --extra row included;
+2. every P row blocks on head (the change is complete), and every A line
+   names an everyday row that moved (no stale acceptance);
+3. the run produced at least one move and one ASK on head (a run that could
+   not have gone red is not evidence; printed as NOT EVIDENCE).
 
-`--extra FILE` adds one command per line, scored like an everyday row and
-reported by shape only (every word but bare flags and tool names becomes `X`;
-a short flag keeps only its letter) and with no hook output on an error:
-use it for commands taken from session history, which may name real items.
+`--extra FILE` adds one command per line, scored like an everyday row with no
+acceptance possible, and reported by shape only (every word but bare flags and
+tool names becomes `X`; a short flag keeps only its letter) and with no hook
+output on an error: use it for commands taken from session history, which may
+name real items.
 
 Hooks only judge a payload; nothing is executed and nothing touches the
 network. The hooks run with HOME, TMPDIR and the metrics directory inside a
@@ -57,7 +60,9 @@ HOOKS = [
     ["guardrails", "guard-sops-decrypt"],
 ]
 MOVING_HOOK = "guard-secret-dump"
-CLASSES = {"P", "C", "Q"}
+CLASSES = {"P", "C", "Q", "L"}
+ACCEPT = "A"
+REASON = " ## "
 # Flags shape() keeps verbatim: one short letter, or a long name of letters and
 # dashes. A longer single-dash word may carry a glued value (`-uadmin`).
 FLAG = re.compile(r"-[A-Za-z]|--[A-Za-z][A-Za-z-]*")
@@ -76,10 +81,26 @@ def rows(path: Path, classed: bool) -> list[tuple[str, str]]:
             out.append(("E", line))
             continue
         cls, _, command = line.partition(" ")
+        if cls == ACCEPT:
+            continue
         if cls not in CLASSES or not command:
             raise HarnessError(f"unclassed row in {path.name}: {line!r}")
         # `⏎` spells a newline, so a classed row can hold a heredoc.
         out.append((cls, command.replace("⏎", "\n")))
+    return out
+
+
+def accepted(path: Path) -> dict[str, str]:
+    """The A lines: everyday command -> its one-line reason."""
+    out = {}
+    for line in path.read_text().splitlines():
+        cls, _, rest = line.partition(" ")
+        if cls != ACCEPT:
+            continue
+        command, sep, reason = rest.partition(REASON)
+        if not sep or not command.strip() or not reason.strip():
+            raise HarnessError(f"A line needs `<command>{REASON}<reason>`: {line!r}")
+        out[command.strip()] = reason.strip()
     return out
 
 
@@ -163,11 +184,14 @@ def compare(base_bin: str, head_bin: str, extra: Path | None, root: Path) -> int
     corpus = rows(EVERYDAY, False) + rows(SHAPES, True)
     if extra is not None:
         corpus += [("X", c) for _, c in rows(extra, False)]
+    accepts = accepted(SHAPES)
     envs = {name: hook_env(root, name) for name in ("base", "head")}
     counts: dict[str, int] = {}
     failures: list[str] = []
     moved: list[str] = []
-    review: list[str] = []
+    passed_to_block: list[str] = []
+    accepted_moves: list[str] = []
+    used_accepts: set[str] = set()
     head_asks = 0
     for n, (cls, command) in enumerate(corpus, 1):
         shown = f"extra row {n}" if cls == "X" else command
@@ -177,36 +201,47 @@ def compare(base_bin: str, head_bin: str, extra: Path | None, root: Path) -> int
             counts[cls] = counts.get(cls, 0) + 1
             head_asks += h == "ASK"
             name = hook[1]
+            if cls == "P" and name == MOVING_HOOK and h != "BLOCK":
+                failures.append(f"P row does not block on head ({h}): {shown}")
             if b == h:
-                if cls == "P" and name == MOVING_HOOK and b == "ASK":
-                    failures.append(f"P row still asks on head: {shown}")
                 continue
             line = f"{name}: {b} -> {h} [{cls}] {shown if cls != 'X' else shape(command)}"
             if (cls, name, b, h) == ("P", MOVING_HOOK, "ASK", "BLOCK"):
                 moved.append(line)
-            elif cls in ("E", "X") and (name, b, h) == (MOVING_HOOK, "ASK", "BLOCK"):
-                # An unclassed row can be a printed-value shape too: listed
-                # for a person to read, never passed silently.
-                review.append(line)
+            elif (cls, name, b, h) == ("P", MOVING_HOOK, "ALLOW", "BLOCK"):
+                passed_to_block.append(line)
+            elif cls == "E" and command in accepts and (name, b, h) == (MOVING_HOOK, "ASK", "BLOCK"):
+                used_accepts.add(command)
+                accepted_moves.append(f"{line}  ({accepts[command]})")
             else:
                 failures.append(f"unwanted move: {line}")
+    for command in sorted(set(accepts) - used_accepts):
+        failures.append(f"A line names a row that did not move: {command}")
     rows_by_class = {cls: counts[cls] // len(HOOKS) for cls in sorted(counts)}
     print(f"rows by class: {rows_by_class} x {len(HOOKS)} hooks")
-    print(f"moved ({len(moved)}):")
-    for line in moved:
-        print(f"  {line}")
-    print(f"moved on unclassed rows, read each by hand ({len(review)}):")
-    for line in review:
-        print(f"  {line}")
+    for title, lines in (
+        ("ASK -> BLOCK on printed rows", moved),
+        ("ALLOW -> BLOCK on printed rows", passed_to_block),
+        ("accepted moves on everyday rows", accepted_moves),
+    ):
+        print(f"{title} ({len(lines)}):")
+        for line in lines:
+            print(f"  {line}")
     if failures:
         print(f"FAILED ({len(failures)}):")
         for line in failures:
             print(f"  {line}")
         return 1
-    if not moved or not head_asks:
-        print("NOT EVIDENCE: no ASK -> BLOCK move, or no ASK left on head")
+    if not (moved or passed_to_block) or not head_asks:
+        print("NOT EVIDENCE: no move to BLOCK, or no ASK left on head")
         return 1
-    print("OK: every move is ASK -> BLOCK by guard-secret-dump on a printed-value row")
+    if accepted_moves:
+        print(
+            "OK: every move is to BLOCK by guard-secret-dump, on a printed-value row "
+            f"or one of {len(accepted_moves)} accepted everyday rows"
+        )
+    else:
+        print("OK: every move is to BLOCK by guard-secret-dump on a printed-value row")
     return 0
 
 
