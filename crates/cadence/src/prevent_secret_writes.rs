@@ -722,7 +722,8 @@ impl Check for SecretWritesGuard {
                                  A real credential must never be written into a tracked file.\n\
                                  Fix: replace it with a placeholder or an env-var reference. If this is \
                                  a genuine false positive (test fixture, documentation), write it \
-                                 manually outside Claude Code."
+                                 manually outside Claude Code.\n{}",
+                                cadence_hooks_core::confirm::OPERATOR_HANDOFF
                             ));
                         }
                     }
@@ -745,7 +746,7 @@ impl Check for SecretWritesGuard {
                         return CheckResult::allow();
                     }
 
-                    return CheckResult::block(with_forgectl_hint(
+                    let blocked = with_forgectl_hint(
                         format!(
                             "🚫 BLOCKED: '{filename}' is a protected file (secrets/credentials). \
                              Modify manually outside Claude Code."
@@ -754,6 +755,10 @@ impl Check for SecretWritesGuard {
                         Some(&path),
                         filename,
                         self.detect,
+                    );
+                    return CheckResult::block(format!(
+                        "{blocked}\n{}",
+                        cadence_hooks_core::confirm::OPERATOR_HANDOFF
                     ));
                 }
 
@@ -804,12 +809,11 @@ impl Check for SecretWritesGuard {
                             "\nNote: a pure-loader .envrc (dotenv, source_env, use …, layout …, watch_file lines only) can be written with the Write tool instead.",
                         );
                     }
-                    return CheckResult::block(with_forgectl_hint(
-                        message,
-                        HintKind::Write,
-                        None,
-                        &target,
-                        self.detect,
+                    let blocked =
+                        with_forgectl_hint(message, HintKind::Write, None, &target, self.detect);
+                    return CheckResult::block(format!(
+                        "{blocked}\n{}",
+                        cadence_hooks_core::confirm::OPERATOR_HANDOFF
                     ));
                 }
 
@@ -2560,7 +2564,13 @@ mod tests {
         let guard = SecretWritesGuard { detect: absent };
         let result = guard.run(&make_write_input("/project/.env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert_eq!(result.message.as_deref(), Some(ENV_WRITE_BLOCK));
+        assert_eq!(
+            result.message.unwrap(),
+            format!(
+                "{ENV_WRITE_BLOCK}\n{}",
+                cadence_hooks_core::confirm::OPERATOR_HANDOFF
+            )
+        );
     }
 
     #[test]
@@ -2577,7 +2587,8 @@ mod tests {
             format!(
                 "{ENV_WRITE_BLOCK}\nOr: forgectl env set <KEY> --file /project/.env — the value \
                  arrives on stdin (pipe it from op read or a file; printf only for a non-secret), \
-                 never argv; forgectl env --help"
+                 never argv; forgectl env --help\n{}",
+                cadence_hooks_core::confirm::OPERATOR_HANDOFF
             )
         );
     }
@@ -2641,9 +2652,14 @@ mod tests {
         assert!(!absent_msg.contains("forgectl"));
         // The present branch is the control proving the absent one could have
         // differed.
+        // Both end with the operator line; the hint sits just before it.
+        let handoff = format!("\n{}", cadence_hooks_core::confirm::OPERATOR_HANDOFF);
+        let base = absent_msg
+            .strip_suffix(handoff.as_str())
+            .expect("the block ends with the operator line");
         assert_eq!(
             format!(
-                "{absent_msg}\nOr: forgectl env set <KEY> --file <path> — the value arrives on stdin (pipe it from op read or a file; printf only for a non-secret), never argv; forgectl env --help"
+                "{base}\nOr: forgectl env set <KEY> --file <path> — the value arrives on stdin (pipe it from op read or a file; printf only for a non-secret), never argv; forgectl env --help{handoff}"
             ),
             present_msg
         );

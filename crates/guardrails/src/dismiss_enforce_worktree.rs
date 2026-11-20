@@ -18,6 +18,7 @@
 
 use crate::dismiss_main_branch_warn::{parse_duration, session_id_from_env};
 use crate::snooze_meta::{self, DismissArmed, SnoozeMeta};
+use cadence_hooks_core::markers::write_marker;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -97,6 +98,61 @@ pub fn is_snoozed_now(repo_root: &Path) -> bool {
     cadence_hooks_core::worktree::is_snoozed_now(repo_root)
 }
 
+/// A snooze that was written: when, until when, and the sidecar failure if the
+/// best-effort provenance write did not land.
+pub struct ArmedSnooze {
+    pub armed_at: u64,
+    pub until: u64,
+    pub sidecar_error: Option<(PathBuf, std::io::Error)>,
+}
+
+/// Why [`arm_in_common_dir`] could not write the snooze.
+pub enum SnoozeWriteError {
+    CreateDir(PathBuf, std::io::Error),
+    Marker(PathBuf, std::io::Error),
+}
+
+/// Write the snooze marker and its provenance sidecar under an already
+/// resolved git common dir, for `secs` from now. The one writer behind both
+/// `dismiss-enforce-worktree` and the guard's confirmed retry
+/// (cameronsjo/cadence-hooks#1658), so the two arm identical state. The
+/// sidecar is best-effort: its failure is reported, never fatal.
+pub fn arm_in_common_dir(
+    common: &Path,
+    secs: u64,
+    reason: Option<&str>,
+    session_id: Option<String>,
+) -> Result<ArmedSnooze, SnoozeWriteError> {
+    let path = marker_path(common);
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return Err(SnoozeWriteError::CreateDir(parent.to_path_buf(), e));
+    }
+    let armed_at = now_epoch();
+    let until = armed_at.saturating_add(secs);
+    // Temp file plus rename: never follows a symlink squatting either name,
+    // now that a hook (a confirmed retry) writes here as well as the CLI.
+    if let Err(e) = write_marker(&path, &format!("{until}\n")) {
+        return Err(SnoozeWriteError::Marker(path, e));
+    }
+    let meta = SnoozeMeta {
+        reason: reason.map(str::to_string),
+        session_id,
+        armed_at: Some(armed_at as i64),
+        expires_at: Some(until as i64),
+    };
+    let sidecar = snooze_meta::sidecar_for(&path);
+    let sidecar_error = write_marker(&sidecar, &meta.to_json())
+        .err()
+        .map(|e| (sidecar, e));
+    Ok(ArmedSnooze {
+        armed_at,
+        until,
+        sidecar_error,
+    })
+}
+
 /// The dismiss mechanism name recorded in bypass provenance.
 const MECHANISM: &str = "dismiss-enforce-worktree";
 
@@ -167,32 +223,21 @@ pub fn perform_dismiss(
         return Err(());
     };
 
-    let path = marker_path(&common);
-    if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        eprintln!("cadence-hooks: could not create {}: {e}", parent.display());
-        return Err(());
-    }
-
-    let armed_at = now_epoch();
-    let until = armed_at.saturating_add(secs);
-    if let Err(e) = fs::write(&path, format!("{until}\n")) {
-        eprintln!("cadence-hooks: could not write {}: {e}", path.display());
-        return Err(());
-    }
-
-    // Provenance sidecar — best-effort, must never fail the snooze.
     let reason = snooze_meta::normalize_reason(reason);
     let session_id = session_id_from_env();
-    let meta = SnoozeMeta {
-        reason: reason.clone(),
-        session_id: session_id.clone(),
-        armed_at: Some(armed_at as i64),
-        expires_at: Some(until as i64),
+    let armed = match arm_in_common_dir(&common, secs, reason.as_deref(), session_id.clone()) {
+        Ok(armed) => armed,
+        Err(SnoozeWriteError::CreateDir(dir, e)) => {
+            eprintln!("cadence-hooks: could not create {}: {e}", dir.display());
+            return Err(());
+        }
+        Err(SnoozeWriteError::Marker(path, e)) => {
+            eprintln!("cadence-hooks: could not write {}: {e}", path.display());
+            return Err(());
+        }
     };
-    let sidecar = snooze_meta::sidecar_for(&path);
-    if let Err(e) = fs::write(&sidecar, meta.to_json()) {
+    let (armed_at, until) = (armed.armed_at, armed.until);
+    if let Some((sidecar, e)) = armed.sidecar_error {
         eprintln!(
             "cadence-hooks: note — snooze set, but provenance sidecar {} could not be written: {e}",
             sidecar.display()

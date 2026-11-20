@@ -17,6 +17,12 @@
 //!
 //! Markers are advisory — every failure path degrades open (ADR-0001): a marker
 //! that can't be written just means the nudge may re-fire, never a block.
+//!
+//! The confirm tier ([`crate::confirm`]) also keeps its `confirm-<sha256>`
+//! markers in [`marker_dir`], through [`write_marker`], but not through
+//! [`session_marker`]: a confirmation lets a block pass, so it requires a
+//! `session_id` and a private directory, and a failure there blocks rather
+//! than degrading open.
 
 use crate::gitstate::GitState;
 use crate::paths;
@@ -105,7 +111,16 @@ fn marker_base_from(override_dir: Option<String>) -> PathBuf {
 /// sticky `/tmp` the corrective rename fails, so the mute persists. Consumers
 /// that read marker content to gate output check this first and skip the gate.
 pub fn marker_dir_is_private() -> bool {
-    marker_dir() != marker_base_from(std::env::var("CADENCE_MARKER_DIR").ok())
+    private_marker_dir().is_some()
+}
+
+/// [`marker_dir`] when it resolved to its hardened per-user directory, `None`
+/// when it failed open to the shared base. One resolution answers both "where"
+/// and "is it private", for a caller that needs both.
+pub fn private_marker_dir() -> Option<PathBuf> {
+    let override_dir = std::env::var("CADENCE_MARKER_DIR").ok();
+    let dir = marker_dir_from(override_dir.clone());
+    (dir != marker_base_from(override_dir)).then_some(dir)
 }
 
 /// Create the marker dir and lock it to `0700`, refusing a pre-planted symlink.
@@ -142,8 +157,9 @@ fn harden_marker_dir(dir: &Path) -> io::Result<()> {
 /// The session scope key: the Claude Code `session_id` when present, else a
 /// per-process best-effort id.
 ///
-/// No session_id in payload → per-process best-effort (advisory only; a future
-/// block-gating consumer must require session_id). The pre-CP0 `PPID` env read is
+/// No session_id in payload → per-process best-effort (advisory only; a
+/// block-gating consumer must require session_id, as [`crate::confirm`] does
+/// with its own key). The pre-CP0 `PPID` env read is
 /// gone — `PPID` is never exported into a hook's environment (the very bug #133
 /// fixed), so it only ever fell through to `process::id()` anyway.
 fn session_scope(input: &HookInput) -> String {
@@ -173,8 +189,10 @@ fn hash_of(s: &str) -> u64 {
 ///
 /// The hash is non-cryptographic and fixed-seed, so marker names are predictable
 /// by design: security rests on the `0700` [`marker_dir`], never on name
-/// secrecy. `agent_id` is deliberately NOT part of the key — `HookInput` carries
-/// none today, and CP2 will decide whether subagent-scoped markers extend it.
+/// secrecy. `agent_id` is deliberately NOT part of this key, so a subagent
+/// shares its parent's session markers. The confirm tier keys on `agent_id`
+/// too ([`crate::confirm`]), because a pass must stay with the agent that
+/// confirmed.
 pub fn session_marker(input: &HookInput, kind: &str, repo_root: Option<&str>) -> PathBuf {
     let sid_hash = hash_of(&session_scope(input));
     let name = match repo_root {
@@ -1563,7 +1581,7 @@ fn claim_tool_event_nudge_within(
 
 /// Create `path` as a new, empty file, refusing to follow a symlink squatting
 /// the name (`O_EXCL`) and refusing to reuse an existing one.
-fn create_exclusive(path: &Path) -> io::Result<()> {
+pub(crate) fn create_exclusive(path: &Path) -> io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
