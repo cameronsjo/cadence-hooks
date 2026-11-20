@@ -490,6 +490,8 @@ pub fn confirm_block(
 mod tests {
     use super::*;
     use crate::Outcome;
+    // Used only by the unix-only shared-marker-dir test.
+    #[cfg(unix)]
     use crate::markers::{marker_dir, marker_dir_is_private};
     use crate::test_builders::{make_bash, with_marker_dir};
 
