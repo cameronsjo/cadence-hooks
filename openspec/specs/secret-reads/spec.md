@@ -1,7 +1,7 @@
 # secret-reads Specification
 
 ## Purpose
-Secret reads keep secret file contents and bare secret values out of the conversation context: `cadence-hooks cadence prevent-secret-leaks` guards reads of secret-named files, `cadence-hooks cadence guard-secret-dump` asks before a command prints a bare secret value, `cadence-hooks cadence redact-secret-output` masks secrets in Bash output after it runs, `cadence-hooks guardrails guard-sops-decrypt` guards `sops` decrypts, and `cadence-hooks guardrails guard-op-vault-scan` guards 1Password vault enumeration.
+Secret reads keep secret file contents and bare secret values out of the conversation context: `cadence-hooks cadence prevent-secret-leaks` guards reads of secret-named files, `cadence-hooks cadence guard-secret-dump` blocks a command that prints a bare secret value and asks before one hands it to a consumer, `cadence-hooks cadence redact-secret-output` masks secrets in Bash output after it runs, `cadence-hooks guardrails guard-sops-decrypt` guards `sops` decrypts, and `cadence-hooks guardrails guard-op-vault-scan` guards 1Password vault enumeration.
 
 ## Requirements
 
@@ -173,20 +173,57 @@ A `prevent-secret-leaks` hint line MUST render the literal placeholder `<path>` 
 - **WHEN** a Bash command runs `gh env list` or `direnv allow`
 - **THEN** the hook allows silently
 
-### Requirement: Ask before a bare secret value is printed
-On PreToolUse for Bash, `guard-secret-dump` SHALL return ask (never block) when a command, including inside substitutions, `sh -c`, and `eval`, runs a producer whose output is a bare secret value with no name beside it. It MUST stay silent when the producer's pipeline sends stdout to a real file or ends in a hash (`shasum` family, `md5sum`, `b2sum`, `cksum`). A stdin consumer such as `docker login --password-stdin` SHALL still ask. It has no escape variable; the prompt is the escape.
+### Requirement: A bare secret value is judged by where it goes
+On PreToolUse for Bash, `guard-secret-dump` SHALL judge each bare-value producer (the producer table), nested ones included, by where the value goes. It SHALL block (exit 2), never in the confirm tier, when the value would be the command's own output: the producer ends its pipeline without sending stdout to a real file (`>&2` and terminal paths still print), the value is a substitution in an `echo`/`printf` argument word or is the whole first word, or a `sh -c`/`eval` script prints it.
 
 #### Scenario: Bare-value producers
-- **WHEN** a Bash command runs `security find-generic-password -s x -w`, `op read op://v/i/f`, `kubectl get secret s -o jsonpath='{.data.k}'`, `aws secretsmanager get-secret-value --secret-id x`, or `pass show x`
+- **WHEN** a Bash command runs `op read op://v/i/f`, `op read op://v/i/f >&2`, `security find-generic-password -s x -w`, `op item get x --reveal`, or `cd /repo && op read op://v/i/f`
+- **THEN** the hook exits 2 with `BLOCKED: guard-secret-dump` on stderr
+
+#### Scenario: Printed through an argument printer or a script
+- **WHEN** a Bash command runs `echo "$(op read op://v/i/f)"`, `printf '%s\n' "$(pass show x)"`, `"$(op read op://v/i/f)"`, `X=1 "$(op read op://v/i/f)"`, `bash -c 'op read op://v/i/f'`, or `eval 'pass show x'`
+- **THEN** the hook blocks
+
+### Requirement: A secret value handed to a consumer keeps the ask
+`guard-secret-dump` SHALL return ask, not block, when a producer's value goes to a consumer: a pipe into another program, a substitution used as an argument, an assignment or an inline environment prefix, a here-string or heredoc, or a process substitution. It MUST stay silent when the producer's pipeline ends in a hash (`shasum` family, `md5sum`, `b2sum`, `cksum`) or sends stdout to a real file.
+
+#### Scenario: Value handed to a consumer
+- **WHEN** a Bash command runs `op read op://v/i/t | gh auth login --with-token`, `security find-generic-password -s x -w | pbcopy`, `GH_TOKEN="$(op read op://v/i/t)" gh api user`, `curl -H "Authorization: Bearer $(op read op://v/i/f)" https://x`, `docker login --password-stdin <<< "$(op read op://v/i/f)"`, or `echo "$(op read op://v/i/f)" | docker login --password-stdin`
 - **THEN** the hook returns ask with a reason containing `guard-secret-dump:`
 
+#### Scenario: Not an argument word, or not a lone first word
+- **WHEN** a Bash command runs `printf -v TOKEN '%s' "$(op read op://v/i/f)"`, `echo hi 2>"$(op read op://v/i/f)"`, `echo <(op read op://v/i/f)`, `$HOME/bin/tool --token "$(op read op://v/i/f)"`, or `"$TOOL" login -p "$(op read op://v/i/f)"`
+- **THEN** the hook returns ask, since `printf -v` assigns, a redirect target and a process substitution are not printed, and a first word that only starts with `$` names a command rather than holding the value
+
+#### Scenario: Heredoc body
+- **WHEN** a Bash command runs `kubectl apply -f -` or `cat > config.yml` with an unquoted heredoc whose body holds `$(op read op://v/i/f)`
+- **THEN** the hook returns ask, since the body feeds the command's stdin, though the splitter reads each body substitution as a segment of its own
+
 #### Scenario: Hashed or saved value
-- **WHEN** a Bash command runs `kubectl get secret s -o jsonpath='{.data.k}' | base64 -d | shasum` or `op read op://v/i/f > /tmp/v`
+- **WHEN** a Bash command runs `kubectl get secret s -o jsonpath='{.data.k}' | base64 -d | shasum` or `op read op://v/i/f > token.txt`
 - **THEN** the hook allows silently
 
 #### Scenario: Ordinary command is allowed
-- **WHEN** a Bash command runs `kubectl get pods`
+- **WHEN** a Bash command runs `kubectl get pods` or `op run -- gh api user`
 - **THEN** the hook allows silently
+
+### Requirement: Uncertain shapes keep the secret-value ask
+`guard-secret-dump` MUST NOT block a script holding a `{ … }` or `( … )` group, or a segment with more `)` than `(`: the group's redirect is not visible per segment. Nor MUST it block a segment where a word that is not a redirect holds a `>`, or a redirect word holds a second one: the redirect is glued where the guard does not read it. Such a producer keeps the ask.
+
+#### Scenario: Grouped script
+- **WHEN** a Bash command runs `{ op read op://v/i/f; } > token.txt` or `( op read op://v/i/f ) | pbcopy`
+- **THEN** the hook returns ask
+
+#### Scenario: Glued redirect
+- **WHEN** a Bash command runs `echo "T=$(op read op://v/i/f)">>.env`, `op read op://v/i/f>/dev/null`, or `op read op://v/i/f 2>&1>/dev/null`
+- **THEN** the hook returns ask
+
+### Requirement: The secret-value block message
+The `guard-secret-dump` block message SHALL begin `BLOCKED: guard-secret-dump`, name the producer label and never the command text, and name consumer forms in one sentence: a pipe into the program that needs the value, the clipboard, and the tool's reference form. The guard has no escape variable of its own; it is not protected, so `CADENCE_DISABLE=guard-secret-dump` and `CADENCE_BYPASS=1` switch it off.
+
+#### Scenario: Consumer forms named
+- **WHEN** a Bash command runs `op read op://v/i/f`
+- **THEN** stderr names `op read`, `--password-stdin`, `pbcopy` and `op run --`, and does not contain `op://v/i/f`
 
 ### Requirement: Mask secrets in Bash output
 On PostToolUse for Bash, `redact-secret-output` SHALL replace, in place in stdout and stderr, credential tokens, private key blocks, URL passwords, and values whose name is secret-shaped (env, YAML, JSON, flag, header, table, `.netrc`). Each masked span MUST read `[redacted: secret-named value]` or `[redacted: <kind>]`. It SHALL return the full output object (`stdout`, `stderr`, `interrupted`, `isImage`) as `updatedToolOutput` only when something was masked, and MUST NOT rewrite image output.
@@ -324,3 +361,29 @@ On PreToolUse for Bash, `guard-op-vault-scan` SHALL block when a segment's comma
 #### Scenario: Another session token
 - **WHEN** `op item list --session tok1` blocks and the next attempt is `op item list --session tok2`
 - **THEN** the second command blocks
+
+### Requirement: The producer table
+`guard-secret-dump` SHALL recognize a bare-value producer by one row per executable, after command runners are peeled, and MUST NOT judge a program outside the table a producer. Two builtins, `echo` and `printf` (not `printf -v`), SHALL be the only commands treated as printing their arguments.
+
+#### Scenario: 1Password and Keychain rows
+- **WHEN** a Bash command runs `op read <ref>` (unless `-o`/`--out-file` names a real file), `op item get <item> --reveal`, or `security find-generic-password` / `find-internet-password` with a short-flag cluster holding `w`
+- **THEN** each is a producer
+
+#### Scenario: Cluster and cloud rows
+- **WHEN** a Bash command runs `kubectl get secret` with `-o jsonpath|go-template|template|custom-columns` or `--template` (or `-o json|yaml` piped into `jq`/`yq`), `vault read|kv get -field`, `aws secretsmanager get-secret-value`, `aws ecr get-login-password`, `aws ssm get-parameter --with-decryption`, `aws configure get <secret key>`, `az keyvault secret show`, `az account get-access-token`, `gcloud secrets versions access`, or `gcloud auth print-access-token`
+- **THEN** each is a producer
+
+#### Scenario: Password-manager rows
+- **WHEN** a Bash command runs `pass <name>` or `pass show <name>`, `gopass show`, `bw get password`, `lpass show --password`, `doppler secrets get --plain`, or `heroku auth:token`
+- **THEN** each is a producer
+
+#### Scenario: Not a producer
+- **WHEN** a Bash command runs `op item get db --fields username`, `security find-generic-password -s x`, `vault kv get secret/x`, or `aws configure get region`
+- **THEN** the hook allows silently
+
+### Requirement: The limit of the value rule
+`guard-secret-dump` SHALL judge only what one command's text shows. A consumer that itself prints the value (`… | cat`, `… | tee .env`, `cat <<< "$(op read …)"`), a later command that prints a variable (`X=$(op read …); echo $X`), and a print inside a script file are outside it, and MUST keep the ask or pass rather than block.
+
+#### Scenario: Later print of a variable
+- **WHEN** a Bash command runs `X=$(security find-generic-password -s x -w); echo $X`
+- **THEN** the hook returns ask

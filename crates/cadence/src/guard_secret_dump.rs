@@ -1,5 +1,6 @@
-//! Ask before a command prints a bare, unnamed secret value
-//! (cameronsjo/cadence-hooks#776). PreToolUse, `Bash`, **Ask-only**.
+//! Block a command that prints a bare, unnamed secret value, and ask before
+//! one hands it to a consumer (cameronsjo/cadence-hooks#776, #1662).
+//! PreToolUse, `Bash`.
 //!
 //! The backstop for `redact-secret-output`. That hook masks values by the
 //! *name* printed beside them, so it is structurally blind to a command whose
@@ -14,8 +15,32 @@
 //! - `vault read|kv get -field=…`, `aws secretsmanager get-secret-value`,
 //!   `gcloud secrets versions access`, `pass show`.
 //!
-//! `Ask`, never `Block`: both motivating incidents were legitimate work, and
-//! the prompt is its own escape hatch — so no bypass or dismiss exists.
+//! **Where the value goes decides the verdict** (#1662, cadence-ecosystem
+//! ADR-0046 rule 2: a secret entering the context is a block kind, because a
+//! leaked value has to be rotated and a rotation cannot be undone):
+//! - **to the context → block.** The producer's stdout is the command's own
+//!   output (last stage of its pipeline, no redirect to a real file; `>&2` and
+//!   terminal paths still print), or the value is a substitution in an
+//!   argument word of `echo`/`printf` (not `printf -v`, a redirect word or its
+//!   target, or a process-substitution word), or the first word is exactly one
+//!   substitution (the shell reports the value as an unknown command), or a
+//!   `sh -c`/`eval` script prints it to that output. Never confirm-tier.
+//! - **to a consumer → ask, unchanged.** A pipe into another program, a
+//!   substitution used as an argument (including of a command named by a
+//!   variable, `$HOME/bin/tool --token "$(…)"`), assignment, `printf -v` or
+//!   inline prefix, a here-string or heredoc, a process substitution. The guard cannot
+//!   prove the consumer quiet, so the prompt stays; it must not become a block.
+//! - **contained → silent**, as below.
+//!
+//! The limit: a consumer that itself prints the value (`| cat`, `| tee`, `cat <<<`),
+//! a later command that prints a variable (`X=$(…); echo $X`), and a print
+//! inside a script file are outside what one command's text shows, and keep
+//! the ask or pass. A script inside a `{ … }`/`( … )` group keeps the ask too:
+//! the group's redirect is not visible per segment.
+//!
+//! No escape variable: `CADENCE_DISABLE=guard-secret-dump` (this guard is not
+//! protected) and `CADENCE_BYPASS=1` in the hook's environment are the
+//! existing ways for a person to see a value through Claude.
 //!
 //! **Egress predicate — why this stays quiet on real work.** The top-level
 //! pipeline is walked from the producing segment
@@ -61,7 +86,7 @@
 
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, child_scripts, command_word, is_redirect_token, peel_command_runners,
-    split_segments_with_ops_joining_redirects, strip_group_wrappers, tokenize,
+    split_segments_with_ops_joining_redirects, strip_group_wrappers, substitution_bodies, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -77,11 +102,50 @@ impl Check for SecretDumpGuard {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
-        match first_exposed_dump(command) {
-            Some(producer) => CheckResult::ask(ask_message(producer)),
+        match judge(command) {
+            Some(Finding {
+                label,
+                exposure: Exposure::Printed,
+            }) => CheckResult::block(block_message(label)),
+            Some(Finding {
+                label,
+                exposure: Exposure::Exposed,
+            }) => CheckResult::ask(ask_message(label)),
             None => CheckResult::allow(),
         }
     }
+}
+
+/// Where a producer's bare value goes, as far as one command's text shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exposure {
+    /// The value lands in the command's own output, so it enters the
+    /// conversation context: a block (cameronsjo/cadence-hooks#1662).
+    Printed,
+    /// The value goes to a consumer (a pipe, a substitution used as an
+    /// argument or assignment, a here-string, a process substitution) that
+    /// the guard cannot prove keeps it quiet: an ask, as before.
+    Exposed,
+}
+
+/// A producer and where its value goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Finding {
+    pub label: &'static str,
+    pub exposure: Exposure,
+}
+
+fn block_message(producer: &str) -> String {
+    format!(
+        "BLOCKED: guard-secret-dump\n\
+         Found: `{producer}` would print a bare secret value into this conversation, and a \
+         secret that reaches the context is leaked and has to be rotated.\n\
+         Fix: hand the value to the program that needs it without printing it: pipe it in \
+         (`… | docker login --password-stdin`), put it on the clipboard (`… | pbcopy`), or \
+         pass it by reference so the consumer resolves it (`op run -- <cmd>`, \
+         `TOKEN=\"$(op read …)\" <cmd>`). To check a value without seeing it, end the \
+         pipeline with `shasum`."
+    )
 }
 
 fn ask_message(producer: &str) -> String {
@@ -96,19 +160,59 @@ fn ask_message(producer: &str) -> String {
     )
 }
 
-/// The label of the first bare-value producer whose stdout reaches the
-/// transcript, or `None`.
+/// The label of the first bare-value producer [`judge`] finds printed or
+/// exposed, whichever verdict it gets, or `None`.
 pub fn first_exposed_dump(command: &str) -> Option<&'static str> {
-    exposed_in(command, 0)
+    judge(command).map(|finding| finding.label)
 }
 
-/// [`first_exposed_dump`] over one script, recursing into every child script
-/// the shell runs from a segment — `$(…)`, backticks, `<(…)`, `sh -c`/`bash
-/// -c`, `eval` — via core's read-only `child_scripts`, up to
-/// `MAX_WRAPPER_DEPTH`. A producer inside a substitution is judged against its
-/// own pipeline: `$(op read … | sha256sum)` is contained, `X=$(op read …)`
-/// is not.
-fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
+/// The verdict for `command`: the first producer whose value is printed
+/// ([`Exposure::Printed`]), else the first whose value reaches a consumer the
+/// guard cannot prove quiet ([`Exposure::Exposed`]), else `None`.
+pub fn judge(command: &str) -> Option<Finding> {
+    let mut first_exposed = None;
+    let printed = exposed_in(command, 0, true, &mut first_exposed);
+    printed
+        .map(|label| Finding {
+            label,
+            exposure: Exposure::Printed,
+        })
+        .or_else(|| {
+            first_exposed.map(|label| Finding {
+                label,
+                exposure: Exposure::Exposed,
+            })
+        })
+}
+
+/// Commands that print their arguments: a substitution in one of their
+/// argument words lands in their output ([`printed_bodies`] excludes
+/// `printf -v`, redirect words and process substitutions). Deliberately two
+/// builtins; any other program that takes the value as an argument is a
+/// consumer (cameronsjo/cadence-hooks#1662).
+const ARGUMENT_PRINTERS: &[&str] = &["echo", "printf"];
+
+/// [`judge`] over one script, recursing into every child script the shell
+/// runs from a segment — `$(…)`, backticks, `<(…)`, `sh -c`/`bash -c`,
+/// `eval` — via core's read-only `child_scripts`, up to `MAX_WRAPPER_DEPTH`.
+///
+/// `reaches_context` says whether this script's own stdout ends up in the
+/// command's output: true at the top, inherited by a `-c`/`eval` script,
+/// false for a substitution body (the shell captures it) unless
+/// [`printed_bodies`] finds it in an argument word of an
+/// [`ARGUMENT_PRINTERS`] command or as the whole first word (the shell then
+/// reports the value as an unknown command), and false for a process
+/// substitution (a consumer reads it).
+///
+/// Returns the label of the first producer whose value is printed. The first
+/// producer whose value is merely exposed (today's ask) is kept in
+/// `first_exposed`.
+fn exposed_in(
+    script: &str,
+    depth: usize,
+    reaches_context: bool,
+    first_exposed: &mut Option<&'static str>,
+) -> Option<&'static str> {
     let segments = split_segments_with_ops_joining_redirects(script);
     let argvs: Vec<Vec<String>> = segments
         .iter()
@@ -117,18 +221,62 @@ fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
             peel_command_runners(&tokens).to_vec()
         })
         .collect();
+    // A `{ …; } > f` or `( … ) | x` group sends its members' output somewhere
+    // the per-segment view cannot see, so nothing in a grouped script is
+    // judged printed; it keeps today's ask.
+    let grouped = segments.iter().any(|(segment, _)| is_group_edge(segment));
+    // The splitter strips a heredoc body and re-appends each substitution in
+    // it as a segment of its own, so `$(op read …)` from the body of
+    // `kubectl apply -f - <<EOF` looks like a lone substitution in command
+    // position. Where it really goes is the stdin of the heredoc's command, a
+    // consumer, so a script holding a heredoc never takes the command-position
+    // rule (security review round 1).
+    let heredoc = has_heredoc(script);
     for (i, argv) in argvs.iter().enumerate() {
+        let segment_prints = reaches_context
+            && !grouped
+            && segments[i].1 != Some("|")
+            && !stdout_to_file(argv)
+            && !glued_redirect(argv);
         if depth < MAX_WRAPPER_DEPTH {
             let stripped = strip_group_wrappers(&segments[i].0);
-            let mut children = child_scripts(argv, stripped);
-            children.extend(process_substitutions(stripped));
+            let substitutions = substitution_bodies(stripped);
+            // Read from the unstripped segment: `strip_group_wrappers` trims
+            // the closing `)` of `echo $(…)`, and a printing segment is never
+            // inside a group anyway.
+            let printed = if segment_prints {
+                printed_bodies(
+                    peel_command_runners(&tokenize(segments[i].0.trim())),
+                    !heredoc,
+                )
+            } else {
+                Vec::new()
+            };
+            let mut children: Vec<(String, bool)> = child_scripts(argv, stripped)
+                .into_iter()
+                .map(|child| {
+                    // A `-c`/`eval` script writes to this segment's stdout; a
+                    // substitution is captured unless this segment prints it.
+                    let prints = if substitutions.contains(&child) {
+                        printed.contains(&child)
+                    } else {
+                        segment_prints
+                    };
+                    (child, prints)
+                })
+                .collect();
+            children.extend(
+                process_substitutions(stripped)
+                    .into_iter()
+                    .map(|child| (child, false)),
+            );
             // Every child is judged, wherever its output goes, with no
             // exceptions: an argument can be printed by the command, a runner,
             // `set -x` or a verbose flag, and each "safe consumer" or "stdin
             // sink" exemption tried here produced bypasses (review rounds 4-6).
-
-            for child in children {
-                if let Some(label) = exposed_in(&child, depth + 1) {
+            // Only the printed/exposed split depends on where it goes.
+            for (child, prints) in children {
+                if let Some(label) = exposed_in(&child, depth + 1, prints, first_exposed) {
                     return Some(label);
                 }
             }
@@ -138,11 +286,119 @@ fn exposed_in(script: &str, depth: usize) -> Option<&'static str> {
         else {
             continue;
         };
-        if !pipeline_contains_it(&segments, &argvs, i) {
+        if segment_prints {
             return Some(label);
+        }
+        if !pipeline_contains_it(&segments, &argvs, i) {
+            first_exposed.get_or_insert(label);
         }
     }
     None
+}
+
+/// Substitution bodies whose value lands in the output of the segment whose
+/// (runner-peeled) words are `argv`: every body of a first word that is one
+/// whole substitution (the shell runs the value as a command and reports it
+/// when that fails), and the bodies in the argument words of an
+/// [`ARGUMENT_PRINTERS`] command. Redirect words and their targets,
+/// process-substitution words, and `printf -v` (which assigns, not prints)
+/// contribute nothing.
+fn printed_bodies(argv: &[String], command_position: bool) -> Vec<String> {
+    let Some(first) = argv.first() else {
+        return Vec::new();
+    };
+    if is_lone_substitution(first) {
+        return if command_position {
+            substitution_bodies(first)
+        } else {
+            Vec::new()
+        };
+    }
+    let word = command_word(first);
+    if !ARGUMENT_PRINTERS.contains(&word.as_ref()) {
+        return Vec::new();
+    }
+    let args = &argv[1..];
+    let assigns = word == "printf"
+        && args
+            .iter()
+            .take_while(|t| t.starts_with('-') && *t != "--")
+            .any(|t| t == "-v");
+    if assigns {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut target_next = false;
+    for token in args {
+        if std::mem::take(&mut target_next) {
+            continue;
+        }
+        if is_redirect_token(token) {
+            // `>` alone takes the next word as its target; `2>x` glues it.
+            target_next = token
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+                .trim_start_matches(['<', '>', '|', '&'])
+                .is_empty();
+            continue;
+        }
+        if token.contains("<(") || token.contains(">(") {
+            continue;
+        }
+        out.extend(substitution_bodies(token));
+    }
+    out
+}
+
+/// Does a word of `argv` that is not itself a redirect hold a `>`? The
+/// tokenizer keeps a redirect glued to the word before it
+/// (`op read x>token.txt`, `echo "$(…)">>.env`) inside that word, where
+/// [`stdout_to_file`] cannot read it. Such a segment is never judged printing
+/// and keeps its ask; a quoted `>` (`echo "a -> b"`) only does the same
+/// (security review round 2).
+fn glued_redirect(argv: &[String]) -> bool {
+    argv.iter().any(|token| {
+        if !is_redirect_token(token) {
+            return token.contains('>');
+        }
+        // `2>&1>/dev/null`: a second redirect after the first one's target.
+        token
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+            .trim_start_matches(['<', '>', '|', '&'])
+            .contains('>')
+    })
+}
+
+/// Does `script` hold a heredoc operator (`<<`, `<<-`), as opposed to a
+/// here-string (`<<<`)? Read from raw text, quotes included: a false yes only
+/// keeps an ask.
+fn has_heredoc(script: &str) -> bool {
+    let bytes = script.as_bytes();
+    bytes.windows(2).enumerate().any(|(i, w)| {
+        w == b"<<" && bytes.get(i + 2) != Some(&b'<') && (i == 0 || bytes[i - 1] != b'<')
+    })
+}
+
+/// Is `word` exactly one `$(…)` or backtick substitution?
+fn is_lone_substitution(word: &str) -> bool {
+    (word.starts_with("$(") && word.ends_with(')'))
+        || (word.len() > 1
+            && word.starts_with('`')
+            && word.ends_with('`')
+            && word.matches('`').count() == 2)
+}
+
+/// Does `segment` open or close a `{ … }` / `( … )` group? A brace group's
+/// braces are words of their own (`{ op read x; } > f`), so `{.data.k}` and
+/// `{a,b}` are not edges. A `)` counts only when the segment closes more
+/// parentheses than it opens, so a segment ending in its own `$(…)` is not
+/// one either. Erring toward "grouped" only keeps today's ask.
+fn is_group_edge(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    let opens_brace = trimmed == "{" || trimmed.starts_with("{ ") || trimmed.starts_with("{\t");
+    if opens_brace || trimmed.starts_with(['}', '(', ')']) {
+        return true;
+    }
+    trimmed.matches(')').count() > trimmed.matches('(').count()
 }
 
 /// Bodies of `<(…)` / `>(…)` process substitutions in `segment`, which core's
@@ -505,7 +761,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposed_dumps_ask() {
+    fn producers_are_found() {
         let cases: &[(&str, &str)] = &[
             (
                 "security find-generic-password -s svc -a me -w",
@@ -759,13 +1015,15 @@ mod tests {
             "security find-generic-password -s svc -w &>/dev/null",
             "op read --out-file /tmp/f op://v/i/f",
             "op read -o /tmp/f op://v/i/f",
+            "op read op://v/i/f > token.txt",
+            "op run -- gh api user",
+            "op run --env-file app.env -- npm test",
             "aws configure get region",
             "aws ssm get-parameter --name /x",
             "pass ls",
             "pass",
             "kubectl get secret s -o json | jq -r .data.p | base64 -d | sha256sum",
             "vault kv get secret/x",
-            "pass ls",
             // Output names its values: the redactor's job.
             "kubectl get secret app -o yaml",
             "kubectl get secret app -o json",
@@ -784,13 +1042,247 @@ mod tests {
         }
     }
 
+    /// Shapes whose value lands in the command's own output
+    /// (cameronsjo/cadence-hooks#1662): each one blocks.
     #[test]
-    fn check_asks_with_message() {
+    fn printed_values_block() {
+        let cases: &[(&str, &str)] = &[
+            ("op read op://vault/item/password", "op read"),
+            ("op read 'op://vault/item/password' >&2", "op read"),
+            ("op read op://v/i/f > /dev/stdout", "op read"),
+            ("op read op://v/i/f -o /dev/stdout", "op read"),
+            ("op read op://v/i/f 2>/dev/null", "op read"),
+            ("op read op://v/i/f &", "op read"),
+            (
+                "op item get db --fields password --reveal",
+                "op item get --reveal",
+            ),
+            (
+                "security find-generic-password -s svc -a me -w",
+                "security find-*-password -w",
+            ),
+            (
+                "sudo security find-generic-password -ws svc",
+                "security find-*-password -w",
+            ),
+            (
+                "echo start; security find-generic-password -s x -w && echo done",
+                "security find-*-password -w",
+            ),
+            ("echo x | shasum; op read op://v/i/f", "op read"),
+            ("cd /repo && op read op://v/i/f", "op read"),
+            (
+                "kubectl get secret app -o jsonpath='{.data.token}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl -n prod get secrets/app -ojsonpath={.data.k}",
+                "kubectl get secret -o jsonpath",
+            ),
+            ("vault kv get -field=password secret/x", "vault read -field"),
+            (
+                "aws secretsmanager get-secret-value --secret-id x --query SecretString --output text",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "gcloud auth print-access-token",
+                "gcloud auth print-access-token",
+            ),
+            ("pass show x", "pass show"),
+            ("pass db", "pass show"),
+            // A substitution an argument printer prints.
+            ("echo $(op read op://v/i/f)", "op read"),
+            ("echo \"$(op read op://v/i/f)\"", "op read"),
+            ("echo -n \"token: $(op read op://v/i/f)\"", "op read"),
+            ("printf \"%s\\n\" \"$(op read x)\"", "op read"),
+            ("printf '%s\\n' \"$(pass show x)\"", "pass show"),
+            ("eval 'pass show x'", "pass show"),
+            ("echo `pass show x`", "pass show"),
+            ("sudo echo \"$(op read op://v/i/f)\"", "op read"),
+            ("echo \"$(op read op://v/i/f)\" >&2", "op read"),
+            // A substitution in command position: the shell reports the value.
+            ("\"$(op read op://v/i/f)\"", "op read"),
+            ("$(pass show x)", "pass show"),
+            ("X=1 \"$(op read op://v/i/f)\"", "op read"),
+            // A here-string is not a heredoc: command position still reads.
+            ("\"$(op read op://v/i/f)\" <<< x", "op read"),
+            (
+                "echo \"$(op read op://v/i/f)\"; cat <<EOF\nhi\nEOF",
+                "op read",
+            ),
+            ("printf '%s\\n' -v \"$(op read op://v/i/f)\"", "op read"),
+            // A `-c`/`eval` script writes to the command's output.
+            ("sh -c 'pass show x'", "pass show"),
+            ("bash -c 'op read op://v/i/f'", "op read"),
+            ("eval 'vault kv get -field=p secret/x'", "vault read -field"),
+            ("bash -c 'echo \"$(op read op://v/i/f)\"'", "op read"),
+        ];
+        for (command, want) in cases {
+            assert_eq!(
+                judge(command),
+                Some(Finding {
+                    label: want,
+                    exposure: Exposure::Printed
+                }),
+                "{command}"
+            );
+        }
+    }
+
+    /// Shapes that hand the value to a consumer keep today's ask: the guard
+    /// cannot prove the consumer quiet, and must not newly block them.
+    #[test]
+    fn consumer_values_keep_their_ask() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "op read op://v/i/token | gh auth login --with-token",
+                "op read",
+            ),
+            (
+                "security find-generic-password -s svc -w | docker login -u me --password-stdin",
+                "security find-*-password -w",
+            ),
+            (
+                "security find-generic-password -s svc -w | pbcopy",
+                "security find-*-password -w",
+            ),
+            ("op read op://v/i/f | grep -i abc", "op read"),
+            // The stated limit: a consumer that itself prints keeps the ask.
+            ("op read op://v/i/f | cat", "op read"),
+            ("cat <<< \"$(op read op://v/i/f)\"", "op read"),
+            ("GH_TOKEN=\"$(op read op://v/i/t)\" gh api user", "op read"),
+            (
+                "kubectl get secret app -o jsonpath='{.data.token}' | base64 -d",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret s -o json | jq -r .data.p | base64 -d",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "X=$(security find-generic-password -s svc -w); echo $X",
+                "security find-*-password -w",
+            ),
+            ("export GH_TOKEN=\"$(op read op://v/i/t)\"", "op read"),
+            ("TOKEN=$(op read op://v/i/f) gh api user", "op read"),
+            ("env T=\"$(op read op://v/i/f)\" printenv T", "op read"),
+            (
+                "curl -H \"Authorization: Bearer $(op read op://v/i/f)\" https://x",
+                "op read",
+            ),
+            ("psql \"postgres://u:$(pass show db)@h/db\"", "pass show"),
+            ("ssh h \"echo $(op read op://v/i/f)\"", "op read"),
+            (
+                "docker login --password-stdin <<< \"$(op read op://v/i/f)\"",
+                "op read",
+            ),
+            (
+                "gh auth login --with-token < <(op read op://v/i/f)",
+                "op read",
+            ),
+            ("cat <(pass show x)", "pass show"),
+            (
+                "echo \"$(op read op://v/i/f)\" | docker login --password-stdin",
+                "op read",
+            ),
+            ("echo \"$(op read op://v/i/f)\" > token.txt", "op read"),
+            ("echo $(op read op://v/i/f | sha256sum)", "op read"),
+            ("{ op read op://v/i/f; } > token.txt", "op read"),
+            ("( op read op://v/i/f ) | pbcopy", "op read"),
+            ("bash -c 'op read op://v/i/f' | pbcopy", "op read"),
+            ("echo $(bash -c 'op read op://v/i/f') > f", "op read"),
+            // Code review round 1: a command word that only starts with `$`,
+            // `printf -v`, a redirect target and a process substitution.
+            (
+                "$HOME/bin/tool --token \"$(op read op://v/i/f)\"",
+                "op read",
+            ),
+            ("\"$TOOL\" login -p \"$(op read op://v/i/f)\"", "op read"),
+            (
+                "${KUBECTL:-kubectl} create secret generic s --from-literal=p=\"$(op read op://v/i/f)\"",
+                "op read",
+            ),
+            ("printf -v TOKEN '%s' \"$(op read op://v/i/f)\"", "op read"),
+            ("echo hi 2>\"$(op read op://v/i/f)\"", "op read"),
+            ("echo <(op read op://v/i/f)", "op read"),
+            // Security review round 1: a heredoc body feeds its command's
+            // stdin, a consumer, though the splitter re-appends its
+            // substitutions as segments of their own.
+            (
+                "docker login -u me --password-stdin <<EOF\n$(op read op://v/i/f)\nEOF",
+                "op read",
+            ),
+            (
+                "cat <<EOF | docker login --password-stdin\n$(op read op://v/i/f)\nEOF",
+                "op read",
+            ),
+            (
+                "kubectl apply -f - <<EOF\nkind: Secret\n  pw: $(op read op://v/i/f)\nEOF",
+                "op read",
+            ),
+            (
+                "cat > config.yml <<EOF\npw: $(op read op://v/i/f)\nEOF",
+                "op read",
+            ),
+            (
+                "tee config.yml >/dev/null <<EOF\npw: $(op read op://v/i/f)\nEOF",
+                "op read",
+            ),
+            (
+                "psql <<-EOF\nALTER ROLE u PASSWORD '$(pass show db)';\nEOF",
+                "pass show",
+            ),
+            (
+                "gh secret set K <<EOF\n$(op read op://v/i/f)\nEOF",
+                "op read",
+            ),
+            // A consumer that prints keeps the ask too (the stated limit).
+            ("cat <<EOF\n$(op read op://v/i/f)\nEOF", "op read"),
+            // Security review round 2: a redirect glued to the word before it.
+            ("echo \"T=$(op read op://v/i/f)\">>.env", "op read"),
+            ("echo $(op read op://v/i/f)>f", "op read"),
+            ("printf '%s' \"$(op read op://v/i/f)\">.env", "op read"),
+            ("op read op://v/i/f>/dev/null", "op read"),
+            ("op read 'op://v/i/f'>token.txt", "op read"),
+            ("op read op://v/i/f 2>&1>/dev/null", "op read"),
+            // A consumer that prints keeps the ask (the stated limit).
+            ("op read op://v/i/f | tee .env", "op read"),
+        ];
+        for (command, want) in cases {
+            assert_eq!(
+                judge(command),
+                Some(Finding {
+                    label: want,
+                    exposure: Exposure::Exposed
+                }),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_blocks_a_printed_value_and_asks_for_a_consumer() {
         let input = HookInput::from_json(
             r#"{"tool_name":"Bash","tool_input":{"command":"op read op://v/i/f"}}"#,
         )
         .unwrap();
         let result = SecretDumpGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        let message = result.message.unwrap();
+        assert!(message.contains("`op read`"), "{message}");
+        assert!(message.contains("pbcopy"), "{message}");
+        assert!(message.contains("--password-stdin"), "{message}");
+        assert!(message.contains("op run --"), "{message}");
+        assert!(
+            !message.contains("op://v/i/f"),
+            "never echoes command text: {message}"
+        );
+
+        let consumer = HookInput::from_json(
+            r#"{"tool_name":"Bash","tool_input":{"command":"op read op://v/i/f | pbcopy"}}"#,
+        )
+        .unwrap();
+        let result = SecretDumpGuard.run(&consumer);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Ask);
         assert!(result.message.unwrap().contains("op read"));
 
