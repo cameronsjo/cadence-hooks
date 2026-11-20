@@ -54,3 +54,13 @@ The PR's review moved these decisions into `openspec/specs/secret-reads/spec.md`
 - `op inject` with no output file, and a producer behind the `perl -e 'alarm N; exec @ARGV'` runner, block when printed and otherwise keep main's verdict.
 - A closed stdout and a stdout sent after a stderr already in a file keep the ask; zsh `print` is an argument printer.
 - The comparison fails on any everyday move without an `A` line, and gains an `L` class for stated limits.
+
+## Review round 2 (cameronsjo/cadence-hooks#1663)
+
+Also recorded in the main spec directly:
+
+- One rule for structured output: a form blocks when its value reaches the output, and keeps main's verdict only where a test proves the redactor masks it. `CLOUD_READS` is the per-subcommand table of value fields and proven-masked formats; a `--query` or `jq` path for another field and `-o none` keep main's verdict.
+- A help or version call on any producer is never printed.
+- kubectl selectors block only when they reach the data, the annotations, the whole metadata or a whole object.
+- `kubectl get secret -o json|yaml` printed blocks (plain `-o yaml` moves from allow to block on purpose), unless a safe filter shows only key names or metadata leaves. Whole `.metadata`, `.metadata.annotations` and `del(.data)` are not safe: the `last-applied-configuration` annotation can hold the data.
+- Output-format variables (`AWS_DEFAULT_OUTPUT`, `AZURE_CORE_OUTPUT`) are read like the flag, and `head`/`tail -c` no longer keep key names.

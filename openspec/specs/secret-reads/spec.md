@@ -396,17 +396,32 @@ On PreToolUse for Bash, `guard-op-vault-scan` SHALL block when a segment's comma
 - **WHEN** a Bash command runs `op inject -i config.tpl` with no `-o`/`--out-file` file, or a producer behind the perl timeout runner
 - **THEN** the hook blocks when the value is printed, and otherwise keeps the verdict it had before the runner was read (`op inject -i config.tpl | kubectl apply -f -` allows)
 
-#### Scenario: Default JSON the redactor masks
-- **WHEN** a Bash command runs `az account get-access-token` or `aws secretsmanager get-secret-value --secret-id x` with no `--query` and JSON output, alone or piped only into `cat`, `tee`, `head`, `tail` or `jq .`
-- **THEN** the hook returns ask, because `redact-secret-output` masks `accessToken` and `SecretString`; piped into a filter such as `jq -r .SecretString` the name is gone and it blocks, and `aws ssm get-parameter --with-decryption`, `az keyvault secret show` and `op item get --reveal` print a value field the redactor does not mask, and block
+#### Scenario: Help and version
+- **WHEN** a Bash command runs any producer with `-h`, `-help`, `--help`, `help`, `version`, or a `--version` with no value after it (`op read --help`, `az keyvault secret show -h`, `pass show --help`)
+- **THEN** the hook keeps main's verdict, since usage or a version is printed, not a value; `az keyvault secret show … --version abc` selects a secret version and is judged as a read
 
-#### Scenario: Structured Secret output
-- **WHEN** a Bash command runs `kubectl get secret s -o json | jq …` or `-o yaml | yq …`
-- **THEN** it blocks only when the filter walks under `.data` or `.stringData` (`jq -r '.data.token' | base64 -d`), and otherwise (`jq .`, `jq '.items[].metadata.name'`) returns ask, since the names beside the values remain
+### Requirement: Structured output blocks unless the redactor is proven to mask it
+`guard-secret-dump` SHALL block a structured form whose value reaches the output, and keep main's verdict only where a test proves `redact-secret-output` masks the value. For az and aws reads a table of value fields per subcommand decides: a `--query` naming a value field (or `@`, or the whole parent) prints it, any other `--query` and `-o none` keep main's verdict. A `kubectl get secret -o json|yaml` blocks when printed, unless a safe filter shows only names or metadata.
 
-#### Scenario: Help text
-- **WHEN** a Bash command runs `op read --help` or `op inject --help`
-- **THEN** the hook keeps main's verdict (ask and allow), since usage text is printed, not a value
+#### Scenario: Formats the redactor masks
+- **WHEN** a Bash command runs `az account get-access-token` in json, jsonc or yaml, or `aws secretsmanager get-secret-value --secret-id x` in json, yaml or yaml-stream, with no value `--query`, alone or piped only into `cat`, `tee`, `head`/`tail` without `-c`, or `jq .`
+- **THEN** the hook returns ask; text, table and tsv output, an `AWS_DEFAULT_OUTPUT`/`AZURE_CORE_OUTPUT` prefix selecting one, `| jq -r .SecretString`, and `aws ssm get-parameter --with-decryption`, `az keyvault secret show` and `op item get --reveal` block
+
+#### Scenario: A query for another field
+- **WHEN** a Bash command runs `az keyvault secret show … --query id -o tsv`, `aws secretsmanager get-secret-value … --query VersionId`, `aws ssm get-parameter … --query Parameter.Version`, or `az account get-access-token -o none`
+- **THEN** the hook keeps main's verdict, while `--query value`, `--query SecretString` and `--query Parameter` block
+
+#### Scenario: A kubectl selector
+- **WHEN** a Bash command runs `kubectl get secret` with a jsonpath, template or custom-columns selector
+- **THEN** it blocks when the selector names `data` or `stringData` as a word, the annotations or the whole metadata, uses recursive descent, or prints a whole object (`{.data}`, `{@}`, `{..password}`, `{.items[0]}`, `range $k, $v := .data`), and keeps main's verdict when it names only metadata leaves, `type` or `kind` (`{.items[*].metadata.name}`, `NAME:.metadata.name,TYPE:.type`)
+
+#### Scenario: A Secret's json or yaml
+- **WHEN** a Bash command runs `kubectl get secret app -o yaml`, `-o json | jq .`, `| jq '.metadata'`, `| jq 'del(.data)'`, `| jq -r '.metadata.name + "=\(.data.token)"'` or `| yq '.data'`
+- **THEN** the hook blocks, since the redactor leaves ordinary key names unmasked, base64 is not masking, and the `last-applied-configuration` annotation can hold the data
+
+#### Scenario: A safe filter on a Secret
+- **WHEN** a Bash command pipes a Secret's json into `jq -r '.data | keys[]'`, `'.data | keys | join(",")'`, `'.data | to_entries[] | .key'`, `'.items[] | "\(.metadata.namespace)/\(.metadata.name)"'`, `'.items[0].metadata.name'` or `'del(.data, .metadata.annotations)'`
+- **THEN** the hook keeps main's verdict, as do `kubectl describe secret`, a pipe into a consumer and a redirect to a file
 
 #### Scenario: 1Password and Keychain rows
 - **WHEN** a Bash command runs `op read <ref>` (unless `-o`/`--out-file` names a real file), `op item get <item> --reveal`, or `security find-generic-password` / `find-internet-password` with a short-flag cluster holding `w`

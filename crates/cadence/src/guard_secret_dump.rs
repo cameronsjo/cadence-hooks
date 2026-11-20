@@ -81,8 +81,11 @@
 //! - `echo $(op read … | sha256sum)` asks: core's top-level splitter cuts the
 //!   substitution at its inner pipe, so the hash cannot be proven to contain
 //!   the value;
-//! - `kubectl get secret -o yaml|json`: the output carries key names, which
-//!   `redact-secret-output` masks;
+//! - `kubectl get secret -o yaml|json` that feeds a consumer or a file. It
+//!   keeps main's ask behind a names-only filter ([`names_only_filter`]);
+//!   printed, it blocks, because the redactor leaves ordinary key names
+//!   (`config.json`, `DATABASE_URL`) unmasked and base64 is not masking
+//!   (review round 2);
 //! - `sops -d`: owned by `guard-sops-decrypt` (a hard block);
 //! - `op read --out-file|-o <f>`: the value goes to a file.
 //!
@@ -143,6 +146,13 @@ pub struct Finding {
 }
 
 fn block_message(producer: &str) -> String {
+    let kubectl = if producer.starts_with("kubectl") {
+        "\nFor a Secret: list its keys (`kubectl get secret <name> -o json | jq '.data | keys'`, \
+         which still prompts), describe it (`kubectl describe secret <name>` shows sizes, not \
+         values), or pipe the one field into its consumer."
+    } else {
+        ""
+    };
     format!(
         "BLOCKED: guard-secret-dump\n\
          Found: `{producer}` would print a bare secret value into this conversation, and a \
@@ -152,14 +162,14 @@ fn block_message(producer: &str) -> String {
          pass it by reference so the consumer resolves it (`op run -- <cmd>`, \
          `TOKEN=\"$(op read …)\" <cmd>`). The clipboard, a pipe into a login and an inline \
          variable still raise a permission prompt; the tool's own run form (`op run -- <cmd>`) \
-         does not. To check a value without seeing it, end the pipeline with `shasum`."
+         does not. To check a value without seeing it, end the pipeline with `shasum`.{kubectl}"
     )
 }
 
 fn ask_message(producer: &str) -> String {
     format!(
-        "🔑 guard-secret-dump: `{producer}` prints a bare secret value, and nothing in this \
-         command keeps it out of the transcript.\n   \
+        "🔑 guard-secret-dump: `{producer}` reads a bare secret value and hands it to a \
+         program the guard cannot prove keeps it quiet.\n   \
          A value with no name beside it cannot be masked after the fact.\n   \
          To check it without printing it: end the pipeline with `shasum`, or \
          redirect it to a file.\n   \
@@ -461,22 +471,37 @@ fn is_path_filter(filter: &str) -> bool {
 
 /// A producer form whose value never reaches the context through its own
 /// output, so it keeps main's verdict and never blocks:
+/// - a help or version call on any producer ([`help_or_version`]);
 /// - a clipboard flag on `pass`, `gopass` or `lpass` (the value goes to the
 ///   clipboard);
-/// - a default-JSON form whose value field `redact-secret-output` masks, each
-///   proven by a test here (`default_json_values_the_redactor_masks`):
-///   `az account get-access-token` (`accessToken`) and
-///   `aws secretsmanager get-secret-value` (`SecretString`), with no
-///   `--query` and JSON output, and only while every later stage keeps the
-///   key names (`keeps_names`): `… | jq -r .SecretString` strips the name the
-///   redactor masks by and prints the bare value. The guard reads only the
-///   command, so a CLI configured for another default output format is
-///   outside it.
-fn never_printed(argv: &[String], keeps_names: bool) -> bool {
+/// - a cloud CLI read whose output hides the value ([`cloud_value_hidden`]);
+/// - a kubectl selector that does not reach a Secret's data
+///   ([`selector_reaches_data`]).
+///
+/// `keeps_names` says every later stage keeps the key names, and
+/// `env_format` is an output-format variable set before the command
+/// (`AWS_DEFAULT_OUTPUT=text`, `AZURE_CORE_OUTPUT=tsv`).
+fn never_printed(
+    argv: &[String],
+    keeps_names: bool,
+    env_format: Option<&str>,
+    later_filters: &[String],
+) -> bool {
     let Some(first) = argv.first() else {
         return false;
     };
     let rest = &argv[1..];
+    if help_or_version(rest) {
+        return true;
+    }
+    if command_word(first) == "op"
+        && rest.windows(2).any(|w| w[0] == "item" && w[1] == "get")
+        && filters_pick_other_fields(&["value"], later_filters)
+    {
+        // `op item get … --format json | jq -r .title`: the filter keeps a
+        // field that is not a value (code review of round 2).
+        return true;
+    }
     let word = command_word(first);
     let clip = |t: &String| {
         t == "--clip"
@@ -487,68 +512,612 @@ fn never_printed(argv: &[String], keeps_names: bool) -> bool {
                 && t[1..].contains('c')
                 && t[1..].chars().all(|c| c.is_ascii_alphanumeric()))
     };
-    let json_default = |format_flags: &[&str]| {
-        keeps_names
-            && !rest
-                .iter()
-                .any(|t| t == "--query" || t.starts_with("--query="))
-            && rest.iter().enumerate().all(|(i, t)| {
-                let value = if format_flags.contains(&t.as_str()) {
-                    rest.get(i + 1).map(String::as_str)
-                } else if let Some(v) = t.strip_prefix("--output=") {
-                    Some(v)
-                } else if format_flags.contains(&"-o") && t.starts_with("-o") && t.len() > 2 {
-                    // A glued `-otsv`.
-                    Some(t[2..].trim_start_matches('='))
-                } else {
-                    None
-                };
-                value.is_none_or(|v| v == "json")
-            })
-    };
     match word.as_ref() {
         "pass" | "gopass" | "lpass" => rest.iter().any(clip),
-        // `op … --help` prints usage, not a value: main's verdict stays.
-        "op" => rest.iter().any(|t| t == "-h" || t == "--help"),
-        "az" => {
-            rest.windows(2)
-                .any(|w| w[0] == "account" && w[1] == "get-access-token")
-                && json_default(&["-o", "--output"])
-        }
-        "aws" => {
-            rest.iter().any(|t| t == "secretsmanager")
-                && rest.iter().any(|t| t == "get-secret-value")
-                && json_default(&["--output"])
-        }
+        "az" | "aws" => cloud_value_hidden(&word, rest, keeps_names, env_format, later_filters),
+        "kubectl" => bare_output_format(rest) && !selector_reaches_data(rest),
         _ => false,
     }
 }
 
-/// Does a later `jq`/`yq` stage of segment `start`'s pipeline walk under a
-/// Secret's `.data` or `.stringData` (`.data.token`, `.items[].data["k"]`)?
-fn selects_secret_data(
+/// `-h`, `-help`, `--help`, `--version`, a `help` as the last word
+/// (`aws … get-secret-value help`) or a `version` as the first (`bw
+/// version`): the call prints usage or a version, not a value. One rule for
+/// every producer (review round 2). A bare word elsewhere can be an item
+/// name (`pass show version`) and is not read as help.
+fn help_or_version(rest: &[String]) -> bool {
+    let last = rest.len().saturating_sub(1);
+    rest.iter().enumerate().any(|(i, t)| match t.as_str() {
+        "-h" | "-help" | "--help" => true,
+        "help" => i == last,
+        "version" => i == 0,
+        // `az keyvault secret show --version <id>` selects a version: only a
+        // `--version` with no value after it asks for the tool's version.
+        "--version" => rest.get(i + 1).is_none_or(|next| next.starts_with('-')),
+        _ => false,
+    })
+}
+
+/// One cloud CLI read that prints a secret value: the fields of its response
+/// that hold the value, and the output formats in which
+/// `redact-secret-output` masks that value (each proven by a test here,
+/// `structured_values_the_redactor_masks`). A format outside the list prints
+/// the value unmasked.
+struct CloudRead {
+    tool: &'static str,
+    words: &'static [&'static str],
+    value_fields: &'static [&'static str],
+    /// Objects that hold a value field, selected whole by a query that is
+    /// exactly one of them (`--query Parameter`).
+    parents: &'static [&'static str],
+    masked_formats: &'static [&'static str],
+}
+
+/// The value-field table, one row per executable and subcommand (review
+/// round 2). A `--query` that names none of the row's fields selects
+/// something else (an id, a version, an expiry) and keeps main's verdict.
+const CLOUD_READS: &[CloudRead] = &[
+    CloudRead {
+        tool: "aws",
+        words: &["secretsmanager", "get-secret-value"],
+        value_fields: &["SecretString", "SecretBinary"],
+        parents: &[],
+        masked_formats: &["json", "yaml", "yaml-stream"],
+    },
+    CloudRead {
+        tool: "aws",
+        words: &["ssm", "get-parameter"],
+        value_fields: &["Value"],
+        parents: &["Parameter"],
+        masked_formats: &[],
+    },
+    CloudRead {
+        tool: "aws",
+        words: &["ssm", "get-parameters"],
+        value_fields: &["Value"],
+        parents: &["Parameters", "Parameters[]", "Parameters[*]"],
+        masked_formats: &[],
+    },
+    CloudRead {
+        tool: "aws",
+        words: &["ssm", "get-parameters-by-path"],
+        value_fields: &["Value"],
+        parents: &["Parameters", "Parameters[]", "Parameters[*]"],
+        masked_formats: &[],
+    },
+    CloudRead {
+        tool: "az",
+        words: &["account", "get-access-token"],
+        value_fields: &["accessToken"],
+        parents: &[],
+        masked_formats: &["json", "jsonc", "yaml"],
+    },
+    CloudRead {
+        tool: "az",
+        words: &["keyvault", "secret", "show"],
+        value_fields: &["value"],
+        parents: &[],
+        masked_formats: &[],
+    },
+];
+
+/// Does this az/aws read keep its value out of the output? `-o none` prints
+/// nothing. A `--query` hides the value unless it names a value field or
+/// projects the whole response (`@`). With no query, the value is hidden only
+/// in a masked format and while later stages keep the key names
+/// (`… | jq -r .SecretString` strips the name the redactor masks by). The
+/// format comes from `-o`/`--output` (glued or not), else the environment
+/// prefix, else the CLI default, `json`; a CLI configured for another default
+/// is outside what the command shows.
+fn cloud_value_hidden(
+    tool: &str,
+    rest: &[String],
+    keeps_names: bool,
+    env_format: Option<&str>,
+    later_filters: &[String],
+) -> bool {
+    let Some(read) = CLOUD_READS
+        .iter()
+        .find(|r| r.tool == tool && r.words.iter().all(|w| rest.iter().any(|t| t == w)))
+    else {
+        return false;
+    };
+    // `… | jq -r .ARN` keeps a field that is not the value, as
+    // `--query ARN` does (code review of round 2).
+    let whole_parent = |path: &str| selects_parent_whole(path, read.parents);
+    if filters_pick_other_fields(read.value_fields, later_filters)
+        && !later_filters
+            .iter()
+            .any(|f| whole_parent(f.trim().trim_start_matches('.')))
+    {
+        return true;
+    }
+    let format_flags: &[&str] = if tool == "az" {
+        &["-o", "--output"]
+    } else {
+        &["--output"]
+    };
+    let flag_format = rest.iter().enumerate().find_map(|(i, t)| {
+        if format_flags.contains(&t.as_str()) {
+            rest.get(i + 1).map(String::as_str)
+        } else if let Some(v) = t.strip_prefix("--output=") {
+            Some(v)
+        } else if tool == "az" && t.starts_with("-o") && t.len() > 2 {
+            // A glued `-otsv`.
+            Some(t[2..].trim_start_matches('='))
+        } else {
+            None
+        }
+    });
+    let format = flag_format.or(env_format).unwrap_or("json");
+    if format == "none" {
+        return true;
+    }
+    let query = rest.iter().enumerate().find_map(|(i, t)| {
+        if t == "--query" {
+            rest.get(i + 1).map(String::as_str)
+        } else {
+            t.strip_prefix("--query=")
+        }
+    });
+    match query {
+        Some(q) => {
+            let names_value = q
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|word| read.value_fields.contains(&word));
+            let bare = q.trim().trim_matches(['\'', '"']).trim();
+            let whole = matches!(bare, "@" | "*") || whole_parent(bare);
+            !names_value && !whole
+        }
+        None => keeps_names && read.masked_formats.contains(&format),
+    }
+}
+
+/// Does `path` (a `--query` or a jq path without its leading `.`) select one
+/// of `parents` whole, optionally indexed or filtered (`Parameter`,
+/// `Parameters[0]`, `Parameters[?Name=='x']`), so it prints the value inside?
+/// `Parameter.Version` walks on to another field and does not (code review
+/// of round 2).
+fn selects_parent_whole(path: &str, parents: &[&str]) -> bool {
+    let path = path.trim().trim_matches(['\'', '"']).trim();
+    parents.iter().any(|parent| {
+        let name = parent.trim_end_matches("[*]").trim_end_matches("[]");
+        let Some(rest) = path.strip_prefix(name) else {
+            return false;
+        };
+        // `Parameter.*` projects every field of the parent.
+        let rest = rest.strip_suffix(".*").unwrap_or(rest);
+        // Only bracket groups may follow the parent's name.
+        let mut depth = 0i32;
+        rest.chars().all(|c| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ if depth > 0 => {}
+                _ => return false,
+            }
+            true
+        }) && depth == 0
+    })
+}
+
+/// Does a later `jq`/`yq` filter keep only fields that are not the value? It
+/// is not `.`, names none of `value_fields` and none of their parents (a
+/// word match), so `jq -r .ARN` and `jq -r .title` pick something else while
+/// `jq -r .SecretString` and `jq .` do not. With no later filter, no.
+fn filters_pick_other_fields(value_fields: &[&str], later_filters: &[String]) -> bool {
+    !later_filters.is_empty()
+        && later_filters.iter().any(|filter| {
+            let f = filter.trim();
+            f != "."
+                && is_path_filter(f)
+                && !f
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|word| value_fields.contains(&word))
+        })
+}
+
+/// The filters of the `jq`/`yq` stages after segment `start` in its pipeline.
+fn later_filters(
+    segments: &[(String, Option<&'static str>)],
+    argvs: &[Vec<String>],
+    start: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = start;
+    while segments[i].1 == Some("|") && i + 1 < argvs.len() {
+        i += 1;
+        if let Some(filter) = jq_filter(&argvs[i]) {
+            out.push(filter.to_string());
+        }
+    }
+    out
+}
+
+/// Does a kubectl jsonpath, template or custom-columns selector reach a
+/// Secret's data: name `data`/`stringData` (`.data`, `index .data`,
+/// `range $k, $v := .data`), or print a whole object (`{@}`, `{.}`,
+/// `{.items[*]}`, `{{.}}`, `{{json .}}`)? A selector that names only
+/// metadata, `type` or `kind`, or one the guard cannot read, does not, and
+/// keeps main's verdict (review round 2).
+fn selector_reaches_data(rest: &[String]) -> bool {
+    let mut expression = String::new();
+    if let Some(format) = output_format(rest) {
+        expression.push_str(format);
+    }
+    for (i, t) in rest.iter().enumerate() {
+        if t == "--template" {
+            expression.push_str(rest.get(i + 1).map_or("", String::as_str));
+        } else if let Some(v) = t.strip_prefix("--template=") {
+            expression.push_str(v);
+        }
+    }
+    // `data` as its own word (`.data`, `index .data`, `["data"]`) or
+    // `stringData`; `metadata` holds the letters but is not a data field.
+    let names_data = expression.match_indices("data").any(|(at, _)| {
+        let before = expression[..at].chars().next_back();
+        let after = expression[at + "data".len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_alphabetic())
+            && after.is_none_or(|c| !c.is_ascii_alphabetic())
+    }) || expression.contains("stringData");
+    // `last-applied-configuration` keeps the applied manifest, data
+    // included, so the annotations or the whole metadata reach it too
+    // (security review of round 2).
+    let squeezed_meta: String = expression.chars().filter(|c| !c.is_whitespace()).collect();
+    let names_annotations = expression.contains("annotations")
+        || squeezed_meta.contains(".metadata}")
+        || squeezed_meta.contains(".metadata,")
+        || squeezed_meta.ends_with(".metadata");
+    if names_data || names_annotations {
+        return true;
+    }
+    let squeezed: String = expression.chars().filter(|c| !c.is_whitespace()).collect();
+    // Recursive descent (`{..password}`) can reach any field, and an indexed
+    // item (`{.items[0]}`) is a whole Secret (code review of round 2).
+    if squeezed.contains("..") {
+        return true;
+    }
+    if let Some(at) = squeezed.rfind(".items[") {
+        let tail = &squeezed[at + ".items[".len()..];
+        if tail.split_once(']').is_some_and(|(_, after)| after == "}") {
+            return true;
+        }
+    }
+    ["{@}", "{.}", "{$}", "{{.}}", "{{json.}}", "{{toJson.}}"]
+        .iter()
+        .any(|whole| squeezed.contains(whole))
+        || squeezed.ends_with(".items[*]}")
+        || squeezed.ends_with(".items}")
+        || squeezed.ends_with("=@")
+}
+
+/// `kubectl get secret(s) … -o json|yaml`: the whole Secret, data included,
+/// which `redact-secret-output` does not mask for ordinary key names
+/// (`config.json`, `DATABASE_URL`; a test here shows it). It prints only
+/// when printed, so a consumer shape behind it keeps main's verdict.
+fn structured_secret(argv: &[String]) -> bool {
+    argv.first().is_some_and(|w| command_word(w) == "kubectl")
+        && argv[1..].iter().any(|t| t == "get")
+        && argv[1..].iter().any(|t| names_secret_resource(t))
+        && output_format(&argv[1..]).is_some_and(|f| f == "json" || f == "yaml")
+        && !help_or_version(&argv[1..])
+}
+
+/// Does the pipeline from a structured Secret at segment `start` print it?
+/// Every later stage passes it through or is a `jq`/`yq` filter, each able to
+/// reach the terminal, and no filter is a names-only one
+/// ([`names_only_filter`]); anything else on a Secret's json or yaml is
+/// treated as reaching its data (review round 2).
+fn structured_secret_prints(
     segments: &[(String, Option<&'static str>)],
     argvs: &[Vec<String>],
     start: usize,
 ) -> bool {
+    if !stage_can_print(&argvs[start]) {
+        return false;
+    }
     let mut i = start;
-    while segments[i].1 == Some("|") && i + 1 < argvs.len() {
+    while segments[i].1 == Some("|") {
         i += 1;
-        let argv = &argvs[i];
-        let filter_stage = argv
-            .first()
-            .is_some_and(|w| matches!(command_word(w).as_ref(), "jq" | "gojq" | "jaq" | "yq"));
-        if filter_stage
-            && argv[1..].iter().any(|t| {
-                ["data", "stringData"]
-                    .iter()
-                    .any(|key| t.contains(&format!(".{key}.")) || t.contains(&format!(".{key}[")))
-            })
+        let Some(argv) = argvs.get(i) else {
+            return false;
+        };
+        if !stage_can_print(argv) {
+            return false;
+        }
+        if let Some(filter) = jq_filter(argv) {
+            if names_only_filter(filter) {
+                return false;
+            }
+        } else if !is_pass_through(argv) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The filter of a `jq`-family or `yq` stage, or `None` for another command.
+/// No filter operand means `.`.
+fn jq_filter(argv: &[String]) -> Option<&str> {
+    let word = command_word(argv.first()?);
+    if !matches!(word.as_ref(), "jq" | "gojq" | "jaq" | "yq") {
+        return None;
+    }
+    let mut rest = &argv[1..];
+    if word == "yq" && rest.first().is_some_and(|t| t == "e" || t == "eval") {
+        rest = &rest[1..];
+    }
+    // Skip the row's options that take a value (`--arg k v`, `yq -o json`,
+    // `--indent 2`), so an option's value is not read as the filter
+    // (code review of round 2).
+    let valued = PASS_THROUGH
+        .iter()
+        .find(|r| r.name == word.as_ref())
+        .map_or(&[][..], |r| r.valued);
+    let mut i = 0;
+    while i < rest.len() {
+        let t = rest[i].as_str();
+        if !t.starts_with('-') || t == "-" {
+            return Some(t);
+        }
+        // `--arg`, `--argjson`, `--slurpfile` and `--rawfile` take two.
+        let two = matches!(t, "--arg" | "--argjson" | "--slurpfile" | "--rawfile");
+        i += if two {
+            3
+        } else if valued.contains(&t) {
+            2
+        } else {
+            1
+        };
+    }
+    Some(".")
+}
+
+/// Metadata leaves a names-only filter may read. Whole `.metadata` and
+/// `.metadata.annotations` are not among them: client-side `kubectl apply`
+/// stores the full manifest, data included, in the
+/// `last-applied-configuration` annotation (security review of round 2).
+const SAFE_LEAVES: &[&str] = &[
+    "metadata.name",
+    "metadata.namespace",
+    "metadata.labels",
+    "metadata.uid",
+    "metadata.creationTimestamp",
+    "metadata.resourceVersion",
+    "metadata.ownerReferences",
+    "metadata.generation",
+    "type",
+    "kind",
+    "apiVersion",
+    // `to_entries[] | .key`: a key name, not its value.
+    "key",
+];
+
+/// Steps that only reshape what earlier steps produced.
+const FORMATTING_STEPS: &[&str] = &[
+    ".[]", "@tsv", "@csv", "@sh", "@text", "sort", "unique", "reverse", "length",
+];
+
+/// The safe-filter allowlist for a Secret's json or yaml: filters that print
+/// only names or metadata (review round 2). String literals are set aside,
+/// but the code inside a `\(…)` interpolation is read like any other. The
+/// filter is names-only when either:
+/// - one top-level step is `keys`, `keys[]`, `keys_unsorted`,
+///   `keys_unsorted[]` or `length`, and every later step only formats
+///   ([`FORMATTING_STEPS`], `join(…)`);
+/// - or every path in every step is an item iteration (`.items[]`,
+///   `.items[0]`) or walks a [`SAFE_LEAVES`] entry, at least one does, and
+///   every step without a path only formats;
+/// - or it deletes the data and the annotations both
+///   (`del(.data, .metadata.annotations)`).
+fn names_only_filter(filter: &str) -> bool {
+    let code = filter_code(filter);
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(inner) = compact
+        .strip_prefix("del(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let deleted: Vec<&str> = inner.split(',').collect();
+        let gone = |p: &str| deleted.contains(&p);
+        return gone(".data") && gone(".metadata.annotations");
+    }
+    let steps: Vec<String> = top_level_steps(&code)
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    let formats =
+        |s: &str| FORMATTING_STEPS.contains(&s) || (s.starts_with("join(") && s.ends_with(')'));
+    let keys_like = |s: &str| {
+        matches!(
+            s,
+            "keys" | "keys[]" | "keys_unsorted" | "keys_unsorted[]" | "length"
+        )
+    };
+    if let Some(at) = steps.iter().position(|s| keys_like(s))
+        && steps[at + 1..].iter().all(|s| formats(s))
+    {
+        return true;
+    }
+    // `.data | to_entries[] | .key`: only the key names come out.
+    if let Some(at) = steps
+        .iter()
+        .position(|s| s == "to_entries[]" || s == "to_entries")
+    {
+        let tail = &steps[at + 1..];
+        if tail.first().is_some_and(|s| s == ".key" || s == ".[].key")
+            && tail[1..].iter().all(|s| formats(s))
         {
             return true;
         }
     }
-    false
+    let mut any_leaf = false;
+    for step in &steps {
+        let paths = path_references(step);
+        if paths.is_empty() {
+            if !formats(step) {
+                return false;
+            }
+            continue;
+        }
+        for path in paths {
+            match item_relative(&path) {
+                None => {}
+                Some(rest) if rest.is_empty() => {}
+                Some(rest) => {
+                    let safe = SAFE_LEAVES.iter().any(|leaf| {
+                        rest == *leaf
+                            || rest.starts_with(&format!("{leaf}."))
+                            || rest.starts_with(&format!("{leaf}["))
+                    });
+                    if !safe {
+                        return false;
+                    }
+                    any_leaf = true;
+                }
+            }
+        }
+    }
+    any_leaf
+}
+
+/// `path` relative to one item: `.items[]`, `.items[*]`, `.items[N]` or
+/// `.items` stripped, then the leading `.`. `Some("")` for a bare item
+/// iteration (`.items[]`, `.`), `None` for an index on its own (`.[]`).
+fn item_relative(path: &str) -> Option<String> {
+    let mut rest = path;
+    if let Some(after) = rest.strip_prefix(".items") {
+        rest = after;
+        if let Some(index) = rest.strip_prefix('[') {
+            rest = index.split_once(']').map_or("", |(_, after)| after);
+        }
+    }
+    if rest == ".[]" {
+        return None;
+    }
+    Some(rest.trim_start_matches('.').to_string())
+}
+
+/// The code of a jq/yq filter: string literal text dropped, the code inside
+/// each `\(…)` interpolation kept (set off by blanks), so `"\(.data.token)"`
+/// is read as `.data.token` and a `|` inside a literal is not a step.
+fn filter_code(filter: &str) -> String {
+    let chars: Vec<char> = filter.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_string {
+            if c == '"' {
+                in_string = true;
+                out.push_str("\"\"");
+            } else {
+                out.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\\' if chars.get(i + 1) == Some(&'(') => {
+                // An interpolation: copy its code up to the matching `)`.
+                let mut depth = 1;
+                let mut j = i + 2;
+                out.push(' ');
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        out.push(chars[j]);
+                    }
+                    j += 1;
+                }
+                out.push(' ');
+                i = j;
+            }
+            '\\' => i += 2,
+            '"' => {
+                in_string = false;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The `|`-separated steps of a filter at parenthesis depth zero.
+fn top_level_steps(filter: &str) -> Vec<&str> {
+    let mut steps = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in filter.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '|' if depth == 0 => {
+                steps.push(&filter[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    steps.push(&filter[start..]);
+    steps
+}
+
+/// The path references in one filter step: each run that starts with a `.`
+/// not glued to a word, through letters, digits, `_`, `-`, `.`, `[`, `]`,
+/// `*`, `?` and quotes.
+fn path_references(step: &str) -> Vec<String> {
+    let chars: Vec<char> = step.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let glued = i > 0
+            && (chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], ']' | ')' | '_'));
+        if chars[i] == '.' && !glued {
+            let start = i;
+            // A `]` the path did not open closes an enclosing array literal
+            // (`[.metadata.namespace, .metadata.name]`), not the path.
+            let mut open = 0i32;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || "._-[]*?\"'".contains(chars[i]))
+            {
+                match chars[i] {
+                    '[' => open += 1,
+                    ']' if open == 0 => break,
+                    ']' => open -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            out.push(chars[start..i].iter().collect());
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The label of a printed `kubectl get secret -o json|yaml`.
+const STRUCTURED_SECRET: &str = "kubectl get secret -o json|yaml";
+
+/// The value of the output-format variable `tool` reads, set before the
+/// command in `segment` (`AWS_DEFAULT_OUTPUT=text aws …`, `env
+/// AZURE_CORE_OUTPUT=tsv az …`), which the CLI reads like its `--output`
+/// flag. Each tool reads only its own variable.
+fn output_format_variable(segment: &str, tool: &str) -> Option<String> {
+    let name = match tool {
+        "aws" => "AWS_DEFAULT_OUTPUT=",
+        "az" => "AZURE_CORE_OUTPUT=",
+        _ => return None,
+    };
+    tokenize(segment)
+        .iter()
+        .find_map(|t| t.strip_prefix(name).map(str::to_string))
 }
 
 /// Are two substitution bodies the same once quotes are set aside? A printed
@@ -579,7 +1148,12 @@ fn keeps_names(
         let whole = argv
             .first()
             .is_some_and(|w| match command_word(w).as_ref() {
-                "cat" | "tee" | "head" | "tail" => true,
+                "cat" | "tee" => true,
+                // `-c`/`--bytes` can cut the key name off and leave part of
+                // the value (security review round 2).
+                "head" | "tail" => !argv[1..]
+                    .iter()
+                    .any(|t| t.starts_with("-c") || t.starts_with("--bytes")),
                 // `jq .` reformats but keeps every key.
                 "jq" | "gojq" | "jaq" => argv[1..]
                     .iter()
@@ -619,7 +1193,7 @@ fn print_only_producer(argv: &[String]) -> Option<&'static str> {
         };
         target.is_some_and(|f| !f.is_empty() && !is_terminal_path(f))
     });
-    let help = rest.iter().any(|t| t == "-h" || t == "--help");
+    let help = help_or_version(rest);
     (!to_file && !help).then_some("op inject")
 }
 
@@ -660,6 +1234,11 @@ fn stdout_closed_or_dup_to_file(argv: &[String]) -> bool {
         }
         let glued = after_fd.trim_start_matches(['>', '|']);
         let (dup, target) = match glued.strip_prefix('&') {
+            // `>& out.txt`: the target is the next word.
+            Some("") => {
+                i += 1;
+                (true, argv.get(i).cloned().unwrap_or_default())
+            }
             Some(fd) => (true, fd.to_string()),
             None if glued.is_empty() => {
                 i += 1;
@@ -856,16 +1435,33 @@ fn exposed_in(
         if segment_prints && let Some(label) = print_only_producer(argv) {
             return Some(label);
         }
+        // A Secret's json or yaml: printed unless only names or metadata come
+        // out (review round 2); otherwise main's verdict (an ask behind
+        // `jq`/`yq`, a pass otherwise).
+        if structured_secret(argv)
+            && reaches_context
+            && !grouped
+            && structured_secret_prints(&segments, &argvs, i)
+        {
+            return Some(STRUCTURED_SECRET);
+        }
         let direct = producer(argv);
         let Some(label) = direct.or_else(|| structured_secret_filtered(&segments, &argvs, i))
         else {
             continue;
         };
-        // `kubectl get secret -o json|yaml` prints names beside values, which
-        // the redactor masks; only a later filter that walks under `.data` or
-        // `.stringData` prints a bare value (security review of round 1).
-        let bare = direct.is_some() || selects_secret_data(&segments, &argvs, i);
-        if segment_prints && bare && !never_printed(argv, keeps_names(&segments, &argvs, i)) {
+        let env_format = argv
+            .first()
+            .and_then(|w| output_format_variable(&segments[i].0, &command_word(w)));
+        if segment_prints
+            && direct.is_some()
+            && !never_printed(
+                argv,
+                keeps_names(&segments, &argvs, i),
+                env_format.as_deref(),
+                &later_filters(&segments, &argvs, i),
+            )
+        {
             return Some(label);
         }
         if !quiet_here && !pipeline_contains_it(&segments, &argvs, i) {
@@ -1363,6 +1959,82 @@ mod tests {
         !out.contains(PLANTED)
     }
 
+    /// Review round 2: the yaml, yaml-stream and jsonc forms the CLOUD_READS
+    /// table lists as masked are masked; a Secret's json or yaml with
+    /// ordinary key names is not, so those forms block. Representative
+    /// output with a made-up value.
+    #[test]
+    fn structured_values_the_redactor_masks() {
+        let masked_forms = [
+            (
+                "aws secretsmanager --output yaml",
+                format!(
+                    "ARN: arn:aws:secretsmanager:us-east-1:123456789012:secret:x-AbCdEf\nName: x\nSecretString: {PLANTED}\nVersionStages:\n- AWSCURRENT\n"
+                ),
+            ),
+            (
+                "aws secretsmanager --output yaml (JSON string)",
+                format!(
+                    "ARN: arn:aws:x\nName: x\nSecretString: '{{\"password\":\"{PLANTED}\"}}'\n"
+                ),
+            ),
+            (
+                "aws secretsmanager --output yaml-stream",
+                format!("- ARN: arn:aws:x\n  Name: x\n  SecretString: {PLANTED}\n"),
+            ),
+            (
+                "az account get-access-token -o yaml",
+                format!(
+                    "accessToken: {PLANTED}\nexpiresOn: '2026-11-19 22:00:00.000000'\ntokenType: Bearer\n"
+                ),
+            ),
+            (
+                "az account get-access-token -o jsonc",
+                format!(
+                    "{{\n  \u{1b}[94m\"accessToken\"\u{1b}[0m: \u{1b}[92m\"{PLANTED}\"\u{1b}[0m,\n  \u{1b}[94m\"tokenType\"\u{1b}[0m: \u{1b}[92m\"Bearer\"\u{1b}[0m\n}}"
+                ),
+            ),
+        ];
+        for (form, sample) in &masked_forms {
+            assert!(masked(sample), "{form}: the redactor must mask the value");
+        }
+        let secret_yaml = format!(
+            "apiVersion: v1\ndata:\n  config.json: {PLANTED}\n  DATABASE_URL: {PLANTED}\nkind: Secret\nmetadata:\n  name: app\n"
+        );
+        let secret_json = format!(
+            "{{\n    \"apiVersion\": \"v1\",\n    \"data\": {{\n        \"api\": \"{PLANTED}\"\n    }},\n    \"kind\": \"Secret\"\n}}"
+        );
+        for (form, sample) in [
+            ("kubectl get secret -o yaml", &secret_yaml),
+            ("kubectl get secret -o json", &secret_json),
+        ] {
+            assert!(
+                !masked(sample),
+                "{form}: unmasked, so the block stays (update the guard if this changes)"
+            );
+        }
+        for command in [
+            "aws secretsmanager get-secret-value --secret-id x --output yaml",
+            "az account get-access-token -o jsonc",
+        ] {
+            assert_eq!(
+                judge(command).map(|f| f.exposure),
+                Some(Exposure::Exposed),
+                "{command}"
+            );
+        }
+        for command in [
+            "kubectl get secret app -o yaml",
+            "kubectl get secret app -o json",
+        ] {
+            assert_eq!(
+                judge(command).map(|f| f.exposure),
+                Some(Exposure::Printed),
+                "{command}"
+            );
+        }
+    }
+
     /// Review round 1: a producer form keeps main's ask only where the
     /// redactor masks its value; the forms it does not mask keep the block.
     /// Each sample is representative default output with a made-up value.
@@ -1509,11 +2181,11 @@ mod tests {
             ),
             (
                 "kubectl get secret s -o json | jq -r .data.p | base64 -d",
-                "kubectl get secret -o json|yaml | jq",
+                "kubectl get secret -o json|yaml",
             ),
             (
                 "kubectl get secret s -o yaml | yq .data.p",
-                "kubectl get secret -o json|yaml | jq",
+                "kubectl get secret -o json|yaml",
             ),
             ("vault kv get -field=password secret/x", "vault read -field"),
             ("vault read -field=value secret/x", "vault read -field"),
@@ -1706,9 +2378,14 @@ mod tests {
             "pass",
             "kubectl get secret s -o json | jq -r .data.p | base64 -d | sha256sum",
             "vault kv get secret/x",
-            // Output names its values: the redactor's job.
-            "kubectl get secret app -o yaml",
-            "kubectl get secret app -o json",
+            // Review round 2: a Secret's json or yaml that feeds a consumer
+            // or a file keeps main's silence; `describe` shows sizes.
+            "kubectl get secret app -o yaml | kubectl apply -f -",
+            "kubectl get secret app -o yaml > secret.yaml",
+            "kubectl get secret app -o json | grep -c token",
+            "kubectl describe secret app",
+            "kubectl get secret --help",
+            "op inject --version",
             "kubectl get pods -o jsonpath='{.items[*].metadata.name}'",
             // Not a -w read.
             "security find-generic-password -s svc",
@@ -1819,7 +2496,7 @@ mod tests {
             ),
             (
                 "kubectl get secret s -o json | jq -r .data.p | base64 -d",
-                "kubectl get secret -o json|yaml | jq",
+                "kubectl get secret -o json|yaml",
             ),
             ("echo \"$(op read op://v/i/f)\" | cat", "op read"),
             ("bash -c 'op read op://v/i/f' | cat", "op read"),
@@ -1905,11 +2582,168 @@ mod tests {
             // A filter that walks under a Secret's `.data` prints its value.
             (
                 "kubectl get secret s -o json | jq -r '.data.token' | base64 -d",
-                "kubectl get secret -o json|yaml | jq",
+                "kubectl get secret -o json|yaml",
             ),
             (
                 "kubectl get secret s -o yaml | yq '.data.token'",
-                "kubectl get secret -o json|yaml | jq",
+                "kubectl get secret -o json|yaml",
+            ),
+            // Review round 2: a Secret's json or yaml that reaches the output,
+            // whole or through a filter outside the safe-filter allowlist.
+            (
+                "kubectl get secret app -o json",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secrets -o yaml",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o yaml | cat",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret s -o json | jq .",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data | map_values(@base64d)'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data | to_entries[] | \"\\(.key)=\\(.value | @base64d)\"'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data | .token' | base64 -d",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.[\"data\"][\"token\"]' | base64 -d",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o yaml | yq '.data'",
+                "kubectl get secret -o json|yaml",
+            ),
+            // A selector that reaches data, or the whole object.
+            (
+                "kubectl get secret app -o jsonpath='{.data}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret app -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{end}}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret app -o jsonpath='{@}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secrets -o custom-columns=NAME:.metadata.name,DATA:.data",
+                "kubectl get secret -o jsonpath",
+            ),
+            // An output-format variable selects the unmasked form, as the flag.
+            (
+                "AWS_DEFAULT_OUTPUT=text aws secretsmanager get-secret-value --secret-id x",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "AZURE_CORE_OUTPUT=tsv az account get-access-token",
+                "az account get-access-token",
+            ),
+            // `tail -c` can cut the key name off.
+            (
+                "aws secretsmanager get-secret-value --secret-id x | tail -c 60",
+                "aws secretsmanager get-secret-value",
+            ),
+            // A query for the value field, in any format but `none`.
+            (
+                "aws secretsmanager get-secret-value --secret-id x --query SecretString --output json",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "az keyvault secret show --vault-name v --name n --query value -o tsv",
+                "az keyvault secret show",
+            ),
+            (
+                "aws ssm get-parameter --name /x --with-decryption --query Parameter",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            // Code review of round 2: a whole parameter by index, a value
+            // filter after a cloud read, recursive descent, an indexed item.
+            (
+                "aws ssm get-parameters --names x --with-decryption --query 'Parameters[0]'",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            (
+                "aws ssm get-parameter --name /x --with-decryption | jq -r .Parameter",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x | jq -r .SecretString",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "op item get x --reveal --format json | jq -r '.fields[] | .value'",
+                "op item get --reveal",
+            ),
+            (
+                "kubectl get secret s -o jsonpath='{..password}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secrets -o jsonpath='{.items[0]}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            // Security review of round 2: data inside an interpolation, and
+            // the metadata and annotations that can hold the applied
+            // manifest.
+            (
+                "kubectl get secret app -o json | jq -r '.metadata.name + \"=\\(.data.token)\"'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secrets -o json | jq -r '.items[] | .metadata.name + \" \\(.data.token | @base64d)\"'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq '.metadata'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq '.metadata.annotations'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o json | jq 'del(.data)'",
+                "kubectl get secret -o json|yaml",
+            ),
+            (
+                "kubectl get secret app -o jsonpath='{.metadata.annotations}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            // A bare `help` or `version` elsewhere is an item name.
+            ("pass show version", "pass show"),
+            ("bw get password version", "bw get password"),
+            ("bw get password help --session s", "bw get password"),
+            // Whole-object spellings of a query.
+            (
+                "aws secretsmanager get-secret-value --secret-id x --query '*'",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "aws ssm get-parameter --name /x --with-decryption --query 'Parameter.*'",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            // `--version <id>` picks a secret version; the read prints.
+            (
+                "az keyvault secret show --vault-name v -n x --version abc123",
+                "az keyvault secret show",
             ),
             // `tee` to the terminal prints whatever follows it.
             (
@@ -2106,10 +2940,6 @@ mod tests {
                 "kubectl get secret -o json|yaml | jq",
             ),
             (
-                "kubectl get secret s -o json | jq .",
-                "kubectl get secret -o json|yaml | jq",
-            ),
-            (
                 "kubectl get secret s -o yaml | yq '.metadata.name'",
                 "kubectl get secret -o json|yaml | jq",
             ),
@@ -2123,6 +2953,191 @@ mod tests {
             ),
             // `--help` prints usage.
             ("op read --help", "op read"),
+            // Review round 2: a kubectl selector that names only metadata,
+            // `type` or a count keeps main's ask.
+            (
+                "kubectl get secrets -o jsonpath='{.items[*].metadata.name}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secrets -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret app -o jsonpath='{.type}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret app -o jsonpath='{.metadata.labels.database}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secret app -o jsonpath='{.metadata.creationTimestamp}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secrets -o custom-columns=NAME:.metadata.name,TYPE:.type",
+                "kubectl get secret -o jsonpath",
+            ),
+            (
+                "kubectl get secrets -n prod -o go-template='{{range .items}}{{.metadata.name}}{{\"\\n\"}}{{end}}'",
+                "kubectl get secret -o jsonpath",
+            ),
+            // Help and version on any producer.
+            ("az keyvault secret show --help", "az keyvault secret show"),
+            ("az keyvault secret show -h", "az keyvault secret show"),
+            (
+                "gcloud secrets versions access --help",
+                "gcloud secrets versions access",
+            ),
+            (
+                "gcloud auth print-access-token --help",
+                "gcloud auth print-access-token",
+            ),
+            ("heroku auth:token --help", "heroku auth:token"),
+            ("bw get password --help", "bw get password"),
+            ("gopass show --help", "gopass show"),
+            ("pass show --help", "pass show"),
+            (
+                "aws secretsmanager get-secret-value help",
+                "aws secretsmanager get-secret-value",
+            ),
+            // A query for a field that is not the value, and `-o none`.
+            (
+                "az keyvault secret show --vault-name v --name n --query id -o tsv",
+                "az keyvault secret show",
+            ),
+            (
+                "az keyvault secret show --vault-name v --name n --query attributes.expires -o tsv",
+                "az keyvault secret show",
+            ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x --query Name --output text",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x --query VersionId",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "aws ssm get-parameter --name /x --with-decryption --query Parameter.Version",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            (
+                "az account get-access-token --query expiresOn -o tsv",
+                "az account get-access-token",
+            ),
+            (
+                "az account get-access-token -o none",
+                "az account get-access-token",
+            ),
+            // Structured formats the redactor masks
+            // (`structured_values_the_redactor_masks`).
+            (
+                "aws secretsmanager get-secret-value --secret-id x --output yaml",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x --output yaml-stream",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "az account get-access-token -o yaml",
+                "az account get-access-token",
+            ),
+            (
+                "az account get-access-token -o jsonc",
+                "az account get-access-token",
+            ),
+            // Code review of round 2: an option that takes a value is not
+            // the filter.
+            (
+                "kubectl get secret s -o yaml | yq -o json '.metadata.name'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret s -o json | jq --arg k v '.data | keys'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret s -o json | jq -r --indent 2 'keys'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            // A filter that picks a field that is not the value.
+            (
+                "aws secretsmanager get-secret-value --secret-id x | jq -r .ARN",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "op item get x --reveal --format json | jq -r '.fields[] | .label'",
+                "op item get --reveal",
+            ),
+            // `>& file` sends both streams to the file.
+            ("op read op://v/i/f >& out.txt", "op read"),
+            // Security review of round 2: name listings in every step,
+            // through interpolation, formatting and an indexed item.
+            (
+                "kubectl get secrets -A -o json | jq -r '.items[] | \"\\(.metadata.namespace)/\\(.metadata.name)\"'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secrets -o json | jq -r '.items[] | [.metadata.namespace, .metadata.name] | @tsv'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secrets -o json | jq -r '.items[] | \"\\(.metadata.name) \\(.type)\"'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data | keys | .[]'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data | keys | join(\",\")'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret app -o json | jq -r '.data | to_entries[] | .key'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secrets -o json | jq -r '.items[0].metadata.name'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret app -o json | jq 'del(.data, .metadata.annotations)'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret app -o json | jq --arg n app '.metadata.name == $n'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            // A cloud read's JSON filtered to a field that is not the value.
+            (
+                "az account get-access-token | jq -r .expiresOn",
+                "az account get-access-token",
+            ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x | jq -r .Name",
+                "aws secretsmanager get-secret-value",
+            ),
+            (
+                "aws ssm get-parameters-by-path --path /x --with-decryption --query 'Parameters[*].Name'",
+                "aws ssm get-parameter --with-decryption",
+            ),
+            // The safe-filter allowlist: names or metadata only.
+            (
+                "kubectl get secret app -o json | jq -r '.data | keys[]'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secrets -o json | jq -r '.items[] | .metadata.namespace + \"/\" + .metadata.name'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
+            (
+                "kubectl get secret app -o json | jq '.data | length'",
+                "kubectl get secret -o json|yaml | jq",
+            ),
             // Letter clusters: `print -rv` assigns, `gopass show -co` copies.
             ("print -rv T \"$(op read op://v/i/f)\"", "op read"),
             ("gopass show -co db", "gopass show"),
