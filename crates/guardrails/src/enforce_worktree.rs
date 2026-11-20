@@ -7224,6 +7224,14 @@ mod tests {
         cadence_hooks_core::worktree::is_snoozed_now(primary)
     }
 
+    /// `path` as it must be written in Bash command text to name `path`. On
+    /// Windows a native `D:\a\b` pasted into a command is shell escapes, and
+    /// bash (and the guard's export and `ln` readings, which follow bash)
+    /// sees `D:ab`; the forward-slash spelling survives. Unchanged on Unix.
+    fn sh(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
     #[test]
     fn confirm_edit_retry_passes_and_arms_the_snooze() {
         let scratch = scratch("confirm-edit");
@@ -7391,8 +7399,18 @@ mod tests {
                 run_confirmed(&first, &cfg(false, false)).outcome,
                 Outcome::Block
             );
-            let root = GitState::resolve(&primary).unwrap().repo_root;
-            let action = format!("{}\u{1f}{}", root.to_string_lossy(), file.to_string_lossy());
+            // The key exactly as `confirm_primary_block` builds it: the repo
+            // root the guard recorded, and the file through
+            // `lexical_normalize` (on Windows that lowercases the drive and
+            // folds the separators, so `to_string_lossy` is another key).
+            let mut probe = GitProbe::default();
+            run_enforce_with(&first, &cfg(false, false), &mut probe);
+            let root = &probe
+                .primary_blocks
+                .first()
+                .expect("a primary block")
+                .repo_root;
+            let action = format!("{root}\u{1f}{}", lexical_normalize(&file.to_string_lossy()));
             assert!(cadence_hooks_core::confirm::backdate_for_tests(
                 &first,
                 "enforce-worktree",
@@ -7438,9 +7456,9 @@ mod tests {
             let link = wt.join("into-primary");
             let command = format!(
                 "ln -s {} {} && git -C {} commit -m x",
-                primary.display(),
-                link.display(),
-                link.display()
+                sh(&primary),
+                sh(&link),
+                sh(&link)
             );
             for call in ["t1", "t2"] {
                 let mut input = make_bash(&command);
@@ -7550,7 +7568,7 @@ mod tests {
         let scratch_b = scratch("confirm-moved-b");
         let (a, _wt_a) = primary_and_worktree(&scratch_a);
         let (b, _wt_b) = primary_and_worktree(&scratch_b);
-        let b = b.display().to_string();
+        let b = sh(&b);
         let attempt = |command: &str, call: &str| {
             let mut input = make_bash(command);
             input.cwd = Some(a.to_string_lossy().into_owned());
