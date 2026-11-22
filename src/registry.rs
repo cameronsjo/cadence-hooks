@@ -310,7 +310,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "guard-secret-dump",
-        description: "Ask before a command prints a bare, unnamed secret value",
+        description: "Block a command that prints a bare secret value; ask before one feeds a consumer",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
         // Remote: no-op when the producing tools are absent; harmless to keep armed.

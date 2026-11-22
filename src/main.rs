@@ -298,7 +298,7 @@ enum CadenceCommands {
     RedactExternalContent,
     /// Mask secret values in Bash output before they reach the transcript
     RedactSecretOutput,
-    /// Ask before a command prints a bare, unnamed secret value
+    /// Block a command that prints a bare secret value; ask before one feeds a consumer
     GuardSecretDump,
     /// Nudge when the cadence-hooks binary or Claude Code has drifted behind
     /// the plugin-shipped platform baseline (SessionStart)
