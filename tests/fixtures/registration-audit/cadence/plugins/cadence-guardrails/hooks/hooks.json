@@ -201,6 +201,12 @@
           },
           {
             "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-container-rm",
+            "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails warn-gh-merge-preflight",
             "if": "<redacted in the public fixture; the audit reads only whether an `if:` is present>",
             "timeout": 5
