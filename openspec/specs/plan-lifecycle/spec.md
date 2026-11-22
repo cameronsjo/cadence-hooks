@@ -17,7 +17,7 @@ On PostToolUse for `ExitPlanMode`, `session persist-plan-approval` SHALL write t
 - **THEN** no plan file is written and the hook exits 0 with no output
 
 ### Requirement: Persist an approve-and-clear pickup
-For an approve-and-clear, the hook SHALL persist from the child session's PostToolUse events when its first user message is the injected `Implement the following plan:` prompt, setting `approved_session_id` to the parent. It MUST persist only when the prompt's pointer names a parent transcript under `<config_dir>/projects` holding an `ExitPlanMode` call with this exact plan. It MUST reach a verdict at most once per session.
+For an approve-and-clear, the hook SHALL persist from the child session's PostToolUse events when its first user message is the injected `Implement the following plan:` prompt, setting `approved_session_id` to the parent. It MUST persist only when the prompt's pointer names a parent transcript under `<config_dir>/projects` holding an `ExitPlanMode` call with this exact plan, or a Code Mode approval of it (next requirement). It MUST reach a verdict at most once per session.
 
 #### Scenario: Genuine approve-and-clear
 - **WHEN** a child session's first message is the injected implement-prompt whose pointer names the parent transcript holding the matching `ExitPlanMode` call
@@ -26,6 +26,21 @@ For an approve-and-clear, the hook SHALL persist from the child session's PostTo
 #### Scenario: Hand-typed implement prompt
 - **WHEN** a session's first message starts with `Implement the following plan:` but its pointer names no transcript holding that plan
 - **THEN** nothing is persisted
+
+### Requirement: Code Mode approval in the parent transcript
+For an approval made through Code Mode's `REPL` tool, the parent transcript SHALL count as holding the plan when a main-chain `plan_mode` attachment names a plan-store file holding this exact plan and a later main-chain `REPL` call's code contains `tools.ExitPlanMode(`. The file MUST pass the same plan-store check as an `ExitPlanMode` `planFilePath`. Only the 16 most recently named distinct attachment paths SHALL be read, newest first.
+
+#### Scenario: Code Mode approve-and-clear
+- **WHEN** the parent transcript records a `plan_mode` attachment naming a plan-store file that holds the child's plan, then a `REPL` call whose code is `await tools.ExitPlanMode({})`
+- **THEN** the plan is persisted once, attributed to the parent session
+
+#### Scenario: Code Mode call without a matching plan file
+- **WHEN** the parent's `REPL` call to `tools.ExitPlanMode(` comes before any `plan_mode` attachment, or the named plan-store file holds a different plan, or lies outside `<config_dir>/plans`
+- **THEN** nothing is persisted
+
+#### Scenario: Matching plan file named first in a long session
+- **WHEN** the matching plan file was named by the earliest `plan_mode` attachment and 16 other distinct plan files were named after it, then the `REPL` call came
+- **THEN** nothing is persisted, since only the 16 most recently named paths are read
 
 ### Requirement: Frontmatter merged into one block
 The persisted file SHALL carry one leading frontmatter block. The hook MUST write `status: "in-flight"`, `updated`, `branch`, `session_id`, `machine` (a salted hostname digest), and, when known, `approved_session_id`, `model`, and `harness`, and MUST drop plan-authored lines for those keys or `session`, `approved_in`, `body_sha256`. A plan's `status: blocked`, and its `branch:` when none resolves, MUST be kept, as MUST all other plan keys.
