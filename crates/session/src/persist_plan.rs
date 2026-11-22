@@ -586,6 +586,15 @@ const POINTER_PATH_LEAD: &str = "transcript at:";
 /// after the call (a resumed session, any write under `<config_dir>/plans`),
 /// so write access to `~/.claude/plans` is part of the same boundary.
 ///
+/// A Code Mode approval stands on the plan file alone, since its call
+/// records no plan text: the parent must hold a main-chain `plan_mode`
+/// attachment naming a plan-store file that holds `body`, and a later
+/// main-chain `REPL` call whose code contains `tools.ExitPlanMode(`
+/// ([`CodeModeEvidence`]). The call is matched as a substring, so it proves
+/// only that the parent's script spelled the call after plan mode named
+/// the file; the plan-store read and the body match carry the weight, on
+/// the same `~/.claude/plans` boundary as the dialog-edit match.
+///
 /// `None` is non-approval, never an anonymous approval.
 fn parent_session_id_from_pointer_lines(
     suffix_lines: &[&str],
@@ -631,8 +640,9 @@ fn is_uuid_shaped(s: &str) -> bool {
 /// the first whole line. Lines that mention neither `"ExitPlanMode"`,
 /// [`CODE_MODE_EXIT_CALL`] nor `"planFilePath"` are never parsed. A Code
 /// Mode approval ([`CodeModeEvidence`]) is judged once the whole window is
-/// read, since its `plan_mode` attachment and its call are separate rows. Any read error is a miss. Each distinct `planFilePath` is read at
-/// most once, and at most [`MAX_PLAN_FILE_READS`] of them in all.
+/// read, since its `plan_mode` attachment and its call are separate rows.
+/// Any read error is a miss. Each distinct `planFilePath` is read at most
+/// once, and at most [`MAX_PLAN_FILE_READS`] of them in all.
 fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> bool {
     use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
     let Ok(meta) = file.metadata() else {
@@ -694,40 +704,87 @@ fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> 
 /// tool: one `REPL` whose `input.code` is a JavaScript script.
 const CODE_MODE_TOOL: &str = "REPL";
 
-/// How a Code Mode script calls `ExitPlanMode` (`await tools.ExitPlanMode({})`).
+/// How a Code Mode script calls `ExitPlanMode`:
+/// `await tools.ExitPlanMode({})`.
 const CODE_MODE_EXIT_CALL: &str = "tools.ExitPlanMode(";
 
 /// The parent transcript's evidence for a Code Mode approval. There the model
 /// calls `ExitPlanMode` from a `REPL` script, so the recorded `tool_use` is
 /// the `REPL` call, carrying no plan text and no `planFilePath`. The plan
-/// file is named instead by the session's `plan_mode` attachment row.
-/// Neither half alone proves anything: [`Self::holds`] needs a call AND a
-/// named plan-store file that holds the body, read through the same
-/// [`PlanFileCheck`] as the top-level path.
+/// file is named instead by the session's `plan_mode` attachment rows,
+/// which come before the call (plan mode is on before the plan is
+/// presented). Neither half alone proves anything: [`Self::holds`] needs a
+/// plan-store file that holds the body, read through the same
+/// [`PlanFileCheck`] as the top-level path, named by an attachment that a
+/// later call follows in transcript order.
+///
+/// The call is recognised by the substring [`CODE_MODE_EXIT_CALL`] in the
+/// script's text, so a script that only spells `tools.ExitPlanMode(` in a
+/// comment or a string literal counts as a call too. A substring test cannot
+/// tell those apart from a real call, and this guard does not parse
+/// JavaScript; the body match against the plan-store file is the proof.
+///
+/// Only the [`MAX_PLAN_FILE_READS`] most recently named distinct paths are
+/// kept, and they are checked newest first: the approving plan's file is the
+/// one named last, so a long session that named more files than the cap
+/// drops the oldest, never the likeliest match.
 #[derive(Default)]
 struct CodeModeEvidence {
-    /// A main-chain `REPL` `tool_use` whose code calls `ExitPlanMode`.
-    call_seen: bool,
-    /// Distinct `planFilePath`s from main-chain `plan_mode` attachments, at
-    /// most [`MAX_PLAN_FILE_READS`].
-    plan_files: Vec<String>,
+    /// Rows observed so far: the transcript-order position of the next row.
+    rows: u64,
+    /// Position of the latest main-chain `REPL` `tool_use` whose code
+    /// calls `ExitPlanMode`.
+    last_call: Option<u64>,
+    /// Distinct `planFilePath`s from main-chain `plan_mode` attachments:
+    /// the path, the position it was first named at, and the position it was
+    /// last named at. At most [`MAX_PLAN_FILE_READS`]; the least recently
+    /// named is dropped first.
+    plan_files: Vec<(String, u64, u64)>,
 }
 
 impl CodeModeEvidence {
+    /// Record one parsed row, in transcript order.
     fn observe(&mut self, row: &Value) {
+        let at = self.rows;
+        self.rows += 1;
         if row_has_code_mode_exit_plan_mode_call(row) {
-            self.call_seen = true;
+            self.last_call = Some(at);
         }
-        if let Some(path) = plan_mode_attachment_path(row)
-            && self.plan_files.len() < MAX_PLAN_FILE_READS
-            && !self.plan_files.iter().any(|p| p == path)
+        let Some(path) = plan_mode_attachment_path(row) else {
+            return;
+        };
+        if let Some(known) = self.plan_files.iter_mut().find(|(p, _, _)| p == path) {
+            known.2 = at;
+            return;
+        }
+        self.plan_files.push((path.to_string(), at, at));
+        if self.plan_files.len() > MAX_PLAN_FILE_READS
+            && let Some(oldest) = self
+                .plan_files
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, last))| *last)
+                .map(|(i, _)| i)
         {
-            self.plan_files.push(path.to_string());
+            self.plan_files.remove(oldest);
         }
     }
 
+    /// Does a call follow an attachment naming a plan-store file that holds
+    /// `body`? Paths are tried most recently named first.
     fn holds(&self, body: &str, plan_files: &mut PlanFileCheck) -> bool {
-        self.call_seen && self.plan_files.iter().any(|p| plan_files.holds(p, body))
+        let Some(call) = self.last_call else {
+            return false;
+        };
+        let mut candidates: Vec<&(String, u64, u64)> = self
+            .plan_files
+            .iter()
+            .filter(|(_, first, _)| *first < call)
+            .collect();
+        candidates.sort_by_key(|(_, _, last)| std::cmp::Reverse(*last));
+        candidates
+            .into_iter()
+            .any(|(path, _, _)| plan_files.holds(path, body))
     }
 }
 
@@ -7437,6 +7494,99 @@ mod tests {
             assert_eq!(
                 resolve_pointer(&transcript.display().to_string(), &root),
                 None,
+                "{label}"
+            );
+        }
+    }
+
+    /// Code Mode order and cap: the call must follow an attachment naming the
+    /// matching plan file, and only the most recently named distinct paths
+    /// are kept.
+    #[test]
+    fn code_mode_call_follows_its_attachment_and_newest_paths_are_kept() {
+        let store = TempDir::new().unwrap();
+        let root = store.path().join("projects");
+        let dir = root.join("-test-project");
+        fs::create_dir_all(&dir).unwrap();
+        let plans = store.path().join("plans");
+        fs::create_dir_all(&plans).unwrap();
+        let matching = plans.join("code-mode.md");
+        fs::write(&matching, format!("{POINTER_BODY}\n")).unwrap();
+        let attach = |path: &Path| {
+            serde_json::json!({"type": "attachment", "isSidechain": false,
+                "attachment": {"type": "plan_mode", "isSubAgent": false,
+                               "planFilePath": path.to_string_lossy()}})
+        };
+        let call = |code: &str| {
+            serde_json::json!({"type": "assistant", "isSidechain": false,
+                "message": {"content": [{"type": "tool_use", "name": "REPL",
+                                         "input": {"code": code}}]}})
+        };
+        let others = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| attach(&plans.join(format!("other-{i}.md"))))
+                .collect()
+        };
+        let cap = MAX_PLAN_FILE_READS;
+        let cases: Vec<(&str, Vec<Value>, bool)> = vec![
+            (
+                "attachment then call (the real order)",
+                vec![attach(&matching), call(CODE_MODE_CALL)],
+                true,
+            ),
+            (
+                "call before the attachment",
+                vec![call(CODE_MODE_CALL), attach(&matching)],
+                false,
+            ),
+            // A substring test cannot tell a commented call from a real one;
+            // the plan-file body match is what this arm rests on.
+            (
+                "exact spelling inside a comment is read as a call",
+                vec![
+                    attach(&matching),
+                    call("// await tools.ExitPlanMode({}) later"),
+                ],
+                true,
+            ),
+            (
+                "more attachments than the cap, matching one last",
+                [
+                    others(cap + 4),
+                    vec![attach(&matching), call(CODE_MODE_CALL)],
+                ]
+                .concat(),
+                true,
+            ),
+            (
+                "matching one oldest, evicted by the cap",
+                [
+                    vec![attach(&matching)],
+                    others(cap),
+                    vec![call(CODE_MODE_CALL)],
+                ]
+                .concat(),
+                false,
+            ),
+            (
+                "matching one named again after the others",
+                [
+                    vec![attach(&matching)],
+                    others(cap),
+                    vec![attach(&matching), call(CODE_MODE_CALL)],
+                ]
+                .concat(),
+                true,
+            ),
+        ];
+        for (i, (label, rows, want)) in cases.into_iter().enumerate() {
+            let parent_id = format!("11111111-2222-3333-4444-5555555556{i:02}");
+            let path = dir.join(format!("{parent_id}.jsonl"));
+            let content: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            fs::write(&path, content).unwrap();
+            assert_eq!(
+                resolve_pointer(&path.display().to_string(), &root),
+                want.then(|| parent_id.clone()),
                 "{label}"
             );
         }
