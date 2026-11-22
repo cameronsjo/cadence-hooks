@@ -188,7 +188,7 @@ On PreToolUse for Bash, `guard-secret-dump` SHALL judge each bare-value producer
 `guard-secret-dump` SHALL treat a value as printed when every later pipeline stage is a pass-through row that copies stdin to stdout (`cat`, `tee`, `head`, `tail`, `base64`, `xxd`, `od`, `jq`, `yq`, `gojq`, `jaq`, `tr`, `sed`, `cut`), the last able to print, or a later `tee` names a terminal path. A row also prints what a here-string, `<(…)` or heredoc body feeds it. Any other stage MUST keep the ask.
 
 #### Scenario: A stage that does not pass the value through
-- **WHEN** a Bash command pipes a value into `tail -n +2`, `sed -n 2p`, `sed -ni …`, `jq . other.json`, `cat /dev/null`, `base64 -i in.txt`, `xxd - out.hex`, or `yq --inplace …`
+- **WHEN** a Bash command pipes a value into `sed -ni …`, `jq . other.json`, `cat /dev/null`, `base64 -i in.txt`, `xxd - out.hex`, or `yq --inplace …`
 - **THEN** the hook returns ask
 
 #### Scenario: Pass-through last stage
@@ -204,7 +204,11 @@ On PreToolUse for Bash, `guard-secret-dump` SHALL judge each bare-value producer
 - **THEN** the hook returns ask
 
 ### Requirement: A filter after a value keeps the value
-`guard-secret-dump` SHALL decide whether a producer form's output carries a value at the producer alone (the per-executable rows, the value-field table, the kubectl selectors that reach data). Once it does, every later `jq`, `gojq`, `jaq` or `yq` stage MUST keep the value whatever its filter text says: the guard MUST NOT read a filter to decide that a stage drops the value. A pipeline whose last stage keeps the value and prints blocks; a consumer or a file after it keeps main's verdict.
+`guard-secret-dump` SHALL decide whether a producer form's output carries a value at the producer alone. Once it does, every later `jq`, `gojq`, `jaq`, `yq` or pass-through stage MUST keep the value whatever its filter, script or selection says, and the guard MUST NOT read a filter to decide that a stage drops the value, except as the masked `jq .` requirement states. A pipeline whose last stage keeps the value and prints blocks; a consumer or a file after it keeps main's verdict.
+
+#### Scenario: A selection after a value
+- **WHEN** a Bash command runs `pass show x | sed -n 1p`, `pass show x | sed -n 's/^password: //p'`, `op read op://v/key/private-key | tail -n +2` or `| tail +2`
+- **THEN** the hook blocks, like `| sed 1q` and `| head -1`
 
 #### Scenario: A field step after the value is selected
 - **WHEN** a Bash command runs `aws secretsmanager get-secret-value … --query SecretString --output text | jq -r .password`, `… | jq -r .SecretString | jq -r .password`, `az keyvault secret show … --query value -o tsv | jq -r .password`, `aws secretsmanager get-secret-value … | jq -r '.[]'`, or `op item get db --reveal --format json | jq -r '.fields[1]'`
@@ -217,6 +221,13 @@ On PreToolUse for Bash, `guard-secret-dump` SHALL judge each bare-value producer
 #### Scenario: A filter before a consumer or a file
 - **WHEN** a Bash command runs `kubectl get secret app -o json | jq -r '.data.token' | docker login --password-stdin u` or `op read op://v/i/f | jq -r .a > out.json`
 - **THEN** the hook keeps main's verdict
+
+### Requirement: A masked jq identity keeps the ask
+`guard-secret-dump` SHALL read one filter: a bare `jq .` after the two cloud reads a test proves the redactor masks, with only options that keep each key beside its value (`-c`, `-r`, `-S`, `-M`, `-C`, `--tab`, `--indent N`, `--arg`, `--argjson`). That form MUST keep main's ask; any other option MUST keep the value.
+
+#### Scenario: Masked jq identity
+- **WHEN** a Bash command runs `aws secretsmanager get-secret-value --secret-id x | jq -C --tab -S .` or `az account get-access-token | jq --indent 4 -M .`
+- **THEN** the hook returns ask, while `| jq --stream .` blocks
 
 ### Requirement: A secret value handed to a consumer keeps the ask
 `guard-secret-dump` SHALL return ask, not block, when a producer's value goes to a consumer: a pipe or a here-string or heredoc into a program outside the pass-through table, a substitution used as an argument, assignment or inline prefix, a process substitution, or a clipboard flag (`pass -c`, `gopass show -c`, `lpass show -c`). It MUST stay silent when the pipeline ends in a hash (`shasum` family, `md5sum`, `b2sum`, `cksum`) or sends stdout to a real file.
@@ -440,7 +451,11 @@ On PreToolUse for Bash, `guard-op-vault-scan` SHALL block when a segment's comma
 
 #### Scenario: A namespace or object named secret
 - **WHEN** a Bash command runs `kubectl get pods -n secrets -o yaml` or `kubectl get deploy secret -o json`
-- **THEN** the hook keeps main's verdict: the resource type is the first word after `get` that is not an option or an option's value
+- **THEN** the hook keeps main's verdict: for a block, the resource type is the first word after `get` that is not an option or an option's value, read only while every option before it is one the guard knows
+
+#### Scenario: An unknown option before the resource type
+- **WHEN** a Bash command runs `kubectl get --as admin secret app -o jsonpath='{.data.token}'`, `kubectl get -L app secrets -o json | jq .` or `kubectl -n secrets get configmaps -o json | jq .`
+- **THEN** the first two block, since one reading of the unknown option (a flag, or an option taking the next word) reaches a Secret type, and the third keeps main's ask, since every ask follows main's rule (any word naming `secret`/`secrets`); `kubectl get --show-labels pods -n secrets -o yaml` reaches no Secret type under either reading and does not block
 
 #### Scenario: Listing a Secret's names
 - **WHEN** a Bash command runs `kubectl get secrets -o name`, a jsonpath, custom-columns or go-template selector naming only metadata, `type`, `kind` or counts, or `kubectl describe secret`, or pipes a Secret's json through a filter into a consumer or a file

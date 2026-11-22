@@ -63,6 +63,7 @@ Also recorded in the main spec directly:
 - A help or version call on any producer is never printed.
 - kubectl selectors block only when they reach the data, the annotations, the whole metadata or a whole object.
 - `kubectl get secret -o json|yaml` printed blocks (plain `-o yaml` moves from allow to block on purpose). Whole `.metadata` and `.metadata.annotations` reach the data: the `last-applied-configuration` annotation can hold it.
+- Output-format variables (`AWS_DEFAULT_OUTPUT`, `AZURE_CORE_OUTPUT`) are read like the flag, and `head`/`tail -c` no longer keep key names.
 
 ## Review round 3 (cameronsjo/cadence-hooks#1663): the taint rule
 
@@ -72,5 +73,12 @@ The round-2 code decided whether a later pipeline stage was safe by enumerating 
 - From there every later `jq`, `gojq`, `jaq`, `yq` or pass-through stage keeps the value, whatever its filter says. The guard reads no filter text to call a stage safe. The pipeline blocks when such a stage ends it and prints, and keeps main's verdict when a consumer or a file comes after.
 - The kubectl names-only allowlist is gone. Names and metadata come from kubectl's own selectors (`-o name`, a jsonpath, custom-columns or go-template naming only metadata, `type`, `kind` or counts) and `kubectl describe secret`, which keep main's verdict; the kubectl block message says so.
 - Accepted on purpose: a filter that selects no value now blocks (`kubectl get secret s -o json | jq '.metadata.name'`, `aws secretsmanager get-secret-value … | jq -r .ARN`, `op read … | jq keys`). The comparison corpus classes these `T`, each with its reason; `--query <field>` or a kubectl selector is the replacement.
-- The one filter still read is `jq .` (no other filter) after the two masked cloud reads, for the masked-format rule: a test proves the redactor masks the re-indented and the `-c` one-line output.
-- Output-format variables (`AWS_DEFAULT_OUTPUT`, `AZURE_CORE_OUTPUT`) are read like the flag, and `head`/`tail -c` no longer keep key names.
+- The one filter still read is `jq .` (no other filter) after the two masked cloud reads, for the masked-format rule: a test proves the redactor masks the re-indented, `-c`, `-C`, `--tab`, `-S` and `--indent 4` output; any other option (`--stream`) blocks.
+
+## Review round 4 (cameronsjo/cadence-hooks#1663)
+
+The operator approved one narrow round on 2026-11-22:
+
+- `sed -n` and `tail -n +K` are no longer read as dropping the value. Under the taint rule every pass-through stage keeps it; a multi-line value's later lines, or the line a `sed -n …p` script picks, are printed.
+- The round-3 kubectl resource-type reader skipped only the options it listed, so an unlisted option before the type (`--as admin`, `-L app`) hid a Secret read that main asked about. The reader does not grow its list: when it meets an option it does not know before the type, it follows both readings (a flag, or an option that takes the next word) and blocks when either one's type names a Secret. A first draft fell back to main's any-word rule there, which the delta's security review showed blocks `kubectl get --show-labels pods -n secrets -o yaml`; main's rule is for asks only. The positional reading only withholds a block: every ask still follows main's rule, so `kubectl -n secrets get configmaps -o json | jq .` keeps main's ask. No command main asked about passes.
+- Accepted on purpose, as the taint rule's consequence: a `sed -n` script that writes a file and prints nothing (`sed -n '/x/w out.txt'`) blocks, because the script is not read. The corpus classes it `T`.

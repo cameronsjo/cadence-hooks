@@ -34,8 +34,11 @@
 //!   output carries a value is decided at the producer alone (the
 //!   per-executable tables, [`CLOUD_READS`], the kubectl selectors that reach
 //!   data). From there every later `jq`, `yq` or [`PASS_THROUGH`] stage
-//!   keeps the value, whatever its filter text says; the guard never reads a
-//!   filter to call a stage safe. So `… --query SecretString --output text |
+//!   keeps the value, whatever its filter, script or selection says (`sed
+//!   -n 1p` and `tail -n +2` included). The guard reads no filter to call a
+//!   stage safe, with one exception: a bare `jq .`, with options that keep
+//!   each key beside its value, after the two cloud reads the redactor is
+//!   proven to mask keeps their ask ([`keeps_names`]). So `… --query SecretString --output text |
 //!   jq -r .password`, `kubectl get secrets -o json | jq '.items[] |
 //!   select(…)'` and `kubectl get secret s -o json | jq '.metadata.name'` all
 //!   block. Names and metadata come from kubectl's own selectors (`-o name`,
@@ -337,13 +340,13 @@ struct PassThrough {
 /// - a file operand other than `-` (the command then reads that file, not
 ///   stdin; `tee`'s operands are outputs, so they do not count);
 /// - an option that writes elsewhere: `base64 -o`, `-i`/`--input`, `sed -i`
-///   in any cluster, `yq -i`/`--inplace`, `xxd` with an output operand;
-/// - a selection that drops the value: `sed -n`, `tail -n +K`/`+K` with K > 1.
+///   in any cluster, `yq -i`/`--inplace`, `xxd` with an output operand.
 ///
-/// A `jq`-family or `yq` filter is not read: the guard cannot prove a filter
-/// drops the value, so `jq keys`, `jq '.items[] | select(…)'` and
-/// `jq 'map_values(@base64d)'` all pass it through (the taint rule, #1663
-/// review round 3).
+/// A script, filter or selection is not read: the guard cannot prove one
+/// drops the value, so `jq keys`, `jq '.items[] | select(…)'`,
+/// `jq 'map_values(@base64d)'`, `sed -n 1p` and `tail -n +2` all pass it
+/// through (the taint rule, #1663 review rounds 3 and 4; a multi-line value
+/// such as a key or a `pass` entry's later lines is printed by them).
 fn is_pass_through(argv: &[String]) -> bool {
     copies_input(argv, false)
 }
@@ -403,7 +406,9 @@ fn copies_input(argv: &[String], fed: bool) -> bool {
             i += if alone && !procsub_next { 2 } else { 1 };
             continue;
         }
-        if t == "-" || !t.starts_with('-') || t.len() == 1 {
+        // `tail +2` is the old spelling of `tail -n +2`, an option.
+        let tail_offset = row.name == "tail" && t.starts_with('+');
+        if !tail_offset && (t == "-" || !t.starts_with('-') || t.len() == 1) {
             operands.push(t);
             i += 1;
             continue;
@@ -418,14 +423,8 @@ fn copies_input(argv: &[String], fed: bool) -> bool {
                     || t.starts_with("--output=")
                     || t.starts_with("--input=")
             }
-            "sed" => {
-                t.starts_with("--in-place")
-                    || t == "--quiet"
-                    || t == "--silent"
-                    || (!t.starts_with("--") && (t.contains('i') || t.contains('n')))
-            }
+            "sed" => t.starts_with("--in-place") || (!t.starts_with("--") && t.contains('i')),
             "yq" => t == "-i" || t == "--inplace",
-            "tail" => tail_skips_lines(t, rest.get(i + 1).map(String::as_str)),
             _ => false,
         };
         if drops_or_diverts {
@@ -474,22 +473,6 @@ fn copies_input(argv: &[String], fed: bool) -> bool {
     }
 }
 
-/// `tail -n +K`, `-n+K` or `+K` with K > 1: the first lines, where a
-/// password store keeps the password, are dropped.
-fn tail_skips_lines(token: &str, next: Option<&str>) -> bool {
-    let count = if token == "-n" {
-        next
-    } else if let Some(glued) = token.strip_prefix("-n") {
-        Some(glued)
-    } else {
-        token.strip_prefix('-').filter(|t| t.starts_with('+'))
-    };
-    count
-        .and_then(|c| c.strip_prefix('+'))
-        .and_then(|k| k.parse::<u64>().ok())
-        .is_some_and(|k| k > 1)
-}
-
 /// A producer form whose value never reaches the context through its own
 /// output, so it keeps main's verdict and never blocks:
 /// - a help or version call on any producer ([`help_or_version`]);
@@ -497,7 +480,8 @@ fn tail_skips_lines(token: &str, next: Option<&str>) -> bool {
 ///   clipboard);
 /// - a cloud CLI read whose output hides the value ([`cloud_value_hidden`]);
 /// - a kubectl selector that does not reach a Secret's data
-///   ([`selector_reaches_data`]).
+///   ([`selector_reaches_data`]), or whose type position names no Secret
+///   ([`kubectl_gets_secret`]).
 ///
 /// `keeps_names` says every later stage keeps the key names, and
 /// `env_format` is an output-format variable set before the command
@@ -523,7 +507,9 @@ fn never_printed(argv: &[String], keeps_names: bool, env_format: Option<&str>) -
     match word.as_ref() {
         "pass" | "gopass" | "lpass" => rest.iter().any(clip),
         "az" | "aws" => cloud_value_hidden(&word, rest, keeps_names, env_format),
-        "kubectl" => bare_output_format(rest) && !selector_reaches_data(rest),
+        "kubectl" => {
+            bare_output_format(rest) && (!selector_reaches_data(rest) || !kubectl_gets_secret(rest))
+        }
         _ => false,
     }
 }
@@ -825,8 +811,9 @@ fn jq_identity_keeps_names(args: &[String]) -> bool {
 }
 
 /// Does every pipeline stage after segment `start` leave its input's lines
-/// whole (`cat`, `tee`, `head`, `tail`), so key names printed beside values
-/// survive to the output?
+/// whole (`cat`, `tee`, `head`, `tail`, or a `jq .` per
+/// [`jq_identity_keeps_names`]), so key names printed beside values survive
+/// to the output?
 fn keeps_names(
     segments: &[(String, Option<&'static str>)],
     argvs: &[Vec<String>],
@@ -1364,7 +1351,7 @@ fn producer(argv: &[String]) -> Option<&'static str> {
             (finds && w_flag).then_some("security find-*-password -w")
         }
         "kubectl" => {
-            let secret = kubectl_gets_secret(rest);
+            let secret = kubectl_names_secret(rest);
             (secret && bare_output_format(rest)).then_some("kubectl get secret -o jsonpath")
         }
         "op" => {
@@ -1510,7 +1497,7 @@ fn structured_secret_filtered(
         return None;
     }
     let rest = &argv[1..];
-    let structured = kubectl_gets_secret(rest)
+    let structured = kubectl_names_secret(rest)
         && output_format(rest).is_some_and(|f| f == "json" || f == "yaml");
     if !structured {
         return None;
@@ -1564,24 +1551,49 @@ const KUBECTL_VALUED: &[&str] = &[
     "--filename",
 ];
 
-/// Does `kubectl … get <type> …` read Secrets? The type is the first word
-/// after `get` that is neither an option nor an option's value, so a
+/// main's rule for whether `kubectl … get …` reads Secrets: any word names
+/// `secret`/`secrets`. It still decides every ask, so nothing main asked
+/// about passes (review round 4).
+fn kubectl_names_secret(rest: &[String]) -> bool {
+    rest.iter().any(|t| t == "get") && rest.iter().any(|t| names_secret_resource(t))
+}
+
+/// Does `kubectl … get <type> …` read Secrets, for a block? The type is the
+/// first word after `get` that is not an option or an option's value, so a
 /// namespace or object named `secret` (`kubectl get pods -n secrets`,
-/// `kubectl get deploy secret`) is not one (code review of round 3).
+/// `kubectl get deploy secret`) is not one (code review of round 3). A
+/// [`KUBECTL_VALUED`] option takes the next word and a `--name=value` word
+/// takes none; any other option might be either (`-w` is a flag, `--as
+/// admin` takes a value), so both readings are followed, and the command is
+/// a Secret read when either one's type names a Secret (review round 4). One
+/// pass over the words: each index is reached or not.
+///
+/// This decides blocks only. Every ask follows [`kubectl_names_secret`],
+/// main's rule, so a command this says no to keeps main's verdict.
 fn kubectl_gets_secret(rest: &[String]) -> bool {
     let Some(at) = rest.iter().position(|t| t == "get") else {
         return false;
     };
-    let mut i = at + 1;
-    while let Some(t) = rest.get(i) {
-        if !t.starts_with('-') {
-            return names_secret_resource(t);
+    let words = &rest[at + 1..];
+    let mut reached = vec![false; words.len() + 2];
+    reached[0] = true;
+    for (i, t) in words.iter().enumerate() {
+        if !reached[i] {
+            continue;
         }
-        i += if KUBECTL_VALUED.contains(&t.as_str()) {
-            2
+        if !t.starts_with('-') {
+            // A type candidate: this reading ends here.
+            if names_secret_resource(t) {
+                return true;
+            }
+        } else if KUBECTL_VALUED.contains(&t.as_str()) {
+            reached[i + 2] = true;
+        } else if t.starts_with("--") && t.contains('=') {
+            reached[i + 1] = true;
         } else {
-            1
-        };
+            reached[i + 1] = true;
+            reached[i + 2] = true;
+        }
     }
     false
 }
@@ -1783,6 +1795,16 @@ mod tests {
         let secretsmanager_compact =
             format!("{{\"ARN\":\"arn:aws:x\",\"Name\":\"x\",\"SecretString\":\"{PLANTED}\"}}");
         let az_compact = format!("{{\"accessToken\":\"{PLANTED}\",\"tokenType\":\"Bearer\"}}");
+        // `jq -C .` (jq 1.7 colours), `--tab`, `-S` (keys sorted) and
+        // `--indent 4`: each pair still sits on one line (review round 4).
+        let secretsmanager_color = format!(
+            "\u{1b}[1;39m{{\n  \u{1b}[0m\u{1b}[34;1m\"ARN\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;32m\"arn:aws:x\"\u{1b}[0m\u{1b}[1;39m,\n  \u{1b}[0m\u{1b}[34;1m\"SecretString\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;32m\"{PLANTED}\"\u{1b}[0m\u{1b}[1;39m\n\u{1b}[1;39m}}\u{1b}[0m"
+        );
+        let secretsmanager_tab_sorted = format!(
+            "{{\n\t\"ARN\": \"arn:aws:x\",\n\t\"Name\": \"x\",\n\t\"SecretString\": \"{PLANTED}\"\n}}"
+        );
+        let az_indent4 =
+            format!("{{\n    \"accessToken\": \"{PLANTED}\",\n    \"tokenType\": \"Bearer\"\n}}");
         for (form, sample) in [
             ("az account get-access-token", &az_token),
             ("aws secretsmanager get-secret-value", &secretsmanager),
@@ -1799,6 +1821,15 @@ mod tests {
                 &secretsmanager_compact,
             ),
             ("az account get-access-token | jq -c .", &az_compact),
+            (
+                "aws secretsmanager get-secret-value | jq -C .",
+                &secretsmanager_color,
+            ),
+            (
+                "aws secretsmanager get-secret-value | jq --tab -S .",
+                &secretsmanager_tab_sorted,
+            ),
+            ("az account get-access-token | jq --indent 4 .", &az_indent4),
         ] {
             assert!(masked(sample), "{form}: the redactor must mask the value");
         }
@@ -2640,10 +2671,8 @@ mod tests {
             ("op read op://v/i/f 2>/dev/null >&2", "op read"),
             // zsh `print -v` assigns.
             ("print -v T \"$(op read op://v/i/f)\"", "op read"),
-            // Code review of round 1: a stage that selects something other
-            // than the value, or does not copy stdin to stdout.
-            ("pass show x | tail -n +2", "pass show"),
-            ("pass show x | sed -n 2p", "pass show"),
+            // Code review of round 1: a stage that writes elsewhere or reads
+            // a file instead of stdin.
             (
                 "op read op://v/i/f | yq --inplace '.a = load_str(\"/dev/stdin\")' f.yml",
                 "op read",
@@ -2866,9 +2895,27 @@ mod tests {
                 "aws secretsmanager get-secret-value --secret-id x | jq --stream .",
                 SM,
             ),
+            // Review round 4: a selection is not read either; a multi-line
+            // value's later lines, or the line it picks, are printed.
+            ("pass show x | tail -n +2", "pass show"),
+            ("pass show x | sed -n 2p", "pass show"),
+            ("pass show email/x | sed -n 's/^password: //p'", "pass show"),
+            ("pass show email/x | sed --quiet 1p", "pass show"),
+            ("op read op://v/key/private-key | tail +2", OP),
+            ("op read op://v/key/private-key | sed -n '2,$p'", OP),
             // An option's value is not the filter.
             ("op read op://v/i/f | yq -I 2 '.a'", OP),
             ("op read op://v/i/f | jq -f filter.jq", OP),
+            // An unknown option before the type keeps main's rule for a
+            // selector that prints data (review round 4).
+            (
+                "kubectl get --as admin secret app -o jsonpath='{.data.token}'",
+                JSONPATH,
+            ),
+            (
+                "kubectl get -s https://k:6443 secret app -o jsonpath='{.data.token}'",
+                JSONPATH,
+            ),
             // Finding 3: a jsonpath that reaches data, into a decode filter.
             (
                 "kubectl get secret app -o jsonpath='{.data}' | jq 'map_values(@base64d)'",
@@ -2908,6 +2955,12 @@ mod tests {
             // The resource type comes after options and their values.
             "kubectl get -n prod secrets -o json",
             "kubectl -n prod get secret app -o yaml",
+            // An option the reader does not know may be a flag or take the
+            // next word, so both readings are followed (review round 4).
+            "kubectl get --as admin secret app -o json | jq .",
+            "kubectl get -L app secrets -o json | jq .",
+            "kubectl get --as-group g secret app -o yaml",
+            "kubectl get -w secrets -o yaml",
         ];
         let all = cases
             .iter()
@@ -2945,12 +2998,52 @@ mod tests {
                 "az account get-access-token | jq -c --indent 0 .",
                 Some(TOKEN),
             ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x | jq --argjson a 1 .",
+                Some(SM),
+            ),
+            (
+                "aws secretsmanager get-secret-value --secret-id x | jq -C --tab -S .",
+                Some(SM),
+            ),
+            (
+                "az account get-access-token | jq --indent 4 -M .",
+                Some(TOKEN),
+            ),
+            // An unknown option before the type keeps main's ask on a
+            // selector that does not print data.
+            (
+                "kubectl get --as admin secrets -o jsonpath='{.items[*].metadata.name}'",
+                Some(JSONPATH),
+            ),
             // jq reads its file operand, not the piped value.
             ("op read op://v/i/f | jq -f filter.jq data.json", Some(OP)),
             // A namespace or object named `secret` is not the Secret type.
             ("kubectl get pods -n secrets -o yaml", None),
             ("kubectl get deploy secret -o json", None),
-            ("kubectl -n secrets get configmaps -o json | jq .", None),
+            // Neither reading of an unknown option reaches a Secret type:
+            // no block, and main's verdict (review round 4).
+            ("kubectl get --show-labels pods -n secrets -o yaml", None),
+            ("kubectl get -w pods -n secrets -o yaml", None),
+            ("kubectl get --as admin deploy secret -o yaml", None),
+            (
+                "kubectl get -L app pods -n secrets -o json | jq .",
+                Some("kubectl get secret -o json|yaml | jq"),
+            ),
+            (
+                "kubectl get -n secrets -A configmaps -o jsonpath='{.items[*].data}'",
+                Some(JSONPATH),
+            ),
+            // The positional reading only withholds a block: main asked here,
+            // so the ask stays (review round 4).
+            (
+                "kubectl -n secrets get configmaps -o json | jq .",
+                Some("kubectl get secret -o json|yaml | jq"),
+            ),
+            (
+                "kubectl get pods -n secrets -o jsonpath='{.items[*].data}'",
+                Some(JSONPATH),
+            ),
             (
                 "kubectl get secrets -o jsonpath='{.items[*].metadata.name}'",
                 Some(JSONPATH),

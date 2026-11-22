@@ -8,11 +8,14 @@
 
 - [x] 1.6 Review round 3: the taint rule. Every `jq`/`yq` stage after a value keeps it, whatever its filter says; the filter allowlists (`filters_pick_other_fields`, `names_only_filter`) are removed
 
+- [x] 1.7 Review round 4: `sed -n` and `tail -n +K` keep the value; the kubectl resource-type reader falls back to main's rule on an unknown option and only ever withholds a block
+
 ## 2. Tests
 
 - [x] 2.1 Each printed shape blocks; each consumer shape keeps its ask; contained shapes stay silent
 - [x] 2.2 Each staged red once: a pipe counted as printing, no producer ever printed, `echo` arguments never printed, a lone first-word substitution never printed, `printf -v` read as printing
 - [x] 2.3 Round 3, each staged red once: a jq/yq filter read again, a Secret's json blocking only with nothing after it, `--arg k v` taking one value
+- [x] 2.4 Round 4, each staged red once: an unknown kubectl option skipped as a boolean, the ask path using the positional reader, `sed -n` read as dropping, `tail +K` read as a file, `--argjson` taking one value, `-C` not keeping the key names
 
 ## 3. Measurement
 
