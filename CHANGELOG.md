@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.136.0] - 2026-11-22
+
 ### Added
 
 - **`guardrails guard-container-rm` asks "are you sure?" before a Bash command removes a Docker container.** `docker rm`, `docker container rm` and `docker container remove`, with or without `-f`, past Docker's global options (`--context`, `-H`, …) and through the wrappers the other guards peel (`sudo`, `env`, `timeout`, `xargs`, `bash -c`, `perl -e '…exec @ARGV'`), block once with a message naming the containers and what `-f` and `-v` add. The identical command again in the same session and agent within ten minutes passes once with a `confirmed` bypass row, keyed on the whole command like `guard-op-vault-scan`; no repository is part of the key. `docker stop`, `restart`, `kill`, `run --rm`, `image rm`, `rmi`, `compose`, `system prune`, and volume and network removal pass untouched. A command it cannot read allows, and it reads command text only, so a script file, the Docker API socket or `ssh host 'docker rm …'` is not seen. The subcommand is registered but unwired until the `cadence-guardrails` plugin adds its hooks.json entry; it replaces a settings ask rule whose dialog auto mode never answers (cameronsjo/cadence-hooks#1661).
