@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.136.1] - 2026-11-22
+
 ### Fixed
 
 - **`persist-plan-approval` persists a plan approval made through Code Mode's REPL tool.** In Code Mode the model calls `ExitPlanMode` from inside a `REPL` script, so the parent transcript records a `REPL` `tool_use` whose code calls `tools.ExitPlanMode(`, with no plan text and no `planFilePath`. The approve-and-clear arm looked only for a top-level `ExitPlanMode` call, missed it, and wrote no plan copy, no `plan-links.jsonl` row and no nudge, so a hand-saved plan named the child session instead of the approver. The arm now also accepts a main-chain `REPL` call to `tools.ExitPlanMode(` that comes after a main-chain `plan_mode` attachment whose plan-store file holds the child's plan, read through the same plan-store check as a top-level `planFilePath`. The 16 most recently named attachment paths are read, newest first. A `REPL` call alone, a call before the attachment, a sidechain call, a file outside the plan store, or a file holding another plan persists nothing. The call is matched as text, so a script that spells `tools.ExitPlanMode(` in a comment counts as a call; the plan-file match is the proof.
