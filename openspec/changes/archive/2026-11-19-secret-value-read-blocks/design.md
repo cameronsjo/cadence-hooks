@@ -59,8 +59,18 @@ The PR's review moved these decisions into `openspec/specs/secret-reads/spec.md`
 
 Also recorded in the main spec directly:
 
-- One rule for structured output: a form blocks when its value reaches the output, and keeps main's verdict only where a test proves the redactor masks it. `CLOUD_READS` is the per-subcommand table of value fields and proven-masked formats; a `--query` or `jq` path for another field and `-o none` keep main's verdict.
+- One rule for structured output: a form blocks when its value reaches the output, and keeps main's verdict only where a test proves the redactor masks it. `CLOUD_READS` is the per-subcommand table of value fields and proven-masked formats; a `--query` for another field and `-o none` keep main's verdict.
 - A help or version call on any producer is never printed.
 - kubectl selectors block only when they reach the data, the annotations, the whole metadata or a whole object.
-- `kubectl get secret -o json|yaml` printed blocks (plain `-o yaml` moves from allow to block on purpose), unless a safe filter shows only key names or metadata leaves. Whole `.metadata`, `.metadata.annotations` and `del(.data)` are not safe: the `last-applied-configuration` annotation can hold the data.
+- `kubectl get secret -o json|yaml` printed blocks (plain `-o yaml` moves from allow to block on purpose). Whole `.metadata` and `.metadata.annotations` reach the data: the `last-applied-configuration` annotation can hold it.
+
+## Review round 3 (cameronsjo/cadence-hooks#1663): the taint rule
+
+The round-2 code decided whether a later pipeline stage was safe by enumerating safe filter shapes (a jq path naming no value field after a cloud read or `op item get`, and a names-only allowlist for a Secret's json or yaml). The round-3 reviews found three holes with one cause: that list never finishes. A field step after `--query SecretString --output text` reopened the value, `select(…)`, `sort_by`, `map(select(…))`, `.metadata.name, .`, `getpath` and `tojson` passed the allowlist while printing whole Secrets, and a jsonpath `{.data}` into `jq 'map_values(@base64d)'` only asked. The operator replaced the enumeration on 2026-11-22:
+
+- Whether a producer form's output carries a value is decided at the producer, as before: the per-executable rows, `CLOUD_READS`, the kubectl selectors that reach data, and the redactor tests for the masked forms.
+- From there every later `jq`, `gojq`, `jaq`, `yq` or pass-through stage keeps the value, whatever its filter says. The guard reads no filter text to call a stage safe. The pipeline blocks when such a stage ends it and prints, and keeps main's verdict when a consumer or a file comes after.
+- The kubectl names-only allowlist is gone. Names and metadata come from kubectl's own selectors (`-o name`, a jsonpath, custom-columns or go-template naming only metadata, `type`, `kind` or counts) and `kubectl describe secret`, which keep main's verdict; the kubectl block message says so.
+- Accepted on purpose: a filter that selects no value now blocks (`kubectl get secret s -o json | jq '.metadata.name'`, `aws secretsmanager get-secret-value … | jq -r .ARN`, `op read … | jq keys`). The comparison corpus classes these `T`, each with its reason; `--query <field>` or a kubectl selector is the replacement.
+- The one filter still read is `jq .` (no other filter) after the two masked cloud reads, for the masked-format rule: a test proves the redactor masks the re-indented and the `-c` one-line output.
 - Output-format variables (`AWS_DEFAULT_OUTPUT`, `AZURE_CORE_OUTPUT`) are read like the flag, and `head`/`tail -c` no longer keep key names.

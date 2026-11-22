@@ -6,10 +6,13 @@
 - [x] 1.3 Grouped scripts and segments with an unmatched `)` keep the ask
 - [x] 1.4 Block message: Found/Fix, consumer forms, never the command text
 
+- [x] 1.6 Review round 3: the taint rule. Every `jq`/`yq` stage after a value keeps it, whatever its filter says; the filter allowlists (`filters_pick_other_fields`, `names_only_filter`) are removed
+
 ## 2. Tests
 
 - [x] 2.1 Each printed shape blocks; each consumer shape keeps its ask; contained shapes stay silent
 - [x] 2.2 Each staged red once: a pipe counted as printing, no producer ever printed, `echo` arguments never printed, a lone first-word substitution never printed, `printf -v` read as printing
+- [x] 2.3 Round 3, each staged red once: a jq/yq filter read again, a Secret's json blocking only with nothing after it, `--arg k v` taking one value
 
 ## 3. Measurement
 

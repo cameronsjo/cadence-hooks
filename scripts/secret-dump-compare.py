@@ -11,15 +11,17 @@ binaries and reads each verdict as ALLOW, ASK or BLOCK:
 - scripts/testdata/secret-value-commands.txt: secret-value shapes, each
   classed P (the value lands in the output), C (the value goes to a consumer),
   Q (nothing reaches the output) or L (a stated limit: a later or remote
-  command the guard does not read prints it), plus A lines that accept a move
+  command the guard does not read prints it) or T (`T <command> ## <reason>`:
+  a filter after a value that selects no value, blocked on purpose by the
+  taint rule, which never reads filter text), plus A lines that accept a move
   on a named everyday row, each with a one-line reason.
 
 The rules:
 
 1. the only moves allowed are to BLOCK on head, by guard-secret-dump: from ASK
-   or ALLOW on a P row, or from ASK on an everyday row an A line names. Any
+   or ALLOW on a P or T row, or from ASK on an everyday row an A line names. Any
    other move fails, on any row and any hook, an --extra row included;
-2. every P row blocks on head (the change is complete), and every A line
+2. every P and T row blocks on head (the change is complete), and every A line
    names an everyday row that moved (no stale acceptance);
 3. the run produced at least one move and one ASK on head (a run that could
    not have gone red is not evidence; printed as NOT EVIDENCE).
@@ -62,6 +64,7 @@ HOOKS = [
 MOVING_HOOK = "guard-secret-dump"
 CLASSES = {"P", "C", "Q", "L"}
 ACCEPT = "A"
+TAINT = "T"
 REASON = " ## "
 # Flags shape() keeps verbatim: one short letter, or a long name of letters and
 # dashes. A longer single-dash word may carry a glued value (`-uadmin`).
@@ -83,7 +86,12 @@ def rows(path: Path, classed: bool) -> list[tuple[str, str]]:
         cls, _, command = line.partition(" ")
         if cls == ACCEPT:
             continue
-        if cls not in CLASSES or not command:
+        if cls == TAINT:
+            command, sep, reason = command.partition(REASON)
+            if not sep or not command.strip() or not reason.strip():
+                raise HarnessError(f"T row needs `T <command>{REASON}<reason>`: {line!r}")
+            command = command.strip()
+        elif cls not in CLASSES or not command:
             raise HarnessError(f"unclassed row in {path.name}: {line!r}")
         # `⏎` spells a newline, so a classed row can hold a heredoc.
         out.append((cls, command.replace("⏎", "\n")))
@@ -190,6 +198,7 @@ def compare(base_bin: str, head_bin: str, extra: Path | None, root: Path) -> int
     failures: list[str] = []
     moved: list[str] = []
     passed_to_block: list[str] = []
+    taint_blocks: list[str] = []
     accepted_moves: list[str] = []
     used_accepts: set[str] = set()
     head_asks = 0
@@ -201,12 +210,14 @@ def compare(base_bin: str, head_bin: str, extra: Path | None, root: Path) -> int
             counts[cls] = counts.get(cls, 0) + 1
             head_asks += h == "ASK"
             name = hook[1]
-            if cls == "P" and name == MOVING_HOOK and h != "BLOCK":
-                failures.append(f"P row does not block on head ({h}): {shown}")
+            if cls in ("P", TAINT) and name == MOVING_HOOK and h != "BLOCK":
+                failures.append(f"{cls} row does not block on head ({h}): {shown}")
             if b == h:
                 continue
             line = f"{name}: {b} -> {h} [{cls}] {shown if cls != 'X' else shape(command)}"
-            if (cls, name, b, h) == ("P", MOVING_HOOK, "ASK", "BLOCK"):
+            if cls == TAINT and (name, h) == (MOVING_HOOK, "BLOCK") and b in ("ASK", "ALLOW"):
+                taint_blocks.append(line)
+            elif (cls, name, b, h) == ("P", MOVING_HOOK, "ASK", "BLOCK"):
                 moved.append(line)
             elif (cls, name, b, h) == ("P", MOVING_HOOK, "ALLOW", "BLOCK"):
                 passed_to_block.append(line)
@@ -222,6 +233,7 @@ def compare(base_bin: str, head_bin: str, extra: Path | None, root: Path) -> int
     for title, lines in (
         ("ASK -> BLOCK on printed rows", moved),
         ("ALLOW -> BLOCK on printed rows", passed_to_block),
+        ("accepted taint-rule blocks on non-value filters", taint_blocks),
         ("accepted moves on everyday rows", accepted_moves),
     ):
         print(f"{title} ({len(lines)}):")
