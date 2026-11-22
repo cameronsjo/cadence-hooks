@@ -316,6 +316,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cadence warn-live-memory-write",
         "cameronsjo/cadence-hooks#618",
     ),
+    // The `cadence-guardrails` hooks.json entry (PreToolUse, matcher `Bash`,
+    // `if: Bash(*docker*)`) lands in a cadence monorepo PR after a release
+    // carries the subcommand; that PR's fixture refresh removes this entry.
+    (
+        "guardrails guard-container-rm",
+        "cameronsjo/cadence-hooks#1661",
+    ),
     // Retired to a silent stub and unwired on purpose: the subcommands stay so
     // an installed plugin pin that still calls them exits 0 with no output.
     // Both entries leave when the stubs are deleted.

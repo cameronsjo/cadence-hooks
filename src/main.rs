@@ -456,6 +456,8 @@ enum GuardrailsCommands {
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
     GuardOpVaultScan,
+    /// Ask before docker rm removes a container (confirm tier: an identical retry passes once)
+    GuardContainerRm,
     /// Block a sops decrypt whose plaintext is not consumed by an allowed tool
     GuardSopsDecrypt,
     /// Block an unscrubbed Write/Edit (or any Bash write) into $CADENCE_RUNBOOKS_DIR
@@ -751,6 +753,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnInlineBody => "warn-inline-body",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
+            GuardrailsCommands::GuardContainerRm => "guard-container-rm",
             GuardrailsCommands::GuardSopsDecrypt => "guard-sops-decrypt",
             GuardrailsCommands::GuardRunbookScrub => "guard-runbook-scrub",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
@@ -1050,6 +1053,10 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             ),
             GuardrailsCommands::GuardOpVaultScan => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard),
+                pre,
+            ),
+            GuardrailsCommands::GuardContainerRm => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_container_rm::ContainerRmGuard),
                 pre,
             ),
             GuardrailsCommands::GuardSopsDecrypt => CheckPlan::new(

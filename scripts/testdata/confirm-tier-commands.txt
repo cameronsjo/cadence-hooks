@@ -137,3 +137,82 @@ export FOO=bar && echo $FOO
 true || false
 date -u
 uname -a
+# Docker (guard-container-rm, cameronsjo/cadence-hooks#1661). The removals
+# among these are listed in container-rm-expected-blocks.txt; every other
+# line must stay allowed.
+docker ps -a
+docker ps -aq --filter status=exited
+docker ps --format '{{.Names}}'
+docker logs web
+docker logs -f --tail 100 web
+docker inspect web
+docker exec -it web sh
+docker exec web cat /etc/hosts
+docker run --rm alpine true
+docker run --rm -it -v ./src:/src alpine sh
+docker run -d --name web -p 8080:80 nginx
+docker run --name rm alpine
+docker start web
+docker stop web
+docker stop $(docker ps -q)
+docker restart web
+docker kill web
+docker pause web
+docker cp web:/var/log/app.log .
+docker build -t app .
+docker build --rm -t app .
+docker pull alpine
+docker push registry.example/app:1
+docker tag app registry.example/app:1
+docker images
+docker image ls
+docker image rm alpine
+docker image remove alpine
+docker image prune -f
+docker rmi alpine
+docker compose up -d
+docker compose down
+docker compose down -v
+docker compose rm
+docker compose rm -f web
+docker compose logs web
+docker system prune
+docker system prune -af
+docker system df
+docker container ls -a
+docker container stop web
+docker container prune
+docker volume ls
+docker volume rm data
+docker network ls
+docker network rm appnet
+docker context ls
+docker context use prod
+docker --context rm ps
+docker info
+docker version
+docker stats --no-stream
+docker rm --help
+docker container rm -h
+docker-compose down
+podman rm web
+echo 'docker rm web'
+git commit -m 'docs: explain docker rm'
+grep -rn 'docker rm' docs
+ssh host 'docker rm web'
+rm -f docker-compose.override.yml
+docker rm web
+docker rm -f web
+docker rm -fv web db
+docker rm --force web
+docker container rm web
+docker container rm -f web
+docker container remove web
+docker --context prod rm web
+docker -H tcp://h:2375 rm web
+sudo docker rm web
+DOCKER_HOST=tcp://h:2375 docker rm web
+docker ps -aq | xargs docker rm
+docker rm $(docker ps -aq)
+docker stop web && docker rm web
+bash -c 'docker rm web'

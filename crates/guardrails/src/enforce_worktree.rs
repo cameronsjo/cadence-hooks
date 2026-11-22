@@ -5596,7 +5596,7 @@ fn run_confirmed(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
 ///
 /// - Edit and Write: the repo and the edited file, as the guard read them.
 /// - Bash: the repo and the whole command, whitespace-normalized as for the
-///   other two confirm-tier guards. An earlier part of a command can move the
+///   other confirm-tier guards. An earlier part of a command can move the
 ///   commit's real target without the scan seeing it (a quoted native-path
 ///   `export GIT_DIR`, a link made in the same command; cameronsjo/cadence-
 ///   hooks#1659 review 4, after rounds 1 and 2 found the same class in the

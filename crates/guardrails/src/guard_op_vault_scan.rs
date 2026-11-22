@@ -82,7 +82,9 @@ const MAX_WRAPPER_LAYERS: usize = 4;
 /// front: the shared runner peel, then `perl -e '…exec @ARGV…'`, repeated.
 /// A shape neither peel recognises is returned unchanged, so the guard keeps
 /// judging the literal command word (the old verdict).
-fn executed_argv(tokens: &[String]) -> &[String] {
+///
+/// `guard-container-rm` reads its command word through the same peel.
+pub(crate) fn executed_argv(tokens: &[String]) -> &[String] {
     let mut argv = peel_command_runners(tokens);
     for _ in 0..MAX_WRAPPER_LAYERS {
         match perl_exec_operands(argv) {

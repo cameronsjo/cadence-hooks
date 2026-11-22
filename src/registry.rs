@@ -583,6 +583,15 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: false,
     },
     HookEntry {
+        name: "guard-container-rm",
+        description: "Ask before docker rm removes a container (confirm tier: an identical retry passes once)",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+        // Remote: no-op when docker is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
         name: "warn-curl-alias",
         description: "Retired (cadence-hooks#1443): exits 0 silently for older plugin wiring",
         namespace: "guardrails",

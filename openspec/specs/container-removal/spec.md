@@ -1,4 +1,9 @@
-## ADDED Requirements
+# container-removal Specification
+
+## Purpose
+A guard on Bash commands that remove a Docker container: `cadence-hooks guardrails guard-container-rm` blocks the first attempt at a `docker rm` or `docker container rm`, naming what it removes, and passes the identical command again once (the confirm tier). It replaces a settings ask rule, whose dialog auto mode never answers (cameronsjo/cadence-hooks#1661).
+
+## Requirements
 
 ### Requirement: Container removal asks first
 On PreToolUse for Bash, `guard-container-rm` SHALL block a command holding a segment that removes a Docker container, and SHALL be in the confirm tier. A segment removes a container when, after the shared runner peel and the `perl -e '…exec @ARGV'` peel, its command word is `docker` and the first word after Docker's global options is `rm`, or is `container` followed by `rm` or `remove`. A removal segment carrying `--help` or `-h` removes nothing and MUST be allowed.
@@ -35,7 +40,7 @@ Before reading the subcommand, `guard-container-rm` SHALL skip Docker's global o
 - **THEN** the guard allows: `rm` is the context's name and `ps` the subcommand
 
 ### Requirement: Container removal message
-The block message SHALL name the containers the segment removes (its non-option operands, redirections dropped), say that the names come at run time when it names none (`xargs docker rm`), and say when `-f`/`--force` or `-v`/`--volumes` is present.
+The block message SHALL name the containers the segment removes (its non-option operands, redirections dropped), say when names come only at run time (`xargs docker rm`, `docker rm $(docker ps -aq)`, a variable), without reading a substitution's own words as names or flags, and say when `-f`/`--force` or `-v`/`--volumes` is present.
 
 #### Scenario: Forced removal through the management command
 - **WHEN** a Bash command is `docker container rm -f web db`
