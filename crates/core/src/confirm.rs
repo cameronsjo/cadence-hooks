@@ -24,11 +24,11 @@
 //!   directly;
 //! - the whole command, normalized only for spaces and tabs
 //!   ([`whole_command_action`], [`Retry::SameCommand`]), beside what the
-//!   guard read: `guard-op-vault-scan`, `guard-held-close`, and an
-//!   `enforce-worktree` Bash commit. An earlier segment (an `export`, a
-//!   sign-in, a link) can change the target without changing what the guard
-//!   reads, so no list of selectors is complete (cameronsjo/cadence-hooks
-//!   #1659 rounds 1, 2 and review 4).
+//!   guard read: `guard-op-vault-scan`, `guard-held-close`,
+//!   `guard-container-rm`, and an `enforce-worktree` Bash commit. An
+//!   earlier segment (an `export`, a sign-in, a link) can change the
+//!   target without changing what the guard reads, so no list of selectors
+//!   is complete (cameronsjo/cadence-hooks #1659 rounds 1, 2 and review 4).
 //!
 //! # One tool call, several processes
 //!

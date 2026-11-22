@@ -192,6 +192,8 @@ pub mod enforcement_status;
 pub mod gh_context;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
+/// Ask before a Bash command removes a Docker container (confirm tier).
+pub mod guard_container_rm;
 /// Block applying the human-only `impact:critical` / `likelihood:critical` labels.
 pub mod guard_critical_grade;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.

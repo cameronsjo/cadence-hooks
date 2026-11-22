@@ -17,8 +17,13 @@ fn cadence_hooks(root: &Path) -> Command {
 }
 
 fn run(root: &Path, payload: &serde_json::Value) -> Output {
+    run_hook(root, "guard-op-vault-scan", payload)
+}
+
+/// Run the `guardrails` hook `hook` on `payload`.
+fn run_hook(root: &Path, hook: &str, payload: &serde_json::Value) -> Output {
     let mut child = cadence_hooks(root)
-        .args(["guardrails", "guard-op-vault-scan"])
+        .args(["guardrails", hook])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -160,6 +165,48 @@ fn two_concurrent_processes_of_one_call_write_one_row() {
         let rows = bypass_rows(root.path());
         assert_eq!(rows.len(), round + 1, "round {round}: {rows:?}");
     }
+}
+
+#[test]
+fn container_removal_confirms_once_through_the_binary() {
+    // guard-container-rm (cameronsjo/cadence-hooks#1661): the command text is
+    // judged, nothing runs.
+    let root = tempfile::tempdir().unwrap();
+    let hook = "guard-container-rm";
+    let cmd = "docker rm -f web";
+    let first = run_hook(root.path(), hook, &payload(cmd, Some("sess-d"), "t1"));
+    assert_eq!(first.status.code(), Some(2), "{}", stderr(&first));
+    let msg = stderr(&first);
+    assert!(msg.contains("removes `web`"), "{msg}");
+    assert!(msg.contains("Are you sure?"), "{msg}");
+
+    // A different command is a new first attempt.
+    let other = run_hook(
+        root.path(),
+        hook,
+        &payload("docker rm -f db", Some("sess-d"), "t2"),
+    );
+    assert_eq!(other.status.code(), Some(2), "{}", stderr(&other));
+
+    let second = run_hook(root.path(), hook, &payload(cmd, Some("sess-d"), "t3"));
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    let rows = bypass_rows(root.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["kind"], "confirmed");
+    assert_eq!(rows[0]["hook"], hook);
+    assert!(!rows[0].to_string().contains("docker"), "{}", rows[0]);
+
+    let third = run_hook(root.path(), hook, &payload(cmd, Some("sess-d"), "t4"));
+    assert_eq!(third.status.code(), Some(2));
+
+    // Everything else Docker does passes silently.
+    let ps = run_hook(
+        root.path(),
+        hook,
+        &payload("docker ps -a", Some("sess-d"), "t5"),
+    );
+    assert_eq!(ps.status.code(), Some(0), "{}", stderr(&ps));
+    assert!(ps.stdout.is_empty() && ps.stderr.is_empty());
 }
 
 #[test]

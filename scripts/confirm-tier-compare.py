@@ -9,7 +9,14 @@ tool calls of one session per binary, and holds two rules:
 - first attempt: base and head agree on every row (any move either way fails);
 - second attempt: the only move allowed is BLOCK on base to ALLOW on head, on
   a row the base also blocked first time, and only for the confirm-tier
-  guards (enforce-worktree, guard-op-vault-scan, guard-held-close).
+  guards (enforce-worktree, guard-op-vault-scan, guard-held-close,
+  guard-container-rm).
+
+A guard in NEW_ON_HEAD that the base binary does not have (its subcommand is
+unrecognized there) is scored against an allow-everywhere baseline instead:
+its first attempt may block only the commands in its expected-blocks file,
+must block each of them, and must pass each on the second attempt. Every
+other row of that guard must allow both times.
 
 The payloads are the Bash commands in scripts/testdata/confirm-tier-commands.txt
 (each run from a primary checkout and from a linked worktree) plus Edit and
@@ -48,8 +55,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-CONFIRM_HOOKS = {"enforce-worktree", "guard-op-vault-scan", "guard-held-close"}
-COMMANDS = Path(__file__).resolve().parent / "testdata" / "confirm-tier-commands.txt"
+CONFIRM_HOOKS = {
+    "enforce-worktree",
+    "guard-op-vault-scan",
+    "guard-held-close",
+    "guard-container-rm",
+}
+TESTDATA = Path(__file__).resolve().parent / "testdata"
+COMMANDS = TESTDATA / "confirm-tier-commands.txt"
+# Guards newer than some base binaries: hook name -> the commands it must block.
+NEW_ON_HEAD = {"guard-container-rm": TESTDATA / "container-rm-expected-blocks.txt"}
 HELD_LEDGER = "cameronsjo/cadence-ecosystem#354 cameronsjo/cadence#107\n"
 ORIGIN = "https://github.com/cameronsjo/cadence-ecosystem.git"
 # Path components a guard treats specially: `.claude` exempts enforce-worktree,
@@ -109,9 +124,22 @@ def setup(root: Path) -> tuple[Path, Path, Path]:
     return primary, wt, ledger
 
 
-def commands() -> list[str]:
-    lines = COMMANDS.read_text().splitlines()
+def commands(path: Path = COMMANDS) -> list[str]:
+    lines = path.read_text().splitlines()
     return [line for line in lines if line.strip() and not line.startswith("#")]
+
+
+def has_hook(binary: str, hook_args: list[str], env: dict[str, str]) -> bool:
+    """Whether `binary` knows the hook subcommand. clap refuses an unknown one
+    with exit 2 and `unrecognized subcommand`, which would read as a block."""
+    p = subprocess.run(
+        [binary, *hook_args],
+        input=b"{}",
+        capture_output=True,
+        env=env,
+        timeout=60,
+    )
+    return b"unrecognized subcommand" not in p.stderr
 
 
 def edits(primary: Path, wt: Path) -> list[tuple[Path, str, dict[str, str]]]:
@@ -174,8 +202,22 @@ def compare(base_bin: str, head_bin: str, root: Path) -> int:
         ("guard-held-close", ["cadence", "guard-held-close", "--ledger", str(ledger)]),
         ("git-safety", ["cadence", "git-safety"]),
         ("prevent-secret-writes", ["cadence", "prevent-secret-writes"]),
+        ("guard-container-rm", ["guardrails", "guard-container-rm"]),
     ]
     edit_hooks = [bash_hooks[0], bash_hooks[4]]
+    # A hook the base binary lacks is scored against an allow baseline.
+    new_hooks = {
+        hook: set(commands(NEW_ON_HEAD[hook]))
+        for hook, args in bash_hooks
+        if hook in NEW_ON_HEAD and not has_hook(base_bin, args, envs["base"])
+    }
+    for hook, expected in new_hooks.items():
+        if not has_hook(head_bin, dict(bash_hooks)[hook], envs["head"]):
+            raise HarnessError(f"{hook} is missing from both binaries")
+        unlisted = expected - set(commands())
+        if unlisted:
+            raise HarnessError(f"{hook} expected blocks not in {COMMANDS.name}: {sorted(unlisted)}")
+    new_blocks: list[str] = []
     cases = [(cwd, "Bash", {"command": c}, bash_hooks) for cwd in (primary, wt) for c in commands()]
     cases += [(cwd, tool, ti, edit_hooks) for cwd, tool, ti in edits(primary, wt)]
 
@@ -189,6 +231,9 @@ def compare(base_bin: str, head_bin: str, root: Path) -> int:
             rows += 1
             verdicts = {}
             for name, binary in (("base", base_bin), ("head", head_bin)):
+                if name == "base" and hook in new_hooks:
+                    verdicts[name] = ["ALLOW", "ALLOW"]
+                    continue
                 session = f"cmp-{i}-{hook}"
                 verdicts[name] = [
                     verdict(
@@ -212,6 +257,16 @@ def compare(base_bin: str, head_bin: str, root: Path) -> int:
                     snooze.unlink()
             (b1, b2), (h1, h2) = verdicts["base"], verdicts["head"]
             label = f"{hook} | {tool} | {ti.get('command', ti.get('file_path'))} | cwd={cwd.name}"
+            if hook in new_hooks:
+                expected = ti.get("command") in new_hooks[hook]
+                if (h1, h2) == (("BLOCK", "ALLOW") if expected else ("ALLOW", "ALLOW")):
+                    if expected:
+                        new_blocks.append(label)
+                        confirm_passes.append(f"(new) BLOCK->ALLOW  {label}")
+                else:
+                    want = "BLOCK then ALLOW" if expected else "ALLOW both times"
+                    first_moves.append(f"{h1},{h2} (want {want})  {label}")
+                continue
             blocks_on_base += b1 == "BLOCK"
             if b1 != h1:
                 first_moves.append(f"{b1}->{h1}  {label}")
@@ -221,6 +276,11 @@ def compare(base_bin: str, head_bin: str, root: Path) -> int:
                 (confirm_passes if confirmed else other_moves).append(move)
 
     print(f"cases={len(cases)} rows={rows} blocks_on_base_first_attempt={blocks_on_base}")
+    for hook, expected in new_hooks.items():
+        print(
+            f"{hook}: absent on base; {len(new_blocks)} expected block rows "
+            f"({len(expected)} commands x 2 checkouts), every other row allowed"
+        )
     for title, moves in (
         ("first-attempt moves", first_moves),
         ("second-attempt BLOCK->ALLOW on a confirm-tier guard", confirm_passes),
