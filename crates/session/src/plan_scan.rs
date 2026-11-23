@@ -325,28 +325,111 @@ const TRIVIAL_NONE_REASONS: &[&str] = &["n/a", "na", "none", "-", ".", "tbd"];
 /// all trivial (cameronsjo/cadence-hooks#1256 M-2).
 fn trivial_none_reason(reason: &str) -> bool {
     let reason = reason
-        .trim_matches(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '/'))
+        .trim_matches(|c: char| c.is_whitespace() || (is_punctuation(c) && c != '/'))
         .to_ascii_lowercase();
     reason.is_empty() || TRIVIAL_NONE_REASONS.contains(&reason.as_str())
 }
 
-/// True when the plan body carries a settled `Panel:` line — anchored at line
-/// start, in exactly one of the plan template's two settled forms:
+/// ASCII punctuation plus the dashes and ellipsis a plan line types: a bare
+/// `Panel: —` or `none — …` says nothing.
+fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation() || matches!(c, '—' | '–' | '…')
+}
+
+/// Trivial as a whole value (rule 1 of [`panel_line_settled`]): empty, only
+/// punctuation, or one of [`TRIVIAL_NONE_REASONS`].
+fn trivial_panel_value(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_whitespace() || is_punctuation(c))
+        || trivial_none_reason(value)
+}
+
+/// First words that mark a placeholder, not an outcome (rule 2).
+const PLACEHOLDER_WORDS: &[&str] = &["pending", "tbd", "todo"];
+
+/// First words that assert no panel ran (rule 4); each needs a real reason.
+const ABSENCE_WORDS: &[&str] = &["none", "skipped", "skip"];
+
+/// The `Panel:` prefixes the gate reads, with the emphasis marker (if any)
+/// that closes a fully emphasized line: `**Panel:** x` closes before the
+/// value, `**Panel: x**` closes after it.
+const PANEL_PREFIXES: [(&str, Option<&str>); 5] = [
+    ("Panel: ", None),
+    ("**Panel:** ", None),
+    ("__Panel:__ ", None),
+    ("**Panel: ", Some("**")),
+    ("__Panel: ", Some("__")),
+];
+
+/// The value of a `Panel:` line (trimmed, outer emphasis stripped), or
+/// `None` when the line is not one. Line-start anchored, a space after the
+/// colon required.
+fn panel_value(line: &str) -> Option<&str> {
+    PANEL_PREFIXES.iter().find_map(|(prefix, close)| {
+        let rest = line.strip_prefix(prefix)?.trim();
+        let rest = close.map_or(rest, |c| rest.strip_suffix(c).unwrap_or(rest));
+        Some(rest.trim())
+    })
+}
+
+/// An unfilled template placeholder (rule 3): a `<…>` span, or a bracketed
+/// span that opens on one (`[<reason …>]`) or wraps the whole value. A
+/// markdown link or a `[see below]` aside mid-line is not a placeholder.
+fn has_template_placeholder(value: &str) -> bool {
+    let angle_span = value
+        .find('<')
+        .is_some_and(|open| value[open + 1..].contains('>'));
+    angle_span || value.contains("[<") || (value.starts_with('[') && value.ends_with(']'))
+}
+
+/// True when a `Panel:` value states an outcome (rules 1–4 of
+/// [`panel_line_settled`]).
+fn panel_value_settled(value: &str) -> bool {
+    if trivial_panel_value(value) || has_template_placeholder(value) {
+        return false;
+    }
+    let word_len = value
+        .find(|c: char| !c.is_alphanumeric())
+        .unwrap_or(value.len());
+    let (word, after) = value.split_at(word_len);
+    let word = word.to_ascii_lowercase();
+    if PLACEHOLDER_WORDS.contains(&word.as_str()) {
+        return false;
+    }
+    if ABSENCE_WORDS.contains(&word.as_str()) {
+        // The word ends at whitespace, punctuation or end of line (the
+        // `find` above), so `nonesuch` and `skipping` are not the keyword.
+        let reason = after
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':'));
+        return !trivial_none_reason(reason);
+    }
+    true
+}
+
+/// True when the plan body carries a settled `Panel:` line: one that states
+/// an outcome. The gate catches a missing, pending or unfilled record, not
+/// wording (ADR-0046: accidents, not adversaries); the human reads the line
+/// at approval. Transcripts showed about 4 of 5 blocks under the old
+/// two-form grammar were plans that already recorded their panel
+/// (`Panel: skipped — docs-only`, `3 seats ran (…) — 57 findings`,
+/// `**Panel:** none — x`), the plan-shape-false-blocks plan, 2026-11-23.
 ///
-/// - `Panel: <seats> ran — <counts…>` (a panel ran; both sides non-empty)
-/// - `Panel: none — <reason>` (the absence assertion; a non-trivial reason —
-///   not empty, `n/a`, `na`, `none`, `-`, `.`, or `tbd`, case-insensitive)
+/// The first visible `Panel:` line's value (trimmed; `Panel: `,
+/// `**Panel:** `, `__Panel:__ `, or a fully emphasized `**Panel: x**`) is
+/// **unsettled** when:
 ///
-/// The separator tolerates what a human actually types: em dash (the
-/// template's canonical form), en dash, `--`, or a plain hyphen — a
-/// hand-written `Panel: none - reason` states the settled fact unambiguously,
-/// and hardcoding U+2014 would fire a false nudge on it (code review of this
-/// change).
+/// 1. the whole value is trivial: empty, punctuation only, or `n/a`, `na`,
+///    `none`, `-`, `.`, `tbd` (cameronsjo/cadence-hooks#761);
+/// 2. its first word is `pending`, `tbd` or `todo` (case-insensitive);
+/// 3. it carries an unfilled template placeholder: a `<…>` span, a `[<`
+///    opener, or a value wrapped in `[…]`;
+/// 4. its first word is `none`, `skipped` or `skip` (a whole word) and the
+///    reason after it (leading dashes, colon and whitespace stripped) is
+///    trivial per rule 1.
 ///
-/// Anything else — no `Panel:` line at all, a `Panel: pending…` placeholder,
-/// or a `## Panel review` heading with no settled line — is unsettled. The
-/// line-start anchor plus the required `Panel: ` prefix means a `## Panel`
-/// heading can never false-match.
+/// Anything else settles: `x ran`, `ran — 3 findings`, `seat — 2 HIGH, all
+/// folded` and `none reason given` each state an outcome.
 ///
 /// **First match in document order decides** — the `Driver:` stamp's
 /// discipline (plan-pipeline-conventions §4/§5): the plan template's `## Panel`
@@ -356,32 +439,17 @@ fn trivial_none_reason(reason: &str) -> bool {
 /// open) nor contradict the stanza. Lines inside fenced code blocks and
 /// block quotes are skipped before the first-match rule applies
 /// ([`visible_lines`]'s discipline) — a fenced or quoted example in a plan
-/// with no stanza at all must not mint a settled verdict (security review of
-/// this change; same class as the quoted-example hole above). HTML
-/// comments, nested fences and leading frontmatter are skipped the same way
+/// with no stanza at all must not mint a settled verdict. HTML comments,
+/// nested fences and leading frontmatter are skipped the same way
 /// (cameronsjo/cadence-hooks#1283), and an unterminated fence or comment
 /// hides to EOF: on a malformed document the failure mode is a spurious
-/// block (fail-loud), never a hidden line settling the gate. Detection only; the caller names this stanza (a static
-/// string, "a settled Panel: line") in the composed format-gate line, never
-/// any matched text.
+/// block (fail-loud), never a hidden line settling the gate. Detection only;
+/// the caller names this stanza (a static string, "a settled Panel: line")
+/// in the composed message, never any matched text.
 pub(crate) fn panel_line_settled(body: &str) -> bool {
-    let Some(rest) = visible_lines(body).find_map(|line| line.strip_prefix("Panel: ")) else {
-        return false;
-    };
-    // Dash tolerance: `--` must be tried before `-` or the second hyphen
-    // leaks into the text it precedes.
-    fn strip_dash(s: &str) -> Option<&str> {
-        let s = s.trim_start();
-        ["—", "–", "--", "-"].iter().find_map(|d| s.strip_prefix(d))
-    }
-    if let Some(after_none) = rest.strip_prefix("none") {
-        return strip_dash(after_none).is_some_and(|reason| !trivial_none_reason(reason));
-    }
-    if let Some((seats, tail)) = rest.split_once(" ran ") {
-        return !seats.trim().is_empty()
-            && strip_dash(tail).is_some_and(|counts| !counts.trim().is_empty());
-    }
-    false
+    visible_lines(body)
+        .find_map(panel_value)
+        .is_some_and(panel_value_settled)
 }
 
 /// Static stanza names the plan-shape gates render — never matched plan
@@ -394,11 +462,13 @@ pub(crate) const PANEL_STANZA: &str = "a settled Panel: line";
 /// `Loop: none — <reason>`. The detector checks only that the heading exists,
 /// never what sits under it (cameronsjo/cadence-hooks#1281).
 pub(crate) const LOOP_STANZA: &str = "a ## Loop section";
-/// The template's `## Concessions` section: one row per place the plan works
-/// around something a platform it builds on cannot do, or the single line
-/// `Concessions: none — <reason>`. The detector checks only that the heading
-/// exists, never what sits under it (cameronsjo/cadence-hooks#1450).
-pub(crate) const CONCESSIONS_STANZA: &str = "a ## Concessions section";
+/// The template's `## Workarounds` section (named `## Concessions` before the
+/// template renamed it; both headings satisfy the detector): one row per place
+/// the plan works around something a platform it builds on cannot do, or the
+/// single line `Workarounds: none — <reason>`. The detector checks only that a
+/// heading exists, never what sits under it (cameronsjo/cadence-hooks#1450,
+/// cameronsjo/cadence-hooks#1675).
+pub(crate) const WORKAROUNDS_STANZA: &str = "a ## Workarounds section";
 pub(crate) const ALTERNATIVES_STANZA: &str = "an Alternatives-declined stanza";
 pub(crate) const CHECKBOX_STANZA: &str = "checkbox tasks";
 pub(crate) const GLOBAL_CONSTRAINTS_STANZA: &str = "a ## Global Constraints section";
@@ -440,7 +510,7 @@ pub(crate) fn template_shaped_plan_without_loop() -> String {
 }
 
 /// [`TEMPLATE_SHAPED_PLAN`] with its `## Concessions` section removed: a plan
-/// that lacks exactly [`CONCESSIONS_STANZA`]. Panics when the section is not
+/// that lacks exactly [`WORKAROUNDS_STANZA`]. Panics when the section is not
 /// there to strip, for the reason [`template_shaped_plan_without_loop`] does.
 #[cfg(test)]
 pub(crate) fn template_shaped_plan_without_concessions() -> String {
@@ -457,10 +527,10 @@ pub(crate) fn template_shaped_plan_without_concessions() -> String {
 
 /// The ONE plan-shape detector both gates consume: the plan template's
 /// stanzas `body` lacks, the `Panel:` line first and the rest in template
-/// order (`## Loop`, `## Concessions`, Alternatives declined,
+/// order (`## Loop`, `## Workarounds`, Alternatives declined,
 /// `## Global Constraints`, `## Orchestrator`, `## Tasks`, checkbox tasks).
 /// Only the `Panel:` line blocks at call time;
-/// the rest nudge, `## Loop` and `## Concessions` included
+/// the rest nudge, `## Loop` and `## Workarounds` included
 /// (cadence-hooks#1019, cadence-hooks#1281, cadence-hooks#1450). Empty for a template-shaped
 /// plan. Two scanners drifted once already (the #675 polish), which is why
 /// persist-time and call-time share this single entry point rather than
@@ -476,9 +546,12 @@ pub(crate) fn missing_stanzas(body: &str) -> Vec<&'static str> {
         missing.push(LOOP_STANZA);
     }
     // Heading only, matched the way `## Loop` is: a table or
-    // `Concessions: none — <reason>` under it is the author's to write.
-    if !section_heading_present(body, "## Concessions") {
-        missing.push(CONCESSIONS_STANZA);
+    // `Workarounds: none — <reason>` under it is the author's to write. The
+    // template's earlier `## Concessions` name still counts (#1675).
+    if !section_heading_present(body, "## Workarounds")
+        && !section_heading_present(body, "## Concessions")
+    {
+        missing.push(WORKAROUNDS_STANZA);
     }
     if !alternatives_stanza_present(body) {
         missing.push(ALTERNATIVES_STANZA);
@@ -2330,7 +2403,9 @@ mod tests {
             "# T\n\nPanel: pending — seats not yet run\n"
         ));
         assert!(!panel_line_settled("# T\n\nPanel: none — \n"));
-        assert!(!panel_line_settled("# T\n\nPanel:  ran — 3 findings\n"));
+        // Flipped by the plan-shape-false-blocks plan (2026-11-23): an outcome
+        // with no seats named still states one.
+        assert!(panel_line_settled("# T\n\nPanel:  ran — 3 findings\n"));
         assert!(!panel_line_settled(
             "# T\n\n## Panel review — findings declined\n\n- none declined\n"
         ));
@@ -2364,10 +2439,11 @@ mod tests {
         assert!(panel_line_settled(
             "# T\n\nPanel: reviewer ran – 1 finding\n"
         ));
-        // …but the dash is still required, and an empty ran-tail is unsettled.
-        assert!(!panel_line_settled("# T\n\nPanel: none reason given\n"));
-        assert!(!panel_line_settled("# T\n\nPanel: x ran — \n"));
-        assert!(!panel_line_settled("# T\n\nPanel: x ran 3 findings\n"));
+        // Flipped by the plan-shape-false-blocks plan (2026-11-23): the dash
+        // is no longer required, and naming the seats that ran is an outcome.
+        assert!(panel_line_settled("# T\n\nPanel: none reason given\n"));
+        assert!(panel_line_settled("# T\n\nPanel: x ran — \n"));
+        assert!(panel_line_settled("# T\n\nPanel: x ran 3 findings\n"));
         // Fenced and block-quoted examples never mint a settled verdict for a
         // plan with no stanza at all (security review of this change).
         assert!(!panel_line_settled(
@@ -2383,6 +2459,68 @@ mod tests {
         ));
     }
 
+    /// The plan-shape-false-blocks plan (2026-11-23, cameronsjo/cadence-hooks#1675):
+    /// a `Panel:` line settles when it states an outcome; only a missing,
+    /// pending, trivial or unfilled-template line is unsettled.
+    #[test]
+    fn panel_line_settles_on_any_stated_outcome_table() {
+        let settle = [
+            "Panel: skipped — docs-only",
+            "Panel: skip: one-line fix",
+            "Panel: 3 seats ran (a, b) — 57 findings",
+            "Panel: seat — 2 HIGH, all folded",
+            "Panel: `x` ran — 1",
+            "**Panel:** none — x",
+            "**Panel: none — x**",
+            "__Panel:__ none — docs-only",
+            "Panel: x ran",
+            "Panel: x ran — ",
+            "Panel: ran — 3 findings",
+            "Panel: none reason given",
+            "Panel: nonesuch ran — 2",
+            "Panel: skipping-seat ran — 1 finding",
+            "Panel: round 1 — 4 findings, all folded",
+            "Panel: plan-reviewer ran — 2 findings [see below]",
+            "Panel: [plan-reviewer](https://example.invalid) ran — 1 finding",
+        ];
+        let unsettled = [
+            "no panel line",
+            "Panel: pending",
+            "Panel: Pending — seats queued",
+            "Panel: Todo: run the seats",
+            "Panel: tbd",
+            "**Panel: pending**",
+            "**Panel:** pending",
+            "__Panel:__ tbd",
+            "Panel: n/a",
+            "Panel: none",
+            "Panel: none.",
+            "Panel: none — n/a",
+            "Panel: skipped",
+            "Panel: skip —",
+            "Panel: <seats> ran — N findings",
+            "Panel: none — [<reason — e.g. x>]",
+            "Panel: none — seats failed: [<list of seats>]",
+            "Panel: [seats ran — N findings]",
+            "Panel: ",
+            "Panel: —",
+            "Panel:x ran — 1",
+            "Panel:",
+            "  Panel: x ran — 1",
+            "```\nPanel: x ran — 1\n```",
+            "> Panel: x ran — 1",
+            "<!--\nPanel: x ran — 1\n-->",
+        ];
+        for line in settle {
+            let plan = format!("# T\n\n{line}\n\nbody\n");
+            assert!(panel_line_settled(&plan), "should settle: {plan:?}");
+        }
+        for line in unsettled {
+            let plan = format!("# T\n\n{line}\n\nbody\n");
+            assert!(!panel_line_settled(&plan), "should be unsettled: {plan:?}");
+        }
+    }
+
     #[test]
     fn missing_stanzas_names_every_absent_stanza_in_template_order() {
         assert_eq!(
@@ -2390,7 +2528,7 @@ mod tests {
             vec![
                 PANEL_STANZA,
                 LOOP_STANZA,
-                CONCESSIONS_STANZA,
+                WORKAROUNDS_STANZA,
                 ALTERNATIVES_STANZA,
                 GLOBAL_CONSTRAINTS_STANZA,
                 ORCHESTRATOR_STANZA,
@@ -2402,7 +2540,7 @@ mod tests {
             missing_stanzas("# T\n\nPanel: none — no seat warranted\n\nprose\n"),
             vec![
                 LOOP_STANZA,
-                CONCESSIONS_STANZA,
+                WORKAROUNDS_STANZA,
                 ALTERNATIVES_STANZA,
                 GLOBAL_CONSTRAINTS_STANZA,
                 ORCHESTRATOR_STANZA,
@@ -2542,7 +2680,7 @@ mod tests {
     fn missing_stanzas_reports_only_concessions_when_the_heading_is_absent() {
         assert_eq!(
             missing_stanzas(&template_shaped_plan_without_concessions()),
-            vec![CONCESSIONS_STANZA]
+            vec![WORKAROUNDS_STANZA]
         );
     }
 
@@ -2587,7 +2725,7 @@ mod tests {
         ] {
             assert_eq!(
                 missing_stanzas(&without_concessions_but_with(decoy)),
-                vec![CONCESSIONS_STANZA],
+                vec![WORKAROUNDS_STANZA],
                 "{label}"
             );
         }
@@ -2621,13 +2759,42 @@ mod tests {
         );
     }
 
+    /// cameronsjo/cadence-hooks#1675: the template renamed the section to
+    /// `## Workarounds`; both headings satisfy the detector, a near-miss
+    /// heading satisfies neither, and the nudge names the current one.
+    #[test]
+    fn missing_stanzas_accepts_workarounds_or_concessions_heading() {
+        for (section, satisfied) in [
+            (
+                "## Workarounds\n\nWorkarounds: none — nothing is worked around\n\n",
+                true,
+            ),
+            (
+                "## Concessions\n\nConcessions: none — nothing is worked around\n\n",
+                true,
+            ),
+            ("### Workarounds\n\nWorkarounds: none — x\n\n", false),
+            ("## workarounds\n\nWorkarounds: none — x\n\n", false),
+            ("Workarounds: none — x\n\n", false),
+        ] {
+            let plan = without_concessions_but_with(section);
+            let want: Vec<&str> = if satisfied {
+                vec![]
+            } else {
+                vec![WORKAROUNDS_STANZA]
+            };
+            assert_eq!(missing_stanzas(&plan), want, "{section:?}");
+        }
+        assert_eq!(WORKAROUNDS_STANZA, "a ## Workarounds section");
+    }
+
     #[test]
     fn missing_stanzas_flags_a_plan_that_has_loop_but_no_concessions() {
         // The shape every plan written before the template gained the section
         // has: a `## Loop` heading and nothing after it.
         let plan = template_shaped_plan_without_concessions();
         assert!(plan.contains("## Loop"), "the Loop section is still there");
-        assert_eq!(missing_stanzas(&plan), vec![CONCESSIONS_STANZA]);
+        assert_eq!(missing_stanzas(&plan), vec![WORKAROUNDS_STANZA]);
     }
 
     // --- hidden positions: comment, nested fence, frontmatter (cadence-hooks#1283) ---
@@ -2781,7 +2948,7 @@ mod tests {
                 assert!(missing.is_empty(), "{label}: {missing:?} in {plan:?}");
             } else {
                 assert!(
-                    missing.contains(&CONCESSIONS_STANZA),
+                    missing.contains(&WORKAROUNDS_STANZA),
                     "{label}: {missing:?} in {plan:?}"
                 );
             }
@@ -2803,7 +2970,7 @@ mod tests {
         );
         assert_eq!(
             missing_stanzas(&concessions_in_fm),
-            vec![CONCESSIONS_STANZA]
+            vec![WORKAROUNDS_STANZA]
         );
         let without_panel = TEMPLATE_SHAPED_PLAN
             .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");

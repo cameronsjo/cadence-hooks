@@ -12,10 +12,10 @@
 //!
 //! | payload | verdict |
 //! |---|---|
-//! | top-level, harness-template plan (no `Panel:` line) | exit 2, stderr names the missing stanzas + the in-band escape |
+//! | top-level, harness-template plan (no `Panel:` line) | exit 2, stderr carries the fix alone: first-line rule + both canonical shapes |
 //! | top-level, template-shaped plan | exit 0, reminders-only nudge (subagents stopped, operator asked) |
 //! | top-level, template-shaped plan minus its `## Loop` section | exit 0, nudge naming that section and no other |
-//! | top-level, template-shaped plan minus its `## Concessions` section | exit 0, nudge naming that section and no other |
+//! | top-level, template-shaped plan minus its `## Concessions` section | exit 0, nudge naming `## Workarounds` and no other |
 //! | top-level, `Panel: none — reason`, no checkbox tasks | exit 0, one nudge sentence + the reminders |
 //! | subagent-originated (`agent_id` present), harness-template plan | exit 0, silent |
 //! | empty `tool_input`, no plan path | exit 0, silent (fail-open, ADR-0001) |
@@ -99,24 +99,33 @@ fn harness_template_plan_is_blocked_naming_stanzas_and_escape() {
         "harness-template plan must block"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("a settled Panel: line"), "stderr: {stderr}");
     assert!(
-        stderr.contains("an Alternatives-declined stanza"),
+        stderr.contains("no settled Panel: line"),
         "stderr: {stderr}"
     );
-    assert!(stderr.contains("checkbox tasks"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("the first Panel: line is the one judged; replace it, don't add another"),
+        "the first-line rule, so the fix doesn't loop: {stderr}"
+    );
+    assert!(
+        stderr.contains("Panel: <seats> ran — N findings, M folded in, K declined"),
+        "ran shape: {stderr}"
+    );
     assert!(
         stderr.contains("Panel: none — <reason>"),
         "escape template: {stderr}"
     );
-    assert!(
-        stderr.contains("shift-tab"),
-        "leave-plan-mode escape: {stderr}"
-    );
-    assert!(
-        stderr.contains(SUBAGENTS_REMINDER) && stderr.contains(OPERATOR_ASK_REMINDER),
-        "the block carries both presentation reminders: {stderr}"
-    );
+    // The fix alone (cameronsjo/cadence-hooks#1675): the advisory list and
+    // both reminders ride the re-call's allow nudge, not the block.
+    for gone in [
+        "an Alternatives-declined stanza",
+        "checkbox tasks",
+        "shift-tab",
+        SUBAGENTS_REMINDER,
+        OPERATOR_ASK_REMINDER,
+    ] {
+        assert!(!stderr.contains(gone), "the block drops {gone:?}: {stderr}");
+    }
     // The message renders as one clean paragraph — a hand-wrapped literal that
     // leaked its indentation once shipped green past the substring asserts.
     assert!(!stderr.contains("  "), "no double spaces: {stderr}");
@@ -175,7 +184,7 @@ fn plan_missing_only_the_loop_section_nudges_naming_it_and_allows() {
         "the nudge names the missing Loop section and no other: {ctx}"
     );
     assert!(
-        !ctx.contains("the one stanza that blocks"),
+        !ctx.contains("no settled Panel: line"),
         "a plan missing only the Loop section draws no block wording: {ctx}"
     );
 }
@@ -197,11 +206,11 @@ fn plan_missing_only_the_concessions_section_nudges_naming_it_and_allows() {
     // missing stanza would put a comma there, and this fixture would no longer
     // be what its name says.
     assert!(
-        ctx.contains("plan lacks a ## Concessions section — advisory"),
+        ctx.contains("plan lacks a ## Workarounds section — advisory"),
         "the nudge names the missing Concessions section and no other: {ctx}"
     );
     assert!(
-        !ctx.contains("the one stanza that blocks"),
+        !ctx.contains("no settled Panel: line"),
         "a plan missing only the Concessions section draws no block wording: {ctx}"
     );
 }
@@ -221,7 +230,7 @@ fn settled_panel_none_with_no_boxes_nudges_once_and_allows() {
         "nudge names the missing stanza: {ctx}"
     );
     assert!(
-        !ctx.contains("a settled Panel: line"),
+        !ctx.contains("a settled Panel: line") && !ctx.contains("no settled Panel: line"),
         "Panel line is settled: {ctx}"
     );
     assert!(
@@ -282,7 +291,10 @@ fn plan_file_path_inside_the_plan_store_is_read_and_judged() {
         "plan-store harness plan must block"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("a settled Panel: line"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("no settled Panel: line"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
