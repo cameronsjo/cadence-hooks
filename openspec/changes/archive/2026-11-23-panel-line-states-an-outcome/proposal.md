@@ -21,4 +21,4 @@ None.
 
 ## Impact
 
-- `cadence-hooks session lint-plan-shape` and the persist-time format-gate sentence of `session persist-plan-approval`, which share the detector. Plans that blocked on a stated panel now allow; no plan that allowed before blocks.
+- `cadence-hooks session lint-plan-shape` and the persist-time format-gate sentence of `session persist-plan-approval`, which share the detector. Plans that blocked on a stated panel now allow. A line that allowed before blocks only when it carries a `<…>` span other than an autolink or opens with `pending`, `tbd` or `todo` as a whole word; a replay of 334 transcript plans found no such line.

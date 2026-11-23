@@ -320,9 +320,10 @@ pub(crate) fn checkbox_present(body: &str) -> bool {
 /// reads the line at approval.
 const TRIVIAL_NONE_REASONS: &[&str] = &["n/a", "na", "none", "-", ".", "tbd"];
 
-/// Trailing (and leading) ASCII punctuation is ignored before the compare,
-/// `/` excepted so `n/a` survives: `n/a.`, `(none)`, `"tbd"!` and `...` are
-/// all trivial (cameronsjo/cadence-hooks#1256 M-2).
+/// Trailing (and leading) punctuation ([`is_punctuation`]: ASCII plus `—`,
+/// `–`, `…`) is ignored before the compare, `/` excepted so `n/a` survives:
+/// `n/a.`, `(none)`, `"tbd"!` and `...` are all trivial
+/// (cameronsjo/cadence-hooks#1256 M-2).
 fn trivial_none_reason(reason: &str) -> bool {
     let reason = reason
         .trim_matches(|c: char| c.is_whitespace() || (is_punctuation(c) && c != '/'))
@@ -373,14 +374,35 @@ fn panel_value(line: &str) -> Option<&str> {
     })
 }
 
-/// An unfilled template placeholder (rule 3): a `<…>` span, or a bracketed
-/// span that opens on one (`[<reason …>]`) or wraps the whole value. A
-/// markdown link or a `[see below]` aside mid-line is not a placeholder.
+/// An unfilled template placeholder (rule 3): a `<…>` span (a `<https://…>`
+/// autolink excepted), or a bracketed span that opens on one (`[<reason …>]`)
+/// or is one span wrapping the whole value (`[seats ran — N findings]`). A
+/// markdown link, a `[see below]` aside, or `[seat-a] ran — [3 findings]`
+/// is not a placeholder.
 fn has_template_placeholder(value: &str) -> bool {
-    let angle_span = value
-        .find('<')
-        .is_some_and(|open| value[open + 1..].contains('>'));
-    angle_span || value.contains("[<") || (value.starts_with('[') && value.ends_with(']'))
+    let angle_span = value.match_indices('<').any(|(open, _)| {
+        let inner = &value[open + 1..];
+        inner.contains('>') && !inner.starts_with("http://") && !inner.starts_with("https://")
+    });
+    let whole_bracketed = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .is_some_and(|inner| !inner.contains(['[', ']']));
+    angle_span || value.contains("[<") || whole_bracketed
+}
+
+/// Byte length of the value's first word: alphanumerics, with a hyphen kept
+/// when an alphanumeric follows it, so `todo-reviewer` and `pending-review`
+/// are seat names, not the `todo` and `pending` keywords.
+fn first_word_len(value: &str) -> usize {
+    let mut chars = value.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let joins = c == '-' && chars.peek().is_some_and(|(_, n)| n.is_alphanumeric());
+        if !c.is_alphanumeric() && !joins {
+            return i;
+        }
+    }
+    value.len()
 }
 
 /// True when a `Panel:` value states an outcome (rules 1–4 of
@@ -389,17 +411,14 @@ fn panel_value_settled(value: &str) -> bool {
     if trivial_panel_value(value) || has_template_placeholder(value) {
         return false;
     }
-    let word_len = value
-        .find(|c: char| !c.is_alphanumeric())
-        .unwrap_or(value.len());
-    let (word, after) = value.split_at(word_len);
+    let (word, after) = value.split_at(first_word_len(value));
     let word = word.to_ascii_lowercase();
     if PLACEHOLDER_WORDS.contains(&word.as_str()) {
         return false;
     }
     if ABSENCE_WORDS.contains(&word.as_str()) {
-        // The word ends at whitespace, punctuation or end of line (the
-        // `find` above), so `nonesuch` and `skipping` are not the keyword.
+        // The word ends at whitespace, punctuation or end of line
+        // ([`first_word_len`]), so `nonesuch` and `skipping` are not the keyword.
         let reason = after
             .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':'));
         return !trivial_none_reason(reason);
@@ -2482,6 +2501,11 @@ mod tests {
             "Panel: round 1 — 4 findings, all folded",
             "Panel: plan-reviewer ran — 2 findings [see below]",
             "Panel: [plan-reviewer](https://example.invalid) ran — 1 finding",
+            "Panel: [seat-a] ran — [3 findings]",
+            "Panel: todo-reviewer ran — 2 findings",
+            "Panel: pending-review ran — 1",
+            "Panel: none — see <https://example.invalid/review>",
+            "Panel: none-needed for a typo",
         ];
         let unsettled = [
             "no panel line",

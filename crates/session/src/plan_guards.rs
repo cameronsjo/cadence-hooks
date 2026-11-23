@@ -911,12 +911,12 @@ mod tests {
         assert_eq!(
             r.outcome,
             Outcome::Nudge,
-            "a missing Concessions section never blocks"
+            "a missing Workarounds section never blocks"
         );
         let msg = r.message.unwrap();
         assert!(
             msg.contains("plan-shape gate: plan lacks a ## Workarounds section — advisory, from "),
-            "the nudge names only the Concessions stanza and marks it advisory: {msg}"
+            "the nudge names only the Workarounds stanza and marks it advisory: {msg}"
         );
         assert!(
             !msg.contains("no settled Panel: line"),
@@ -924,7 +924,34 @@ mod tests {
         );
         assert!(
             msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
-            "the Concessions nudge carries both presentation reminders: {msg}"
+            "the Workarounds nudge carries both presentation reminders: {msg}"
+        );
+    }
+
+    /// The template's current `## Workarounds` name, end to end through the
+    /// gate: a template-shaped plan using it draws the reminders-only nudge
+    /// (cameronsjo/cadence-hooks#1675).
+    #[test]
+    fn plan_shape_workarounds_heading_is_template_shaped() {
+        let plan = plan_scan::TEMPLATE_SHAPED_PLAN.replace(
+            "## Concessions\n\nConcessions: none — nothing is worked around",
+            "## Workarounds\n\nWorkarounds: none — nothing is worked around",
+        );
+        assert_ne!(
+            plan,
+            plan_scan::TEMPLATE_SHAPED_PLAN,
+            "the fixture must carry the section to rename"
+        );
+        let r = judge_plan_shape(&plan);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(
+            !msg.contains("lacks"),
+            "a Workarounds plan is template-shaped: {msg}"
+        );
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "{msg}"
         );
     }
 

@@ -5119,7 +5119,7 @@ mod tests {
                 "format gate: plan lacks a ## Workarounds section — the plan template: \
                  `cadence:arrange` `references/plan-template.md`."
             ),
-            "the persist-time sentence names the Concessions stanza alone: {msg}"
+            "the persist-time sentence names the Workarounds stanza alone: {msg}"
         );
         assert!(
             !msg.contains("a ## Loop section")

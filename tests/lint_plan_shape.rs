@@ -199,7 +199,7 @@ fn plan_missing_only_the_concessions_section_nudges_naming_it_and_allows() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "a missing Concessions section must never block"
+        "a missing Workarounds section must never block"
     );
     let ctx = additional_context(&String::from_utf8_lossy(&out.stdout));
     // The dash straight after the name is what makes it "only": a second
@@ -207,11 +207,11 @@ fn plan_missing_only_the_concessions_section_nudges_naming_it_and_allows() {
     // be what its name says.
     assert!(
         ctx.contains("plan lacks a ## Workarounds section — advisory"),
-        "the nudge names the missing Concessions section and no other: {ctx}"
+        "the nudge names the missing Workarounds section and no other: {ctx}"
     );
     assert!(
         !ctx.contains("no settled Panel: line"),
-        "a plan missing only the Concessions section draws no block wording: {ctx}"
+        "a plan missing only the Workarounds section draws no block wording: {ctx}"
     );
 }
 
