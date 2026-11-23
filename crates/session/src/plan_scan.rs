@@ -2526,6 +2526,7 @@ mod tests {
             "Panel: none — type-only change to `Vec<String>`",
             "Panel: r ran — 3 findings, <5 min -> folded",
             "Panel: r ran — p99 latency <p95 -> 200ms",
+            "Panel: r ran — <x => y",
             "Panel: x ran — `a[<b]` indexing fixed",
             "**Panel**: none — docs-only",
             "__Panel__: skipped — docs-only",
