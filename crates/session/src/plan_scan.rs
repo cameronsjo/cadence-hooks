@@ -313,9 +313,10 @@ pub(crate) fn checkbox_present(body: &str) -> bool {
     unticked + ticked > 0
 }
 
-/// Reasons that satisfy the `Panel: none — <reason>` shape without saying
-/// anything (cameronsjo/cadence-hooks#761): after trimming and ASCII case
-/// folding, empty or exactly one of these. Any other text is a real reason —
+/// Reasons that satisfy the `Panel: none|skipped|skip — <reason>` shape
+/// without saying anything (cameronsjo/cadence-hooks#761), and whole `Panel:`
+/// values that say nothing (rule 1 of [`panel_line_settled`]): after trimming
+/// and ASCII case folding, empty or exactly one of these. Any other text is a real reason —
 /// the gate's threat is model drift, not an adversary, and the human still
 /// reads the line at approval.
 const TRIVIAL_NONE_REASONS: &[&str] = &["n/a", "na", "none", "-", ".", "tbd"];
@@ -374,15 +375,20 @@ fn panel_value(line: &str) -> Option<&str> {
     })
 }
 
-/// An unfilled template placeholder (rule 3): a `<…>` span (a `<https://…>`
-/// autolink excepted), or a bracketed span that opens on one (`[<reason …>]`)
+/// An unfilled template placeholder (rule 3): a `<…>` span outside backtick
+/// code whose text starts with a letter (so `` `Vec<String>` ``, `<5 min ->` and a
+/// `<https://…>` autolink are not placeholders), or a bracketed span that opens on one (`[<reason …>]`)
 /// or is one span wrapping the whole value (`[seats ran — N findings]`). A
 /// markdown link, a `[see below]` aside, or `[seat-a] ran — [3 findings]`
 /// is not a placeholder.
 fn has_template_placeholder(value: &str) -> bool {
-    let angle_span = value.match_indices('<').any(|(open, _)| {
-        let inner = &value[open + 1..];
-        inner.contains('>') && !inner.starts_with("http://") && !inner.starts_with("https://")
+    let plain = strip_inline_code(value);
+    let angle_span = plain.match_indices('<').any(|(open, _)| {
+        let inner = &plain[open + 1..];
+        inner.starts_with(char::is_alphabetic)
+            && inner.contains('>')
+            && !inner.starts_with("http://")
+            && !inner.starts_with("https://")
     });
     let whole_bracketed = value
         .strip_prefix('[')
@@ -2506,6 +2512,8 @@ mod tests {
             "Panel: pending-review ran — 1",
             "Panel: none — see <https://example.invalid/review>",
             "Panel: none-needed for a typo",
+            "Panel: none — type-only change to `Vec<String>`",
+            "Panel: r ran — 3 findings, <5 min -> folded",
         ];
         let unsettled = [
             "no panel line",
