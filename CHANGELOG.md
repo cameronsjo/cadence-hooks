@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.136.2] - 2026-11-23
+
 ### Fixed
 
 - **`session lint-plan-shape` stops blocking plans that already state their panel.** About 4 of 5 blocks in session transcripts were plans with a `Panel:` line the two-form grammar rejected: `Panel: skipped — docs-only`, `3 seats ran (a, b) — 57 findings`, `seat — 2 HIGH, all folded`, or a bolded `**Panel:** none — …`. The first `Panel:` line now settles when it states any outcome, and stays unsettled when it is missing, trivial (`n/a`, `none`, `-`), starts with `pending`, `tbd` or `todo`, carries an unfilled template placeholder (`<seats>`, `[<reason …>]`), or is `none`, `skipped` or `skip` with no real reason. `**Panel:** x`, `**Panel**: x`, `**Panel: x**`, `__Panel:__ x` and `__Panel__: x` read as `Panel: x`. The block message now carries only the fix: the first `Panel:` line is the one judged (replace it, don't add another) and the two canonical shapes; the advisory stanza list and the presentation reminders stay on the allow nudges. A `## Workarounds` heading, the template's current name, now satisfies the stanza `## Concessions` did, and the nudges name `a ## Workarounds section`. The persist-time format-gate sentence shares the detector and changes the same way (cameronsjo/cadence-hooks#1675).
