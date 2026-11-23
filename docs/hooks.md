@@ -354,12 +354,12 @@ frontmatter `approved_session_id`, then by `branch:`.
 |------|-------|--------------|--------|
 | `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched | run |
 | `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip; quiet when the flip names another repo (`-R`, `GH_REPO=`, a PR URL) or another branch | run |
-| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) | run |
+| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan's first `Panel:` line is missing, pending, trivial, or an unfilled template line; any stated outcome settles (`Panel: <seats> ran — …`, `Panel: none — <reason>`, `Panel: skipped — <reason>`, bold or not). The block names only the fix; the allow nudges name other missing template stanzas and carry the presentation reminders (subagents stopped, operator asked to see the plan) | run |
 | `plan-driver` | PreModelSwitch (`source` `command`/`picker`, attended TUI) | Ask the operator to confirm a `/model` switch whose target family differs from the in-flight plan's `## Orchestrator` → `Driver:`; silent unless the hook env shows `CLAUDE_CODE_ENTRYPOINT=cli` and `CLAUDE_CODE_SESSION_ATTENDED=1` with no `CLAUDE_CODE_REMOTE` (with no human attached — SDK, `claude -p`, stream-json — an `ask` refuses the switch outright), on disagreeing or driverless plans, and on an unrecognized model | run |
 
 `nudge-plan-tick` and `warn-plan-ready-flip` only ever warn; `plan-driver` only ever
 asks, and only where a human can answer. `lint-plan-shape` is the
-one plan guard that blocks, and only on the `Panel:` line; subagent-originated calls
+one plan guard that blocks, and only on a `Panel:` line that states no outcome; subagent-originated calls
 (`agent_id` present) and every internal failure allow (ADR-0001).
 
 ### CLI actions (not hooks)

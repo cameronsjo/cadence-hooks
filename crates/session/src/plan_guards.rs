@@ -35,17 +35,21 @@
 //!   before the operator ever sees it — the persist-time lint
 //!   (cadence-hooks#675) runs at PostToolUse, after approval, so it could not
 //!   catch a harness-template plan (Context/Changes/Verification, no panel,
-//!   no alternatives, no checkbox tasks) presented unasked. The block names
-//!   only the static stanza names and the in-band escape
-//!   (`Panel: none — <reason>`); a settled `Panel:` line with other stanzas
-//!   missing draws one nudge sentence instead. Subagent-originated calls
+//!   no alternatives, no checkbox tasks) presented unasked. A line settles
+//!   when it states an outcome; only a missing, pending, trivial or
+//!   unfilled-template line blocks ([`plan_scan::panel_line_settled`],
+//!   cameronsjo/cadence-hooks#1675). The block is static text carrying only
+//!   the fix: the first `Panel:` line is the one judged, and the two
+//!   canonical shapes (`Panel: <seats> ran — …`, `Panel: none — <reason>`).
+//!   A settled `Panel:` line with other stanzas missing draws one nudge
+//!   sentence instead. Subagent-originated calls
 //!   (`agent_id` on the payload) allow silently — a planner subagent
 //!   produces a pre-panel draft by design — and every internal failure (no
 //!   plan text obtainable, unreadable plan-store file) allows (ADR-0001).
 //!   The gate enforces the artifact's *shape*, not that attune ran or that
-//!   the operator asked; those stay prose-governed — but every judged
-//!   outcome (block, stanza nudge, and a reminders-only nudge on a
-//!   template-shaped plan) carries two static presentation-time reminders:
+//!   the operator asked; those stay prose-governed — but both allow
+//!   outcomes (a stanza nudge, and a reminders-only nudge on a
+//!   template-shaped plan) carry two static presentation-time reminders:
 //!   subagents stopped, operator asked to see the plan (the
 //!   presentation-reminders plan, 2026-08-26; deliberately not
 //!   telemetry-driven).
@@ -123,6 +127,10 @@ impl Check for LintPlanShape {
 /// text — the block message never carries matched plan content
 /// (cameronsjo/cadence-hooks#715).
 const PANEL_ESCAPE_TEMPLATE: &str = "Panel: none — <reason>";
+
+/// The canonical shape for a panel that ran, named beside the escape. Static
+/// text, like [`PANEL_ESCAPE_TEMPLATE`].
+const PANEL_RAN_TEMPLATE: &str = "Panel: <seats> ran — N findings, M folded in, K declined";
 
 /// Presentation-time reminders, carried on every top-level `ExitPlanMode`
 /// outcome (the presentation-reminders plan, 2026-08-26). Static text by
@@ -204,10 +212,11 @@ fn plan_text(input: &HookInput) -> Option<String> {
         .and_then(crate::persist_plan::read_plan_store_file)
 }
 
-/// The pure decision: block on an unsettled `Panel:` line (naming both
-/// escapes, with any other missing stanza listed as advice), nudge on a
-/// settled line with other stanzas missing, nudge just the presentation
-/// reminders on a template-shaped plan — every outcome carries both reminders.
+/// The pure decision: block on an unsettled `Panel:` line with the fix alone
+/// (the first-line rule and the two canonical shapes); nudge on a settled
+/// line with other stanzas missing; nudge just the presentation reminders on
+/// a template-shaped plan. Both allow paths carry both reminders; the block
+/// carries neither, since the re-call's allow nudge does.
 fn judge_plan_shape(plan: &str) -> CheckResult {
     let missing = plan_scan::missing_stanzas(plan);
     if missing.is_empty() {
@@ -216,33 +225,17 @@ fn judge_plan_shape(plan: &str) -> CheckResult {
         ));
     }
     if missing.contains(&plan_scan::PANEL_STANZA) {
-        // Only the `Panel:` line blocks. The other stanzas draw a nudge once
-        // it settles, so the block names them as advice, never as required:
-        // calling them "mandatory" once led a session to pad an advisory
-        // answer into a full implementation plan (cadence-hooks#1019).
-        let advised: Vec<&str> = missing
-            .iter()
-            .copied()
-            .filter(|s| *s != plan_scan::PANEL_STANZA)
-            .collect();
-        let advisory = if advised.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " Also missing, advisory only (a nudge, never a block): {} — {}. A plan \
-                 with nothing to implement needs only the `Panel:` line.",
-                advised.join(", "),
-                plan_scan::TEMPLATE_POINTER
-            )
-        };
+        // Only the `Panel:` line blocks, and the block carries the fix alone:
+        // the other stanzas, the template pointer and both presentation
+        // reminders come back on the re-call's allow nudge, so repeating them
+        // here only lengthens the round trip (cameronsjo/cadence-hooks#1675).
+        // The other stanzas are never called mandatory (cadence-hooks#1019).
+        // Naming the first-line rule keeps a fix from appending a second
+        // `Panel:` line under the unsettled one, which would block again.
         return CheckResult::block(format!(
-            "plan-shape gate: this plan lacks {} — the one stanza that blocks. \
-             Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N findings, \
-             M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`) and re-call \
-             ExitPlanMode, or leave plan mode with shift-tab.{advisory} {SUBAGENTS_REMINDER} \
-             The gate checks the artifact's shape only; attune's panel is still yours to \
-             honor. {OPERATOR_ASK_REMINDER}",
-            plan_scan::PANEL_STANZA,
+            "plan-shape gate: no settled Panel: line (the first Panel: line is the one \
+             judged; replace it, don't add another). Then re-call ExitPlanMode. \
+             Panel ran: `{PANEL_RAN_TEMPLATE}`. No panel: `{PANEL_ESCAPE_TEMPLATE}`."
         ));
     }
     CheckResult::nudge(format!(
@@ -819,53 +812,48 @@ mod tests {
 
     // --- judge_plan_shape message pins ---
 
+    /// The block text pinned whole: the fix alone (cameronsjo/cadence-hooks#1675).
+    const BLOCK_MESSAGE: &str = "plan-shape gate: no settled Panel: line (the first Panel: \
+        line is the one judged; replace it, don't add another). Then re-call ExitPlanMode. \
+        Panel ran: `Panel: <seats> ran — N findings, M folded in, K declined`. \
+        No panel: `Panel: none — <reason>`.";
+
     #[test]
-    fn plan_shape_block_message_names_stanzas_and_template_home() {
+    fn plan_shape_block_message_is_the_fix_alone() {
         let r = judge_plan_shape("# T\n\nprose only\n");
         assert_eq!(r.outcome, Outcome::Block);
         let msg = r.message.unwrap();
-        assert!(msg.contains("plan-shape gate: this plan lacks a settled Panel: line"));
-        assert!(
-            msg.contains("the one stanza that blocks"),
-            "the block says only Panel: blocks: {msg}"
-        );
-        assert!(
-            msg.contains(
-                "Also missing, advisory only (a nudge, never a block): a ## Loop section, a ## Concessions section, an Alternatives"
-            ),
-            "the other stanzas are named as advice: {msg}"
-        );
-        assert!(
-            !msg.contains("mandatory"),
-            "advisory stanzas are never called mandatory (cadence-hooks#1019): {msg}"
-        );
-        assert!(
-            msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`"),
-            "the block names the template's home: {msg}"
-        );
-        assert!(
-            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
-            "the block carries both presentation reminders: {msg}"
-        );
-        assert_eq!(
-            msg.matches("ask to see the plan").count(),
-            1,
-            "the operator-ask question is stated once, folded into the tail: {msg}"
-        );
+        assert_eq!(msg, BLOCK_MESSAGE);
+        // What moved off the block: it returns on the re-call's allow nudge.
+        for gone in [
+            SUBAGENTS_REMINDER,
+            OPERATOR_ASK_REMINDER,
+            "Also missing",
+            "shift-tab",
+            "honor",
+            "mandatory",
+            "a ## Loop section",
+        ] {
+            assert!(!msg.contains(gone), "the block drops {gone:?}: {msg}");
+        }
     }
 
     #[test]
-    fn plan_shape_block_with_only_panel_missing_has_no_advisory_tail() {
-        let plan = plan_scan::TEMPLATE_SHAPED_PLAN
-            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
-        let r = judge_plan_shape(&plan);
-        assert_eq!(r.outcome, Outcome::Block);
-        let msg = r.message.unwrap();
-        assert!(msg.contains("the one stanza that blocks"), "{msg}");
-        assert!(
-            !msg.contains("Also missing"),
-            "no advisory list when Panel: is the only gap: {msg}"
-        );
+    fn plan_shape_block_is_the_same_whatever_else_is_missing() {
+        // Panel: alone missing, Panel: + Loop missing, Panel: + Workarounds
+        // missing: one static block, no stanza list riding along.
+        let strip =
+            |p: String| p.replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        for plan in [
+            strip(plan_scan::TEMPLATE_SHAPED_PLAN.to_string()),
+            strip(plan_scan::template_shaped_plan_without_loop()),
+            strip(plan_scan::template_shaped_plan_without_concessions()),
+            "# T\n\nPanel: pending — seats queued\n".to_string(),
+        ] {
+            let r = judge_plan_shape(&plan);
+            assert_eq!(r.outcome, Outcome::Block, "{plan:?}");
+            assert_eq!(r.message.as_deref(), Some(BLOCK_MESSAGE), "{plan:?}");
+        }
     }
 
     #[test]
@@ -876,7 +864,7 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("plan-shape gate: plan lacks "));
         assert!(msg.contains("a ## Loop section"));
-        assert!(msg.contains("a ## Concessions section"));
+        assert!(msg.contains("a ## Workarounds section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -908,7 +896,7 @@ mod tests {
             "the nudge names only the Loop stanza and marks it advisory: {msg}"
         );
         assert!(
-            !msg.contains("the one stanza that blocks"),
+            !msg.contains("no settled Panel: line"),
             "the block wording is for an unsettled Panel: line: {msg}"
         );
         assert!(
@@ -923,53 +911,46 @@ mod tests {
         assert_eq!(
             r.outcome,
             Outcome::Nudge,
-            "a missing Concessions section never blocks"
+            "a missing Workarounds section never blocks"
         );
         let msg = r.message.unwrap();
         assert!(
-            msg.contains("plan-shape gate: plan lacks a ## Concessions section — advisory, from "),
-            "the nudge names only the Concessions stanza and marks it advisory: {msg}"
+            msg.contains("plan-shape gate: plan lacks a ## Workarounds section — advisory, from "),
+            "the nudge names only the Workarounds stanza and marks it advisory: {msg}"
         );
         assert!(
-            !msg.contains("the one stanza that blocks"),
+            !msg.contains("no settled Panel: line"),
             "the block wording is for an unsettled Panel: line: {msg}"
         );
         assert!(
             msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
-            "the Concessions nudge carries both presentation reminders: {msg}"
+            "the Workarounds nudge carries both presentation reminders: {msg}"
         );
     }
 
+    /// The template's current `## Workarounds` name, end to end through the
+    /// gate: a template-shaped plan using it draws the reminders-only nudge
+    /// (cameronsjo/cadence-hooks#1675).
     #[test]
-    fn plan_shape_concessions_is_advisory_when_the_panel_line_blocks() {
-        let plan = plan_scan::template_shaped_plan_without_concessions()
-            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+    fn plan_shape_workarounds_heading_is_template_shaped() {
+        let plan = plan_scan::TEMPLATE_SHAPED_PLAN.replace(
+            "## Concessions\n\nConcessions: none — nothing is worked around",
+            "## Workarounds\n\nWorkarounds: none — nothing is worked around",
+        );
+        assert_ne!(
+            plan,
+            plan_scan::TEMPLATE_SHAPED_PLAN,
+            "the fixture must carry the section to rename"
+        );
         let r = judge_plan_shape(&plan);
-        assert_eq!(r.outcome, Outcome::Block);
+        assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(
-            msg.contains(
-                "Also missing, advisory only (a nudge, never a block): a ## Concessions section"
-            ),
-            "Concessions is named as advice, not as the blocking stanza: {msg}"
-        );
-    }
-
-    #[test]
-    fn plan_shape_loop_is_advisory_when_the_panel_line_blocks() {
-        // Panel: and Loop both missing: the block is for `Panel:` alone, and
-        // the Loop stanza rides along in the advisory tail.
-        let plan = plan_scan::template_shaped_plan_without_loop()
-            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
-        let r = judge_plan_shape(&plan);
-        assert_eq!(r.outcome, Outcome::Block);
-        let msg = r.message.unwrap();
-        assert!(
-            msg.contains("Also missing, advisory only (a nudge, never a block): a ## Loop section"),
-            "Loop is named as advice, not as the blocking stanza: {msg}"
+            !msg.contains("lacks"),
+            "a Workarounds plan is template-shaped: {msg}"
         );
         assert!(
-            msg.contains("this plan lacks a settled Panel: line — the one stanza that blocks"),
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
             "{msg}"
         );
     }

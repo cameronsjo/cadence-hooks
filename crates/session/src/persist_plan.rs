@@ -4998,7 +4998,7 @@ mod tests {
         assert!(msg.contains("format gate: plan lacks "));
         assert!(msg.contains("a settled Panel: line"));
         assert!(msg.contains("a ## Loop section"));
-        assert!(msg.contains("a ## Concessions section"));
+        assert!(msg.contains("a ## Workarounds section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -5116,10 +5116,10 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(
             msg.contains(
-                "format gate: plan lacks a ## Concessions section — the plan template: \
+                "format gate: plan lacks a ## Workarounds section — the plan template: \
                  `cadence:arrange` `references/plan-template.md`."
             ),
-            "the persist-time sentence names the Concessions stanza alone: {msg}"
+            "the persist-time sentence names the Workarounds stanza alone: {msg}"
         );
         assert!(
             !msg.contains("a ## Loop section")
