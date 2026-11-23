@@ -354,12 +354,14 @@ const PLACEHOLDER_WORDS: &[&str] = &["pending", "tbd", "todo"];
 const ABSENCE_WORDS: &[&str] = &["none", "skipped", "skip"];
 
 /// The `Panel:` prefixes the gate reads, with the emphasis marker (if any)
-/// that closes a fully emphasized line: `**Panel:** x` closes before the
-/// value, `**Panel: x**` closes after it.
-const PANEL_PREFIXES: [(&str, Option<&str>); 5] = [
+/// that closes a fully emphasized line: `**Panel:** x` and `**Panel**: x`
+/// close before the value, `**Panel: x**` closes after it.
+const PANEL_PREFIXES: [(&str, Option<&str>); 7] = [
     ("Panel: ", None),
     ("**Panel:** ", None),
     ("__Panel:__ ", None),
+    ("**Panel**: ", None),
+    ("__Panel__: ", None),
     ("**Panel: ", Some("**")),
     ("__Panel: ", Some("__")),
 ];
@@ -386,7 +388,7 @@ fn has_template_placeholder(value: &str) -> bool {
     let angle_span = plain.match_indices('<').any(|(open, _)| {
         let inner = &plain[open + 1..];
         inner.starts_with(char::is_alphabetic)
-            && inner.contains('>')
+            && closes_angle_span(inner)
             && !inner.starts_with("http://")
             && !inner.starts_with("https://")
     });
@@ -394,7 +396,14 @@ fn has_template_placeholder(value: &str) -> bool {
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
         .is_some_and(|inner| !inner.contains(['[', ']']));
-    angle_span || value.contains("[<") || whole_bracketed
+    angle_span || plain.contains("[<") || whole_bracketed
+}
+
+/// A `>` that closes a placeholder: one not part of an `->` or `=>` arrow.
+fn closes_angle_span(inner: &str) -> bool {
+    inner
+        .match_indices('>')
+        .any(|(i, _)| !inner[..i].ends_with(['-', '=']))
 }
 
 /// Byte length of the value's first word: alphanumerics, with a hyphen kept
@@ -441,14 +450,16 @@ fn panel_value_settled(value: &str) -> bool {
 /// `**Panel:** none — x`), the plan-shape-false-blocks plan, 2026-11-23.
 ///
 /// The first visible `Panel:` line's value (trimmed; `Panel: `,
-/// `**Panel:** `, `__Panel:__ `, or a fully emphasized `**Panel: x**`) is
+/// `**Panel:** `, `**Panel**: `, `__Panel:__ `, or a fully emphasized
+/// `**Panel: x**`) is
 /// **unsettled** when:
 ///
 /// 1. the whole value is trivial: empty, punctuation only, or `n/a`, `na`,
 ///    `none`, `-`, `.`, `tbd` (cameronsjo/cadence-hooks#761);
 /// 2. its first word is `pending`, `tbd` or `todo` (case-insensitive);
-/// 3. it carries an unfilled template placeholder: a `<…>` span, a `[<`
-///    opener, or a value wrapped in `[…]`;
+/// 3. it carries an unfilled template placeholder ([`has_template_placeholder`]):
+///    a `<name …>` span outside backtick code (not an autolink, not closed
+///    by an `->` arrow), a `[<` opener, or a value that is one `[…]` span;
 /// 4. its first word is `none`, `skipped` or `skip` (a whole word) and the
 ///    reason after it (leading dashes, colon and whitespace stripped) is
 ///    trivial per rule 1.
@@ -2514,6 +2525,10 @@ mod tests {
             "Panel: none-needed for a typo",
             "Panel: none — type-only change to `Vec<String>`",
             "Panel: r ran — 3 findings, <5 min -> folded",
+            "Panel: r ran — p99 latency <p95 -> 200ms",
+            "Panel: x ran — `a[<b]` indexing fixed",
+            "**Panel**: none — docs-only",
+            "__Panel__: skipped — docs-only",
         ];
         let unsettled = [
             "no panel line",
@@ -2523,6 +2538,7 @@ mod tests {
             "Panel: tbd",
             "**Panel: pending**",
             "**Panel:** pending",
+            "**Panel**: pending",
             "__Panel:__ tbd",
             "Panel: n/a",
             "Panel: none",

@@ -5,7 +5,7 @@
 ## What Changes
 
 - A `Panel:` line settles when it states an outcome. It is unsettled when its value is trivial, starts with `pending`, `tbd` or `todo`, carries an unfilled template placeholder (`<…>`, `[<`, or a value wrapped in `[…]`), or is `none`, `skipped` or `skip` with a trivial reason.
-- `**Panel:** x`, `**Panel: x**` and `__Panel:__ x` are read as `Panel: x`.
+- `**Panel:** x`, `**Panel**: x`, `**Panel: x**` and `__Panel:__ x` are read as `Panel: x`.
 - The block message carries only the fix: the first `Panel:` line is the one judged (replace it, don't add another), then the two canonical shapes. The advisory stanza list and both presentation reminders stay on the allow nudges.
 - `## Workarounds` or `## Concessions` satisfies the workarounds stanza; the nudge names `a ## Workarounds section`.
 
@@ -21,4 +21,4 @@ None.
 
 ## Impact
 
-- `cadence-hooks session lint-plan-shape` and the persist-time format-gate sentence of `session persist-plan-approval`, which share the detector. Plans that blocked on a stated panel now allow. A line that allowed before blocks only when it carries a `<…>` span other than an autolink or opens with `pending`, `tbd` or `todo` as a whole word; a replay of 334 transcript plans found no such line.
+- `cadence-hooks session lint-plan-shape` and the persist-time format-gate sentence of `session persist-plan-approval`, which share the detector. Plans that blocked on a stated panel now allow. In practice, a line that allowed before blocks only when it carries a `<…>` span other than an autolink or opens with `pending`, `tbd` or `todo` as a whole word; a replay of 334 transcript plans found no such line.

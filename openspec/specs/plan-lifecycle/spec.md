@@ -125,7 +125,7 @@ On PreToolUse for a top-level `ExitPlanMode`, `session lint-plan-shape` SHALL bl
 - **THEN** the hook does not block
 
 ### Requirement: Panel line states an outcome
-The first `Panel:` line at line start outside fences, quotes, comments and frontmatter SHALL be judged, with `**Panel:**`, `__Panel:__` and `**Panel: …**` read as `Panel:`. Its value is unsettled when it is trivial (empty, punctuation only, `n/a`, `none`, `tbd`), starts with `pending`, `tbd` or `todo`, carries a template placeholder (`<…>`, `[<`, or wrapped in `[…]`), or is `none`, `skipped` or `skip` with a trivial reason. Any other value MUST settle.
+The first `Panel:` line at line start outside fences, quotes, comments and frontmatter SHALL be judged, with `**Panel:**`, `**Panel**:`, `__Panel:__` and `**Panel: …**` read as `Panel:`. Its value is unsettled when it is trivial (empty, punctuation, `n/a`), starts with `pending`, `tbd` or `todo`, carries a template placeholder (`<name …>` outside code, `[<`, or one `[…]` span), or is `none`, `skipped` or `skip` with a trivial reason. Any other value MUST settle.
 
 #### Scenario: Pending panel line
 - **WHEN** the plan's first panel line is `**Panel: pending**`
