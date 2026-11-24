@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sessions.jsonl` rows record whether the session ran in Claude Code's Code Mode.** `codeMode` is `true` when the transcript has the `{"type":"repl-mode","replMode":true}` row Code Mode writes, `null` when it has a `REPL` tool call but no such row (the row moved, so the answer is unknown), and `false` otherwise. It is read from the transcript `log-session` already holds, so SessionEnd does no second read; a replay of a Code Mode transcript took 28 ms against 28 to 30 ms on 0.136.2. Code Mode turns off Claude Code's own telemetry, so this is the only record of which sessions used it. Other ledgers reach it by `sessionId`.
+
+### Fixed
+
+- **Code Mode rows no longer report a pricing gap for `<synthetic>`.** Code Mode transcripts carry many locally-synthesized assistant records with `model: "<synthetic>"`; the token scan counted them, so every Code Mode `commits`, `sessions` and `subagents` row listed `<synthetic>` in `byModel` and `unpricedModels`, which reads as "cost understated". The scan now skips them after the commit-marker check, so a marker an older binary recorded on a synthetic id still resolves, and a synthetic record never becomes the next marker.
+
 ## [0.136.2] - 2026-11-23
 
 ### Fixed
