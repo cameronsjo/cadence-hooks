@@ -278,6 +278,7 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
     if let Some(first) = hook_names.first() {
         log_schema_drift(
             &input.schema_drift,
+            input.tool_name.as_deref(),
             crate::registry::namespace_of(first),
             Some(first),
         );
@@ -1027,7 +1028,12 @@ pub fn run_logged_logger(
     match MetricsInput::from_stdin() {
         Ok(input) => {
             session_id = input.session_id.clone();
-            log_schema_drift(&input.schema_drift, namespace, hook);
+            log_schema_drift(
+                &input.schema_drift,
+                input.tool_name.as_deref(),
+                namespace,
+                hook,
+            );
             // A panicking logger must not skip the timing write or the exit-0
             // below. Catch the unwind so the contract holds even on a buggy
             // implementation. `AssertUnwindSafe` is required because
@@ -1079,26 +1085,54 @@ pub fn run_logged_logger(
 /// One `schema_drift` row in `failopen.jsonl` per payload key whose object
 /// value failed its typed shape (cadence-hooks#364). The degradation to `None`
 /// already happened and is unchanged; this only makes a drift-shaped mismatch
-/// observable. `drift` holds static key names from `core::schema_drift`, so the
-/// row carries no payload content. Silent on stderr: nothing failed for the
-/// user, and a real drift fires on every matching call.
+/// observable. `drift` holds static key and field names from
+/// `core::schema_drift`, and `toolName` passes [`drift_tool_label`], so the
+/// row carries no payload content. `toolName` and `field` are what make a row
+/// diagnosable: the attributed hook is only the first one wired on the
+/// matcher, not the tool that drifted. Silent on stderr: nothing failed for
+/// the user, and a real drift fires on every matching call.
 ///
 /// At most once per process: every dispatch path parses stdin once, and the
 /// latch keeps a second caller from repeating the same rows.
-fn log_schema_drift(drift: &[&'static str], namespace: Option<&str>, hook: Option<&str>) {
+fn log_schema_drift(
+    drift: &[cadence_hooks_core::SchemaDrift],
+    tool_name: Option<&str>,
+    namespace: Option<&str>,
+    hook: Option<&str>,
+) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if drift.is_empty() || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    for key in drift {
-        cadence_hooks_metrics::log_failopen(
+    let tool = tool_name.map(drift_tool_label);
+    for entry in drift {
+        cadence_hooks_metrics::log_failopen_with(
             "schema_drift",
             namespace,
             hook,
             env!("CARGO_PKG_VERSION"),
-            Some(&format!("{key}: object did not match its typed shape")),
+            Some(&format!(
+                "{}: object did not match its typed shape",
+                entry.key
+            )),
+            &[("toolName", tool), ("field", Some(entry.field))],
         );
     }
+}
+
+/// Longest tool name [`drift_tool_label`] records as-is. Native names are
+/// short PascalCase words (`Bash`, `ExitPlanMode`); 64 leaves room for growth.
+const MAX_DRIFT_TOOL_NAME: usize = 64;
+
+/// The `toolName` a `schema_drift` row records: the payload's tool name when
+/// it is 1 to [`MAX_DRIFT_TOOL_NAME`] ASCII letters, digits or `_`, and
+/// `"other"` for anything else. The name is payload-supplied, so this charset
+/// check is what keeps the row free of arbitrary text. Pure.
+fn drift_tool_label(name: &str) -> &str {
+    let plain = !name.is_empty()
+        && name.len() <= MAX_DRIFT_TOOL_NAME
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if plain { name } else { "other" }
 }
 
 /// Emit the loud fail-open row + stderr breadcrumb when this process's git
@@ -1154,6 +1188,17 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drift_tool_label_keeps_plain_names_and_folds_the_rest() {
+        for plain in ["Bash", "ExitPlanMode", "apply_patch", "A1"] {
+            assert_eq!(drift_tool_label(plain), plain);
+        }
+        let long = "A".repeat(MAX_DRIFT_TOOL_NAME + 1);
+        for odd in ["", "Bash; rm", "mcp__x-y", "Tool\n", "Bäsh", long.as_str()] {
+            assert_eq!(drift_tool_label(odd), "other", "{odd:?}");
+        }
+    }
 
     #[test]
     fn panic_guards_nest_without_unguarding_the_outer_region() {
