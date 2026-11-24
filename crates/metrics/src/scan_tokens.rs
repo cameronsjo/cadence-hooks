@@ -38,6 +38,8 @@ pub struct ScanResult {
     /// Grand total of all tokens in the range (all models combined).
     pub tokens: Tokens,
     pub last_message_id: String,
+    /// Assistant records in the range, `<synthetic>` ones included, so this
+    /// counts records rather than model calls.
     pub messages_scanned: usize,
     /// The model of the last non-synthetic assistant message in the range
     /// (backward-compat), or `unknown` when the range holds only synthetic

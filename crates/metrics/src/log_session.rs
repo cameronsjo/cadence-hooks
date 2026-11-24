@@ -204,6 +204,7 @@ fn session_duration_ms(start_ts: Option<&str>, ts: &str) -> Option<i64> {
 ///
 /// Only lines that contain the marker text are parsed, so the cost on an
 /// ordinary transcript is one substring scan of the string already in memory.
+///
 /// Both probes match Claude Code's compact JSON (no space after `:`), as
 /// written by 2.1.331; spaced JSON would read `false` where `None` is meant.
 ///

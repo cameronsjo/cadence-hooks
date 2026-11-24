@@ -21,6 +21,7 @@
 //! `prompt_content_is_not_deserialized_or_emitted` asserts for
 //! [`crate::transcript`].
 
+use crate::scan_tokens::SYNTHETIC_MODEL;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
@@ -68,8 +69,6 @@ const TURNS_PER_PROMPT_PLACES: u32 = 1;
 
 /// Tokens per unit of every rate in the price table.
 const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
-
-use crate::scan_tokens::SYNTHETIC_MODEL;
 
 /// The charge basis of a gap that cost a **measured** nothing.
 ///

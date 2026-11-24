@@ -118,6 +118,23 @@ mod tests {
     use super::*;
     use crate::scan_tokens::Tokens;
 
+    /// `log-commit` writes no row on `TranscriptScan::Empty`, so a second
+    /// commit in one Code Mode turn, whose range after the marker holds only
+    /// `<synthetic>` records, must scan as `Usage` with zero tokens.
+    #[test]
+    fn a_synthetic_only_range_is_usage_not_empty() {
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        let TranscriptScan::Usage(usage) = scan_transcript(&t, Some("m1")) else {
+            panic!("a synthetic-only range must not be Empty");
+        };
+        assert_eq!(usage.total_tokens, 0);
+        assert!(usage.scan.by_model.is_empty());
+    }
+
     /// A Claude transcript with an unpriced model lists exactly that model.
     ///
     /// Inherited from `priced_breakdown_splits_on_the_harness`. The split it
