@@ -16,8 +16,12 @@ A `sessions.jsonl` row SHALL carry `codeMode`. It MUST be `true` when the transc
 - **THEN** the row has `codeMode` `null`
 
 ### Requirement: Synthetic records are not priced
-The transcript token scan SHALL skip assistant records whose `model` is `<synthetic>` once the commit marker is found, so they add nothing to `tokens`, `byModel`, `unpricedModels` or `costUsd` and never become `lastMessageId`. A marker naming a synthetic record MUST still resolve.
+The transcript token scan SHALL add nothing to `tokens`, `byModel`, `unpricedModels` or `costUsd` for assistant records whose `model` is `<synthetic>`. Such a record MUST still count as scanned and MAY be `lastMessageId`, so a range holding only synthetic records yields a zero-token row rather than none. A marker naming a synthetic record MUST resolve.
 
 #### Scenario: Code Mode commit
 - **WHEN** a commit's range holds priced assistant records and `<synthetic>` records
 - **THEN** the `commits.jsonl` row's `unpricedModels` does not list `<synthetic>`
+
+#### Scenario: Second commit in one Code Mode turn
+- **WHEN** a commit's range after the previous marker holds only `<synthetic>` records
+- **THEN** a `commits.jsonl` row is still written, with zero tokens and an empty `byModel`

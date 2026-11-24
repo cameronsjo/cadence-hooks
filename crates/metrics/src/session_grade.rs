@@ -69,10 +69,7 @@ const TURNS_PER_PROMPT_PLACES: u32 = 1;
 /// Tokens per unit of every rate in the price table.
 const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
 
-/// The model string Claude Code writes for a locally-synthesized assistant
-/// record. Such a record carries `usage` but is not a turn, and
-/// [`crate::scan_tokens`] leaves it out of cost attribution too.
-pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
+use crate::scan_tokens::SYNTHETIC_MODEL;
 
 /// The charge basis of a gap that cost a **measured** nothing.
 ///

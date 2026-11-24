@@ -255,7 +255,7 @@ exit 0. They never block a tool call (see
 | `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed | self-disable |
 | `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` | self-disable |
 | `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` | self-disable |
-| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` | self-disable |
+| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, record `codeMode` (Code Mode session or not), append to `sessions.jsonl` | self-disable |
 | `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd`; the first SessionStart of each UTC day also runs `metrics rotate` for up to 2 s, failing open | self-disable |
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` | self-disable |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` | self-disable |

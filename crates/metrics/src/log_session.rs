@@ -5,6 +5,7 @@
 //! the last commit marker, `log-session` scans the *whole* transcript once at
 //! session end. `sum(commits) ≤ session` — the gap is uncommitted-work cost;
 //! each `/clear` segment mints a new session id and so writes its own row.
+//! The row also records `codeMode`, read from the same transcript string.
 //!
 //! Fire-and-forget: silent no-op on any failure, never blocks.
 
@@ -203,9 +204,13 @@ fn session_duration_ms(start_ts: Option<&str>, ts: &str) -> Option<i64> {
 ///
 /// Only lines that contain the marker text are parsed, so the cost on an
 /// ordinary transcript is one substring scan of the string already in memory.
-// debt: reads a transcript row because the hook payload carries no Code Mode
-// flag (plan Workarounds row, CC 2.1.331); switch to a payload field if Claude
-// Code adds one, and re-pin the row shape if a release moves it.
+/// Both probes match Claude Code's compact JSON (no space after `:`), as
+/// written by 2.1.331; spaced JSON would read `false` where `None` is meant.
+///
+/// The value describes this transcript only. A subagent's own transcript has
+/// no `repl-mode` row, so a subagent row reads `false` or `None`; join it to
+/// its parent's row through `parentSessionId` for the session's mode.
+// debt: reads one compact transcript row shape (CC 2.1.331) because the payload has no Code Mode flag; read a payload field once one exists (cameronsjo/cadence-hooks#1682)
 fn code_mode(transcript: &str) -> Option<bool> {
     let flagged = transcript
         .lines()
