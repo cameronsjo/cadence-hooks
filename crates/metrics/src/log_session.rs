@@ -13,10 +13,10 @@ use crate::common;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
 use crate::session_grade;
-use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
+use crate::transcript::{TranscriptScan, UsageScan};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
-use std::io::Write;
+use std::io::{BufReader, Write};
 
 /// Appends a per-session cost line to `sessions.jsonl` at `SessionEnd`. Holds
 /// the optional price table override path supplied via `--prices`.
@@ -64,10 +64,23 @@ impl Logger for LogSession {
             .filter(|s| !s.is_empty());
         let _ = std::fs::remove_file(&start_marker);
 
-        let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
+        let Ok(file) = std::fs::File::open(transcript_path) else {
             return;
         };
-        let usage = match scan_transcript(&transcript, None) {
+        let prices = Prices::load(self.prices_path.as_deref());
+        // Single streaming pass over the transcript: computes both token usage
+        // and session grading at the same price table (so `costUsd` and
+        // `grading.coldRestartUsdTotal` can never be quoted at different rates)
+        // without reading the whole file into memory or deserializing twice.
+        let mut code_mode_scanner = CodeModeScanner::default();
+        let Ok((scan, grade)) = session_grade::scan_and_grade_reader_with_line_hook(
+            BufReader::new(file),
+            &prices,
+            |line| code_mode_scanner.feed_line(line),
+        ) else {
+            return;
+        };
+        let usage = match scan {
             TranscriptScan::Usage(usage) => usage,
             TranscriptScan::Diagnostic(diagnostic) => {
                 common::append_transcript_diagnostic(
@@ -81,7 +94,6 @@ impl Logger for LogSession {
             TranscriptScan::Empty => return,
         };
 
-        let prices = Prices::load(self.prices_path.as_deref());
         // Unconditional since the unpriced harness was retired (#1040). It was
         // `(usage.harness == "claude").then(...)`, which is now a tautology —
         // left in place it would read as live logic while its `unwrap_or(0.0)`
@@ -99,11 +111,8 @@ impl Logger for LogSession {
         let commits =
             counted.unwrap_or_else(|| commits_in_ledger(&dir.join("commits.jsonl"), session_id));
 
-        // Graded from the same transcript string already in memory, at the same
-        // price table cost is computed from — so `costUsd` and
-        // `grading.coldRestartUsdTotal` can never be quoted at different rates.
-        let grading = session_grade::grade_transcript(&transcript, &prices).to_json();
-        let code_mode = code_mode(&transcript);
+        let grading = grade.to_json();
+        let code_mode = code_mode_scanner.finish();
 
         let record = build_session_record(
             &ts,
@@ -212,22 +221,48 @@ fn session_duration_ms(start_ts: Option<&str>, ts: &str) -> Option<i64> {
 /// no `repl-mode` row, so a subagent row reads `false` or `None`; join it to
 /// its parent's row through `parentSessionId` for the session's mode.
 // debt: reads one compact transcript row shape (CC 2.1.331) because the payload has no Code Mode flag; read a payload field once one exists (cameronsjo/cadence-hooks#1682)
-fn code_mode(transcript: &str) -> Option<bool> {
-    let flagged = transcript
-        .lines()
-        .filter(|line| line.contains(r#""repl-mode""#))
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .any(|row| {
-            row.get("type").and_then(Value::as_str) == Some("repl-mode")
-                && row.get("replMode").and_then(Value::as_bool) == Some(true)
-        });
-    if flagged {
-        Some(true)
-    } else if transcript.contains(r#""name":"REPL""#) {
-        None
-    } else {
-        Some(false)
+#[derive(Default)]
+struct CodeModeScanner {
+    flagged: bool,
+    saw_repl: bool,
+}
+
+impl CodeModeScanner {
+    fn feed_line(&mut self, line: &str) {
+        if self.flagged {
+            return;
+        }
+        if line.contains(r#""repl-mode""#)
+            && let Ok(row) = serde_json::from_str::<Value>(line)
+            && row.get("type").and_then(Value::as_str) == Some("repl-mode")
+            && row.get("replMode").and_then(Value::as_bool) == Some(true)
+        {
+            self.flagged = true;
+            return;
+        }
+        if !self.saw_repl && line.contains(r#""name":"REPL""#) {
+            self.saw_repl = true;
+        }
     }
+
+    fn finish(self) -> Option<bool> {
+        if self.flagged {
+            Some(true)
+        } else if self.saw_repl {
+            None
+        } else {
+            Some(false)
+        }
+    }
+}
+
+#[cfg(test)]
+fn code_mode(transcript: &str) -> Option<bool> {
+    let mut scanner = CodeModeScanner::default();
+    for line in transcript.lines() {
+        scanner.feed_line(line);
+    }
+    scanner.finish()
 }
 
 /// Build the `sessions.jsonl` record. Pure — no I/O. The `byModel`/`unpricedModels`

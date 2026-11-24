@@ -88,3 +88,11 @@ libc.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# `panic = "unwind"` is intentionally kept (do not set `panic = "abort"`):
+# fail-open panic guards rely on `catch_unwind` (see `crates/core/src/lib.rs`,
+# which enforces this at compile time).

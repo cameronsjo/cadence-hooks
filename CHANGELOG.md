@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Reduced hook startup and hot-path overhead across release builds, dispatch, security pattern scanning, and metrics transcript scanning.** Release builds now enable thin LTO, single codegen unit, and symbol stripping while keeping `panic = "unwind"` for fail-open `catch_unwind` guards. Plain `<namespace> <hook>` and `group <specs...>` invocations fast-path around `clap::Command` construction (falling back to `clap` for flags, help, version, CLI subcommands, and unknown arguments), and `group` member resolution uses a direct static lookup instead of constructing a `clap::Command` per member. `rules security-patterns` pre-compiles its pattern regexes once in a `LazyLock` table and skips initialization on unmatched extensions. `metrics log-session` streams the JSONL transcript with `BufReader` in a single pass combining token scanning and session grading, and `metrics log-commit` streams with `BufReader` and records a verified transcript byte offset beside `state/commits/<session>/last` so subsequent commits seek directly to the tail (falling back to a full streaming scan if the file was truncated or rewritten).
+
 ## [0.137.0] - 2026-11-24
 
 ### Added

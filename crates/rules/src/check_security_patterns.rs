@@ -5,6 +5,7 @@
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
+use std::sync::LazyLock;
 
 /// A security pattern to check for in a specific file extension.
 struct SecurityPattern {
@@ -153,25 +154,48 @@ const PATTERNS: &[SecurityPattern] = &[
     },
 ];
 
+struct CompiledPattern {
+    extensions: &'static [&'static str],
+    regex: Regex,
+    message: &'static str,
+}
+
+static COMPILED_PATTERNS: LazyLock<Vec<CompiledPattern>> = LazyLock::new(|| {
+    PATTERNS
+        .iter()
+        .filter_map(|sp| {
+            Regex::new(sp.pattern).ok().map(|regex| CompiledPattern {
+                extensions: sp.extensions,
+                regex,
+                message: sp.message,
+            })
+        })
+        .collect()
+});
+
 /// Scan content for security anti-patterns matching the given file extension.
 ///
 /// Returns `(line_number, message)` tuples for each violation found.
 /// Pure function — no I/O.
 pub fn scan_content(content: &str, ext: &str) -> Vec<(usize, &'static str)> {
+    // Skip regex table initialization altogether for extensions with no rules
+    // (e.g. `.md`, `.json`, `.toml`, `.sh`).
+    if !PATTERNS.iter().any(|sp| sp.extensions.contains(&ext)) {
+        return Vec::new();
+    }
+
     let mut warnings = Vec::new();
 
-    for sp in PATTERNS {
+    for sp in COMPILED_PATTERNS.iter() {
         if !sp.extensions.contains(&ext) {
             continue;
         }
 
-        if let Ok(re) = Regex::new(sp.pattern) {
-            for m in re.find_iter(content) {
-                // Count newlines, not lines: a partial line before the match
-                // ("data = " before "pickle.loads") must not add a line.
-                let line_num = content[..m.start()].matches('\n').count() + 1;
-                warnings.push((line_num, sp.message));
-            }
+        for m in sp.regex.find_iter(content) {
+            // Count newlines, not lines: a partial line before the match
+            // ("data = " before "pickle.loads") must not add a line.
+            let line_num = content[..m.start()].matches('\n').count() + 1;
+            warnings.push((line_num, sp.message));
         }
     }
 
@@ -735,6 +759,15 @@ mod tests {
         assert!(
             msg.contains("injection"),
             "expected injection hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn all_security_patterns_compile_into_static_table() {
+        assert_eq!(
+            COMPILED_PATTERNS.len(),
+            PATTERNS.len(),
+            "every entry in PATTERNS must compile cleanly into COMPILED_PATTERNS"
         );
     }
 

@@ -25,8 +25,11 @@ use crate::scan_tokens::SYNTHETIC_MODEL;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
+use std::io::BufRead;
 
 use crate::prices::Prices;
+use crate::scan_tokens::{CacheCreation, TokenScanner, lenient_cache_creation};
+use crate::transcript::{self, TranscriptScan};
 
 /// A span longer than this between consecutive records is a gap (strictly
 /// greater — a span of exactly this length is not one).
@@ -562,13 +565,410 @@ pub fn grade_transcript_with(
     prices: &Prices,
     grind_turns_per_prompt: f64,
 ) -> SessionGrade {
-    let mut events: Vec<Event> = transcript
+    let events: Vec<Event> = transcript
         .lines()
         .filter_map(|line| serde_json::from_str::<Record>(line).ok())
         .filter(|r| r.is_sidechain != Some(true))
         .filter_map(to_event)
         .collect();
 
+    grade_events(events, prices, grind_turns_per_prompt)
+}
+
+/// String field that preserves both lenient semantics (for grading: wrong type
+/// degrades to `None` so the record's timestamp survives) and strict semantics
+/// (for token scanning: wrong type rejects the line).
+#[derive(Default)]
+enum StrictString {
+    #[default]
+    Missing,
+    Null,
+    Valid(String),
+    Invalid,
+}
+
+impl StrictString {
+    fn as_lenient(&self) -> Option<&str> {
+        match self {
+            Self::Valid(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_strict_opt(&self) -> Result<Option<&str>, ()> {
+        match self {
+            Self::Missing | Self::Null => Ok(None),
+            Self::Valid(s) => Ok(Some(s.as_str())),
+            Self::Invalid => Err(()),
+        }
+    }
+}
+
+fn deserialize_strict_string<'de, D>(deserializer: D) -> Result<StrictString, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct StrictStringVisitor;
+
+    impl<'de> Visitor<'de> for StrictStringVisitor {
+        type Value = StrictString;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string, null, or any other JSON value")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(StrictString::Valid(v.to_string()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+            Ok(StrictString::Valid(v))
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(StrictString::Null)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(StrictString::Null)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(StrictStringVisitor)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(StrictString::Invalid)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(StrictString::Invalid)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(StrictString::Invalid)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(StrictString::Invalid)
+        }
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(StrictString::Invalid)
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(StrictString::Invalid)
+        }
+    }
+
+    deserializer.deserialize_any(StrictStringVisitor)
+}
+
+/// Unsigned integer field preserving both lenient semantics (for grading) and
+/// strict `#[serde(default)] u64` semantics (for token scanning).
+#[derive(Default)]
+enum StrictU64 {
+    #[default]
+    Missing,
+    Valid(u64),
+    FloatInt(u64),
+    NullOrInvalid,
+}
+
+impl StrictU64 {
+    fn as_lenient(&self) -> Option<u64> {
+        match self {
+            Self::Valid(v) | Self::FloatInt(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn as_strict_default(&self) -> Result<u64, ()> {
+        match self {
+            Self::Missing => Ok(0),
+            Self::Valid(v) => Ok(*v),
+            Self::FloatInt(_) | Self::NullOrInvalid => Err(()),
+        }
+    }
+}
+
+fn deserialize_strict_u64<'de, D>(deserializer: D) -> Result<StrictU64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct StrictU64Visitor;
+
+    impl<'de> Visitor<'de> for StrictU64Visitor {
+        type Value = StrictU64;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an unsigned integer or any other JSON value")
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(StrictU64::Valid(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(u64::try_from(v).map_or(StrictU64::NullOrInvalid, StrictU64::Valid))
+        }
+        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+            if v.is_finite() && v >= 0.0 && v.fract() == 0.0 {
+                Ok(StrictU64::FloatInt(v as u64))
+            } else {
+                Ok(StrictU64::NullOrInvalid)
+            }
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(StrictU64::NullOrInvalid)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(StrictU64::NullOrInvalid)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(StrictU64::NullOrInvalid)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(StrictU64::NullOrInvalid)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(StrictU64Visitor)
+        }
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(StrictU64::NullOrInvalid)
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(StrictU64::NullOrInvalid)
+        }
+    }
+
+    deserializer.deserialize_any(StrictU64Visitor)
+}
+
+#[derive(Deserialize)]
+struct CombinedRecord {
+    #[serde(default, deserialize_with = "lenient_string")]
+    r#type: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    timestamp: Option<String>,
+    #[serde(default, rename = "isSidechain")]
+    is_sidechain: Option<bool>,
+    #[serde(default, rename = "isMeta")]
+    is_meta: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    subtype: Option<String>,
+    #[serde(default, rename = "compactMetadata")]
+    compact_metadata: Option<CompactMetadata>,
+    #[serde(default)]
+    message: Option<CombinedMessage>,
+}
+
+#[derive(Deserialize)]
+struct CombinedMessage {
+    #[serde(default, deserialize_with = "deserialize_strict_string")]
+    id: StrictString,
+    #[serde(default, deserialize_with = "deserialize_strict_string")]
+    role: StrictString,
+    #[serde(default, deserialize_with = "deserialize_strict_string")]
+    model: StrictString,
+    #[serde(default)]
+    usage: Option<CombinedUsage>,
+    #[serde(default, deserialize_with = "content_is_string")]
+    content: bool,
+    #[serde(default, rename = "contentIsString")]
+    content_is_string: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CombinedUsage {
+    #[serde(default, deserialize_with = "deserialize_strict_u64")]
+    input_tokens: StrictU64,
+    #[serde(default, deserialize_with = "deserialize_strict_u64")]
+    cache_creation_input_tokens: StrictU64,
+    #[serde(default, deserialize_with = "lenient_cache_creation")]
+    cache_creation: Option<CacheCreation>,
+    #[serde(default, deserialize_with = "deserialize_strict_u64")]
+    cache_read_input_tokens: StrictU64,
+    #[serde(default, deserialize_with = "deserialize_strict_u64")]
+    output_tokens: StrictU64,
+}
+
+impl CombinedMessage {
+    fn feed_token_scanner(&self, scanner: &mut TokenScanner<'_>) {
+        let Ok(Some(id)) = self.id.as_strict_opt() else {
+            return;
+        };
+        let Ok(Some("assistant")) = self.role.as_strict_opt() else {
+            return;
+        };
+        let Ok(model) = self.model.as_strict_opt() else {
+            return;
+        };
+        let Some(u) = &self.usage else {
+            return;
+        };
+        let (Ok(input), Ok(cache_create), Ok(cache_read), Ok(output)) = (
+            u.input_tokens.as_strict_default(),
+            u.cache_creation_input_tokens.as_strict_default(),
+            u.cache_read_input_tokens.as_strict_default(),
+            u.output_tokens.as_strict_default(),
+        ) else {
+            return;
+        };
+        let create_1h = u
+            .cache_creation
+            .as_ref()
+            .map_or(0, |c| c.ephemeral_1h_input_tokens);
+        scanner.record_assistant_usage(
+            id.to_string(),
+            model.map(str::to_string),
+            input,
+            cache_create,
+            create_1h,
+            cache_read,
+            output,
+            0,
+        );
+    }
+}
+
+impl CombinedRecord {
+    fn into_event(self) -> Option<Event> {
+        let ts_ms = self
+            .timestamp
+            .as_deref()?
+            .parse::<jiff::Timestamp>()
+            .ok()?
+            .as_millisecond();
+
+        let kind = self.r#type.as_deref().unwrap_or("");
+        let subtype = self.subtype.as_deref().unwrap_or("");
+
+        let turn = (kind == "assistant")
+            .then(|| {
+                let msg = self.message.as_ref()?;
+                let usage = msg.usage.as_ref()?;
+                let model = msg.model.as_lenient()?;
+                if model == SYNTHETIC_MODEL {
+                    return None;
+                }
+                let cache_creation = usage.cache_creation_input_tokens.as_lenient().unwrap_or(0);
+                Some(Turn {
+                    ts_ms,
+                    context: usage
+                        .input_tokens
+                        .as_lenient()
+                        .unwrap_or(0)
+                        .saturating_add(usage.cache_read_input_tokens.as_lenient().unwrap_or(0))
+                        .saturating_add(cache_creation),
+                    cache_creation,
+                    model: model.to_string(),
+                })
+            })
+            .flatten();
+
+        let is_user_prompt = kind == "user"
+            && self.is_meta != Some(true)
+            && self
+                .message
+                .as_ref()
+                .is_some_and(|m| m.content || m.content_is_string == Some(true));
+
+        let compaction = (kind == "system" && subtype == "compact_boundary").then(|| {
+            let meta = self.compact_metadata.as_ref();
+            Compaction {
+                trigger: meta.and_then(|m| m.trigger.clone()),
+                pre_tokens: meta.and_then(|m| m.pre_tokens).unwrap_or(0),
+            }
+        });
+
+        Some(Event {
+            ts_ms,
+            turn,
+            is_user_prompt,
+            compaction,
+            is_model_refusal_fallback: kind == "system" && subtype == "model_refusal_fallback",
+        })
+    }
+}
+
+/// Stream a JSONL transcript in a single pass, computing both the token usage
+/// scan ([`TranscriptScan`]) and the session grading ([`SessionGrade`]) without
+/// reading the whole file into memory or deserializing each line twice.
+///
+/// Prompt text is never bound: `message.content` uses the shape-only
+/// [`content_is_string`] visitor, preserving the privacy invariant.
+pub fn scan_and_grade_reader<R: BufRead>(
+    reader: R,
+    prices: &Prices,
+) -> std::io::Result<(TranscriptScan, SessionGrade)> {
+    scan_and_grade_reader_with_line_hook(reader, prices, |_| {})
+}
+
+/// Like [`scan_and_grade_reader`], invoking `on_line` for every raw trimmed
+/// transcript line during the same streaming pass.
+pub fn scan_and_grade_reader_with_line_hook<R: BufRead>(
+    mut reader: R,
+    prices: &Prices,
+    mut on_line: impl FnMut(&str),
+) -> std::io::Result<(TranscriptScan, SessionGrade)> {
+    let mut token_scanner = TokenScanner::new(None);
+    let mut events = Vec::new();
+    let mut buf = String::new();
+
+    loop {
+        buf.clear();
+        if reader.read_line(&mut buf)? == 0 {
+            break;
+        }
+        let line = buf.trim_end_matches(['\r', '\n']);
+        on_line(line);
+        match serde_json::from_str::<CombinedRecord>(line) {
+            Ok(record) => {
+                if let Some(msg) = &record.message {
+                    msg.feed_token_scanner(&mut token_scanner);
+                }
+                if record.is_sidechain != Some(true)
+                    && let Some(event) = record.into_event()
+                {
+                    events.push(event);
+                }
+            }
+            Err(_) => {
+                // Rare fallback: a line with a non-bool `isSidechain` or other
+                // grading-only schema error fails `CombinedRecord`, while
+                // `scan_tokens` ignores those top-level fields.
+                token_scanner.feed_line(line);
+            }
+        }
+    }
+
+    let scan = transcript::from_scan_result(token_scanner.finish());
+    let grade = grade_events(events, prices, DEFAULT_GRIND_TURNS_PER_PROMPT);
+    Ok((scan, grade))
+}
+
+fn grade_events(
+    mut events: Vec<Event>,
+    prices: &Prices,
+    grind_turns_per_prompt: f64,
+) -> SessionGrade {
     // Files are not stored in timestamp order.
     events.sort_by_key(|e| e.ts_ms);
 
@@ -1083,6 +1483,43 @@ mod tests {
             json_eq_by_value(&got, &want),
             "grading diverges from the contract's expected file\n  got:  {got}\n  want: {want}"
         );
+    }
+
+    #[test]
+    fn single_pass_scan_and_grade_matches_two_pass_on_fixture_and_edge_cases() {
+        let prices = contract_prices();
+        let (stream_scan, stream_grade) =
+            scan_and_grade_reader(std::io::Cursor::new(FIXTURE.as_bytes()), &prices).unwrap();
+        assert_eq!(
+            stream_scan,
+            crate::transcript::scan_transcript(FIXTURE, None)
+        );
+        let want_grade = grade_transcript(FIXTURE, &prices).to_json();
+        assert!(
+            json_eq_by_value(&stream_grade.to_json(), &want_grade),
+            "single-pass grading diverged on fixture"
+        );
+
+        // Edge cases: lenient string/u64 fields, non-bool isSidechain fallback,
+        // 1h cache creation sub-bucket, and prompt privacy.
+        let edge = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"secret-prompt-text"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":100,"cache_creation_input_tokens":50,"cache_creation":{"ephemeral_1h_input_tokens":20},"cache_read_input_tokens":30,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","message":{"id":"m2","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":"bad","output_tokens":5}}}"#,
+            r#"{"type":"assistant","isSidechain":"not-a-bool","timestamp":"2026-01-01T00:03:00Z","message":{"id":"m3","role":"assistant","model":"claude-sonnet-5","usage":{"input_tokens":40,"output_tokens":4}}}"#,
+        ]
+        .join("\n");
+        let (edge_scan, edge_grade) =
+            scan_and_grade_reader(std::io::Cursor::new(edge.as_bytes()), &prices).unwrap();
+        assert_eq!(edge_scan, crate::transcript::scan_transcript(&edge, None));
+        assert!(
+            json_eq_by_value(
+                &edge_grade.to_json(),
+                &grade_transcript(&edge, &prices).to_json()
+            ),
+            "single-pass grading diverged on edge cases"
+        );
+        assert!(!format!("{edge_scan:?}").contains("secret-prompt-text"));
     }
 
     /// The comparison above must be able to fail — a helper that returns true

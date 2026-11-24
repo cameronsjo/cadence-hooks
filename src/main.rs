@@ -693,6 +693,167 @@ impl From<TimerActionArg> for cadence_hooks_session::timer::TimerAction {
     }
 }
 
+/// Fast-path lookup for plain 2-argument `<namespace> <hook>` invocations with
+/// no flags, bypassing `clap::Command` construction on the hot hook dispatch
+/// path and inside `group::resolve`.
+///
+/// Returns `Some(Commands)` for every registered hook (checks and loggers;
+/// optional flags like `--ledger`, `--baseline`, and `--prices` take their
+/// `None` default). Returns `None` for CLI actions, unknown names, or flags.
+pub(crate) fn parse_plain_hook_command(namespace: &str, hook: &str) -> Option<Commands> {
+    Some(match namespace {
+        "cadence" => Commands::Cadence(match hook {
+            "terminology" => CadenceCommands::Terminology,
+            "orphaned-todos" => CadenceCommands::OrphanedTodos,
+            "prevent-secret-leaks" => CadenceCommands::PreventSecretLeaks,
+            "prevent-secret-writes" => CadenceCommands::PreventSecretWrites,
+            "prevent-secret-push" => CadenceCommands::PreventSecretPush,
+            "memory-guard" => CadenceCommands::MemoryGuard,
+            "git-safety" => CadenceCommands::GitSafety,
+            "line-endings" => CadenceCommands::LineEndings,
+            "env-vars" => CadenceCommands::EnvVars,
+            "warn-docs-update" => CadenceCommands::WarnDocsUpdate,
+            "warn-changelog-entry" => CadenceCommands::WarnChangelogEntry,
+            "warn-overshare" => CadenceCommands::WarnOvershare,
+            "warn-instruction-narrative" => CadenceCommands::WarnInstructionNarrative,
+            "warn-live-memory-write" => CadenceCommands::WarnLiveMemoryWrite,
+            "warn-plugin-root-cruft" => CadenceCommands::WarnPluginRootCruft,
+            "nudge-polish-before-pr" => CadenceCommands::NudgePolishBeforePr,
+            "markdown-lint" => CadenceCommands::MarkdownLint,
+            "audit-runner-pool" => CadenceCommands::AuditRunnerPool,
+            "guard-held-close" => CadenceCommands::GuardHeldClose { ledger: None },
+            "redact-external-content" => CadenceCommands::RedactExternalContent,
+            "redact-secret-output" => CadenceCommands::RedactSecretOutput,
+            "guard-secret-dump" => CadenceCommands::GuardSecretDump,
+            "platform-drift" => CadenceCommands::PlatformDrift { baseline: None },
+            "model-posture" => CadenceCommands::ModelPosture,
+            _ => return None,
+        }),
+        "guardrails" => Commands::Guardrails(match hook {
+            "guard-push-remote" => GuardrailsCommands::GuardPushRemote,
+            "guard-gh-dangerous" => GuardrailsCommands::GuardGhDangerous,
+            "guard-gh-write" => GuardrailsCommands::GuardGhWrite,
+            "guard-forge-write" => GuardrailsCommands::GuardForgeWrite,
+            "guard-critical-grade" => GuardrailsCommands::GuardCriticalGrade,
+            "guard-git-init" => GuardrailsCommands::GuardGitInit,
+            "warn-main-branch" => GuardrailsCommands::WarnMainBranch,
+            "warn-subagent-worktree" => GuardrailsCommands::WarnSubagentWorktree,
+            "warn-agent-dispatch" => GuardrailsCommands::WarnAgentDispatch,
+            "warn-branch-base" => GuardrailsCommands::WarnBranchBase,
+            "warn-cron-datetime" => GuardrailsCommands::WarnCronDatetime,
+            "nudge-upgrade-after-push" => GuardrailsCommands::NudgeUpgradeAfterPush,
+            "warn-untracked" => GuardrailsCommands::WarnUntracked,
+            "warn-amend-pushed" => GuardrailsCommands::WarnAmendPushed,
+            "guard-dotfiles" => GuardrailsCommands::GuardDotfiles,
+            "enforcement-status" => GuardrailsCommands::EnforcementStatus,
+            "guard-read-model" => GuardrailsCommands::GuardReadModel,
+            "warn-pr-issue-link" => GuardrailsCommands::WarnPrIssueLink,
+            "warn-issue-tracker" => GuardrailsCommands::WarnIssueTracker,
+            "warn-going-public" => GuardrailsCommands::WarnGoingPublic,
+            "warn-inline-body" => GuardrailsCommands::WarnInlineBody,
+            "verify-pr-autoclose" => GuardrailsCommands::VerifyPrAutoclose,
+            "guard-op-vault-scan" => GuardrailsCommands::GuardOpVaultScan,
+            "guard-container-rm" => GuardrailsCommands::GuardContainerRm,
+            "guard-sops-decrypt" => GuardrailsCommands::GuardSopsDecrypt,
+            "guard-runbook-scrub" => GuardrailsCommands::GuardRunbookScrub,
+            "warn-curl-alias" => GuardrailsCommands::WarnCurlAlias,
+            "warn-gh-merge-preflight" => GuardrailsCommands::WarnGhMergePreflight,
+            "warn-unreviewed-ready-flip" => GuardrailsCommands::WarnUnreviewedReadyFlip,
+            "warn-chezmoi-apply" => GuardrailsCommands::WarnChezmoiApply,
+            "warn-entry-posture" => GuardrailsCommands::WarnEntryPosture,
+            "warn-stacked-base-delete" => GuardrailsCommands::WarnStackedBaseDelete,
+            "warn-stale-pr-body" => GuardrailsCommands::WarnStalePrBody,
+            "warn-alias-parsing" => GuardrailsCommands::WarnAliasParsing,
+            "guard-browser-device" => GuardrailsCommands::GuardBrowserDevice,
+            "inject-gh-write-context" => GuardrailsCommands::InjectGhWriteContext,
+            "enforce-worktree" => GuardrailsCommands::EnforceWorktree,
+            _ => return None,
+        }),
+        "rules" => Commands::Rules(match hook {
+            "validate-frontmatter" => RulesCommands::ValidateFrontmatter,
+            "security-patterns" => RulesCommands::SecurityPatterns,
+            "warn-recommended-option" => RulesCommands::WarnRecommendedOption,
+            "warn-empty-answers" => RulesCommands::WarnEmptyAnswers,
+            _ => return None,
+        }),
+        "obsidian" => Commands::Obsidian(match hook {
+            "trash-guard" => ObsidianCommands::TrashGuard,
+            "trash-guard-liveness" => ObsidianCommands::TrashGuardLiveness,
+            _ => return None,
+        }),
+        "metrics" => Commands::Metrics(match hook {
+            "snapshot" => MetricsCommands::Snapshot,
+            "log-commit" => MetricsCommands::LogCommit { prices: None },
+            "log-subagent" => MetricsCommands::LogSubagent,
+            "log-session" => MetricsCommands::LogSession { prices: None },
+            "log-session-start" => MetricsCommands::LogSessionStart,
+            "log-polish-nudge" => MetricsCommands::LogPolishNudge,
+            "log-ask-user-question" => MetricsCommands::LogAskUserQuestion,
+            "log-skill" => MetricsCommands::LogSkill,
+            "warn-stale" => MetricsCommands::WarnStale,
+            _ => return None,
+        }),
+        "session" => Commands::Session(match hook {
+            "start" => SessionCommands::Start,
+            "heartbeat" => SessionCommands::Heartbeat,
+            "guard" => SessionCommands::Guard,
+            "warn-branch-drift" => SessionCommands::WarnBranchDrift,
+            "warn-branch-intent" => SessionCommands::WarnBranchIntent,
+            "warn-commit-provenance" => SessionCommands::WarnCommitProvenance,
+            "end" => SessionCommands::End,
+            "backstop-record" => SessionCommands::BackstopRecord,
+            "backstop-warn" => SessionCommands::BackstopWarn,
+            "persist-plan-approval" => SessionCommands::PersistPlanApproval,
+            "nudge-plan-tick" => SessionCommands::NudgePlanTick,
+            "warn-plan-ready-flip" => SessionCommands::WarnPlanReadyFlip,
+            "lint-plan-shape" => SessionCommands::LintPlanShape,
+            "nudge-afk-gap" => SessionCommands::NudgeAfkGap,
+            "plan-driver" => SessionCommands::PlanDriver,
+            _ => return None,
+        }),
+        _ => return None,
+    })
+}
+
+/// True when `(namespace, subcommand)` names a non-hook CLI action under a
+/// hook namespace, so `group::resolve` classifies it as `NotAToolCheck`
+/// without constructing `Cli::command()`.
+pub(crate) fn is_known_cli_action(namespace: &str, subcommand: &str) -> bool {
+    matches!(
+        (namespace, subcommand),
+        ("cadence", "record-polish" | "record-scrub" | "redact-scan")
+            | (
+                "guardrails",
+                "dismiss-main-branch-warn" | "dismiss-enforce-worktree"
+            )
+            | ("metrics", "grade" | "price" | "rotate" | "cat")
+            | ("session", "declare" | "status" | "plans" | "timer")
+    )
+}
+
+/// Fast-path argv parser for the two hot hook-invocation shapes:
+/// - `cadence-hooks <namespace> <hook>` (2 args, no flags)
+/// - `cadence-hooks group <ns>/<hook>...` (>= 1 member, no `-`-prefixed args)
+///
+/// Returns `None` for any flag (`--help`, `-h`, `--version`, `-V`, `--ledger`,
+/// etc.), CLI subcommand, or unknown argument so `main` falls back to `clap`
+/// and preserves 100% of existing help, version, error, and fail-open behavior.
+fn try_fast_parse(args: &[String]) -> Option<Cli> {
+    if args.len() == 2
+        && let Some(command) = parse_plain_hook_command(&args[0], &args[1])
+    {
+        return Some(Cli { command });
+    }
+    if args.len() >= 2 && args[0] == "group" && args[1..].iter().all(|arg| !arg.starts_with('-')) {
+        return Some(Cli {
+            command: Commands::Group {
+                members: args[1..].to_vec(),
+            },
+        });
+    }
+    None
+}
+
 /// Returns the kebab-case hook name for the resolved subcommand.
 /// These match the CLI names that clap derives from the enum variants.
 fn hook_name(cmd: &Commands) -> Option<&'static str> {
@@ -1521,89 +1682,103 @@ fn main() {
         }
     }));
 
-    // Build the clap Command. Under Claude Code, hide `configure` from --help
-    // so the agent can't discover it as a bypass route. The runtime check below
-    // also refuses to run it — defense in depth.
-    let mut cmd = Cli::command();
-    if under_claude_code() {
-        cmd = cmd.mut_subcommand("configure", |sc| sc.hide(true));
-    }
+    // Fast-path plain 2-arg hook dispatch (`cadence-hooks <ns> <hook>`) and
+    // `cadence-hooks group <specs...>` without constructing `Cli::command()`.
+    // Any flag, `--help`/`--version`, CLI subcommand, or unknown argument falls
+    // through to clap so all existing help/error/exit-code behavior is preserved.
+    let fast_cli = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string().ok())
+        .collect::<Option<Vec<String>>>()
+        .and_then(|args| try_fast_parse(&args));
 
-    let cli = match cmd.try_get_matches() {
-        Ok(matches) => match Cli::from_arg_matches(&matches) {
-            Ok(cli) => cli,
+    let cli = if let Some(cli) = fast_cli {
+        cli
+    } else {
+        // Build the clap Command. Under Claude Code, hide `configure` from --help
+        // so the agent can't discover it as a bypass route. The runtime check below
+        // also refuses to run it — defense in depth.
+        let mut cmd = Cli::command();
+        if under_claude_code() {
+            cmd = cmd.mut_subcommand("configure", |sc| sc.hide(true));
+        }
+
+        match cmd.try_get_matches() {
+            Ok(matches) => match Cli::from_arg_matches(&matches) {
+                Ok(cli) => cli,
+                Err(e) => {
+                    eprintln!("cadence-hooks: internal error hydrating args: {e}");
+                    process::exit(1);
+                }
+            },
             Err(e) => {
-                eprintln!("cadence-hooks: internal error hydrating args: {e}");
-                process::exit(1);
-            }
-        },
-        Err(e) => {
-            // Clap errors must NOT block operations. Exit code 2 from clap would
-            // be interpreted as "block" by the hook protocol, so every arm here
-            // fails open (exit 1) instead.
-            let installed = env!("CARGO_PKG_VERSION");
-            match e.kind() {
-                // No subcommand provided — bare `cadence-hooks`, or a namespace
-                // with no hook (e.g. `cadence-hooks cadence`). This is NOT a
-                // version problem: these hooks are invoked by plugins, not run
-                // by hand. Point at --help instead of crying "newer version"
-                // (claude-configurations #223).
-                clap::error::ErrorKind::MissingSubcommand
-                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-                    eprintln!(
-                        "cadence-hooks v{installed}: no subcommand given.\n\
-                         \n\
-                         These hooks are invoked by Claude Code plugins, not run directly.\n\
-                         Run 'cadence-hooks --help' to list subcommands, or\n\
-                         'cadence-hooks doctor' to audit installed plugin wiring."
-                    );
-                    process::exit(1);
+                // Clap errors must NOT block operations. Exit code 2 from clap would
+                // be interpreted as "block" by the hook protocol, so every arm here
+                // fails open (exit 1) instead.
+                let installed = env!("CARGO_PKG_VERSION");
+                match e.kind() {
+                    // No subcommand provided — bare `cadence-hooks`, or a namespace
+                    // with no hook (e.g. `cadence-hooks cadence`). This is NOT a
+                    // version problem: these hooks are invoked by plugins, not run
+                    // by hand. Point at --help instead of crying "newer version"
+                    // (claude-configurations #223).
+                    clap::error::ErrorKind::MissingSubcommand
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                        eprintln!(
+                            "cadence-hooks v{installed}: no subcommand given.\n\
+                             \n\
+                             These hooks are invoked by Claude Code plugins, not run directly.\n\
+                             Run 'cadence-hooks --help' to list subcommands, or\n\
+                             'cadence-hooks doctor' to audit installed plugin wiring."
+                        );
+                        process::exit(1);
+                    }
+                    // Unknown subcommand name (`cadence-hooks future-plugin hook`) or
+                    // an unrecognized flag on a known subcommand — a plugin likely
+                    // expects a newer build. This path deliberately stays
+                    // channel-agnostic (cargo / releases), unlike `doctor`'s
+                    // channel-aware advisory: cargo/releases is truthful regardless
+                    // of how this binary was installed, so it never degenerates into
+                    // a no-op `brew upgrade` (#223) here, where we can't run doctor's
+                    // fuller "already current" detection.
+                    clap::error::ErrorKind::InvalidSubcommand
+                    | clap::error::ErrorKind::UnknownArgument => {
+                        eprintln!(
+                            "cadence-hooks v{installed}: unrecognized subcommand or arguments.\n\
+                             \n\
+                             This usually means a plugin expects a newer version of cadence-hooks.\n\
+                             \n\
+                             To update:\n\
+                             \x20 cargo install --git https://github.com/cameronsjo/cadence-hooks.git\n\
+                             \n\
+                             Or download the latest release:\n\
+                             \x20 https://github.com/cameronsjo/cadence-hooks/releases/latest\n\
+                             \n\
+                             Underlying error: {e}"
+                        );
+                        // Best-effort argv re-read, same as the panic hook — a
+                        // clap parse failure means `cli`/`hook_name` were never
+                        // computed, so the raw argv position is all we have.
+                        let mut argv = std::env::args().skip(1);
+                        let namespace = argv.next();
+                        let subcommand = argv.next();
+                        // The clap error *kind* ("InvalidSubcommand" /
+                        // "UnknownArgument"), not the full error — that is
+                        // multi-line and ANSI-colored, and the kind is the whole
+                        // diagnostic here anyway.
+                        cadence_hooks_metrics::log_failopen(
+                            "version_mismatch",
+                            namespace.as_deref(),
+                            subcommand.as_deref(),
+                            installed,
+                            Some(&format!("{:?}", e.kind())),
+                        );
+                        process::exit(1);
+                    }
+                    // Everything else (--help, --version, other clap errors) uses
+                    // clap's default behavior.
+                    _ => e.exit(),
                 }
-                // Unknown subcommand name (`cadence-hooks future-plugin hook`) or
-                // an unrecognized flag on a known subcommand — a plugin likely
-                // expects a newer build. This path deliberately stays
-                // channel-agnostic (cargo / releases), unlike `doctor`'s
-                // channel-aware advisory: cargo/releases is truthful regardless
-                // of how this binary was installed, so it never degenerates into
-                // a no-op `brew upgrade` (#223) here, where we can't run doctor's
-                // fuller "already current" detection.
-                clap::error::ErrorKind::InvalidSubcommand
-                | clap::error::ErrorKind::UnknownArgument => {
-                    eprintln!(
-                        "cadence-hooks v{installed}: unrecognized subcommand or arguments.\n\
-                         \n\
-                         This usually means a plugin expects a newer version of cadence-hooks.\n\
-                         \n\
-                         To update:\n\
-                         \x20 cargo install --git https://github.com/cameronsjo/cadence-hooks.git\n\
-                         \n\
-                         Or download the latest release:\n\
-                         \x20 https://github.com/cameronsjo/cadence-hooks/releases/latest\n\
-                         \n\
-                         Underlying error: {e}"
-                    );
-                    // Best-effort argv re-read, same as the panic hook — a
-                    // clap parse failure means `cli`/`hook_name` were never
-                    // computed, so the raw argv position is all we have.
-                    let mut argv = std::env::args().skip(1);
-                    let namespace = argv.next();
-                    let subcommand = argv.next();
-                    // The clap error *kind* ("InvalidSubcommand" /
-                    // "UnknownArgument"), not the full error — that is
-                    // multi-line and ANSI-colored, and the kind is the whole
-                    // diagnostic here anyway.
-                    cadence_hooks_metrics::log_failopen(
-                        "version_mismatch",
-                        namespace.as_deref(),
-                        subcommand.as_deref(),
-                        installed,
-                        Some(&format!("{:?}", e.kind())),
-                    );
-                    process::exit(1);
-                }
-                // Everything else (--help, --version, other clap errors) uses
-                // clap's default behavior.
-                _ => e.exit(),
             }
         }
     };
@@ -2380,6 +2555,98 @@ mod tests {
                 "registry entry '{} {}' has no clap subcommand — it's listed but not dispatchable",
                 hook.namespace,
                 hook.name
+            );
+        }
+    }
+
+    #[test]
+    fn fast_parse_matches_clap_for_every_registered_hook() {
+        for hook in HOOKS {
+            let fast = parse_plain_hook_command(hook.namespace, hook.name).unwrap_or_else(|| {
+                panic!(
+                    "registered hook '{} {}' missing from parse_plain_hook_command",
+                    hook.namespace, hook.name
+                )
+            });
+            let clap = Cli::try_parse_from(["cadence-hooks", hook.namespace, hook.name])
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "registered hook '{} {}' failed clap parse: {e}",
+                        hook.namespace, hook.name
+                    )
+                });
+            assert_eq!(hook_name(&fast), hook_name(&clap.command));
+            assert_eq!(hook_name(&fast), Some(hook.name));
+            match (check_plan(&fast), check_plan(&clap.command)) {
+                (Some(fp), Some(cp)) => {
+                    assert_eq!(fp.event(), cp.event());
+                    assert_eq!(fp.is_payload_event(), cp.is_payload_event());
+                }
+                (None, None) => {}
+                (f, c) => panic!(
+                    "'{} {}': fast check_plan ({}) disagreed with clap ({})",
+                    hook.namespace,
+                    hook.name,
+                    f.is_some(),
+                    c.is_some()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn fast_parse_handles_group_and_falls_back_for_flags_and_cli_actions() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+
+        // Group with specs fast-paths without clap.
+        let grouped = try_fast_parse(&s(&[
+            "group",
+            "cadence/terminology",
+            "rules/security-patterns",
+        ]))
+        .expect("group with specs should fast-path");
+        match grouped.command {
+            Commands::Group { members } => {
+                assert_eq!(
+                    members,
+                    vec![
+                        "cadence/terminology".to_string(),
+                        "rules/security-patterns".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected Commands::Group"),
+        }
+
+        // Plain 2-arg hook fast-paths.
+        assert!(try_fast_parse(&s(&["cadence", "terminology"])).is_some());
+        assert!(try_fast_parse(&s(&["metrics", "log-commit"])).is_some());
+
+        // Flags, help, version, bare group, unknown args, and CLI actions fall back to clap.
+        for fallback in [
+            &["--help"][..],
+            &["-h"],
+            &["--version"],
+            &["-V"],
+            &["cadence", "--help"],
+            &["cadence", "-h"],
+            &["cadence", "terminology", "--help"],
+            &["cadence", "guard-held-close", "--ledger", "/tmp/l"],
+            &["cadence", "no-such-hook"],
+            &["group"],
+            &["group", "--help"],
+            &["group", "-h"],
+            &["group", "cadence/terminology", "--unknown"],
+            &["group", "--", "cadence/terminology"],
+            &["metrics", "grade"],
+            &["session", "status"],
+            &["list"],
+            &["doctor"],
+            &["configure"],
+        ] {
+            assert!(
+                try_fast_parse(&s(fallback)).is_none(),
+                "{fallback:?} must fall back to clap"
             );
         }
     }
