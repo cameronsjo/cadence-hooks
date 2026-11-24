@@ -348,11 +348,12 @@ pub struct HookInput {
     /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
     pub prompt: Option<String>,
     /// Payload keys whose value was a JSON *object* that still failed its typed
-    /// shape, and so degraded to `None` through `lenient_option`. Derived by
+    /// shape, and so degraded to `None` through `lenient_option`, each with the
+    /// first field to blame ([`SchemaDrift`]). Derived by
     /// [`schema_drift`], never deserialized — see that function for why this is
     /// the drift-shaped half of the degradation (cadence-hooks#364).
     #[serde(skip)]
-    pub schema_drift: Vec<&'static str>,
+    pub schema_drift: Vec<SchemaDrift>,
     /// `tool_input` keys that were present but failed their typed shape, and
     /// so were dropped while the rest of `tool_input` was kept (see
     /// [`salvage_tool_input`], cadence-hooks#1087). `"tool_input"` means the
@@ -600,8 +601,9 @@ where
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Payload keys whose value is a JSON object that fails its typed shape —
-/// the drift-shaped half of `lenient_option`'s degradation (cadence-hooks#364).
+/// Payload keys whose value is a JSON object that fails its typed shape, each
+/// with the first field to blame ([`SchemaDrift`]) — the drift-shaped half of
+/// `lenient_option`'s degradation (cadence-hooks#364).
 ///
 /// A non-object `tool_input`/`tool_response` (a `Read` string, a `Glob` array)
 /// is expected per-tool variance and is not reported. An object only fails on
@@ -609,8 +611,8 @@ where
 /// so that case is what a Claude Code rename or reshape looks like. MCP tools
 /// (`mcp__*`) are skipped: their input and response shapes belong to
 /// third-party servers, not to Claude Code's schema, so a mismatch there says
-/// nothing about drift. Only key names are returned, never values.
-fn schema_drift(value: &serde_json::Value) -> Vec<&'static str> {
+/// nothing about drift. Only key and field names are returned, never values.
+fn schema_drift(value: &serde_json::Value) -> Vec<SchemaDrift> {
     let is_mcp = value
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
@@ -619,18 +621,69 @@ fn schema_drift(value: &serde_json::Value) -> Vec<&'static str> {
         return Vec::new();
     }
     let mut drift = Vec::new();
-    if let Some(v @ serde_json::Value::Object(_)) = value.get("tool_input")
+    if let Some(v @ serde_json::Value::Object(map)) = value.get("tool_input")
         && ToolInput::deserialize(v).is_err()
     {
-        drift.push("tool_input");
+        drift.push(SchemaDrift {
+            key: "tool_input",
+            field: first_mistyped::<ToolInput>(map, TOOL_INPUT_KEYS, "tool_input"),
+        });
     }
-    if let Some(v @ serde_json::Value::Object(_)) = value.get("tool_response")
+    if let Some(v @ serde_json::Value::Object(map)) = value.get("tool_response")
         && ToolResponse::deserialize(v).is_err()
     {
-        drift.push("tool_response");
+        drift.push(SchemaDrift {
+            key: "tool_response",
+            field: first_mistyped::<ToolResponse>(map, TOOL_RESPONSE_KEYS, "tool_response"),
+        });
     }
     drift
 }
+
+/// One payload key whose object value failed its typed shape, as reported by
+/// [`schema_drift`] (cadence-hooks#364). Both names are static, so a drift row
+/// built from this carries no payload content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaDrift {
+    /// The payload key: `"tool_input"` or `"tool_response"`.
+    pub key: &'static str,
+    /// The alphabetically first modeled field whose value fails its typed
+    /// shape on its own, from [`TOOL_INPUT_KEYS`] or [`TOOL_RESPONSE_KEYS`].
+    /// Equals [`Self::key`] when every field passes alone and only their
+    /// combination fails (duplicate aliases such as `source` + `sourcePath`).
+    pub field: &'static str,
+}
+
+/// The field [`SchemaDrift::field`] names, found the same way
+/// [`salvage_tool_input`] finds the fields it drops, on a copy so the caller's
+/// payload is untouched. Runs only after the whole object already failed.
+/// "First" is alphabetical because [`salvage_fields`] sorts its result; a
+/// change to that sort changes which field a drift row names.
+fn first_mistyped<T: serde::de::DeserializeOwned>(
+    map: &serde_json::Map<String, serde_json::Value>,
+    known: &[&'static str],
+    whole: &'static str,
+) -> &'static str {
+    salvage_fields::<T>(&mut map.clone(), known, whole)
+        .into_iter()
+        .find(|name| *name != whole)
+        .unwrap_or(whole)
+}
+
+/// Every key [`ToolResponse`] models with a typed shape, as static names, so
+/// [`schema_drift`] can name a drifted response field without carrying a
+/// payload-supplied string.
+const TOOL_RESPONSE_KEYS: &[&str] = &[
+    "stdout",
+    "stderr",
+    "interrupted",
+    "isImage",
+    "answers",
+    "plan",
+    "filePath",
+    "isAgent",
+    "hasTaskTool",
+];
 
 /// Every key [`ToolInput`] models, aliases included, as static names.
 ///
@@ -1554,9 +1607,10 @@ pub struct MetricsInput {
     #[serde(skip)]
     pub raw_keys: Vec<String>,
     /// Mirrors [`HookInput::schema_drift`]: keys whose object value failed its
-    /// typed shape. Populated by [`Self::from_json`], not deserialized.
+    /// typed shape, with the field to blame. Populated by [`Self::from_json`],
+    /// not deserialized.
     #[serde(skip)]
-    pub schema_drift: Vec<&'static str>,
+    pub schema_drift: Vec<SchemaDrift>,
 }
 
 impl MetricsInput {
@@ -4127,19 +4181,46 @@ mod tests {
         // #364: `stdout` renamed to a non-string is the drift shape.
         let json = r#"{"tool_name":"Bash","tool_input":{"command":["ls"]},"tool_response":{"stdout":{"text":"x"}}}"#;
         let metrics = MetricsInput::from_json(json).unwrap();
-        assert_eq!(metrics.schema_drift, ["tool_input", "tool_response"]);
+        let drifted = |d: &[SchemaDrift]| d.iter().map(|d| (d.key, d.field)).collect::<Vec<_>>();
+        let expected = [("tool_input", "command"), ("tool_response", "stdout")];
+        assert_eq!(drifted(&metrics.schema_drift), expected);
         assert!(
             metrics.tool_response.is_none(),
             "degradation itself is unchanged"
         );
         let hook = HookInput::from_json(json).unwrap();
-        assert_eq!(hook.schema_drift, ["tool_input", "tool_response"]);
+        assert_eq!(drifted(&hook.schema_drift), expected);
         assert_eq!(
             hook.command(),
             Some("ls"),
             "an argv-array command is joined, not dropped"
         );
         assert!(hook.mistyped_tool_input.is_empty());
+    }
+
+    /// Every name in `TOOL_RESPONSE_KEYS` is a typed `ToolResponse` field, so a
+    /// wrong-typed value under it fails the struct and the drift row can name
+    /// it. A key missing from the struct would deserialize into nothing and
+    /// pass, which this catches.
+    #[test]
+    fn tool_response_keys_are_all_typed_fields() {
+        for key in TOOL_RESPONSE_KEYS {
+            let mistyped = serde_json::json!({ *key: [1] });
+            assert!(
+                ToolResponse::deserialize(&mistyped).is_err(),
+                "{key} is not a typed ToolResponse field"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_names_the_whole_object_when_only_the_combination_fails() {
+        // Each alias parses alone; together they collide, so no single field
+        // is to blame and the row names the key itself.
+        let json = r#"{"tool_name":"Write","tool_input":{"source":"a","sourcePath":"b"}}"#;
+        let drift = HookInput::from_json(json).unwrap().schema_drift;
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert_eq!((drift[0].key, drift[0].field), ("tool_input", "tool_input"));
     }
 
     /// Review N3: the joined argv string, run by a real shell, reproduces
