@@ -8,17 +8,18 @@
 //! panic handling) lives in [`crate::dispatch::run_logged_group`]; this module
 //! only turns the member names into checks.
 //!
-//! Members resolve through the same clap parser and the same
-//! [`crate::check_plan`] table a standalone run uses, so `group cadence/x` and
-//! `cadence x` cannot dispatch different checks. A member that does not
-//! resolve is skipped with a notice and the rest still run, which is what a
-//! separate process for an unknown hook did: fail open for that one hook.
+//! Members resolve through the same static dispatch table
+//! ([`crate::parse_plain_hook_command`] + [`crate::check_plan`]) a standalone
+//! run uses, so `group cadence/x` and `cadence x` cannot dispatch different
+//! checks and resolving N members never constructs `clap::Command`. A member
+//! that does not resolve is skipped with a notice and the rest still run, which
+//! is what a separate process for an unknown hook did: fail open for that one
+//! hook.
 
 use crate::dispatch::{self, GroupMember};
-use crate::{Cli, check_plan, hook_name};
+use crate::{check_plan, hook_name, is_known_cli_action, parse_plain_hook_command};
 use cadence_hooks_core::HookEvent;
 use cadence_hooks_core::bypass::{self, BypassState};
-use clap::Parser;
 
 /// Why a member spec could not join the group.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,10 +40,13 @@ pub(crate) fn resolve(spec: &str) -> Result<(&'static str, dispatch::CheckPlan),
     if namespace.is_empty() || hook.is_empty() || hook.contains('/') {
         return Err(Rejected::Unknown);
     }
-    let cli =
-        Cli::try_parse_from(["cadence-hooks", namespace, hook]).map_err(|_| Rejected::Unknown)?;
-    let name = hook_name(&cli.command).ok_or(Rejected::NotAToolCheck)?;
-    let plan = check_plan(&cli.command).ok_or(Rejected::NotAToolCheck)?;
+    let cmd = match parse_plain_hook_command(namespace, hook) {
+        Some(cmd) => cmd,
+        None if is_known_cli_action(namespace, hook) => return Err(Rejected::NotAToolCheck),
+        None => return Err(Rejected::Unknown),
+    };
+    let name = hook_name(&cmd).ok_or(Rejected::NotAToolCheck)?;
+    let plan = check_plan(&cmd).ok_or(Rejected::NotAToolCheck)?;
     if plan.is_payload_event()
         || !matches!(plan.event(), HookEvent::PreToolUse | HookEvent::PostToolUse)
     {

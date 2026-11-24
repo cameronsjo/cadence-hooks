@@ -12,10 +12,10 @@ use crate::common;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
 use crate::session_grade;
-use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
+use crate::transcript::{TranscriptScan, UsageScan};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
-use std::io::Write;
+use std::io::{BufReader, Write};
 
 /// Appends a per-session cost line to `sessions.jsonl` at `SessionEnd`. Holds
 /// the optional price table override path supplied via `--prices`.
@@ -63,10 +63,19 @@ impl Logger for LogSession {
             .filter(|s| !s.is_empty());
         let _ = std::fs::remove_file(&start_marker);
 
-        let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
+        let Ok(file) = std::fs::File::open(transcript_path) else {
             return;
         };
-        let usage = match scan_transcript(&transcript, None) {
+        let prices = Prices::load(self.prices_path.as_deref());
+        // Single streaming pass over the transcript: computes both token usage
+        // and session grading at the same price table (so `costUsd` and
+        // `grading.coldRestartUsdTotal` can never be quoted at different rates)
+        // without reading the whole file into memory or deserializing twice.
+        let Ok((scan, grade)) = session_grade::scan_and_grade_reader(BufReader::new(file), &prices)
+        else {
+            return;
+        };
+        let usage = match scan {
             TranscriptScan::Usage(usage) => usage,
             TranscriptScan::Diagnostic(diagnostic) => {
                 common::append_transcript_diagnostic(
@@ -80,7 +89,6 @@ impl Logger for LogSession {
             TranscriptScan::Empty => return,
         };
 
-        let prices = Prices::load(self.prices_path.as_deref());
         // Unconditional since the unpriced harness was retired (#1040). It was
         // `(usage.harness == "claude").then(...)`, which is now a tautology —
         // left in place it would read as live logic while its `unwrap_or(0.0)`
@@ -98,10 +106,7 @@ impl Logger for LogSession {
         let commits =
             counted.unwrap_or_else(|| commits_in_ledger(&dir.join("commits.jsonl"), session_id));
 
-        // Graded from the same transcript string already in memory, at the same
-        // price table cost is computed from — so `costUsd` and
-        // `grading.coldRestartUsdTotal` can never be quoted at different rates.
-        let grading = session_grade::grade_transcript(&transcript, &prices).to_json();
+        let grading = grade.to_json();
 
         let record = build_session_record(
             &ts,
