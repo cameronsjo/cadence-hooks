@@ -21,6 +21,7 @@
 //! `prompt_content_is_not_deserialized_or_emitted` asserts for
 //! [`crate::transcript`].
 
+use crate::scan_tokens::SYNTHETIC_MODEL;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
@@ -71,10 +72,6 @@ const TURNS_PER_PROMPT_PLACES: u32 = 1;
 
 /// Tokens per unit of every rate in the price table.
 const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
-
-/// The model string Claude Code writes for a locally-synthesized assistant
-/// record. Such a record carries `usage` but is not a turn.
-const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// The charge basis of a gap that cost a **measured** nothing.
 ///
@@ -918,8 +915,18 @@ impl CombinedRecord {
 /// Prompt text is never bound: `message.content` uses the shape-only
 /// [`content_is_string`] visitor, preserving the privacy invariant.
 pub fn scan_and_grade_reader<R: BufRead>(
+    reader: R,
+    prices: &Prices,
+) -> std::io::Result<(TranscriptScan, SessionGrade)> {
+    scan_and_grade_reader_with_line_hook(reader, prices, |_| {})
+}
+
+/// Like [`scan_and_grade_reader`], invoking `on_line` for every raw trimmed
+/// transcript line during the same streaming pass.
+pub fn scan_and_grade_reader_with_line_hook<R: BufRead>(
     mut reader: R,
     prices: &Prices,
+    mut on_line: impl FnMut(&str),
 ) -> std::io::Result<(TranscriptScan, SessionGrade)> {
     let mut token_scanner = TokenScanner::new(None);
     let mut events = Vec::new();
@@ -931,6 +938,7 @@ pub fn scan_and_grade_reader<R: BufRead>(
             break;
         }
         let line = buf.trim_end_matches(['\r', '\n']);
+        on_line(line);
         match serde_json::from_str::<CombinedRecord>(line) {
             Ok(record) => {
                 if let Some(msg) = &record.message {

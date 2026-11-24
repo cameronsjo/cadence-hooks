@@ -6,10 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sessions.jsonl` rows record whether the session ran in Claude Code's Code Mode.** `codeMode` is `true` when the transcript has the `{"type":"repl-mode","replMode":true}` row Code Mode writes, `null` when it has a `REPL` tool call but no such row (the row moved, so the answer is unknown), and `false` otherwise. It is read from the transcript `log-session` already holds, so SessionEnd does no second read; a replay of a Code Mode transcript took 28 ms against 28 to 30 ms on 0.136.2. Code Mode turns off Claude Code's own telemetry, so this is the only record of which sessions used it. Other ledgers reach it by `sessionId`; a subagent row describes the subagent's own transcript, so join it to the parent through `parentSessionId` (cameronsjo/cadence-hooks#1682).
+
 ### Changed
 
 - **Reduced hook startup and hot-path overhead across release builds, dispatch, security pattern scanning, and metrics transcript scanning.** Release builds now enable thin LTO, single codegen unit, and symbol stripping while keeping `panic = "unwind"` for fail-open `catch_unwind` guards. Plain `<namespace> <hook>` and `group <specs...>` invocations fast-path around `clap::Command` construction (falling back to `clap` for flags, help, version, CLI subcommands, and unknown arguments), and `group` member resolution uses a direct static lookup instead of constructing a `clap::Command` per member. `rules security-patterns` pre-compiles its pattern regexes once in a `LazyLock` table and skips initialization on unmatched extensions. `metrics log-session` streams the JSONL transcript with `BufReader` in a single pass combining token scanning and session grading, and `metrics log-commit` streams with `BufReader` and records a verified transcript byte offset beside `state/commits/<session>/last` so subsequent commits seek directly to the tail (falling back to a full streaming scan if the file was truncated or rewritten).
 - **A `schema_drift` row in `failopen.jsonl` now names the tool and the field that drifted.** Each row gains `toolName` (the payload's tool name when it is plain ASCII letters, digits or `_`, up to 64 characters, else `other`, and `null` when the payload has none) and `field` (the first modeled `tool_input` or `tool_response` field whose value fails its typed shape, or the key itself when only the combination fails). The hook a row names is only the first one wired on the matcher, so `persist-plan-approval`, the one PostToolUse `*` entry, carried every drift with no way to tell which tool caused it. Detection, the once-per-process latch and the `error` text are unchanged, and both new values are static or charset-checked names, never payload content. Read them with `jq 'select(.reason=="schema_drift") | {toolName, field}' ~/.claude/cadence/metrics/failopen.jsonl`.
+
+### Fixed
+
+- **Code Mode rows no longer report a pricing gap for `<synthetic>`.** Code Mode transcripts carry many locally-synthesized assistant records with `model: "<synthetic>"`; the token scan counted them, so every Code Mode `commits`, `sessions` and `subagents` row listed `<synthetic>` in `byModel` and `unpricedModels`, which reads as "cost understated". The scan now adds no tokens and no model bucket for them. They still count as scanned and still move the commit marker, so a second commit in the same Code Mode turn, whose range holds only synthetic records, still gets its row, with zero tokens, an empty `byModel` and `model: "unknown"` (cameronsjo/cadence-hooks#1682).
 
 ## [0.136.2] - 2026-11-23
 

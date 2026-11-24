@@ -2,7 +2,9 @@
 //!
 //! Pure port of `scan-tokens.sh`. Given the transcript contents and an optional
 //! `from` message id, sum the token usage of every assistant message *after*
-//! that id (exclusive). Returns `None` when there is nothing to report — no
+//! that id (exclusive). Locally-synthesized `<synthetic>` records count as
+//! scanned and can be the marker, but add no tokens and no model bucket.
+//! Returns `None` when there is nothing to report — no
 //! matching messages, the marker isn't found, or the range is empty — mirroring
 //! the bash "emit nothing, skip the commit" behavior.
 
@@ -11,6 +13,12 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use serde::Deserialize;
+
+/// The model string Claude Code writes for a locally-synthesized assistant
+/// record. Such a record carries `usage` but is no model call: the scan adds
+/// no tokens or model bucket for it, and the session grader does not count it
+/// as a turn.
+pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Token totals for a scanned range.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -32,11 +40,16 @@ pub struct ScanResult {
     /// Grand total of all tokens in the range (all models combined).
     pub tokens: Tokens,
     pub last_message_id: String,
+    /// Assistant records in the range, `<synthetic>` ones included, so this
+    /// counts records rather than model calls.
     pub messages_scanned: usize,
-    /// The model of the last assistant message in the range (backward-compat).
+    /// The model of the last non-synthetic assistant message in the range
+    /// (backward-compat), or `unknown` when the range holds only synthetic
+    /// records.
     pub model: String,
     /// Per-model token buckets, sorted by model name (BTreeMap order).
-    /// Always populated; single-model ranges produce a one-entry vec.
+    /// Single-model ranges produce a one-entry vec; a range of only
+    /// `<synthetic>` records produces an empty one.
     pub by_model: Vec<(String, Tokens)>,
 }
 
@@ -210,6 +223,20 @@ impl<'a> TokenScanner<'a> {
             return;
         }
 
+        // A locally-synthesized record (Code Mode writes many) is no model
+        // call: it bills nothing and has no price, so a bucket for it would
+        // add `<synthetic>` to `byModel` and a false gap to `unpricedModels`.
+        // It still counts as scanned and still moves the marker: a second
+        // commit in the same Code Mode turn has only synthetic records after
+        // the first commit's marker, and `log-commit` writes no row for an
+        // empty range.
+        if model.as_deref() == Some(SYNTHETIC_MODEL) {
+            self.messages_scanned += 1;
+            self.last_id = Some(id);
+            self.last_message_offset = Some(line_offset);
+            return;
+        }
+
         // The scalar is the API's authoritative total; the sub-bucket is read
         // alongside it, never instead of it. Summing the named sub-buckets
         // would silently drop any future TTL the struct does not name out of
@@ -282,7 +309,9 @@ fn line_matches_marker(line: &str, expected_id: &str) -> bool {
 /// - `from` is `None` or empty: scan from the start.
 /// - `from` not found among scanned messages: returns `None` (the marker
 ///   predates this transcript — skip rather than overcount).
-/// - No assistant messages in range: returns `None`.
+/// - No assistant messages in range: returns `None`. A range holding only
+///   `<synthetic>` records is not empty: it returns zero tokens, so a commit
+///   made later in the same Code Mode turn still gets its row.
 pub fn scan_tokens(transcript: &str, from: Option<&str>) -> Option<ScanResult> {
     let mut scanner = TokenScanner::new(from);
     for line in transcript.lines() {
@@ -422,6 +451,59 @@ mod tests {
     }
 
     // --- by_model bucket tests ---
+
+    #[test]
+    fn synthetic_records_add_no_tokens_or_bucket() {
+        // Non-zero usage on purpose: the filter keys on the model string, not
+        // on the record happening to carry zeros.
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":3}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":500,"cache_read_input_tokens":7,"output_tokens":9}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, None).expect("the range is scanned");
+        assert_eq!(r.by_model.len(), 1, "{:?}", r.by_model);
+        assert_eq!(r.by_model[0].0, "claude-opus-4-7");
+        assert_eq!(r.tokens.input, 10);
+        assert_eq!(r.tokens.cache_read, 0);
+        assert_eq!(r.tokens.output, 3);
+        assert_eq!(r.model, "claude-opus-4-7");
+        assert_eq!(r.messages_scanned, 2);
+        assert_eq!(
+            r.last_message_id, "s1",
+            "a synthetic record still moves the marker"
+        );
+    }
+
+    #[test]
+    fn a_marker_on_a_synthetic_id_resolves() {
+        let t = [
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0}}}"#,
+            r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, Some("s1")).expect("marker found");
+        assert_eq!(r.tokens.input, 4);
+        assert_eq!(r.last_message_id, "m2");
+    }
+
+    /// Two commits in one Code Mode turn: after the first commit's marker the
+    /// range holds only synthetic records, and it must still scan (zero
+    /// tokens, no bucket) so `log-commit` writes the second row.
+    #[test]
+    fn a_range_of_only_synthetic_records_scans_as_zero() {
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":1}}}"#,
+            r#"{"message":{"id":"s2","role":"assistant","model":"<synthetic>","usage":{"input_tokens":1}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, Some("s1")).expect("a synthetic-only range is not empty");
+        assert_eq!(r.tokens, Tokens::default());
+        assert!(r.by_model.is_empty(), "{:?}", r.by_model);
+        assert_eq!(r.model, "unknown");
+        assert_eq!(r.last_message_id, "s2");
+    }
 
     /// Single-model range: by_model has exactly one entry matching the totals.
     #[test]
