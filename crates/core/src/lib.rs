@@ -348,7 +348,8 @@ pub struct HookInput {
     /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
     pub prompt: Option<String>,
     /// Payload keys whose value was a JSON *object* that still failed its typed
-    /// shape, and so degraded to `None` through `lenient_option`. Derived by
+    /// shape, and so degraded to `None` through `lenient_option`, each with the
+    /// first field to blame ([`SchemaDrift`]). Derived by
     /// [`schema_drift`], never deserialized — see that function for why this is
     /// the drift-shaped half of the degradation (cadence-hooks#364).
     #[serde(skip)]
@@ -600,8 +601,9 @@ where
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Payload keys whose value is a JSON object that fails its typed shape —
-/// the drift-shaped half of `lenient_option`'s degradation (cadence-hooks#364).
+/// Payload keys whose value is a JSON object that fails its typed shape, each
+/// with the first field to blame ([`SchemaDrift`]) — the drift-shaped half of
+/// `lenient_option`'s degradation (cadence-hooks#364).
 ///
 /// A non-object `tool_input`/`tool_response` (a `Read` string, a `Glob` array)
 /// is expected per-tool variance and is not reported. An object only fails on
@@ -655,15 +657,15 @@ pub struct SchemaDrift {
 /// The field [`SchemaDrift::field`] names, found the same way
 /// [`salvage_tool_input`] finds the fields it drops, on a copy so the caller's
 /// payload is untouched. Runs only after the whole object already failed.
+/// "First" is alphabetical because [`salvage_fields`] sorts its result; a
+/// change to that sort changes which field a drift row names.
 fn first_mistyped<T: serde::de::DeserializeOwned>(
     map: &serde_json::Map<String, serde_json::Value>,
     known: &[&'static str],
     whole: &'static str,
 ) -> &'static str {
-    let mistyped = salvage_fields::<T>(&mut map.clone(), known, whole);
-    mistyped
-        .iter()
-        .copied()
+    salvage_fields::<T>(&mut map.clone(), known, whole)
+        .into_iter()
         .find(|name| *name != whole)
         .unwrap_or(whole)
 }
@@ -1605,7 +1607,8 @@ pub struct MetricsInput {
     #[serde(skip)]
     pub raw_keys: Vec<String>,
     /// Mirrors [`HookInput::schema_drift`]: keys whose object value failed its
-    /// typed shape. Populated by [`Self::from_json`], not deserialized.
+    /// typed shape, with the field to blame. Populated by [`Self::from_json`],
+    /// not deserialized.
     #[serde(skip)]
     pub schema_drift: Vec<SchemaDrift>,
 }

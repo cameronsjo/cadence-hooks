@@ -66,7 +66,11 @@ fn build_failopen_record_with(
     });
     if let Some(obj) = record.as_object_mut() {
         for (key, value) in fields {
-            obj.insert((*key).to_string(), json!(value.map(sanitize_error)));
+            // A reason-specific field never replaces a core column.
+            debug_assert!(!obj.contains_key(*key), "{key} is a core failopen column");
+            if !obj.contains_key(*key) {
+                obj.insert((*key).to_string(), json!(value.map(sanitize_error)));
+            }
         }
     }
     record
@@ -514,6 +518,23 @@ fn recency_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_fields_are_sanitized_and_none_is_null() {
+        let rec = build_failopen_record_with(
+            "schema_drift",
+            Some("session"),
+            Some("persist-plan-approval"),
+            "0.0.0",
+            Some("tool_input: object did not match its typed shape"),
+            &[("toolName", Some("Bash\u{1b}[31m")), ("field", None)],
+        );
+        assert_eq!(rec["reason"], "schema_drift");
+        assert!(rec["field"].is_null());
+        let tool = rec["toolName"].as_str().unwrap();
+        assert!(!tool.contains('\u{1b}'), "{tool:?}");
+        assert!(tool.starts_with("Bash"), "{tool:?}");
+    }
     use crate::common::ENV_LOCK;
 
     // --- record shape ---

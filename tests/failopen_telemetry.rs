@@ -384,6 +384,17 @@ fn drift_row_records_an_unplain_tool_name_as_other() {
     );
 }
 
+/// A drifted payload with no `tool_name` records `toolName: null`.
+#[test]
+fn drift_row_without_a_tool_name_records_null() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_response":{"stdout":{"t":"x"}}}"#;
+    let tmp = run_with_payload(&["metrics", "log-subagent"], payload);
+    let rows = failopen_rows(tmp.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0]["toolName"].is_null(), "{rows:?}");
+    assert_eq!(rows[0]["field"], "stdout");
+}
+
 /// #364: expected per-tool variance (a non-object response) stays silent.
 #[test]
 fn non_object_tool_response_writes_no_failopen_row() {
