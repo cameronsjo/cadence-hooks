@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.137.0] - 2026-11-24
+
 ### Added
 
 - **`sessions.jsonl` rows record whether the session ran in Claude Code's Code Mode.** `codeMode` is `true` when the transcript has the `{"type":"repl-mode","replMode":true}` row Code Mode writes, `null` when it has a `REPL` tool call but no such row (the row moved, so the answer is unknown), and `false` otherwise. It is read from the transcript `log-session` already holds, so SessionEnd does no second read; a replay of a Code Mode transcript took 28 ms against 28 to 30 ms on 0.136.2. Code Mode turns off Claude Code's own telemetry, so this is the only record of which sessions used it. Other ledgers reach it by `sessionId`; a subagent row describes the subagent's own transcript, so join it to the parent through `parentSessionId` (cameronsjo/cadence-hooks#1682).
