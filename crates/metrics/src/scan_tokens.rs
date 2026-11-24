@@ -145,6 +145,15 @@ pub fn scan_tokens(transcript: &str, from: Option<&str>) -> Option<ScanResult> {
             // The marker message itself is excluded from the sum.
             continue;
         }
+        // A locally-synthesized record (Code Mode writes many) is no model
+        // call: it bills nothing and has no price, so counting it would add a
+        // `<synthetic>` bucket to `byModel` and a false gap to
+        // `unpricedModels`. Skipped after the marker gate, so a marker an
+        // older binary recorded on a synthetic id still resolves; skipped
+        // records also never become the next marker.
+        if m.model.as_deref() == Some(crate::session_grade::SYNTHETIC_MODEL) {
+            continue;
+        }
 
         let u = m.usage.as_ref().unwrap();
         // The scalar is the API's authoritative total; the sub-bucket is read
@@ -263,6 +272,47 @@ mod tests {
     // --- by_model bucket tests ---
 
     /// Single-model range: by_model has exactly one entry matching the totals.
+    #[test]
+    fn synthetic_records_are_left_out_of_cost_attribution() {
+        // Non-zero usage on purpose: the filter keys on the model string, not
+        // on the record happening to carry zeros.
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":3}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":500,"cache_read_input_tokens":7,"output_tokens":9}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, None).expect("the real message is scanned");
+        assert_eq!(r.by_model.len(), 1, "{:?}", r.by_model);
+        assert_eq!(r.by_model[0].0, "claude-opus-4-7");
+        assert_eq!(r.tokens.input, 10);
+        assert_eq!(r.tokens.output, 3);
+        assert_eq!(r.messages_scanned, 1);
+        assert_eq!(
+            r.last_message_id, "m1",
+            "a synthetic id never becomes the marker"
+        );
+        assert_eq!(r.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn a_marker_on_a_synthetic_id_still_resolves() {
+        // An older binary could record a synthetic id as the commit marker.
+        let t = [
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0}}}"#,
+            r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, Some("s1")).expect("marker found");
+        assert_eq!(r.tokens.input, 4);
+        assert_eq!(r.last_message_id, "m2");
+    }
+
+    #[test]
+    fn a_range_of_only_synthetic_records_is_empty() {
+        let t = r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":1}}}"#;
+        assert_eq!(scan_tokens(t, None), None);
+    }
+
     #[test]
     fn single_model_by_model_has_one_bucket() {
         let result = scan_tokens(&fixture(), None).unwrap();
