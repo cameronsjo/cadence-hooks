@@ -5,6 +5,7 @@
 //! the last commit marker, `log-session` scans the *whole* transcript once at
 //! session end. `sum(commits) ≤ session` — the gap is uncommitted-work cost;
 //! each `/clear` segment mints a new session id and so writes its own row.
+//! The row also records `codeMode`, read from the same transcript string.
 //!
 //! Fire-and-forget: silent no-op on any failure, never blocks.
 
@@ -102,6 +103,7 @@ impl Logger for LogSession {
         // price table cost is computed from — so `costUsd` and
         // `grading.coldRestartUsdTotal` can never be quoted at different rates.
         let grading = session_grade::grade_transcript(&transcript, &prices).to_json();
+        let code_mode = code_mode(&transcript);
 
         let record = build_session_record(
             &ts,
@@ -115,6 +117,7 @@ impl Logger for LogSession {
             start_ts.as_deref(),
             commits,
             grading,
+            code_mode,
         );
 
         let sessions_path = dir.join("sessions.jsonl");
@@ -189,6 +192,44 @@ fn session_duration_ms(start_ts: Option<&str>, ts: &str) -> Option<i64> {
     Some(diff.as_secs() * 1000 + i64::from(diff.subsec_millis()))
 }
 
+/// Whether the session ran in Claude Code's Code Mode, where the model calls one
+/// `REPL` tool and its script makes the inner tool calls. Pure.
+///
+/// - `Some(true)`: the transcript has a `{"type":"repl-mode","replMode":true}`
+///   row, which Claude Code writes for a Code Mode session.
+/// - `None`: no such row, but a `REPL` tool call is present. The row has
+///   moved or changed shape, so the answer is unknown rather than a wrong
+///   `false`.
+/// - `Some(false)`: neither.
+///
+/// Only lines that contain the marker text are parsed, so the cost on an
+/// ordinary transcript is one substring scan of the string already in memory.
+///
+/// Both probes match Claude Code's compact JSON (no space after `:`), as
+/// written by 2.1.331; spaced JSON would read `false` where `None` is meant.
+///
+/// The value describes this transcript only. A subagent's own transcript has
+/// no `repl-mode` row, so a subagent row reads `false` or `None`; join it to
+/// its parent's row through `parentSessionId` for the session's mode.
+// debt: reads one compact transcript row shape (CC 2.1.331) because the payload has no Code Mode flag; read a payload field once one exists (cameronsjo/cadence-hooks#1682)
+fn code_mode(transcript: &str) -> Option<bool> {
+    let flagged = transcript
+        .lines()
+        .filter(|line| line.contains(r#""repl-mode""#))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|row| {
+            row.get("type").and_then(Value::as_str) == Some("repl-mode")
+                && row.get("replMode").and_then(Value::as_bool) == Some(true)
+        });
+    if flagged {
+        Some(true)
+    } else if transcript.contains(r#""name":"REPL""#) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// Build the `sessions.jsonl` record. Pure — no I/O. The `byModel`/`unpricedModels`
 /// shapes come from [`crate::model_breakdown`], shared verbatim with `log_commit`.
 #[allow(clippy::too_many_arguments)]
@@ -204,6 +245,7 @@ fn build_session_record(
     start_ts: Option<&str>,
     commits: u64,
     grading: Value,
+    code_mode: Option<bool>,
 ) -> Value {
     let scan = &usage.scan;
     let (by_model, unpriced) = usage.priced_breakdown(prices);
@@ -237,6 +279,8 @@ fn build_session_record(
         // Always an object, never null — grading is total over any transcript
         // that reaches here, so a consumer never has to branch on absence.
         "grading": grading,
+        // Additive like `grading`. See [`code_mode`] for what null means.
+        "codeMode": code_mode,
     });
     record["costUsd"] = json!(cost);
     record
@@ -246,6 +290,60 @@ fn build_session_record(
 mod tests {
     use super::*;
     use crate::scan_tokens::{ScanResult, Tokens, scan_tokens};
+
+    /// The row shapes `code_mode` reads, pinned as Claude Code 2.1.331 writes
+    /// them (2026-11-24).
+    #[test]
+    fn code_mode_reads_the_repl_mode_row() {
+        let repl_row = r#"{"type":"repl-mode","replMode":true,"sessionId":"s1"}"#;
+        let off_row = r#"{"type":"repl-mode","replMode":false,"sessionId":"s1"}"#;
+        let turn = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        let repl_call = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"REPL","input":{"code":"1"}}]}}"#;
+        let cases: &[(&str, &[&str], Option<bool>)] = &[
+            ("flag row", &[turn, repl_row, repl_call], Some(true)),
+            ("flag row off", &[off_row, turn], Some(false)),
+            ("no row, no REPL call", &[turn, turn], Some(false)),
+            ("REPL call but no row", &[turn, repl_call], None),
+            (
+                "text mentioning repl-mode",
+                &[r#"{"type":"user","message":{"content":"\"repl-mode\" talk"}}"#],
+                Some(false),
+            ),
+            ("empty", &[], Some(false)),
+        ];
+        for (name, lines, want) in cases {
+            assert_eq!(code_mode(&lines.join("\n")), *want, "{name}");
+        }
+    }
+
+    #[test]
+    fn session_record_carries_code_mode() {
+        let prices = Prices::embedded();
+        let mut subagent = sample_input();
+        subagent.parent_session_id = Some("parent".into());
+        for (input, mode, want) in [
+            (sample_input(), Some(true), json!(true)),
+            (sample_input(), None, Value::Null),
+            (subagent, Some(false), json!(false)),
+        ] {
+            let record = build_session_record(
+                "ts",
+                &input,
+                "s1",
+                "main",
+                "r",
+                &sample_usage(),
+                0.0,
+                &prices,
+                None,
+                0,
+                Value::Null,
+                mode,
+            );
+            assert_eq!(record["codeMode"], want);
+            assert_eq!(record["schemaVersion"], common::TOKEN_RECORD_SCHEMA_VERSION);
+        }
+    }
 
     #[test]
     fn name_is_log_session() {
@@ -330,6 +428,7 @@ mod tests {
             None,
             2,
             Value::Null,
+            Some(false),
         );
         assert_eq!(record["sessionId"], "s1");
         assert_eq!(record["transcriptPath"], "/tmp/t.jsonl");
@@ -381,6 +480,7 @@ mod tests {
             None,
             0,
             Value::Null,
+            Some(false),
         );
         // Absent → null, not omitted.
         assert!(record["reason"].is_null());
@@ -428,6 +528,7 @@ mod tests {
             None,
             0,
             Value::Null,
+            Some(false),
         );
         let unpriced = record["unpricedModels"].as_array().unwrap();
         assert_eq!(unpriced.len(), 1);
@@ -449,6 +550,7 @@ mod tests {
             Some("2026-07-02T00:10:00Z"),
             5,
             Value::Null,
+            Some(false),
         );
         assert_eq!(record["startTs"], "2026-07-02T00:10:00Z");
         assert_eq!(record["endTs"], "2026-07-02T00:10:30Z");
@@ -545,6 +647,7 @@ mod tests {
             None,
             0,
             Value::Null,
+            Some(false),
         );
         assert_eq!(record["costUsd"], 0.004_2);
         assert!(record.get("estimatedCostUsd").is_none());
