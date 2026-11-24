@@ -41,7 +41,21 @@ fn build_failopen_record(
     binary_version: &str,
     error: Option<&str>,
 ) -> Value {
-    json!({
+    build_failopen_record_with(reason, namespace, subcommand, binary_version, error, &[])
+}
+
+/// [`build_failopen_record`] plus reason-specific `fields`, each sanitized like
+/// `error` (a `None` value is written as `null`). Additive keys on a v2 row:
+/// readers reach every field through `Value::get`, so no version bump. Pure.
+fn build_failopen_record_with(
+    reason: &str,
+    namespace: Option<&str>,
+    subcommand: Option<&str>,
+    binary_version: &str,
+    error: Option<&str>,
+    fields: &[(&'static str, Option<&str>)],
+) -> Value {
+    let mut record = json!({
         "schemaVersion": FAILOPEN_SCHEMA_VERSION,
         "reason": reason,
         "namespace": namespace,
@@ -49,7 +63,13 @@ fn build_failopen_record(
         "binaryVersion": binary_version,
         "error": error.map(sanitize_error),
         "ts": common::utc_timestamp(),
-    })
+    });
+    if let Some(obj) = record.as_object_mut() {
+        for (key, value) in fields {
+            obj.insert((*key).to_string(), json!(value.map(sanitize_error)));
+        }
+    }
+    record
 }
 
 /// Append one fail-open event to `<metrics_dir>/failopen.jsonl`.
@@ -83,7 +103,24 @@ pub fn log_failopen(
     binary_version: &str,
     error: Option<&str>,
 ) {
-    let record = build_failopen_record(reason, namespace, subcommand, binary_version, error);
+    log_failopen_with(reason, namespace, subcommand, binary_version, error, &[]);
+}
+
+/// [`log_failopen`] with reason-specific extra `fields` on the row, such as
+/// the `schema_drift` row's `toolName` and `field`
+/// (cameronsjo/cadence-hooks#364). The same rule holds for each value as for
+/// `error`: call sites pass static names or charset-checked text, never
+/// payload content. Fail-open like [`log_failopen`].
+pub fn log_failopen_with(
+    reason: &str,
+    namespace: Option<&str>,
+    subcommand: Option<&str>,
+    binary_version: &str,
+    error: Option<&str>,
+    fields: &[(&'static str, Option<&str>)],
+) {
+    let record =
+        build_failopen_record_with(reason, namespace, subcommand, binary_version, error, fields);
 
     let dir = common::metrics_dir();
     if std::fs::create_dir_all(&dir).is_err() {
