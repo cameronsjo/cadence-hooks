@@ -84,7 +84,7 @@ pub use log_bypass::{
 };
 pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
-pub use log_failopen::log_failopen;
+pub use log_failopen::{log_failopen, log_failopen_with};
 pub use log_guard_nudge::log_guard_nudge;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;

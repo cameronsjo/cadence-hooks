@@ -294,7 +294,8 @@ fn run_with_payload(args: &[&str], payload: &str) -> tempfile::TempDir {
 }
 
 /// #364: an object whose declared field mismatches writes one `schema_drift`
-/// row naming only the key, on both the check and the logger dispatch paths.
+/// row naming the key, the tool and the field, never a value, on both the
+/// check and the logger dispatch paths.
 #[test]
 fn object_shaped_mismatch_writes_schema_drift_row() {
     let secret = "never-copy-this-value";
@@ -314,6 +315,8 @@ fn object_shaped_mismatch_writes_schema_drift_row() {
             rows[0]["error"],
             "tool_response: object did not match its typed shape"
         );
+        assert_eq!(rows[0]["toolName"], "Bash", "{args:?}");
+        assert_eq!(rows[0]["field"], "stdout", "{args:?}");
         let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
         assert!(!raw.contains(secret), "no payload value reaches the ledger");
     }
@@ -337,6 +340,59 @@ fn group_fan_out_writes_schema_drift_once() {
     assert_eq!(rows.len(), 1, "one drift row per payload key: {rows:?}");
     assert_eq!(rows[0]["reason"], "schema_drift");
     assert_eq!(rows[0]["subcommand"], "git-safety");
+}
+
+/// A wrong-typed `tool_input` field is named on the row, and a payload that
+/// matches its typed shape writes no row at all.
+#[test]
+fn drift_row_names_the_mistyped_tool_input_field() {
+    let drifted = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","description":{"text":"never-copy-this"}}}"#;
+    let clean = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","description":"list"}}"#;
+    for args in [
+        &["metrics", "log-subagent"][..],
+        &["cadence", "git-safety"][..],
+    ] {
+        let tmp = run_with_payload(args, drifted);
+        let rows = failopen_rows(tmp.path());
+        assert_eq!(rows.len(), 1, "{args:?}: {rows:?}");
+        assert_eq!(rows[0]["toolName"], "Bash", "{args:?}");
+        assert_eq!(rows[0]["field"], "description", "{args:?}");
+        let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
+        assert!(
+            !raw.contains("never-copy-this"),
+            "no payload value reaches the ledger"
+        );
+
+        let tmp = run_with_payload(args, clean);
+        assert!(failopen_rows(tmp.path()).is_empty(), "{args:?}");
+    }
+}
+
+/// A tool name outside the plain charset is recorded as `"other"`, so a
+/// payload-supplied name cannot put arbitrary text on the row.
+#[test]
+fn drift_row_records_an_unplain_tool_name_as_other() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash; rm -rf ~","tool_input":{"command":"ls"},"tool_response":{"stdout":{"t":"x"}}}"#;
+    let tmp = run_with_payload(&["metrics", "log-subagent"], payload);
+    let rows = failopen_rows(tmp.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["toolName"], "other");
+    let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
+    assert!(
+        !raw.contains("rm -rf"),
+        "the raw name never reaches the ledger"
+    );
+}
+
+/// A drifted payload with no `tool_name` records `toolName: null`.
+#[test]
+fn drift_row_without_a_tool_name_records_null() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_response":{"stdout":{"t":"x"}}}"#;
+    let tmp = run_with_payload(&["metrics", "log-subagent"], payload);
+    let rows = failopen_rows(tmp.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0]["toolName"].is_null(), "{rows:?}");
+    assert_eq!(rows[0]["field"], "stdout");
 }
 
 /// #364: expected per-tool variance (a non-object response) stays silent.
