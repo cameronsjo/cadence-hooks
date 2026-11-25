@@ -12,8 +12,8 @@
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
 use cadence_hooks_core::shell::{
-    command_segments, command_segments_with_dirs, may_spell_word, parse_work_dir,
-    strip_group_wrappers, tokenize, unescape_word,
+    command_segments_with_dirs, may_spell_word, parse_work_dir, strip_group_wrappers, tokenize,
+    unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -670,6 +670,10 @@ impl Check for GitSafetyGuard {
         "git-safety"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
@@ -693,8 +697,8 @@ impl Check for GitSafetyGuard {
         // Current-branch resolution for bare-HEAD force pushes (#71): lazy
         // (only when such a segment appears) and memoized across segments.
         let mut resolved_branch: Option<BranchResolution> = None;
-        let segments = command_segments(command);
-        for segment in &segments {
+        let segments = input.command_segments();
+        for segment in segments {
             // Per-segment alias check: a `git config alias.x …` segment is
             // exempt, but a destructive sibling in the same chain is not.
             if is_alias_definition(segment) {

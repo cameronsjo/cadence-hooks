@@ -68,20 +68,13 @@ const NUDGE_VIOLATIONS: &[(&str, &str, &str)] = &[(
     "legacy status, exempted, inherited",
 )];
 
-static BLOCK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+static ALL_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     let patterns: Vec<&str> = BLOCK_VIOLATIONS
         .iter()
+        .chain(NUDGE_VIOLATIONS.iter())
         .map(|(_, pattern, _)| *pattern)
         .collect();
-    RegexSet::new(&patterns).expect("block terminology patterns should compile")
-});
-
-static NUDGE_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
-    let patterns: Vec<&str> = NUDGE_VIOLATIONS
-        .iter()
-        .map(|(_, pattern, _)| *pattern)
-        .collect();
-    RegexSet::new(&patterns).expect("nudge terminology patterns should compile")
+    RegexSet::new(&patterns).expect("terminology patterns should compile")
 });
 
 /// Result of checking content for terminology violations.
@@ -95,24 +88,18 @@ pub struct TerminologyResult {
 /// Check content for inclusive terminology violations.
 /// Returns block-tier and nudge-tier violations separately.
 pub fn check_terminology(content: &str) -> TerminologyResult {
-    let block_matches = BLOCK_PATTERNS.matches(content);
-    let nudge_matches = NUDGE_PATTERNS.matches(content);
-
-    let blocks: Vec<(String, String)> = block_matches
-        .iter()
-        .map(|idx| {
+    let block_count = BLOCK_VIOLATIONS.len();
+    let mut blocks = Vec::new();
+    let mut nudges = Vec::new();
+    for idx in ALL_PATTERNS.matches(content) {
+        if idx < block_count {
             let (term, _, replacement) = BLOCK_VIOLATIONS[idx];
-            (term.to_string(), replacement.to_string())
-        })
-        .collect();
-
-    let nudges: Vec<(String, String)> = nudge_matches
-        .iter()
-        .map(|idx| {
-            let (term, _, replacement) = NUDGE_VIOLATIONS[idx];
-            (term.to_string(), replacement.to_string())
-        })
-        .collect();
+            blocks.push((term.to_string(), replacement.to_string()));
+        } else {
+            let (term, _, replacement) = NUDGE_VIOLATIONS[idx - block_count];
+            nudges.push((term.to_string(), replacement.to_string()));
+        }
+    }
 
     TerminologyResult { blocks, nudges }
 }
@@ -423,6 +410,9 @@ impl Check for TerminologyGuard {
         let mut nudges: Vec<(String, String)> = Vec::new();
         for (new_text, old_text) in &fragments {
             let mut found = check_terminology(new_text);
+            if found.blocks.is_empty() && found.nudges.is_empty() {
+                continue;
+            }
             if !old_text.is_empty() {
                 let existing = check_terminology(old_text);
                 found.blocks = subtract_existing(found.blocks, &existing.blocks);

@@ -297,6 +297,10 @@ impl Check for WarnMainBranch {
         "warn-main-branch"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         self.run_with_env_allow(input, std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref())
     }
@@ -323,6 +327,10 @@ impl WarnMainBranch {
         let Some((branch, repo_root)) = branch_and_root(&dir) else {
             return CheckResult::allow();
         };
+
+        if !is_default_branch(&branch) {
+            return CheckResult::allow();
+        }
 
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();

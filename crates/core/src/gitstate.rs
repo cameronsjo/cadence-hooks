@@ -27,7 +27,7 @@
 //! few small reads of `HEAD`-family files, so it is cheap and testable without a
 //! subprocess — the same discipline `resolve_git_common_dir` already keeps.
 
-use crate::paths::{find_git_root, read_gitdir_file, resolve_git_common_dir};
+use crate::paths::{find_git_root, read_gitdir_file, resolve_commondir};
 use std::path::{Path, PathBuf};
 
 /// Whether a checkout is the repository's **primary** checkout or a **linked**
@@ -99,12 +99,42 @@ impl GitState {
         //    nearest existing ancestor before calling here, so new-file writes
         //    are unaffected.
         let start = std::fs::canonicalize(start).ok()?;
+        // `start` is already canonical, so every ancestor walked by
+        // `find_git_root` is already canonical — no second `canonicalize` on
+        // `repo_root` is needed.
         let repo_root = find_git_root(&start.to_string_lossy())?;
-        // Derive the worktree admin dir and common dir from the *raw* root — the
-        // filesystem walk needs the real on-disk path — before canonicalizing
-        // the outward-facing identity paths.
-        let (worktree_kind, git_dir) = worktree_git_dir(&repo_root)?;
-        let git_common_dir = resolve_git_common_dir(&repo_root)?;
+        let dot_git = repo_root.join(".git");
+        // Resolve `git_dir`, `git_common_dir`, and `worktree_kind` in one pass
+        // instead of reading `.git` and `commondir` twice.
+        let (worktree_kind, git_dir, git_common_dir) = if dot_git.is_dir() {
+            // Fast path: a real `.git` directory is always a primary checkout
+            // and is itself the common dir. Only canonicalize if `.git` itself
+            // is a symlink to a directory.
+            let common =
+                if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.file_type().is_symlink()) {
+                    canonicalize_or(&dot_git)
+                } else {
+                    dot_git.clone()
+                };
+            (WorktreeKind::Primary, dot_git, common)
+        } else if dot_git.is_file() {
+            let git_dir = read_gitdir_file(&dot_git, &repo_root)?;
+            let raw_common = resolve_commondir(&git_dir);
+            let canon_git_dir = canonicalize_or(&git_dir);
+            let canon_common = if raw_common == git_dir {
+                canon_git_dir.clone()
+            } else {
+                canonicalize_or(&raw_common)
+            };
+            let kind = if canon_git_dir == canon_common {
+                WorktreeKind::Primary
+            } else {
+                WorktreeKind::Linked
+            };
+            (kind, git_dir, canon_common)
+        } else {
+            return None;
+        };
         // Fail closed on a layout the repo's own text could forge
         // (cadence-hooks#670): `gitdir:` and `commondir:` are plain text under
         // whoever controls the directory. Both targets must be real
@@ -119,8 +149,8 @@ impl GitState {
         let branch = head_branch(&git_dir);
         let default_branch = default_branch_from(&git_common_dir);
         Some(GitState {
-            repo_root: canonicalize_or(&repo_root),
-            git_common_dir: canonicalize_or(&git_common_dir),
+            repo_root,
+            git_common_dir,
             branch,
             worktree_kind,
             default_branch,
@@ -145,40 +175,6 @@ impl GitState {
 /// A plausible git dir: a directory holding a regular `HEAD` file.
 fn is_git_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join("HEAD").is_file()
-}
-
-/// The worktree's own git admin directory — where *this* checkout's `HEAD`
-/// lives — plus whether it is primary or linked. For a primary checkout this is
-/// `<repo_root>/.git`; for a linked worktree it is the admin dir the `.git`
-/// *file* points at (`…/.git/worktrees/<name>`), which is NOT the shared common
-/// dir. `None` when `.git` is neither a dir nor a parseable file.
-///
-/// The kind comes from [`crate::worktree::git_dir_is_common_dir`] — the same
-/// canonical comparison [`crate::worktree::is_primary_checkout`] uses — rather
-/// than the `.git` surface form. Reading `.git`-is-a-file as Linked was wrong
-/// for a `--separate-git-dir` primary, whose `.git` is a file pointing at the
-/// common dir itself (cadence-hooks#255): `warn-subagent-worktree` consumes
-/// `is_primary()` for its policy decision and so missed its nudge on exactly
-/// those checkouts, while the block-capable `enforce-worktree` path — already
-/// on the canonical helper — called the same repository primary. One
-/// comparison now serves both (cadence-hooks#345).
-fn worktree_git_dir(repo_root: &Path) -> Option<(WorktreeKind, PathBuf)> {
-    let dot_git = repo_root.join(".git");
-    // Fast path, shared with `is_primary_checkout`: a real `.git` *directory*
-    // is always a primary checkout, and is itself the admin dir.
-    if dot_git.is_dir() {
-        return Some((WorktreeKind::Primary, dot_git));
-    }
-    if !dot_git.is_file() {
-        return None;
-    }
-    let git_dir = read_gitdir_file(&dot_git, repo_root)?;
-    let kind = if crate::worktree::git_dir_is_common_dir(&git_dir, repo_root) {
-        WorktreeKind::Primary
-    } else {
-        WorktreeKind::Linked
-    };
-    Some((kind, git_dir))
 }
 
 /// Parse `<git_dir>/HEAD` into the branch name, or `None` for a detached HEAD

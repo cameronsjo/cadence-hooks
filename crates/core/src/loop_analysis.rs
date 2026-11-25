@@ -35,11 +35,32 @@ pub enum LoopAnalysis {
     ParseFailed,
 }
 
+/// Cheap pre-filter: a bash loop must contain one of `for`, `while`, `until`,
+/// or `select`. When none appears in `command` (and `command` is within the
+/// parse byte/nesting caps, which must still report `ParseFailed`), skip
+/// spawning the `parse-command` thread and running `brush-parser`.
+fn may_contain_loop(command: &str) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CADENCE_TEST_PANIC").is_some() {
+        return true;
+    }
+    if command.len() > MAX_PARSE_BYTES || group_nesting_depth(command) > MAX_PARSE_NESTING {
+        return true;
+    }
+    command.contains("for")
+        || command.contains("while")
+        || command.contains("until")
+        || command.contains("select")
+}
+
 /// Parse a shell command and analyze any loops for `gh` commands.
 ///
 /// Returns a `LoopAnalysis` indicating whether loops are safe (all `gh` commands
 /// have explicit `-R`/`--repo` flags) or need blocking.
 pub fn analyze_gh_loops(command: &str) -> LoopAnalysis {
+    if !may_contain_loop(command) {
+        return LoopAnalysis::NoLoops;
+    }
     let program = match parse_command(command) {
         Some(p) => p,
         None => return LoopAnalysis::ParseFailed,
@@ -182,6 +203,9 @@ fn collect_top_level_pushes_from_pipeline(pipeline: &Pipeline, out: &mut Vec<Loo
 
 /// Parse a shell command and analyze any loops for `git push` commands.
 pub fn analyze_push_loops(command: &str) -> LoopAnalysis {
+    if !may_contain_loop(command) {
+        return LoopAnalysis::NoLoops;
+    }
     push_loops_of(parse_command(command).as_ref())
 }
 

@@ -79,12 +79,32 @@ fn effective_terms(extra_raw: &str) -> Vec<String> {
 }
 
 /// True when `word` (lowercased) matches a `\b<word>\b` boundary in `haystack`
-/// (already lowercased). `word` is regex-escaped, so app-name terms with no
-/// special chars match literally.
+/// (already lowercased), without compiling a regex per call.
 fn word_boundary_match(haystack: &str, word: &str) -> bool {
-    Regex::new(&format!(r"\b{}\b", regex::escape(word)))
-        .map(|re| re.is_match(haystack))
-        .unwrap_or(false)
+    if word.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let starts_word = word.chars().next().is_some_and(is_word);
+    let ends_word = word.chars().next_back().is_some_and(is_word);
+    let mut offset = 0;
+    while let Some(pos) = haystack[offset..].find(word) {
+        let start = offset + pos;
+        let end = start + word.len();
+        let left_ok = match haystack[..start].chars().next_back() {
+            Some(c) => is_word(c) != starts_word,
+            None => starts_word,
+        };
+        let right_ok = match haystack[end..].chars().next() {
+            Some(c) => is_word(c) != ends_word,
+            None => ends_word,
+        };
+        if left_ok && right_ok {
+            return true;
+        }
+        offset = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Scan `haystack` (repo name + description) for a matching term. Returns the

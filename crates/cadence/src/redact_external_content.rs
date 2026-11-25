@@ -1180,6 +1180,10 @@ impl Check for RedactExternalContent {
         "redact-external-content"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         // An MCP call publishes whatever its server does with its input, and
         // the field names are the server's (`body`, `title`, `description`,
@@ -1225,6 +1229,16 @@ fn run_command_or_edit(input: &HookInput) -> CheckResult {
     // Phase 1 — route by surface. Only Bash carries a postable command; a
     // Write/Edit runs the identity pass ONLY (see `run_edit`).
     let Some(command) = command else {
+        // Skip loading and parsing the term source when the target file is
+        // exempt (the term source itself, or local code/config outside any
+        // work tree).
+        let file_path = input
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
+        if identity::is_term_source(file_path) || is_local_code_or_config(file_path) {
+            return CheckResult::allow();
+        }
         // The term source, loaded once. Every failure yields an empty
         // list (fail-open on the guard's own failure); doctor and the
         // SessionStart probe, not this call, keep an absent file from

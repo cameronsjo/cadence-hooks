@@ -1608,6 +1608,9 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Vec<Stop> {
 /// cannot say is `UNRESOLVABLE_DIR`, where every probe fails and the push
 /// goes ahead with a warning.
 fn push_invocations_every_dir(command: &str, cwd: &str) -> Vec<PushInvocation> {
+    if !cadence_hooks_core::shell::may_spell_word(command, "git") {
+        return Vec::new();
+    }
     let mut pushes = push_invocations(command, cwd);
     if !contains_ignoring_ascii_case(command, "push") {
         return pushes;
@@ -1961,6 +1964,10 @@ pub struct PreventSecretPushGuard;
 impl Check for PreventSecretPushGuard {
     fn name(&self) -> &str {
         "prevent-secret-push"
+    }
+
+    fn spawns_subprocesses(&self) -> bool {
+        true
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {

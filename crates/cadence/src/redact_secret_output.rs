@@ -116,7 +116,7 @@
 use crate::credential_scan::{self, PEM_END_RE, PEM_KIND};
 use cadence_hooks_core::worktree::is_truthy;
 use cadence_hooks_core::{BypassProvenance, Check, CheckResult, HookInput, ToolResponse};
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -519,10 +519,14 @@ fn char_end(original: &str, at: usize) -> usize {
 fn token_spans(text: &str, spans: &mut Vec<Span>) {
     let mut hits = credential_scan::direct_spans(text);
     hits.sort_by_key(|h| h.start);
-    let ends: Vec<(usize, usize)> = PEM_END_RE
-        .find_iter(text)
-        .map(|m| (m.start(), m.end()))
-        .collect();
+    let ends: Vec<(usize, usize)> = if text.contains("-----END") {
+        PEM_END_RE
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let first_begin = hits
         .iter()
         .find(|h| h.kind == PEM_KIND)
@@ -1418,6 +1422,9 @@ fn name_value_json_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
 }
 
 fn env_string_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
+    if !text.contains('"') || !text.contains('=') {
+        return;
+    }
     for m in ENV_STRING.find_iter(text) {
         let body = &text[m.start() + 1..m.end() - 1];
         let Some((name, value)) = body.split_once('=') else {
@@ -1531,11 +1538,24 @@ fn npmrc_spans(text: &str, spans: &mut Vec<Span>) {
     }
 }
 
+static ARGV_CMD_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+    let patterns: Vec<String> = ARGV_FLAGS
+        .iter()
+        .map(|(cmd, _)| regex::escape(cmd))
+        .collect();
+    RegexSet::new(&patterns).expect("argv cmd regex set is valid")
+});
+
 /// Flag values judged per command line before the rest is masked whole.
 const ARGV_FLAG_CAP: usize = 256;
 
 fn argv_flag_spans(text: &str, spans: &mut Vec<Span>) {
-    for (cmd, re) in ARGV_FLAGS.iter() {
+    let matched = ARGV_CMD_SET.matches(text);
+    if !matched.matched_any() {
+        return;
+    }
+    for idx in matched {
+        let (cmd, re) = &ARGV_FLAGS[idx];
         // Each word-bounded occurrence of the command, scanned to its line
         // end once (a later occurrence on an already-scanned line is skipped).
         let mut scanned_to = 0;
@@ -1703,184 +1723,190 @@ fn at_line_start(text: &str, at: usize) -> bool {
 /// the previous masked value, so an adversarial run of `token=token=…` stays
 /// linear.
 fn inline_spans(text: &str, names: &mut Names, spans: &mut Vec<Span>) {
-    let mut done = 0;
-    let mut eol_cache = (usize::MAX, 0);
-    let mut arg_run = ArgRun::new();
-    let mut parens = Parens::default();
-    for m in INLINE_EQ.find_iter(text) {
-        let head = m.as_str();
-        let start = m.end();
-        // The name starts after the lead separator, which may be the `\n`
-        // ending the previous line: then this is a line-start form.
-        let name_at =
-            m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
-        if start < done || at_line_start(text, name_at) || text[start..].starts_with('=') {
-            continue;
-        }
-        let Some(strength) = names.get(tail_name(&head[..head.len() - 1])) else {
-            continue;
-        };
-        let lead = head.chars().next().filter(|c| !is_name_char(*c));
-        let eol = line_end(text, start, &mut eol_cache);
-        // Inside a call's argument list (`Client(api_key=api_key, …)`), a
-        // value closed by `,`/`)` that is the name itself, an attribute path,
-        // a call, or a lowercase snake identifier is a variable passed along.
-        // Anything else — a mixed-case or digit-bearing word, or a value with
-        // no closing `,`/`)` (`INFO (pid 12 token=…`) — takes the normal path.
-        if parens.depth_at(text, name_at) > 0
-            && !matches!(text[start..].chars().next(), Some('"' | '\''))
-            && let Some(len) = arg_run.delimiter(text, start, eol)
-            && arg_run.skips(text, start, tail_name(&head[..head.len() - 1]))
-        {
-            done = start + len;
-            continue;
-        }
-        let (vs, ve) = match text[start..eol].chars().next() {
-            Some(q @ ('"' | '\'')) => {
-                let inner = &text[start + 1..eol];
-                (
-                    start + 1,
-                    start + 1 + closing_quote(inner, q).unwrap_or(inner.len()),
-                )
+    if text.contains('=') {
+        let mut done = 0;
+        let mut eol_cache = (usize::MAX, 0);
+        let mut arg_run = ArgRun::new();
+        let mut parens = Parens::default();
+        for m in INLINE_EQ.find_iter(text) {
+            let head = m.as_str();
+            let start = m.end();
+            // The name starts after the lead separator, which may be the `\n`
+            // ending the previous line: then this is a line-start form.
+            let name_at =
+                m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
+            if start < done || at_line_start(text, name_at) || text[start..].starts_with('=') {
+                continue;
             }
-            _ => {
-                // A strong name masks to the end of the line (a password
-                // with spaces is still one password); a weak one, or a
-                // value inside a quoted/query context, stops at its delimiter.
-                let stop = |c: char| match lead {
-                    Some(q @ ('"' | '\'')) => c == q,
-                    Some('?' | '&') => c == '&' || c.is_whitespace(),
-                    _ if matches!(
-                        strength,
-                        Strength::Strong | Strength::Counter | Strength::Tally
-                    ) =>
-                    {
-                        false
-                    }
-                    _ => c.is_whitespace() || matches!(c, '&' | '"' | '\''),
-                };
-                // A plain `… pass=5` (#1342): not a `--pass=` flag, not a
-                // query string's `&pass=`, not quoted or inside a `{…}`.
-                let plain = matches!(lead, Some(' ' | '\t' | ';' | '|' | '('))
-                    && !head[1..].starts_with('-');
-                if strength == Strength::Tally
-                    && plain
-                    && let Some(n) = short_tally_len(&text[start..eol])
-                {
-                    done = start + n;
-                    continue;
+            let Some(strength) = names.get(tail_name(&head[..head.len() - 1])) else {
+                continue;
+            };
+            let lead = head.chars().next().filter(|c| !is_name_char(*c));
+            let eol = line_end(text, start, &mut eol_cache);
+            // Inside a call's argument list (`Client(api_key=api_key, …)`), a
+            // value closed by `,`/`)` that is the name itself, an attribute path,
+            // a call, or a lowercase snake identifier is a variable passed along.
+            // Anything else — a mixed-case or digit-bearing word, or a value with
+            // no closing `,`/`)` (`INFO (pid 12 token=…`) — takes the normal path.
+            if parens.depth_at(text, name_at) > 0
+                && !matches!(text[start..].chars().next(), Some('"' | '\''))
+                && let Some(len) = arg_run.delimiter(text, start, eol)
+                && arg_run.skips(text, start, tail_name(&head[..head.len() - 1]))
+            {
+                done = start + len;
+                continue;
+            }
+            let (vs, ve) = match text[start..eol].chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    let inner = &text[start + 1..eol];
+                    (
+                        start + 1,
+                        start + 1 + closing_quote(inner, q).unwrap_or(inner.len()),
+                    )
                 }
-                let tally = (strength == Strength::Counter
-                    && !matches!(lead, Some('"' | '\'' | '?' | '&')))
-                .then(|| tally_len(&text[start..eol]))
-                .flatten();
-                let len =
-                    tally.unwrap_or_else(|| text[start..eol].find(stop).unwrap_or(eol - start));
-                (start, start + len)
+                _ => {
+                    // A strong name masks to the end of the line (a password
+                    // with spaces is still one password); a weak one, or a
+                    // value inside a quoted/query context, stops at its delimiter.
+                    let stop = |c: char| match lead {
+                        Some(q @ ('"' | '\'')) => c == q,
+                        Some('?' | '&') => c == '&' || c.is_whitespace(),
+                        _ if matches!(
+                            strength,
+                            Strength::Strong | Strength::Counter | Strength::Tally
+                        ) =>
+                        {
+                            false
+                        }
+                        _ => c.is_whitespace() || matches!(c, '&' | '"' | '\''),
+                    };
+                    // A plain `… pass=5` (#1342): not a `--pass=` flag, not a
+                    // query string's `&pass=`, not quoted or inside a `{…}`.
+                    let plain = matches!(lead, Some(' ' | '\t' | ';' | '|' | '('))
+                        && !head[1..].starts_with('-');
+                    if strength == Strength::Tally
+                        && plain
+                        && let Some(n) = short_tally_len(&text[start..eol])
+                    {
+                        done = start + n;
+                        continue;
+                    }
+                    let tally = (strength == Strength::Counter
+                        && !matches!(lead, Some('"' | '\'' | '?' | '&')))
+                    .then(|| tally_len(&text[start..eol]))
+                    .flatten();
+                    let len =
+                        tally.unwrap_or_else(|| text[start..eol].find(stop).unwrap_or(eol - start));
+                    (start, start + len)
+                }
+            };
+            done = ve.max(start);
+            if value_masks(strength, &text[vs..ve], false) {
+                spans.push(named(vs, ve));
             }
-        };
-        done = ve.max(start);
-        if value_masks(strength, &text[vs..ve], false) {
-            spans.push(named(vs, ve));
         }
     }
-    done = 0;
-    eol_cache = (usize::MAX, 0);
-    for m in INLINE_COLON.find_iter(text) {
-        let head = m.as_str();
-        // The blanks after `:` are skipped here, not matched, so the next
-        // `name:` on the line can still use one as its leading separator
-        // (`=> Send header: Authorization: Bearer …`).
-        let start =
-            m.end() + text[m.end()..].len() - text[m.end()..].trim_start_matches([' ', '\t']).len();
-        let name_at =
-            m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
-        if start < done || at_line_start(text, name_at) {
-            continue;
-        }
-        let colon = head.rfind(':').unwrap_or(head.len());
-        let Some(strength) = names.get(tail_name(&head[..colon])) else {
-            continue;
-        };
-        // A bare `pass:` after another word on its line may be prose ("one
-        // record per pass: x"). Its unquoted value keeps every rule of its
-        // `Strength::Tally` (the short count skip, the value test) and, on top
-        // of them, masks only when the value's first word looks like a
-        // credential ("DB pass: <secret> (rotate)", #1449). A quoted value
-        // keeps the rules alone.
-        let weak_pass = strength == Strength::Tally && !pass_key_position(text, name_at);
-        let eol = line_end(text, start, &mut eol_cache);
-        let rest = &text[start..eol];
-        if rest.starts_with("//") {
-            continue;
-        }
-        let quote = head.chars().next().filter(|c| matches!(c, '"' | '\''));
-        // After a label (`Error: token: …`, `main.go:5: token: …`) the value
-        // is a message: several words there are prose, not a credential.
-        let label = text[..name_at].trim_end_matches([' ', '\t']).ends_with(':');
-        let (vs, ve, quoted) = match (quote, rest.chars().next()) {
-            (Some(q), _) => (0, closing_quote(rest, q).unwrap_or(rest.len()), true),
-            (None, Some(q @ ('"' | '\''))) => {
-                let inner = &rest[1..];
-                (1, 1 + closing_quote(inner, q).unwrap_or(inner.len()), true)
+    if text.contains(':') {
+        let mut done = 0;
+        let mut eol_cache = (usize::MAX, 0);
+        for m in INLINE_COLON.find_iter(text) {
+            let head = m.as_str();
+            // The blanks after `:` are skipped here, not matched, so the next
+            // `name:` on the line can still use one as its leading separator
+            // (`=> Send header: Authorization: Bearer …`).
+            let start = m.end() + text[m.end()..].len()
+                - text[m.end()..].trim_start_matches([' ', '\t']).len();
+            let name_at =
+                m.start() + head.len() - head.trim_start_matches(|c: char| !is_name_char(c)).len();
+            if start < done || at_line_start(text, name_at) {
+                continue;
             }
-            _ => {
-                if strength == Strength::Tally
-                    && head.starts_with([' ', '\t'])
-                    && let Some(n) = short_tally_len(rest)
-                {
-                    done = start + n;
-                    continue;
+            let colon = head.rfind(':').unwrap_or(head.len());
+            let Some(strength) = names.get(tail_name(&head[..colon])) else {
+                continue;
+            };
+            // A bare `pass:` after another word on its line may be prose ("one
+            // record per pass: x"). Its unquoted value keeps every rule of its
+            // `Strength::Tally` (the short count skip, the value test) and, on top
+            // of them, masks only when the value's first word looks like a
+            // credential ("DB pass: <secret> (rotate)", #1449). A quoted value
+            // keeps the rules alone.
+            let weak_pass = strength == Strength::Tally && !pass_key_position(text, name_at);
+            let eol = line_end(text, start, &mut eol_cache);
+            let rest = &text[start..eol];
+            if rest.starts_with("//") {
+                continue;
+            }
+            let quote = head.chars().next().filter(|c| matches!(c, '"' | '\''));
+            // After a label (`Error: token: …`, `main.go:5: token: …`) the value
+            // is a message: several words there are prose, not a credential.
+            let label = text[..name_at].trim_end_matches([' ', '\t']).ends_with(':');
+            let (vs, ve, quoted) = match (quote, rest.chars().next()) {
+                (Some(q), _) => (0, closing_quote(rest, q).unwrap_or(rest.len()), true),
+                (None, Some(q @ ('"' | '\''))) => {
+                    let inner = &rest[1..];
+                    (1, 1 + closing_quote(inner, q).unwrap_or(inner.len()), true)
                 }
-                // The unquoted value runs to the end of the line, so a note or
-                // a next field after the secret is part of it: judge its first
-                // word (`first_word`). When that word is not credential-shaped,
-                // nothing masks and only that word is spent, so a secret-named
-                // field later on the line is still read ("Admin pass: hunter2,
-                // DB pass: <secret>"). This runs once per match, so it and the
-                // short count test above read the value from its front and
-                // stop early; a trim from the end would walk a long blank run
-                // once per match. The search reads to the end of the line only
-                // when no word there qualifies, and then no bare `pass:` that
-                // runs this search is left on it: such a `pass:` starts its own
-                // word, which qualifies, and a name inside a tag word
-                // (`</x(pass:>`) follows an opener, so it is in key position.
-                // When the word passes, the value starts at it: markup
-                // before it is kept, and a line that ends in a tag
-                // (`<p><b>DB pass:</b> <secret></p>`) is not read as a
-                // placeholder from `</b>` to `</p>`.
-                let mut from = 0;
-                if weak_pass {
-                    match first_word(rest) {
-                        Some((word, end)) if secret_like(word) => from = end - word.len(),
-                        first => {
-                            done = start + first.map_or(rest.len(), |(_, end)| end);
-                            continue;
+                _ => {
+                    if strength == Strength::Tally
+                        && head.starts_with([' ', '\t'])
+                        && let Some(n) = short_tally_len(rest)
+                    {
+                        done = start + n;
+                        continue;
+                    }
+                    // The unquoted value runs to the end of the line, so a note or
+                    // a next field after the secret is part of it: judge its first
+                    // word (`first_word`). When that word is not credential-shaped,
+                    // nothing masks and only that word is spent, so a secret-named
+                    // field later on the line is still read ("Admin pass: hunter2,
+                    // DB pass: <secret>"). This runs once per match, so it and the
+                    // short count test above read the value from its front and
+                    // stop early; a trim from the end would walk a long blank run
+                    // once per match. The search reads to the end of the line only
+                    // when no word there qualifies, and then no bare `pass:` that
+                    // runs this search is left on it: such a `pass:` starts its own
+                    // word, which qualifies, and a name inside a tag word
+                    // (`</x(pass:>`) follows an opener, so it is in key position.
+                    // When the word passes, the value starts at it: markup
+                    // before it is kept, and a line that ends in a tag
+                    // (`<p><b>DB pass:</b> <secret></p>`) is not read as a
+                    // placeholder from `</b>` to `</p>`.
+                    let mut from = 0;
+                    if weak_pass {
+                        match first_word(rest) {
+                            Some((word, end)) if secret_like(word) => from = end - word.len(),
+                            first => {
+                                done = start + first.map_or(rest.len(), |(_, end)| end);
+                                continue;
+                            }
                         }
                     }
+                    let tally = (strength == Strength::Counter).then(|| tally_len(rest));
+                    // Trim only when no count ends the value: a run of counts
+                    // (`lastpass: 5 lastpass: 5 …`) reaches here once per match.
+                    (
+                        from,
+                        tally.flatten().unwrap_or_else(|| rest.trim_end().len()),
+                        false,
+                    )
                 }
-                let tally = (strength == Strength::Counter).then(|| tally_len(rest));
-                // Trim only when no count ends the value: a run of counts
-                // (`lastpass: 5 lastpass: 5 …`) reaches here once per match.
-                (
-                    from,
-                    tally.flatten().unwrap_or_else(|| rest.trim_end().len()),
-                    false,
-                )
+            };
+            done = start + ve;
+            let value = &rest[vs..ve];
+            let masks = if quoted {
+                value_masks(strength, value, false)
+            } else if label
+                && value.trim().contains(' ')
+                && !is_header_name(tail_name(&head[..colon]))
+            {
+                false
+            } else {
+                value_masks(strength, value, true)
+            };
+            if masks {
+                spans.push(named(start + vs, start + ve));
             }
-        };
-        done = start + ve;
-        let value = &rest[vs..ve];
-        let masks = if quoted {
-            value_masks(strength, value, false)
-        } else if label && value.trim().contains(' ') && !is_header_name(tail_name(&head[..colon]))
-        {
-            false
-        } else {
-            value_masks(strength, value, true)
-        };
-        if masks {
-            spans.push(named(start + vs, start + ve));
         }
     }
     if text.contains("--") {

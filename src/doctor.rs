@@ -189,12 +189,24 @@ fn extract_invocation(command: &str) -> Option<(String, String)> {
     // if the basename is our dispatcher or binary name.
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
-    let dispatcher_idx = tokens.iter().position(|tok| {
+    let dispatcher_idx = tokens.iter().enumerate().position(|(i, tok)| {
         // Strip one layer of surrounding quotes (single or double).
         let tok = tok.trim_matches(|c| c == '\'' || c == '"');
         // Take the basename (after the last '/').
         let basename = tok.rsplit('/').next().unwrap_or(tok);
-        basename == "run-cadence-hooks.sh" || basename == "cadence-hooks"
+        if basename == "run-cadence-hooks.sh" {
+            return true;
+        }
+        if basename == "cadence-hooks" {
+            // Skip `command -v cadence-hooks` / `which cadence-hooks` probes
+            // used by inline fast-path hook commands so the subsequent
+            // `exec cadence-hooks <ns> <subcmd>` is extracted.
+            let prev = i
+                .checked_sub(1)
+                .map(|p| tokens[p].trim_matches(|c| c == '\'' || c == '"'));
+            return !matches!(prev, Some("-v" | "-V" | "which"));
+        }
+        false
     })?;
 
     // The two tokens immediately after the dispatcher (skip flags starting with '-').
@@ -10143,6 +10155,35 @@ mod tests {
         assert!(inert_permission_findings(&path).is_empty());
         std::fs::write(&path, r#"{"permissions":{"deny":"x","ask":[1]}}"#).unwrap();
         assert!(inert_permission_findings(&path).is_empty());
+    }
+
+    #[test]
+    fn extract_invocation_handles_inline_fast_path_standalone_and_group() {
+        let standalone = r#"[ -z "${CADENCE_HOOKS_BIN:-}" ] && command -v cadence-hooks >/dev/null 2>&1 && exec cadence-hooks guardrails enforce-worktree || exec "${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails enforce-worktree"#;
+        assert_eq!(
+            extract_invocation(standalone),
+            Some(("guardrails".to_string(), "enforce-worktree".to_string()))
+        );
+
+        let group = r#"[ -z "${CADENCE_HOOKS_BIN:-}" ] && command -v cadence-hooks >/dev/null 2>&1 && exec cadence-hooks group cadence/terminology cadence/memory-guard || exec "${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" group cadence/terminology cadence/memory-guard"#;
+        assert_eq!(
+            extract_invocation(group),
+            Some(("group".to_string(), "cadence/terminology".to_string()))
+        );
+        assert_eq!(
+            group_members(group),
+            Some(vec![
+                "cadence/terminology".to_string(),
+                "cadence/memory-guard".to_string(),
+            ])
+        );
+
+        let which_form =
+            r#"which cadence-hooks >/dev/null 2>&1 && exec cadence-hooks cadence git-safety"#;
+        assert_eq!(
+            extract_invocation(which_form),
+            Some(("cadence".to_string(), "git-safety".to_string()))
+        );
     }
 
     #[test]

@@ -379,6 +379,70 @@ pub struct HookInput {
     /// deserialized, so a payload cannot supply a sanitized copy of itself.
     #[serde(skip)]
     pub mcp_tool_input: Option<serde_json::Value>,
+    /// True once [`with_resolved_dir_variables`] / [`Self::resolve_dir_variables_in_place`]
+    /// has already run on this input, so `group` members don't re-run it per check.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub dir_vars_resolved: bool,
+    /// Lazily cached [`shell::command_segments`] for `self.command()`, shared
+    /// across checks in a `group` run.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub cached_command_segments: std::sync::OnceLock<Vec<String>>,
+}
+
+/// Strict-typed mirror of [`HookInput`] used for the fast-path single-pass
+/// `serde_json::from_str` parse in [`HookInput::from_json_detailed`].
+///
+/// Unlike [`HookInput`], `tool_input`, `tool_response`, and the string fields
+/// do **not** use `lenient_option`: any non-object `tool_input`/`tool_response`
+/// or mistyped field fails deserialization immediately and falls back to the
+/// `serde_json::Value` + [`schema_drift`] + salvage path.
+#[derive(Deserialize)]
+struct StrictHookInput {
+    tool_name: Option<String>,
+    tool_input: Option<ToolInput>,
+    tool_response: Option<ToolResponse>,
+    cwd: Option<String>,
+    transcript_path: Option<String>,
+    session_id: Option<String>,
+    hook_event_name: Option<String>,
+    source: Option<String>,
+    model: Option<String>,
+    from_model: Option<String>,
+    to_model: Option<String>,
+    agent_id: Option<String>,
+    tool_use_id: Option<String>,
+    prompt: Option<String>,
+}
+
+impl From<StrictHookInput> for HookInput {
+    fn from(s: StrictHookInput) -> Self {
+        Self {
+            tool_name: s.tool_name,
+            normalized_tool: None,
+            tool_input: s.tool_input,
+            tool_response: s.tool_response,
+            cwd: s.cwd,
+            transcript_path: s.transcript_path,
+            session_id: s.session_id,
+            hook_event_name: s.hook_event_name,
+            source: s.source,
+            model: s.model,
+            from_model: s.from_model,
+            to_model: s.to_model,
+            agent_id: s.agent_id,
+            tool_use_id: s.tool_use_id,
+            prompt: s.prompt,
+            schema_drift: Vec::new(),
+            mistyped_tool_input: Vec::new(),
+            tool_input_non_object: false,
+            mistyped_top_level: Vec::new(),
+            mcp_tool_input: None,
+            dir_vars_resolved: false,
+            cached_command_segments: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 /// `tool_input` keys that carry the operation a guard judges, for a
@@ -1000,6 +1064,23 @@ impl HookInput {
 
     /// [`HookInput::from_json`], keeping the [`ParseFailure`] classification.
     pub fn from_json_detailed(raw: &str) -> Result<Self, ParseFailure> {
+        // Fast path: single-pass strict deserialization directly from `raw`,
+        // avoiding the `serde_json::Value` DOM tree and 4× deserializations
+        // when the payload is well-formed and neither `apply_patch` nor
+        // `mcp__*`. Any mistyped field, non-object `tool_input`/`tool_response`,
+        // or parse error falls back to the full `Value` + drift + salvage path.
+        if let Ok(strict) = serde_json::from_str::<StrictHookInput>(raw) {
+            let needs_value_path = strict
+                .tool_name
+                .as_deref()
+                .is_some_and(|n| n == "apply_patch" || n.starts_with("mcp__"));
+            if !needs_value_path {
+                let mut input = HookInput::from(strict);
+                input.normalize_aliases();
+                return Ok(input);
+            }
+        }
+
         let plain = |message: String| ParseFailure {
             message,
             patch_targets_unenumerable: false,
@@ -1046,7 +1127,14 @@ impl HookInput {
         input.mistyped_top_level = mistyped_top_level;
         input.tool_input_non_object = tool_input_non_object;
         input.mcp_tool_input = mcp_tool_input;
-        if let Some(tool_input) = input.tool_input.as_mut()
+        input.normalize_aliases();
+        Ok(input)
+    }
+
+    /// Normalize harness aliases (`cmd` → `command`, Codex tool names, MCP
+    /// filesystem tool names) in place after deserialization.
+    fn normalize_aliases(&mut self) {
+        if let Some(tool_input) = self.tool_input.as_mut()
             && tool_input.command.is_none()
         {
             tool_input.command = tool_input.cmd.take();
@@ -1054,18 +1142,18 @@ impl HookInput {
         // Every alias below writes `normalized_tool`, never `tool_name` — see
         // that field's doc comment for why the literal name has to survive.
         if matches!(
-            input.tool_name.as_deref(),
+            self.tool_name.as_deref(),
             Some("exec_command" | "unified_exec" | "shell")
         ) {
-            input.normalized_tool = Some("Bash".to_string());
+            self.normalized_tool = Some("Bash".to_string());
         }
         if matches!(
-            input.tool_name.as_deref(),
+            self.tool_name.as_deref(),
             Some("spawn_agent" | "spawn_agents_on_csv" | "multi_agents")
         ) {
-            input.normalized_tool = Some("Agent".to_string());
+            self.normalized_tool = Some("Agent".to_string());
         }
-        if let Some(name) = input.tool_name.as_deref()
+        if let Some(name) = self.tool_name.as_deref()
             && name.starts_with("mcp__")
         {
             let lower = name.to_ascii_lowercase();
@@ -1092,25 +1180,25 @@ impl HookInput {
                 None
             };
             if let Some((tool, operation)) = operation {
-                input.normalized_tool = Some(tool.to_string());
-                if let Some(tool_input) = input.tool_input.as_mut() {
+                self.normalized_tool = Some(tool.to_string());
+                if let Some(tool_input) = self.tool_input.as_mut() {
                     tool_input.operation = Some(operation.to_string());
                 }
             }
         }
-        Ok(input)
     }
 
-    /// Expand a Codex `apply_patch` payload into one Claude-shaped input per
-    /// target operation. Non-patch payloads return a single clone.
-    pub fn normalized_inputs(&self) -> Result<Vec<Self>, String> {
+    /// Expand a Codex `apply_patch` (or rename) payload into one Claude-shaped
+    /// input per target operation, returning `Ok(None)` without cloning on the
+    /// common single-input path.
+    pub fn normalized_inputs_if_expanded(&self) -> Result<Option<Vec<Self>>, String> {
         if self.tool_name() != Some("apply_patch") {
             if self.operation() == Some("rename")
                 && let Some(tool_input) = self.tool_input.as_ref()
                 && let (Some(source), Some(destination)) =
                     (tool_input.source.clone(), tool_input.destination.clone())
             {
-                return Ok(vec![
+                return Ok(Some(vec![
                     self.file_operation("Edit", "rename-source", source, None, None),
                     self.file_operation(
                         "Write",
@@ -1119,9 +1207,9 @@ impl HookInput {
                         None,
                         tool_input.content.clone(),
                     ),
-                ]);
+                ]));
             }
-            return Ok(vec![self.clone()]);
+            return Ok(None);
         }
         let patch = self
             .tool_input
@@ -1178,7 +1266,16 @@ impl HookInput {
         if inputs.is_empty() {
             return Err("apply_patch contained no file operations".to_string());
         }
-        Ok(inputs)
+        Ok(Some(inputs))
+    }
+
+    /// Expand a Codex `apply_patch` payload into one Claude-shaped input per
+    /// target operation. Non-patch payloads return a single clone.
+    pub fn normalized_inputs(&self) -> Result<Vec<Self>, String> {
+        match self.normalized_inputs_if_expanded()? {
+            Some(inputs) => Ok(inputs),
+            None => Ok(vec![self.clone()]),
+        }
     }
 
     fn file_operation(
@@ -1240,6 +1337,35 @@ impl HookInput {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.command.as_deref())
+    }
+
+    /// Cached [`shell::command_segments`] for [`Self::command`], computed at
+    /// most once per [`HookInput`] so `group` members on `PreToolUse:Bash`
+    /// parse the command once instead of repeating it per check.
+    pub fn command_segments(&self) -> &[String] {
+        self.cached_command_segments.get_or_init(|| {
+            self.command()
+                .map(shell::command_segments)
+                .unwrap_or_default()
+        })
+    }
+
+    /// Resolve literal directory variables in [`Self::command`] once in place
+    /// and mark this input resolved so per-member [`decide_check`] calls in a
+    /// `group` skip repeating [`with_resolved_dir_variables`].
+    pub fn resolve_dir_variables_in_place(&mut self) {
+        if self.dir_vars_resolved {
+            return;
+        }
+        if let Some(command) = self.command()
+            && let std::borrow::Cow::Owned(resolved) =
+                dir_variables::resolve_literal_dir_variables(command)
+            && let Some(tool_input) = self.tool_input.as_mut()
+        {
+            tool_input.command = Some(resolved);
+            let _ = self.cached_command_segments.take();
+        }
+        self.dir_vars_resolved = true;
     }
 
     /// Is this an MCP tool's call? Keyed on the literal name the harness sent,
@@ -1631,16 +1757,18 @@ impl MetricsInput {
         // Same per-field salvage as `HookInput` (cadence-hooks#1087), so one
         // mistyped field does not cost a logger the whole `tool_input`.
         salvage_tool_input(&mut value);
-        let mut input: MetricsInput = serde_json::from_value(value.clone()).map_err(|e| {
+        let raw_keys: Vec<String> = value
+            .as_object()
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut input: MetricsInput = serde_json::from_value(value).map_err(|e| {
             json_parse_failure(&e, s, || {
                 serde_json::from_str::<MetricsInput>(s)
                     .err()
                     .map(|e| (e.line(), e.column()))
             })
         })?;
-        if let Some(obj) = value.as_object() {
-            input.raw_keys = obj.keys().cloned().collect();
-        }
+        input.raw_keys = raw_keys;
         input.schema_drift = drift;
         Ok(input)
     }
@@ -1912,6 +2040,16 @@ pub trait Check {
     fn skip_at_effort(&self) -> &[&str] {
         &[]
     }
+
+    /// Whether this check may spawn external subprocesses (`git`, `gh`, etc.)
+    /// or perform blocking I/O that warrants a dedicated thread and per-thread
+    /// git deadline in `cadence-hooks group`.
+    ///
+    /// Pure in-memory checks return `false` (default) and run inline on the
+    /// main thread in `group` without thread-spawn overhead.
+    fn spawns_subprocesses(&self) -> bool {
+        false
+    }
 }
 
 /// Pure: should `run_check` short-circuit for the given effort level?
@@ -2159,9 +2297,12 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
 /// [`CheckResult`] — e.g. to record a denial — between deciding and exiting,
 /// without changing what [`run_check`] itself does.
 pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult> {
-    let current_effort = std::env::var("CLAUDE_EFFORT").ok();
-    if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
-        return None;
+    let skip_levels = check.skip_at_effort();
+    if !skip_levels.is_empty() {
+        let current_effort = std::env::var("CLAUDE_EFFORT").ok();
+        if should_skip_for_effort(skip_levels, current_effort.as_deref()) {
+            return None;
+        }
     }
     shell::reset_command_unread();
     shell::note_command_home(input.command().unwrap_or(""));
@@ -2180,6 +2321,9 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// when there is none. The rewrite is an identity under bash, so a check reads
 /// the same command, with `git -C "$M"` spelled the way it runs.
 pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, HookInput> {
+    if input.dir_vars_resolved {
+        return std::borrow::Cow::Borrowed(input);
+    }
     let Some(command) = input.command() else {
         return std::borrow::Cow::Borrowed(input);
     };
@@ -2190,6 +2334,8 @@ pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, Ho
             if let Some(tool_input) = owned.tool_input.as_mut() {
                 tool_input.command = Some(resolved);
             }
+            let _ = owned.cached_command_segments.take();
+            owned.dir_vars_resolved = true;
             std::borrow::Cow::Owned(owned)
         }
     }
@@ -2202,7 +2348,10 @@ pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, Ho
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    let (rendered, code) = render_check_result(result, event, feedback_footer().as_deref());
+    let footer = (result.outcome == Outcome::Block)
+        .then(feedback_footer)
+        .flatten();
+    let (rendered, code) = render_check_result(result, event, footer.as_deref());
     if let Some(out) = rendered.stdout {
         crate::outln!("{out}");
     }
@@ -2219,7 +2368,10 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
 /// and has to merge their outputs into the single response one hook process
 /// may give. Same renderer, same clamp, same footer as [`emit_and_exit`].
 pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>, Option<String>) {
-    let (rendered, _) = render_check_result(result, event, feedback_footer().as_deref());
+    let footer = (result.outcome == Outcome::Block)
+        .then(feedback_footer)
+        .flatten();
+    let (rendered, _) = render_check_result(result, event, footer.as_deref());
     (rendered.stdout, rendered.stderr)
 }
 

@@ -35,7 +35,7 @@
 //! per-invocation notice on the machine you are not looking at is functionally
 //! a silent disarm.
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -130,6 +130,12 @@ pub(crate) const SUPPORTED_VERSION: u32 = 1;
 #[derive(Debug, Clone, Default)]
 struct Compiled {
     terms: Vec<Option<Regex>>,
+    /// Pre-filter over every valid term pattern so a clean text (the common
+    /// case) runs one combined DFA pass and skips all per-term and allow
+    /// regexes.
+    term_set: Option<RegexSet>,
+    /// Maps each pattern index in `term_set` back to its index in `terms`.
+    set_to_term: Vec<usize>,
     term_allows: Vec<Vec<Option<Regex>>>,
     global_allows: Vec<Option<Regex>>,
 }
@@ -148,14 +154,34 @@ fn compile_allows(allows: &[AllowEntry]) -> Vec<Option<Regex>> {
 
 impl IdentityList {
     fn compiled(&self) -> &Compiled {
-        self.compiled.get_or_init(|| Compiled {
-            terms: self.terms.iter().map(|t| term_regex(&t.term)).collect(),
-            term_allows: self
-                .terms
-                .iter()
-                .map(|t| compile_allows(&t.allow))
-                .collect(),
-            global_allows: compile_allows(&self.allow),
+        self.compiled.get_or_init(|| {
+            let mut terms = Vec::with_capacity(self.terms.len());
+            let mut patterns = Vec::with_capacity(self.terms.len());
+            let mut set_to_term = Vec::with_capacity(self.terms.len());
+            for (i, t) in self.terms.iter().enumerate() {
+                if let Some(pat) = term_pattern(&t.term) {
+                    let re = cached_regex(&pat);
+                    if re.is_some() {
+                        patterns.push(pat);
+                        set_to_term.push(i);
+                    }
+                    terms.push(re);
+                } else {
+                    terms.push(None);
+                }
+            }
+            let term_set = RegexSet::new(&patterns).ok();
+            Compiled {
+                terms,
+                term_set,
+                set_to_term,
+                term_allows: self
+                    .terms
+                    .iter()
+                    .map(|t| compile_allows(&t.allow))
+                    .collect(),
+                global_allows: compile_allows(&self.allow),
+            }
         })
     }
 
@@ -523,7 +549,7 @@ pub(crate) fn validate(list: &IdentityList) -> Vec<String> {
 /// (an unconditional `\b` around a term starting with `.` or `/` would never
 /// match). Multi-word terms match across space, hyphen, and underscore, because
 /// that is how the same name is spelled in prose, in a hostname, and in a slug.
-fn term_regex(term: &str) -> Option<Regex> {
+fn term_pattern(term: &str) -> Option<String> {
     let t = term.trim();
     if t.is_empty() {
         return None;
@@ -540,13 +566,12 @@ fn term_regex(term: &str) -> Option<Regex> {
         .chars()
         .next_back()
         .is_some_and(|c| c.is_alphanumeric() || c == '_');
-    let pattern = format!(
+    Some(format!(
         "(?i){}{}{}",
         if starts_word { r"\b" } else { "" },
         body,
         if ends_word { r"\b" } else { "" }
-    );
-    cached_regex(&pattern)
+    ))
 }
 
 /// Compile `pattern` once per process. A scan runs once per posted text, and
@@ -646,9 +671,10 @@ pub(crate) fn scan_identity(
     }
     let compiled = list.compiled();
     let mut hits: Vec<IdentityHit> = Vec::new();
-    for (i, term) in list.terms.iter().enumerate() {
+    let mut check_term = |i: usize| {
+        let term = &list.terms[i];
         let Some(re) = compiled.terms[i].as_ref() else {
-            continue;
+            return;
         };
         // A term-level or global allow excusing this context skips the term.
         let excused = term
@@ -658,7 +684,7 @@ pub(crate) fn scan_identity(
             .chain(list.allow.iter().zip(&compiled.global_allows))
             .any(|(a, pat)| is_allowed(a, pat.as_ref(), text, file_path, destination));
         if excused {
-            continue;
+            return;
         }
         for m in re.find_iter(text) {
             hits.push(IdentityHit {
@@ -666,6 +692,19 @@ pub(crate) fn scan_identity(
                 snippet: m.as_str().to_string(),
                 offset: m.start(),
             });
+        }
+    };
+    if let Some(set) = compiled.term_set.as_ref() {
+        let matched = set.matches(text);
+        if !matched.matched_any() {
+            return hits;
+        }
+        for set_idx in matched {
+            check_term(compiled.set_to_term[set_idx]);
+        }
+    } else {
+        for i in 0..list.terms.len() {
+            check_term(i);
         }
     }
     hits.sort_by_key(|h| h.offset);

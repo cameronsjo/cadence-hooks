@@ -573,7 +573,7 @@ pub(crate) fn read_gitdir_file(dot_git_file: &Path, repo_root: &Path) -> Option<
 
 /// Read `<gitdir>/commondir` to reach the shared `.git`; absent or empty →
 /// `gitdir` itself is the common dir (a submodule has no separate common dir).
-fn resolve_commondir(gitdir: &Path) -> PathBuf {
+pub(crate) fn resolve_commondir(gitdir: &Path) -> PathBuf {
     // Same bounded-read discipline as `read_gitdir_file` above — repo-controlled,
     // on the same hot path.
     match read_capped(&gitdir.join("commondir"), MAX_UNTRUSTED_CONFIG_BYTES) {
