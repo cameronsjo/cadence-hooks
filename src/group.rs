@@ -59,6 +59,9 @@ pub(crate) fn resolve(spec: &str) -> Result<(&'static str, dispatch::CheckPlan),
 pub(crate) fn run(specs: &[String]) -> ! {
     let mut members: Vec<GroupMember> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
+    let bypass_env = std::env::var(bypass::BYPASS_VAR).ok();
+    let disable_env = std::env::var(bypass::DISABLE_VAR).ok();
+    let is_remote = cadence_hooks_core::remote::is_remote();
     for spec in specs {
         let resolved = resolve(spec).and_then(|(name, plan)| {
             if members.iter().any(|m| m.hook == name) {
@@ -91,7 +94,7 @@ pub(crate) fn run(specs: &[String]) -> ! {
         };
         // The same per-hook switch `main` applies to a standalone run, with the
         // same stderr trace (#89).
-        match bypass::resolve(name) {
+        match bypass::resolve_from(bypass_env.as_deref(), disable_env.as_deref(), name) {
             BypassState::Disabled => {
                 eprintln!("⚠️  cadence-hooks: '{name}' disabled via CADENCE_DISABLE");
                 continue;
@@ -106,7 +109,7 @@ pub(crate) fn run(specs: &[String]) -> ! {
         // Cloud sessions: a self-disabled member is skipped like a disabled one.
         // (No hook declares BlockWithReason yet; when one does, a group needs its
         // own semantics for it rather than this skip.)
-        if crate::registry::remote_gate(name, cadence_hooks_core::remote::is_remote()).is_some() {
+        if crate::registry::remote_gate(name, is_remote).is_some() {
             continue;
         }
         members.push(GroupMember { hook: name, plan });

@@ -47,10 +47,9 @@ use cadence_hooks_core::config::{
     AllowEntry, env_allow_entries, env_extra_hosts, is_allowed_with_extra_hosts,
 };
 use cadence_hooks_core::shell::{
-    COMMAND_RUNNERS, GitQuery, UNRESOLVABLE_DIR, command_segments, command_segments_with_dirs,
-    command_word, executable_tokens, git_command_detailed, host_and_repo_from_url,
-    is_assignment_word, names_transparent_prefix, parse_work_dir, peel_command_runners,
-    strip_group_wrappers,
+    COMMAND_RUNNERS, GitQuery, UNRESOLVABLE_DIR, command_segments_with_dirs, command_word,
+    executable_tokens, git_command_detailed, host_and_repo_from_url, is_assignment_word,
+    names_transparent_prefix, parse_work_dir, peel_command_runners, strip_group_wrappers,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 
@@ -1222,6 +1221,10 @@ impl Check for ForgeWriteGuard {
         "guard-forge-write"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
@@ -1258,8 +1261,8 @@ impl Check for ForgeWriteGuard {
         // Reading 1: the whole command's segments, which carry an assignment
         // into later segments (`R=o/r; glab mr create -R $R`), in the
         // directory the whole-command scan reads.
-        for segment in command_segments(command) {
-            let Some(write) = forge_write(&segment) else {
+        for segment in input.command_segments() {
+            let Some(write) = forge_write(segment) else {
                 continue;
             };
             let verdict = match write.forge {
@@ -1272,7 +1275,7 @@ impl Check for ForgeWriteGuard {
                     let mut dirs: Vec<String> = whole_dir
                         .get_or_insert_with(|| cwd.map(|c| parse_work_dir(command, c)))
                         .as_deref()
-                        .map(|d| vec![dir_after_runners(&segment, d)])
+                        .map(|d| vec![dir_after_runners(segment, d)])
                         .unwrap_or_default();
                     // A `--repo` is checked for being a local directory in
                     // every directory a segment of the command may run in:

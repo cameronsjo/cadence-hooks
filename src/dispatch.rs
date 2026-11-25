@@ -192,8 +192,11 @@ pub fn run_logged_plan(plan: CheckPlan, hook: Option<&str>) -> ! {
     // Hoisted above the stdin parse so both the parse-failure arm and the
     // decided-result arm below can record against the same canonical name.
     let hook_name = hook.unwrap_or_else(|| plan.check.name());
-    let (input, normalized_inputs) = parse_or_exit(&[hook_name]);
-    match decide_member(&plan, hook_name, &input, &normalized_inputs, started) {
+    let (input, expanded_inputs) = parse_or_exit(&[hook_name]);
+    let normalized_inputs = expanded_inputs
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(&input));
+    match decide_member(&plan, hook_name, &input, normalized_inputs, started) {
         MemberVerdict::Silent => process::exit(Outcome::Allow.code()),
         // Exit 1, not 0. Neither code blocks — `Outcome::code` maps every
         // non-Block outcome to 0 — so the *user's* operation proceeds
@@ -227,8 +230,8 @@ fn any_security_critical(hook_names: &[&str]) -> bool {
 /// counted. The fail-closed arm fires when any of them is security-critical:
 /// a separate process for that hook would have blocked, and a group must not
 /// be a way around that.
-fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
-    let input = match HookInput::from_stdin_detailed() {
+fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Option<Vec<HookInput>>) {
+    let mut input = match HookInput::from_stdin_detailed() {
         Ok(input) => input,
         Err(e) => {
             let unenumerable_patch = e.patch_targets_unenumerable;
@@ -307,7 +310,7 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
         eprintln!("{}", unreadable_operation_message(&unreadable));
         process::exit(2);
     }
-    let normalized_inputs = match input.normalized_inputs() {
+    let mut expanded_inputs = match input.normalized_inputs_if_expanded() {
         Ok(inputs) => inputs,
         Err(error) => {
             for hook_name in hook_names {
@@ -352,7 +355,15 @@ fn parse_or_exit(hook_names: &[&str]) -> (HookInput, Vec<HookInput>) {
             process::exit(0);
         }
     };
-    (input, normalized_inputs)
+    // Resolve literal directory variables once up front so `group` members
+    // don't repeat the scan per check.
+    input.resolve_dir_variables_in_place();
+    if let Some(inputs) = expanded_inputs.as_mut() {
+        for item in inputs {
+            item.resolve_dir_variables_in_place();
+        }
+    }
+    (input, expanded_inputs)
 }
 
 /// The block message for a payload whose operation could not be read
@@ -630,7 +641,7 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
     let started = Instant::now();
     guard_interactive_terminal("group", members.first().map(|m| m.plan.event), None);
     let names: Vec<&'static str> = members.iter().map(|m| m.hook).collect();
-    let (input, normalized_inputs) = parse_or_exit(&names);
+    let (input, expanded_inputs) = parse_or_exit(&names);
     let event = input
         .hook_event_name
         .as_deref()
@@ -640,10 +651,26 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
                 .first()
                 .map_or(HookEvent::PreToolUse, |m| m.plan.event)
         });
-    let shared = Arc::new((input, normalized_inputs));
-    let (tx, rx) = mpsc::channel::<(usize, MemberVerdict)>();
+    let shared = Arc::new((input, expanded_inputs));
+    let mut verdicts: Vec<Option<MemberVerdict>> = names.iter().map(|_| None).collect();
     let mut degraded = notices;
+
+    // Debug-build stall trigger forces threaded execution so deadline tests
+    // can observe group_deadline fail-open behavior on any member.
+    #[cfg(debug_assertions)]
+    let force_threads = std::env::var_os("CADENCE_TEST_GROUP_STALL_MS").is_some();
+    #[cfg(not(debug_assertions))]
+    let force_threads = false;
+
+    let mut inline_members: Vec<(usize, GroupMember)> = Vec::new();
+    let mut threaded_count = 0usize;
+    let (tx, rx) = mpsc::channel::<(usize, MemberVerdict)>();
+
     for (index, member) in members.into_iter().enumerate() {
+        if !force_threads && !member.plan.check.spawns_subprocesses() {
+            inline_members.push((index, member));
+            continue;
+        }
         let tx = tx.clone();
         let shared = Arc::clone(&shared);
         let hook = member.hook;
@@ -662,13 +689,18 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
                     cadence_hooks_core::deadline::arm();
                     #[cfg(debug_assertions)]
                     test_group_stall();
-                    let (input, normalized_inputs) = &*shared;
-                    decide_member(&member.plan, hook, input, normalized_inputs, Instant::now())
+                    let (input, expanded_inputs) = &*shared;
+                    let normalized = expanded_inputs
+                        .as_deref()
+                        .unwrap_or(std::slice::from_ref(input));
+                    decide_member(&member.plan, hook, input, normalized, Instant::now())
                 }))
                 .unwrap_or(MemberVerdict::Panicked);
                 let _ = tx.send((index, verdict));
             });
-        if spawned.is_err() {
+        if spawned.is_ok() {
+            threaded_count += 1;
+        } else {
             // The thread never existed, so nothing will report for it. A
             // process launch for it would have failed the same way.
             log_member_failopen("group_spawn", hook);
@@ -680,14 +712,37 @@ pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
     }
     drop(tx);
 
-    let mut verdicts: Vec<Option<MemberVerdict>> = names.iter().map(|_| None).collect();
+    // Run pure in-memory checks inline on the main thread while any
+    // subprocess-spawning members execute in parallel on their threads.
+    if !inline_members.is_empty() {
+        let (input, expanded_inputs) = &*shared;
+        let normalized = expanded_inputs
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(input));
+        for (index, member) in inline_members {
+            let hook = member.hook;
+            let namespace = crate::registry::namespace_of(hook).unwrap_or("unknown");
+            let prev = crate::CURRENT_HOOK.with(|current| current.replace(Some((namespace, hook))));
+            let _guard = PanicGuard::arm();
+            let verdict = catch_unwind(AssertUnwindSafe(|| {
+                cadence_hooks_core::deadline::arm();
+                decide_member(&member.plan, hook, input, normalized, Instant::now())
+            }))
+            .unwrap_or(MemberVerdict::Panicked);
+            crate::CURRENT_HOOK.with(|current| current.set(prev));
+            verdicts[index] = Some(verdict);
+        }
+    }
+
     let budget = group_collect_budget();
-    loop {
-        let remaining = budget.saturating_sub(started.elapsed());
-        match rx.recv_timeout(remaining) {
-            Ok((index, verdict)) => verdicts[index] = Some(verdict),
-            // Every sender is gone (all reported), or the budget ran out.
-            Err(_) => break,
+    if threaded_count > 0 {
+        loop {
+            let remaining = budget.saturating_sub(started.elapsed());
+            match rx.recv_timeout(remaining) {
+                Ok((index, verdict)) => verdicts[index] = Some(verdict),
+                // Every sender is gone (all reported), or the budget ran out.
+                Err(_) => break,
+            }
         }
     }
 

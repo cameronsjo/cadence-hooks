@@ -18,10 +18,13 @@ impl Check for LineEndingsGuard {
             return CheckResult::allow();
         };
 
-        // Only check shell scripts
-        // Case-insensitive extension check for shell scripts
-        let lower_path = path.to_lowercase();
-        if !lower_path.ends_with(".sh") && !lower_path.ends_with(".bash") {
+        // Only check shell scripts (case-insensitive extension check, zero alloc)
+        let is_shell_script = |suffix: &str| {
+            path.len() >= suffix.len()
+                && path.is_char_boundary(path.len() - suffix.len())
+                && path[path.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        };
+        if !is_shell_script(".sh") && !is_shell_script(".bash") {
             return CheckResult::allow();
         }
 

@@ -5579,6 +5579,10 @@ impl Check for EnforceWorktree {
         HOOK_NAME
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         run_confirmed(input, &EnvConfig::from_env())
     }

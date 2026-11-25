@@ -208,18 +208,45 @@ impl Check for PersistPlanApproval {
         "persist-plan-approval"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
-        let host = gethostname::gethostname().to_string_lossy().into_owned();
-        let utc_now = cadence_hooks_core::time::utc_timestamp();
-        let local_date = cadence_hooks_core::time::local_date();
         // Narrow defense-in-depth on top of the dispatch-layer panic guard
         // (cameronsjo/cadence-hooks#349): this fires on every PostToolUse
         // call, and a bug here must not eat the approval (or the tool call).
+        // Defer `gethostname()`, timestamps, and `DestinationEnv::from_process()`
+        // behind the fast-path gates so every non-ExitPlanMode call after the
+        // first scan of a session pays only a single `stat(2)` on its marker.
         let result = std::panic::catch_unwind(|| {
-            let env = DestinationEnv::from_process();
             if input.tool_name() == Some("ExitPlanMode") {
+                let host = gethostname::gethostname().to_string_lossy().into_owned();
+                let utc_now = cadence_hooks_core::time::utc_timestamp();
+                let local_date = cadence_hooks_core::time::local_date();
+                let env = DestinationEnv::from_process();
                 run_persist_plan_approval(input, &utc_now, &local_date, &host, &env)
             } else {
+                if input.agent_id().is_some()
+                    || input
+                        .session_id()
+                        .filter(|s| identity::is_safe_session_id(s))
+                        .is_none()
+                {
+                    return CheckResult::allow();
+                }
+                let marker = cadence_hooks_core::markers::session_marker(
+                    input,
+                    INJECTED_SCAN_MARKER_KIND,
+                    None,
+                );
+                if marker.exists() {
+                    return CheckResult::allow();
+                }
+                let host = gethostname::gethostname().to_string_lossy().into_owned();
+                let utc_now = cadence_hooks_core::time::utc_timestamp();
+                let local_date = cadence_hooks_core::time::local_date();
+                let env = DestinationEnv::from_process();
                 run_injected_plan_persist(input, &utc_now, &local_date, &host, &env)
             }
         })

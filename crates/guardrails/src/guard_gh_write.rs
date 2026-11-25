@@ -3092,6 +3092,10 @@ impl Check for GhWriteGuard {
         "guard-gh-write"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();

@@ -578,6 +578,18 @@ impl RunbookScrubGuard {
     /// env mutation and an ambient escape cannot turn a block-expecting
     /// assertion into a false pass (cadence-hooks#486).
     fn run_with(&self, input: &HookInput, env: Env, marked: &dyn Fn(&str) -> bool) -> CheckResult {
+        // Gate on tool name and file path before `RunbooksDir::resolve`
+        // (`canonicalize`), so non-Write/Edit calls pay no filesystem syscalls.
+        if !matches!(
+            input.normalized_tool_name(),
+            Some("Write" | "Edit" | "MultiEdit")
+        ) {
+            return CheckResult::allow();
+        }
+        let Some(path) = input.file_path() else {
+            return CheckResult::allow();
+        };
+
         let Env {
             dir,
             escape,
@@ -602,44 +614,33 @@ impl RunbookScrubGuard {
             .and_then(|m| RunbooksDir::resolve(Some(m), home, &cwd))
             .map(|m| m.spellings);
 
-        let message = match input.normalized_tool_name().unwrap_or("") {
-            "Write" | "Edit" | "MultiEdit" => {
-                let Some(path) = input.file_path() else {
+        let message = if marker_spellings
+            .as_deref()
+            .is_some_and(|m| file_path_lands_in(&path, &cwd, m))
+        {
+            Some(marker_block(&path))
+        } else if !file_path_lands_in(&path, &cwd, &dir.spellings) {
+            return CheckResult::allow();
+        } else {
+            match resulting_document(input) {
+                Some(content) if marked(&markers::scrub_digest(content.as_bytes())) => {
                     return CheckResult::allow();
-                };
-                if marker_spellings
-                    .as_deref()
-                    .is_some_and(|m| file_path_lands_in(&path, &cwd, m))
-                {
-                    Some(marker_block(&path))
-                } else if !file_path_lands_in(&path, &cwd, &dir.spellings) {
-                    return CheckResult::allow();
-                } else {
-                    match resulting_document(input) {
-                        Some(content) if marked(&markers::scrub_digest(content.as_bytes())) => {
-                            return CheckResult::allow();
-                        }
-                        Some(_) => Some(write_block(
-                            &path,
-                            "this write lands in the runbooks directory, and the resulting \
-                             content has no scrub marker.",
-                        )),
-                        // Fail closed: a resulting document this hook cannot
-                        // compute is one nobody can vouch for.
-                        None => Some(write_block(
-                            &path,
-                            "this edit lands in the runbooks directory, and its resulting \
-                             content cannot be computed to check for a scrub marker (an \
-                             unreadable file, an old_string not found literally, or an edit \
-                             without an old_string/new_string pair).",
-                        )),
-                    }
                 }
+                Some(_) => Some(write_block(
+                    &path,
+                    "this write lands in the runbooks directory, and the resulting \
+                     content has no scrub marker.",
+                )),
+                // Fail closed: a resulting document this hook cannot
+                // compute is one nobody can vouch for.
+                None => Some(write_block(
+                    &path,
+                    "this edit lands in the runbooks directory, and its resulting \
+                     content cannot be computed to check for a scrub marker (an \
+                     unreadable file, an old_string not found literally, or an edit \
+                     without an old_string/new_string pair).",
+                )),
             }
-            // Bash is not judged: the bytes a command writes are not knowable
-            // before it runs, and reading its paths cost more false blocks than
-            // it saved (cameronsjo/cadence-hooks#1442, #1434, #1435, #1441).
-            _ => None,
         };
         let Some(message) = message else {
             return CheckResult::allow();

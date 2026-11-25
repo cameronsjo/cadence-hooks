@@ -1570,58 +1570,54 @@ pub fn is_secret_shaped_var_name(name: &str) -> bool {
 ///
 /// The match is reported by *name* only — [`scan_secret_values`] never returns
 /// the value, so the secret is not echoed into hook output or logs.
-static SECRET_VALUE_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
-    [
-        // AWS long-term (AKIA) and temporary (ASIA) access key ids.
-        ("AWS access key id", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-        // GitHub tokens: classic PAT (ghp_), OAuth (gho_), user-to-server
-        // (ghu_), server-to-server (ghs_), refresh (ghr_) — all 36-char bodies.
-        ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{36}\b"),
-        // GitHub fine-grained PAT — the `github_pat_` prefix is near-unique.
-        (
-            "GitHub fine-grained PAT",
-            r"\bgithub_pat_[A-Za-z0-9_]{30,}\b",
-        ),
-        // OpenAI keys (legacy `sk-…`, `sk-proj-…`, `sk-svcacct-…`). Anchored on
-        // the `T3BlbkFJ` infix every such key carries — a far stronger
-        // discriminator than the weak `sk-` prefix. Requiring the infix avoids
-        // the false-positive class a bare `sk-<32 alnum>` hit: `sk-`-namespaced
-        // hashes (`sk-<md5>`, `sk-<uuid>`), hyphenated slugs (`sk-proj-foo-bar`),
-        // and padded doc placeholders (`sk-xxxx…`) — none contain `T3BlbkFJ`.
-        // Trade-off: a hypothetical future key format without the infix would be
-        // missed (acceptable for a best-effort catch; precision over recall).
-        (
-            "OpenAI API key",
-            r"\bsk-[A-Za-z0-9_-]*T3BlbkFJ[A-Za-z0-9_-]{10,}",
-        ),
-        // Slack bot/user/legacy/refresh/app tokens.
-        ("Slack token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-        // PEM private-key header (RSA/EC/DSA/OPENSSH/ENCRYPTED/bare).
-        (
-            "private key (PEM)",
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, p)| {
-        (
-            name,
-            Regex::new(p).expect("secret value pattern should compile"),
-        )
-    })
-    .collect()
+const SECRET_VALUE_SPECS: &[(&str, &str)] = &[
+    // AWS long-term (AKIA) and temporary (ASIA) access key ids.
+    ("AWS access key id", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    // GitHub tokens: classic PAT (ghp_), OAuth (gho_), user-to-server
+    // (ghu_), server-to-server (ghs_), refresh (ghr_) — all 36-char bodies.
+    ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{36}\b"),
+    // GitHub fine-grained PAT — the `github_pat_` prefix is near-unique.
+    (
+        "GitHub fine-grained PAT",
+        r"\bgithub_pat_[A-Za-z0-9_]{30,}\b",
+    ),
+    // OpenAI keys (legacy `sk-…`, `sk-proj-…`, `sk-svcacct-…`). Anchored on
+    // the `T3BlbkFJ` infix every such key carries — a far stronger
+    // discriminator than the weak `sk-` prefix. Requiring the infix avoids
+    // the false-positive class a bare `sk-<32 alnum>` hit: `sk-`-namespaced
+    // hashes (`sk-<md5>`, `sk-<uuid>`), hyphenated slugs (`sk-proj-foo-bar`),
+    // and padded doc placeholders (`sk-xxxx…`) — none contain `T3BlbkFJ`.
+    // Trade-off: a hypothetical future key format without the infix would be
+    // missed (acceptable for a best-effort catch; precision over recall).
+    (
+        "OpenAI API key",
+        r"\bsk-[A-Za-z0-9_-]*T3BlbkFJ[A-Za-z0-9_-]{10,}",
+    ),
+    // Slack bot/user/legacy/refresh/app tokens.
+    ("Slack token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    // PEM private-key header (RSA/EC/DSA/OPENSSH/ENCRYPTED/bare).
+    (
+        "private key (PEM)",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+    ),
+];
+
+static SECRET_VALUE_SET: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new(SECRET_VALUE_SPECS.iter().map(|(_, p)| *p))
+        .expect("secret value pattern set should compile")
 });
 
 /// Scan `text` for an embedded live secret value, returning the *name* of the
 /// first matching pattern (never the value itself). `None` when clean.
 ///
-/// Patterns are high-confidence by design (see [`SECRET_VALUE_PATTERNS`]); this
+/// Patterns are high-confidence by design (see [`SECRET_VALUE_SPECS`]); this
 /// is a best-effort accidental-paste catch, not an exhaustive exfil boundary.
 pub fn scan_secret_values(text: &str) -> Option<&'static str> {
-    SECRET_VALUE_PATTERNS
-        .iter()
-        .find(|(_, re)| re.is_match(text))
-        .map(|(name, _)| *name)
+    SECRET_VALUE_SET
+        .matches(text)
+        .into_iter()
+        .next()
+        .map(|idx| SECRET_VALUE_SPECS[idx].0)
 }
 
 /// Paths exempt from the secret-value content scan: this repo's own source,

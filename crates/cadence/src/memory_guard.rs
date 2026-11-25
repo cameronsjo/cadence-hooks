@@ -19,6 +19,9 @@ impl MemoryGuard {
     /// Anchoring here keeps the guard off unrelated project files that merely
     /// have a `memory/` directory (`docs/memory/`, `assets/memory/`) — #93.
     fn is_memory_path(path: &str) -> bool {
+        if !path.contains("memory") {
+            return false;
+        }
         let config_dir = cadence_hooks_core::paths::claude_config_dir();
         Self::is_memory_path_under(path, &config_dir.to_string_lossy())
     }

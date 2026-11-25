@@ -5587,19 +5587,34 @@ pub fn run_bounded_capped_input(
     // nothing to drain and nothing to wait for, so it is complete by
     // construction. With a handle, only `Ok(())` is complete: `Disconnected`
     // means the reader died before signalling, and a timeout means the pipe is
-    // still held open.
-    let drained = |budget: Duration| -> bool {
-        match done.as_ref() {
-            None => true,
-            Some(rx) => matches!(rx.recv_timeout(budget), Ok(())),
+    // still held open. Tracked so we never call `recv_timeout` a second time
+    // after the single signal has already been consumed.
+    let mut stdout_done = done.is_none();
+    let mut stdout_complete = done.is_none();
+    let mut drained = |budget: Duration| -> bool {
+        if stdout_done {
+            return stdout_complete;
         }
+        if let Some(rx) = done.as_ref() {
+            match rx.recv_timeout(budget) {
+                Ok(()) => {
+                    stdout_done = true;
+                    stdout_complete = true;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    stdout_done = true;
+                    stdout_complete = false;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        stdout_complete
     };
-    // Kept separate from `drained` so the arms that discard stdout do not copy
-    // the buffer they are about to throw away.
+    // Kept separate from `drained` so the arms that discard stdout do not touch
+    // the buffer they are about to throw away. Moves the buffer out once on
+    // return rather than cloning it.
     let bytes_so_far = || -> Vec<u8> {
-        sink.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        std::mem::take(&mut *sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
     };
 
     // Give up on the child: signal its whole process group (Unix), then the
@@ -5611,7 +5626,12 @@ pub fn run_bounded_capped_input(
     };
 
     let started = std::time::Instant::now();
+    // Exponential backoff used only when stdout closed before process exit
+    // (rare: normally stdout EOF arrives right as the child exits, so the
+    // first `try_wait()` succeeds immediately with zero sleep).
+    let mut poll_delay = Duration::from_micros(200);
     loop {
+        let _ = drained(timeout.saturating_sub(started.elapsed()));
         if overflow.load(Ordering::SeqCst) {
             give_up(&mut child);
             let status = child.wait();
@@ -5654,7 +5674,8 @@ pub fn run_bounded_capped_input(
                 return GitSpawn::Truncated(output);
             }
             Ok(None) => {
-                if started.elapsed() >= timeout {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
                     give_up(&mut child);
                     let _ = child.wait();
                     // The bytes are discarded on this arm, and the shared
@@ -5663,7 +5684,9 @@ pub fn run_bounded_capped_input(
                     crate::deadline::note_hit();
                     return GitSpawn::TimedOut;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                let remaining = timeout.saturating_sub(elapsed);
+                std::thread::sleep(poll_delay.min(remaining));
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(10));
             }
             Err(_) => {
                 give_up(&mut child);

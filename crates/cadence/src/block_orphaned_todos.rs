@@ -50,9 +50,16 @@ fn is_exempt(path: &str) -> bool {
 /// byte offset. This prevents a referenced marker on the same line from masking an
 /// unrelated orphaned marker at a different position.
 pub fn find_orphaned(content: &str) -> Vec<(usize, String)> {
+    if !ORPHANED_PATTERN.is_match(content) {
+        return Vec::new();
+    }
+
     let mut orphans = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
+        if !ORPHANED_PATTERN.is_match(line) {
+            continue;
+        }
         // Collect byte offsets of all referenced markers on this line
         let referenced_offsets: Vec<usize> = REFERENCED_PATTERN
             .find_iter(line)
