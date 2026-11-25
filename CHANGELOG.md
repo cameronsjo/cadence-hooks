@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.139.0] - 2026-11-25
+
 ### Performance
 
 - **Core dispatch pipeline and hot-path check optimizations.** Removed the 10 ms polling floor and stdout buffer clone in `run_bounded_capped_input` by waking immediately on stdout EOF with short progressive backoff if the child exits after closing stdout; replaced `git rev-parse` subprocess spawns in `worktree::would_block_here` and `metrics::common::branch` with pure-filesystem `GitState::resolve` and deduplicated `GitState::resolve` filesystem walks; added a strict-first single-pass JSON deserialization fast path in `HookInput::from_json_detailed`, eliminated `HookInput` cloning on the single-input `normalized_inputs` path and `serde_json::Value` cloning in `MetricsInput::from_json`; gated `feedback_footer()` on `Outcome::Block`; ran pure in-memory checks inline on the main thread in `group` while keeping subprocess-spawning checks parallelized; hoisted `with_resolved_dir_variables` and cached `command_segments` on `HookInput`; fast-pathed `loop_analysis` when no shell loop keywords appear; taught `doctor` `extract_invocation` to recognize inline `command -v cadence-hooks` fast-path hook commands; and added pre-filters, deferred I/O, and combined `RegexSet` scans across `prevent-secret-push`, `persist-plan-approval`, `redact-external-content`, `redact-secret-output`, `warn-main-branch`, `guard-runbook-scrub`, `secret_patterns`, `terminology`, `block-orphaned-todos`, `memory-guard`, `validate-line-endings`, and `warn-going-public`.
