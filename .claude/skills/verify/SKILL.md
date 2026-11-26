@@ -5,7 +5,7 @@ description: Use before committing a change to a hook in this repo, or when poli
 
 # Verify a cadence-hooks change
 
-Tests prove the code does what the tests say. This proves the shipped binary does what the change claims: build it, feed each changed hook real payloads, and read the verdicts. Run it from the repo root on the branch you are about to commit, with `origin/main` merged in: the base side is `origin/main`, so an unmerged branch shows main's newer changes as if they were yours.
+Tests prove the code does what the tests say. This proves the shipped binary does what the change claims: build it, feed each changed hook real payloads, and read the verdicts. Run it from the repo root on the branch you are about to commit, with `origin/main` merged in: the base side is `origin/main`, so an unmerged branch shows main's newer changes as if they were yours. Run every block in one bash session: later steps read `V`, `HEAD_BIN`, `BASE_BIN` and `CASE_ENV` from earlier ones, and with them empty the cleanup removes nothing.
 
 ## 1. Build both binaries
 
@@ -53,7 +53,7 @@ Run it once per changed hook, with `<ns> <hook>` and the payload dir set to that
 The list comes from `rg 'env::var' crates/*/src src` and the `const ..._VAR` names beside them; re-run it when a hook adds a variable. A claim case that needs one (most often `CADENCE_ALLOWED_OWNERS=<owner>` for an ownership guard, since the scratch `HOME` has no saved config) adds it to `CASE_ENV` for that hook, and the PR table says so. The scratch `HOME` also means `gh` has no login, so a hook that asks GitHub sees an unauthenticated `gh`.
 
 ```bash
-CASE_ENV=""   # e.g. CASE_ENV="CADENCE_ALLOWED_OWNERS=<owner>"; space-separated, no spaces in values
+CASE_ENV=()   # e.g. CASE_ENV=(CADENCE_ALLOWED_OWNERS=<owner> GH_REPO=<owner>/<repo>)
 for p in "$V"/payloads/<hook>/*.json; do
   for side in base head; do
     b="$BASE_BIN"; [ "$side" = head ] && b="$HEAD_BIN"
@@ -62,7 +62,7 @@ for p in "$V"/payloads/<hook>/*.json; do
     m="$(mktemp -d "$V/markers.XXXXXX")"   # fresh per run, so no once-only marker carries over
     out="$(env -i PATH="$PATH" HOME="$V/home" TMPDIR="$V/tmp" \
       CADENCE_METRICS_DIR="$V/metrics" CADENCE_MARKER_DIR="$m" \
-      $CASE_ENV "$b" try <ns> <hook> --payload "$p" 2>&1)"
+      "${CASE_ENV[@]}" "$b" try <ns> <hook> --payload "$p" 2>&1)"
     printf '%s\n' "$out" | sed -n 's/^Outcome: *//p' | grep . \
       || { echo "ERROR (no outcome line):"; printf '%s\n' "$out" | tail -3; }
   done
