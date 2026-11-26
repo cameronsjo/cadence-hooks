@@ -1,8 +1,8 @@
 //! Integration tests for the `denials.jsonl` audit log written at the dispatch
 //! outcome→exit-code seam (O1).
 //!
-//! Drives the built binary end to end: a terminology-violating Edit piped to
-//! `cadence terminology` must (a) still block byte-identically, and (b) append
+//! Drives the built binary end to end: a CRLF-introducing Edit piped to
+//! `cadence line-endings` must (a) still block byte-identically, and (b) append
 //! exactly one privacy-safe deny row to `denials.jsonl`. A companion run against
 //! an unwritable metrics dir proves the write is fail-open and never perturbs
 //! the block (ADR-0001).
@@ -23,31 +23,23 @@ fn cadence_hooks() -> Command {
     cmd
 }
 
-fn flagged_term() -> &'static str {
-    concat!("white", "list")
-}
-
-/// A terminology-violating Edit against a non-excluded, non-git path. The
-/// `old_string` carries no violation, so the introduced `whitelist` fires a
-/// hard block (exit 2).
-fn run_terminology(
+/// A CRLF-introducing Edit against a shell script. `cadence line-endings`
+/// fires a hard block (exit 2) without touching git state.
+fn run_blocking_edit(
     metrics_dir: &std::path::Path,
     payload_cwd: &std::path::Path,
     old_private_content: &str,
     new_private_content: &str,
 ) -> Output {
-    let file_path = payload_cwd.join("notes.md");
-    std::fs::write(
-        &file_path,
-        format!("we should permit {old_private_content}"),
-    )
-    .expect("failed to create controlled Edit target");
+    let file_path = payload_cwd.join("script.sh");
+    std::fs::write(&file_path, format!("echo {old_private_content}\n"))
+        .expect("failed to create controlled Edit target");
     let payload = serde_json::json!({
         "tool_name": "Edit",
         "tool_input": {
             "file_path": file_path,
-            "new_string": format!("we should {} {new_private_content}", flagged_term()),
-            "old_string": format!("we should permit {old_private_content}"),
+            "new_string": format!("echo {new_private_content}\r\n"),
+            "old_string": format!("echo {old_private_content}\n"),
         },
         "session_id": "itsess",
         "cwd": payload_cwd,
@@ -55,7 +47,7 @@ fn run_terminology(
     .to_string();
 
     let mut cmd = cadence_hooks();
-    cmd.args(["cadence", "terminology"]);
+    cmd.args(["cadence", "line-endings"]);
     cmd.env("CADENCE_METRICS_DIR", metrics_dir);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -98,7 +90,7 @@ fn private_content_sentinels(nonce_dir: &std::path::Path) -> (String, String) {
 fn block_writes_one_privacy_safe_deny_row() {
     let tmp = tempfile::tempdir().unwrap();
     let (old_private_content, new_private_content) = private_content_sentinels(tmp.path());
-    let out = run_terminology(
+    let out = run_blocking_edit(
         tmp.path(),
         tmp.path(),
         &old_private_content,
@@ -106,15 +98,11 @@ fn block_writes_one_privacy_safe_deny_row() {
     );
 
     // The block itself is unchanged: exit 2, block message + feedback footer.
-    assert_eq!(out.status.code(), Some(2), "terminology block must exit 2");
+    assert_eq!(out.status.code(), Some(2), "line-endings block must exit 2");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("BLOCKED: Inclusive terminology"),
+        stderr.contains("BLOCKED: Shell script contains Windows-style CRLF"),
         "block message present: {stderr}"
-    );
-    assert!(
-        stderr.contains(flagged_term()),
-        "names the offending term: {stderr}"
     );
     assert!(
         stderr.contains("/cadence:feedback"),
@@ -127,7 +115,7 @@ fn block_writes_one_privacy_safe_deny_row() {
     assert_eq!(rows.len(), 1, "exactly one denial row: {rows:?}");
     let row = &rows[0];
     assert_eq!(
-        row["hook"], "terminology",
+        row["hook"], "line-endings",
         "canonical registry name, not Check::name()"
     );
     assert_eq!(row["decision"], "deny");
@@ -215,7 +203,7 @@ fn logging_does_not_perturb_the_block_when_write_fails() {
     // This is the load-bearing "logger must not touch enforcement output" check.
     let ok = tempfile::tempdir().unwrap();
     let (old_private_content, new_private_content) = private_content_sentinels(ok.path());
-    let writable = run_terminology(
+    let writable = run_blocking_edit(
         ok.path(),
         ok.path(),
         &old_private_content,
@@ -228,7 +216,7 @@ fn logging_does_not_perturb_the_block_when_write_fails() {
     let blocker_file = blocker_dir.path().join("not-a-dir");
     std::fs::write(&blocker_file, b"x").unwrap();
     let unwritable_metrics = blocker_file.join("metrics");
-    let failopen = run_terminology(
+    let failopen = run_blocking_edit(
         &unwritable_metrics,
         ok.path(),
         &old_private_content,

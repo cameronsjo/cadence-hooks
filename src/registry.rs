@@ -130,7 +130,7 @@ pub const HOOKS: &[HookEntry] = &[
     // cadence
     HookEntry {
         name: "terminology",
-        description: "Block inclusive terminology violations",
+        description: "Nudge on inclusive terminology violations",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content guard; no machine-local state.

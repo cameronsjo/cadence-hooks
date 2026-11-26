@@ -251,7 +251,7 @@ enum ConfigureCommands {
 
 #[derive(Subcommand)]
 enum CadenceCommands {
-    /// Block inclusive terminology violations
+    /// Nudge on inclusive terminology violations
     Terminology,
     /// Block orphaned code markers without issue references
     OrphanedTodos,
