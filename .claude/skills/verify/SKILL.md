@@ -31,11 +31,11 @@ Map each changed `crates/<ns>/src/<file>.rs` to its hook with `$HEAD_BIN list`. 
 
 ## 3. Write the payloads
 
-One JSON file per case in `$V/payloads`, named for the case. For each changed hook:
+One JSON file per case in `$V/payloads/<hook>/`, named for the case, so each hook runs only its own payloads. For each changed hook:
 
 - **The claim.** Each case the change says it fixes or adds, with the verdict it should now give.
 - **The everyday control.** At least three routine commands or edits the hook sees daily (`git status`, `git push origin feature`, a plain Write). These must stay ALLOW, or the change is a new false block (CLAUDE.md, ADR-0046 rule 4).
-- **A known red.** One case the hook already blocks or nudges at base. It proves the table can show something other than ALLOW.
+- **A known red.** One case the hook already blocks or nudges at base. It proves the table can show something other than ALLOW. For a new hook there is no base verdict: use a case the head does not ALLOW.
 - **The shape owner.** Check the hook owns each payload's shape (reads vs writes, Bash vs Write). A payload sent to the wrong guard reads as a false ALLOW.
 
 ```json
@@ -44,10 +44,10 @@ One JSON file per case in `$V/payloads`, named for the case. For each changed ho
 
 ## 4. Run them at head and at the base
 
-Run under a scratch metrics dir, with the three exemption variables cleared. Otherwise every deny lands in the real `denials.jsonl`, and a disabled guard passes for the wrong reason.
+Run it once per changed hook, with `<ns> <hook>` and the payload dir set to that hook. Run under a scratch metrics dir, with the three exemption variables cleared. Otherwise every deny lands in the real `denials.jsonl`, and a disabled guard passes for the wrong reason.
 
 ```bash
-for p in "$V"/payloads/*.json; do
+for p in "$V"/payloads/<hook>/*.json; do
   for side in base head; do
     b="$BASE_BIN"; [ "$side" = head ] && b="$HEAD_BIN"
     printf '%s %s: ' "$(basename "$p")" "$side"
@@ -64,10 +64,10 @@ done
 
 ## 5. Read the result
 
-- **PASS:** every claim case gives its stated verdict at head, every everyday control is ALLOW at head, and the known red is not ALLOW at base.
-- **FAIL:** any claim case gives another verdict, any control is NUDGE or BLOCK at head, the known red is ALLOW at base, or any row says ERROR (other than a new hook's base rows). Fix it before committing.
+- **PASS:** every claim case gives its stated verdict at head, every everyday control is ALLOW at head, and the known red is not ALLOW at base (at head for a new hook, whose base rows are `n/a`).
+- **FAIL:** any claim case gives another verdict, any control is NUDGE or BLOCK at head, the known red is ALLOW (at base, or at head for a new hook), or any row says ERROR (other than a new hook's base rows). Fix it before committing.
 
-Wiring is a separate check. If the change also needs a `hooks.json` entry in the cadence monorepo, a hook with no matching `if:` never runs: `tests/hook_registration_audit.rs` covers that side.
+Wiring is a separate check. If the change also needs a `hooks.json` entry in the cadence monorepo, a hook whose `if:` matches none of the commands it should see never runs. `tests/hook_registration_audit.rs` checks only that a Bash hook has an `if:` key, not what it matches, so read the filter by hand.
 
 Report the table (case, expected, base, head) in the PR body, then clean up:
 
