@@ -282,7 +282,7 @@ pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {
         return CheckResult::allow();
     }
 
-    let Some(plan) = plan_for_current_branch(&repo_root) else {
+    let Some(plan) = plan_for_tick_nudge(&repo_root, input.session_id.as_deref()) else {
         return CheckResult::allow();
     };
     let root_str = repo_root.to_string_lossy();
@@ -329,7 +329,7 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(repo_root) = crate::registry::repo_root(cwd) else {
         return CheckResult::allow();
     };
-    let Some(plan) = plan_for_current_branch(&repo_root) else {
+    let Some(plan) = plan_for_tick_nudge(&repo_root, input.session_id.as_deref()) else {
         return CheckResult::allow();
     };
     // The plan speaks for the cwd's branch only, so a flip aimed anywhere
@@ -501,17 +501,26 @@ fn claim_marker(path: &Path) -> bool {
     }
 }
 
-/// The in-flight plan doc bound to the repo's current branch, if any. Binding
-/// is exact `branch:` equality — a plan carrying a stale or absent `branch:`
-/// is a silent no-fire (the guard must not guess), and shared-main repos
-/// match naturally because both sides read `main`. First match wins in
-/// `plan_scan`'s deterministic path order.
+/// The in-flight plan doc bound to the repo's current branch for guard checks
+/// (cadence-hooks#1676).
 ///
-/// A plan git ignores is skipped (cadence#2153): a repo can point
-/// `CADENCE_PLANS_DIR` at a gitignored folder, and these guards' advice is to
-/// commit the plan, which such a repo does not do.
-fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
-    plans_for_current_branch(repo_root).into_iter().next()
+/// Binding is exact `branch:` equality — a plan carrying a stale or absent
+/// `branch:` is a silent no-fire. When exactly one committable in-flight plan
+/// is bound to the current branch, returns it. When multiple plans share the
+/// branch (e.g. shared `main` with several in-flight plans), narrows to a
+/// unique plan whose `approved_session_id` matches `session_id`; otherwise
+/// returns `None` rather than naming an unrelated plan.
+fn plan_for_tick_nudge(repo_root: &Path, session_id: Option<&str>) -> Option<InFlightPlan> {
+    let plans = plans_for_current_branch(repo_root);
+    if plans.len() <= 1 {
+        return plans.into_iter().next();
+    }
+    let sid = session_id.filter(|s| !s.is_empty())?;
+    let mut owned: Vec<InFlightPlan> = plans
+        .into_iter()
+        .filter(|plan| plan.approved_session_id.as_deref() == Some(sid))
+        .collect();
+    if owned.len() == 1 { owned.pop() } else { None }
 }
 
 /// Every committable in-flight plan bound to the current branch, in scan order.
@@ -1724,5 +1733,81 @@ mod tests {
             run_nudge_plan_tick(&real).outcome,
             cadence_hooks_core::Outcome::Nudge
         );
+    }
+
+    #[test]
+    fn tick_nudge_stays_silent_when_multiple_plans_share_branch_unowned() {
+        // #1676: on a shared-main repo with multiple in-flight plans, a session
+        // that did not approve any of them must not be nudged with an unrelated
+        // plan.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-28-old-plan.md",
+            "in-flight",
+            "main",
+            "# Old\n\n- [ ] step\n",
+        );
+        write_plan(
+            tmp.path(),
+            "2026-11-25-new-plan.md",
+            "in-flight",
+            "main",
+            "# New\n\n- [ ] step\n",
+        );
+        commit_all(tmp.path(), "plans land");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("w{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let input = bash_input(
+            "unrelated-session",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn tick_nudge_names_session_owned_plan_on_shared_branch() {
+        // #1676: when multiple in-flight plans share `main` and exactly one was
+        // approved by this session, the tick nudge names that plan (not the
+        // first plan in scan order).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-28-old-plan.md",
+            "in-flight",
+            "main",
+            "# Old\n\n- [ ] step\n",
+        );
+        let owned_dir = tmp.path().join("docs/plans");
+        fs::write(
+            owned_dir.join("2026-11-25-owned-plan.md"),
+            "---\nstatus: in-flight\nbranch: main\napproved_session_id: my-session-1676\n---\n\n# Owned\n\n- [ ] step\n",
+        )
+        .unwrap();
+        commit_all(tmp.path(), "plans land");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("w{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let input = bash_input(
+            "my-session-1676",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        let res = run_nudge_plan_tick(&input);
+        assert_eq!(res.outcome, cadence_hooks_core::Outcome::Nudge);
+        let msg = res.message.unwrap_or_default();
+        assert!(msg.contains("2026-11-25-owned-plan.md"), "{msg}");
+        assert!(!msg.contains("2026-09-28-old-plan.md"), "{msg}");
     }
 }

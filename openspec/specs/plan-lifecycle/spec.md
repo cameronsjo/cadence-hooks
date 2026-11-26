@@ -166,11 +166,15 @@ Both allow outcomes of `session lint-plan-shape` SHALL carry the reminders `Make
 - **THEN** the hook exits 0 and `failopen.jsonl` gains a row with reason `plan-file-outside-store`
 
 ### Requirement: Tick nudge after a landed commit
-After a Bash `git commit` whose output shows git's commit summary line, `session nudge-plan-tick` SHALL nudge once per session per repo when the branch's in-flight plan (exact `branch:` match) was touched by neither the last three commits nor the working tree, naming it and mentioning `git commit --amend`. It MUST NOT block; an aborted commit, an unbound plan, or a git failure MUST allow.
+After a Bash `git commit` whose output shows git's commit summary line, `session nudge-plan-tick` SHALL nudge once per session per repo when the branch's in-flight plan (exact `branch:` match; when multiple plans share the branch, only a unique plan matching `approved_session_id`) was untouched by the last three commits and working tree, naming it and `git commit --amend`. It MUST NOT block; ambiguous shared branches, aborted commits, or git failures MUST allow.
 
 #### Scenario: Three commits skip the plan
 - **WHEN** a commit lands on `feat/x` whose in-flight plan was untouched by the last three commits and is clean in the working tree
 - **THEN** the hook nudges `living plan untouched` naming the plan, and a later commit in the same session is silent
+
+#### Scenario: Multiple plans share the branch with no session match
+- **WHEN** two in-flight plans both declare `branch: main`, neither matches the session's `approved_session_id`, and a commit lands on `main`
+- **THEN** the hook exits 0 with no output
 
 #### Scenario: Ordinary commit is allowed
 - **WHEN** a commit lands on a branch with no in-flight plan
