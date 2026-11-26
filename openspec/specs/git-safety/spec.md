@@ -104,11 +104,15 @@ Per ADR-0046, `git-safety` MUST NOT refuse a command because part of it could no
 - **THEN** the hook exits 0 with no message
 
 ### Requirement: Untracked files at commit
-`warn-untracked` SHALL nudge (exit 0, never block) on a `git add` or `git commit` segment when the target repository has untracked, non-ignored files, listing up to 20 sanitized names and a count of the rest, and filtering build artifacts (`.log`, `.tmp`, `.cache`, `.pyc`, `.class`, `.o`, `.a`, `.so`, `.dylib`). Any git failure or unresolvable directory MUST yield silence.
+`warn-untracked` SHALL nudge (exit 0, never block) on a `git add` or `git commit` segment when the target repository has untracked, non-ignored files that are not already being staged by a `git add` segment in the same command, listing up to 20 sanitized names and a count of the rest, and filtering build artifacts (`.log`, `.tmp`, `.cache`, `.pyc`, `.class`, `.o`, `.a`, `.so`, `.dylib`). Any git failure or unresolvable directory MUST yield silence.
 
 #### Scenario: Forgotten file
 - **WHEN** `git commit -m x` runs with an untracked `notes.md` at the repository root
 - **THEN** the hook exits 0 with a nudge listing `?? notes.md`
+
+#### Scenario: Untracked file staged in the same command
+- **WHEN** `git add notes.md && git commit -m x` runs and `notes.md` is the only untracked file
+- **THEN** the hook exits 0 with no message
 
 #### Scenario: Only artifacts
 - **WHEN** the only untracked file is `debug.log`

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cadence terminology` now nudges instead of blocking, stops matching `slavery`, and subtracts pre-existing terms on `Write` overwrites.** Per the accident-only guard review (#1638, ADR-0046), inclusive-terminology checks are advisory nudges rather than hard blocks; the `ry` suffix was removed from the `slave` pattern so historical/literary prose (`slavery`) no longer triggers (#1692); and whole-file `Write` overwrites read the existing regular file (up to 2 MiB) when a match is found so carried-through terms do not re-fire.
+- **`rules security-patterns` only nudges on newly introduced matches during `Edit`/`MultiEdit` and skips TypeScript type-assertion hints in test files.** Editing an unrelated line in a file with pre-existing matches no longer re-emits the entire file's hints on every edit, and routine `as Type` assertions in `*.test.*`, `*.spec.*`, `tests/`, and `__tests__/` files no longer fire while real RCE/XSS patterns remain active.
+- **`guardrails warn-untracked` excludes files already named in a `git add` segment of the same command.** Running `git add <new-file> && git commit -m ...` or `git add -A && git commit` no longer warns that the files being staged in that command are untracked.
+
 ## [0.139.0] - 2026-11-25
 
 ### Performance

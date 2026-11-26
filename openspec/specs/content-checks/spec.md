@@ -5,61 +5,61 @@ Write-time content checks that judge the text a Write, Edit or MultiEdit puts on
 
 ## Requirements
 
-### Requirement: Terminology hard block
-`cadence terminology` SHALL block (exit 2) a Write, Edit or MultiEdit whose introduced text contains one of its seven hard-block terms, matched case-insensitively at a word boundary, plural, past and gerund forms included. The stderr message MUST contain `BLOCKED: Inclusive terminology violation detected`, name the file, and give the required alternative for each term. A call with no editable text, or with no flagged term, MUST be allowed.
+### Requirement: Terminology advisory nudge
+`cadence terminology` SHALL nudge (exit 0 with `Terminology nudge` as additional context, never block) on a Write, Edit or MultiEdit introducing a flagged term, matched case-insensitively at a word boundary (excluding unrelated words such as `slavery`). The message MUST name the file when present and suggest alternatives. Calls with no editable text or no introduced flagged term MUST be allowed.
 
-#### Scenario: Hard-block term in a new file
-- **WHEN** a Write to `src/acl.rs` carries a hard-block term
-- **THEN** the hook exits 2 and stderr names the term and its alternative
+#### Scenario: Flagged term in a new file
+- **WHEN** a Write to `src/acl.rs` carries a flagged term
+- **THEN** the hook exits 0 with a `Terminology nudge` naming the term and its alternative
 
 #### Scenario: Ordinary content is allowed
 - **WHEN** a Write to `src/main.rs` carries content with no flagged term
 - **THEN** the hook exits 0 with no output
 
-#### Scenario: Substring of a longer word
-- **WHEN** a flagged term appears only inside a longer word with no word boundary before it
-- **THEN** the hook exits 0
+#### Scenario: Historical prose word is allowed
+- **WHEN** a Write to `notes/folklore.md` contains `slavery`
+- **THEN** the hook exits 0 with no output
 
 ### Requirement: Terminology judges only introduced text
-`terminology` SHALL judge each edit fragment on its own and MUST drop a term that also appears in that fragment's `old_string`, so a term carried through an Edit never fires. A Write has no old text, so its whole content is judged. The one nudge-tier term (the dated word for a legacy exemption) MUST produce a nudge (exit 0 with the message as additional context), never a block.
+`terminology` SHALL judge each edit fragment on its own and MUST drop a term that also appears in that fragment's `old_string`, so a term carried through an Edit never fires. For a Write overwriting an existing regular file on disk (up to 2 MiB), it MUST also drop terms already present on disk so whole-file rewrites do not re-flag untouched content.
 
 #### Scenario: Pre-existing term carried through an Edit
-- **WHEN** an Edit's `old_string` and `new_string` both contain the same hard-block term
+- **WHEN** an Edit's `old_string` and `new_string` both contain the same flagged term
+- **THEN** the hook exits 0
+
+#### Scenario: Pre-existing term carried through a Write overwrite
+- **WHEN** a Write overwrites an existing file that already contains the same flagged term
 - **THEN** the hook exits 0
 
 #### Scenario: Edit introduces a term
-- **WHEN** an Edit's `new_string` adds a hard-block term absent from its `old_string`
-- **THEN** the hook exits 2 and names only that term
-
-#### Scenario: Nudge-tier term
-- **WHEN** a Write introduces only the nudge-tier term
-- **THEN** the hook exits 0 with a message containing `Terminology nudge`
+- **WHEN** an Edit's `new_string` adds a flagged term absent from its `old_string`
+- **THEN** the hook exits 0 with a `Terminology nudge` naming only that term
 
 ### Requirement: Terminology built-in exemptions
 `terminology` SHALL allow every write to a file whose basename is `CLAUDE.md` in any case, to a path with consecutive `.claude` and `hooks` or `rules` components, and to a file inside the session's own cadence-hooks checkout (a worktree of it, or a gitignored nested checkout). A path that merely contains a `cadence-hooks` component outside the session's workspace, or a decorated name such as `evilclaude.md`, MUST NOT be exempt.
 
 #### Scenario: Instruction file exempt
-- **WHEN** a Write to `/repo/CLAUDE.md` carries a hard-block term
+- **WHEN** a Write to `/repo/CLAUDE.md` carries a flagged term
 - **THEN** the hook exits 0
 
 #### Scenario: Look-alike directory is not exempt
-- **WHEN** the session's cwd is an unrelated repo and a Write to `/tmp/cadence-hooks/doc.md` carries a hard-block term
-- **THEN** the hook exits 2
+- **WHEN** the session's cwd is an unrelated repo and a Write to `/tmp/cadence-hooks/doc.md` carries a flagged term
+- **THEN** the hook exits 0 with a `Terminology nudge`
 
 ### Requirement: Terminology per-repo softening
-`terminology` SHALL read `terminology.exemptions` from `<git root>/.claude/cadence.json`. Each entry has `paths` globs, optional `terms` (omitted means all), and optional `mode`: `allow` (default) drops the violation, `nudge` demotes a block to a nudge. The first matching entry MUST decide, and softening MUST only remove or demote, never add. A missing or invalid file MUST leave the block standing; a dropped malformed key MUST be named under `Config anomalies in .claude/cadence.json`.
+`terminology` SHALL read `terminology.exemptions` from `<git root>/.claude/cadence.json`. Each entry has `paths` globs, optional `terms`, and optional `mode` (`allow` drops the nudge; `nudge` keeps it). First match wins, and exemptions MUST never add findings. Missing or invalid JSON leaves the nudge standing; dropped malformed keys MUST be named under `Config anomalies in .claude/cadence.json`.
 
-#### Scenario: Nudge-mode exemption
-- **WHEN** an exemption with `"mode": "nudge"` covers `config/acl.yml` and a Write to it carries a hard-block term
-- **THEN** the hook exits 0 and returns a terminology nudge
+#### Scenario: Allow-mode exemption
+- **WHEN** an exemption with `"mode": "allow"` covers `config/acl.yml` and a Write to it carries a flagged term
+- **THEN** the hook exits 0 with no output
 
 #### Scenario: Bare pattern matches the basename
-- **WHEN** an exemption lists `vendor-list.yml` and a Write to `deep/dir/vendor-list.yml` carries a hard-block term
-- **THEN** the hook exits 0
+- **WHEN** an exemption lists `vendor-list.yml` and a Write to `deep/dir/vendor-list.yml` carries a flagged term
+- **THEN** the hook exits 0 with no output
 
 #### Scenario: Invalid config file
-- **WHEN** `.claude/cadence.json` is not valid JSON and a Write carries a hard-block term
-- **THEN** the hook exits 2
+- **WHEN** `.claude/cadence.json` is not valid JSON and a Write carries a flagged term
+- **THEN** the hook exits 0 with a `Terminology nudge`
 
 ### Requirement: Orphaned code markers
 `cadence orphaned-todos` SHALL block (exit 2) a write whose introduced text has one of `TODO`, `FIXME`, `HACK`, `XXX`, `REFACTOR`, `BUG` or `OPTIMIZE` followed by a colon but not written as `MARKER(#123):`. The message MUST list each line as `L<n>: <text>` and end with `Required format: MARKER(#ISSUE): description`. A lowercase marker, or one with no colon, MUST NOT fire. The whole `new_string` is judged, so a marker carried through an Edit still blocks.
@@ -231,11 +231,19 @@ For a `docs/plans/` file the hook SHALL block with `Living-plan frontmatter vali
 - **THEN** the hook exits 0 with a nudge saying plugin agents ignore it
 
 ### Requirement: Security pattern hints
-After a Write or Edit, `rules security-patterns` SHALL scan the resulting document against a fixed per-extension table of anti-patterns and nudge with `Security hints for <file>:` and one `L<n>: <message>` line per match. A pattern MUST apply only to its own extensions. It MUST never block, MUST skip `/.claude/hooks/`, `/.claude/settings`, `/.claude/rules/` and paths ending in `CLAUDE.md`, and MUST allow when no content can be read.
+After a Write or Edit, `rules security-patterns` SHALL scan the resulting document per extension and nudge with `Security hints for <file>:` and `L<n>: <message>` lines. Edit/MultiEdit MUST report only newly introduced hints, and TypeScript type-assertion hints MUST skip test files (`*.test.*`, `*.spec.*`, `tests/`, `__tests__/`). It MUST never block, skip `/.claude/{hooks,settings,rules}` and `CLAUDE.md`, and allow unreadable files.
 
 #### Scenario: Pickle in Python
 - **WHEN** a Write to `app.py` contains `data = pickle.loads(blob)`
 - **THEN** the hook exits 0 with a nudge reading `L1: RCE risk: use json or msgpack instead of pickle`
+
+#### Scenario: Unrelated Edit does not re-emit pre-existing hints
+- **WHEN** an Edit modifies an unrelated line in a Python file that already contains `os.system(...)`
+- **THEN** the hook exits 0 with no output
+
+#### Scenario: TypeScript type assertion in a test file
+- **WHEN** a Write to `register.test.ts` contains `getMock() as UserData`
+- **THEN** the hook exits 0 with no output
 
 #### Scenario: Pattern in the wrong language
 - **WHEN** a Write to `notes.txt` contains `pickle.loads`
