@@ -5,6 +5,7 @@
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// A security pattern to check for in a specific file extension.
@@ -12,6 +13,10 @@ struct SecurityPattern {
     extensions: &'static [&'static str],
     pattern: &'static str,
     message: &'static str,
+    /// When true, skip this pattern in test files (`*.test.*`, `*.spec.*`,
+    /// `tests/`, `__tests__/`), where it is routine scaffolding rather than a
+    /// security risk.
+    skip_in_tests: bool,
 }
 
 const PATTERNS: &[SecurityPattern] = &[
@@ -19,138 +24,165 @@ const PATTERNS: &[SecurityPattern] = &[
         extensions: &["py"],
         pattern: r"pickle[.]loads",
         message: "RCE risk: use json or msgpack instead of pickle",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"yaml[.]load[(]",
         message: "Use yaml.safe_load()",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"shell\s*=\s*True",
         message: "Command injection risk: pass arg list to subprocess",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"trust_remote_code\s*=\s*True",
         message: "Runs arbitrary code from model repos",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"__import__[(]",
         message: "Arbitrary module loading",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["js", "jsx", "mjs", "cjs"],
         pattern: r"new\s+Function[(]",
         message: "Function() constructor can run arbitrary code",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["js", "jsx", "mjs", "cjs"],
         pattern: r"[.]innerHTML\s*=",
         message: "XSS risk: use textContent or sanitize first",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["js", "jsx", "mjs", "cjs"],
         pattern: r"Math[.]random[(][)]",
         message: "Not cryptographically secure",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["ts", "tsx"],
         pattern: r"[)\]}]\s+as\s+[A-Z]",
         message: "Type assertion bypasses validation",
+        skip_in_tests: true,
     },
     SecurityPattern {
         extensions: &["go"],
         pattern: r#""text/template""#,
         message: "Use html/template for HTML output",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["go"],
         pattern: r#""math/rand""#,
         message: "Use crypto/rand for security-sensitive randomness",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["go"],
         pattern: r#""unsafe""#,
         message: "unsafe package -- document safety invariants",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["rs"],
         pattern: r"unsafe\s*[{]",
         message: "Ensure // SAFETY: comment and test with Miri",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["rs"],
         pattern: r"from_utf8_unchecked",
         message: "UB risk on external input",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["java"],
         pattern: r"ObjectInputStream",
         message: "Deserialization RCE -- use ObjectInputFilter",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["java"],
         pattern: r"java\.util\.Random(?:$|[^A-Za-z])",
         message: "Use SecureRandom for security-sensitive values",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["cs"],
         pattern: r"BinaryFormatter",
         message: "RCE vector, removed in .NET 9",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["cs"],
         pattern: r"TypeNameHandling",
         message: "Deserialization attack -- ensure TypeNameHandling.None",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["cs"],
         pattern: r"DtdProcessing[.]Parse",
         message: "XXE risk -- use DtdProcessing.Prohibit",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["swift"],
         pattern: r"UserDefaults.*(password|secret|token|apiKey)",
         message: "Store secrets in Keychain",
+        skip_in_tests: false,
     },
     // Python — RCE / command injection
     SecurityPattern {
         extensions: &["py"],
         pattern: r"\beval\s*[(]",
         message: "RCE risk: eval() executes arbitrary code",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"\bexec\s*[(]",
         message: "RCE risk: exec() runs arbitrary code",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"\bos[.]system\s*[(]",
         message: "Command injection risk: use subprocess with an arg list",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["py"],
         pattern: r"pickle[.]load[(]",
         message: "RCE risk: use json or msgpack instead of pickle",
+        skip_in_tests: false,
     },
     // JS/JSX — RCE / XSS
     SecurityPattern {
         extensions: &["js", "jsx", "mjs", "cjs"],
         pattern: r"\beval\s*[(]",
         message: "RCE risk: eval() executes arbitrary code",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["js", "jsx", "mjs", "cjs"],
         pattern: r"\bdocument[.]write\s*[(]",
         message: "XSS risk: avoid document.write()",
+        skip_in_tests: false,
     },
     SecurityPattern {
         extensions: &["jsx", "tsx"],
         pattern: r"dangerouslySetInnerHTML",
         message: "XSS risk: sanitize before dangerouslySetInnerHTML",
+        skip_in_tests: false,
     },
 ];
 
@@ -158,6 +190,7 @@ struct CompiledPattern {
     extensions: &'static [&'static str],
     regex: Regex,
     message: &'static str,
+    skip_in_tests: bool,
 }
 
 static COMPILED_PATTERNS: LazyLock<Vec<CompiledPattern>> = LazyLock::new(|| {
@@ -168,16 +201,38 @@ static COMPILED_PATTERNS: LazyLock<Vec<CompiledPattern>> = LazyLock::new(|| {
                 extensions: sp.extensions,
                 regex,
                 message: sp.message,
+                skip_in_tests: sp.skip_in_tests,
             })
         })
         .collect()
 });
+
+/// True when `path` is a test file (`*.test.*`, `*.spec.*`, or under
+/// `tests/` / `__tests__/`).
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(&lower);
+    if filename.contains(".test.") || filename.contains(".spec.") {
+        return true;
+    }
+    lower
+        .split('/')
+        .any(|seg| seg == "__tests__" || seg == "tests")
+}
 
 /// Scan content for security anti-patterns matching the given file extension.
 ///
 /// Returns `(line_number, message)` tuples for each violation found.
 /// Pure function — no I/O.
 pub fn scan_content(content: &str, ext: &str) -> Vec<(usize, &'static str)> {
+    scan_content_filtered(content, ext, false)
+}
+
+fn scan_content_filtered(
+    content: &str,
+    ext: &str,
+    in_test_file: bool,
+) -> Vec<(usize, &'static str)> {
     // Skip regex table initialization altogether for extensions with no rules
     // (e.g. `.md`, `.json`, `.toml`, `.sh`).
     if !PATTERNS.iter().any(|sp| sp.extensions.contains(&ext)) {
@@ -187,7 +242,7 @@ pub fn scan_content(content: &str, ext: &str) -> Vec<(usize, &'static str)> {
     let mut warnings = Vec::new();
 
     for sp in COMPILED_PATTERNS.iter() {
-        if !sp.extensions.contains(&ext) {
+        if !sp.extensions.contains(&ext) || (in_test_file && sp.skip_in_tests) {
             continue;
         }
 
@@ -200,6 +255,59 @@ pub fn scan_content(content: &str, ext: &str) -> Vec<(usize, &'static str)> {
     }
 
     warnings
+}
+
+/// Compute which pattern messages were newly introduced by an `Edit` or
+/// `MultiEdit` (count increased in `new_text` relative to `old_text`).
+fn introduced_messages(
+    fragments: &[(String, String)],
+    ext: &str,
+    in_test_file: bool,
+) -> HashSet<&'static str> {
+    let mut introduced = HashSet::new();
+    for (new_text, old_text) in fragments {
+        let new_hits = scan_content_filtered(new_text, ext, in_test_file);
+        if new_hits.is_empty() {
+            continue;
+        }
+        let mut new_counts: HashMap<&'static str, usize> = HashMap::new();
+        for (_, msg) in new_hits {
+            *new_counts.entry(msg).or_insert(0) += 1;
+        }
+        let mut old_counts: HashMap<&'static str, usize> = HashMap::new();
+        if !old_text.is_empty() {
+            for (_, msg) in scan_content_filtered(old_text, ext, in_test_file) {
+                *old_counts.entry(msg).or_insert(0) += 1;
+            }
+        }
+        for (msg, count) in new_counts {
+            if count > old_counts.get(msg).copied().unwrap_or(0) {
+                introduced.insert(msg);
+            }
+        }
+    }
+    introduced
+}
+
+/// Line ranges in `content` covered by each non-empty `new_text` fragment, used
+/// to narrow post-edit hints to the edited region when the file also has
+/// pre-existing matches of the same pattern elsewhere.
+fn edited_line_ranges(content: &str, fragments: &[(String, String)]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for (new_text, _) in fragments {
+        if new_text.is_empty() {
+            continue;
+        }
+        let mut search_start = 0;
+        while let Some(rel) = content[search_start..].find(new_text.as_str()) {
+            let abs = search_start + rel;
+            let start_line = content[..abs].matches('\n').count() + 1;
+            let end_line = start_line + new_text.matches('\n').count();
+            ranges.push((start_line, end_line));
+            search_start = abs + new_text.len();
+        }
+    }
+    ranges
 }
 
 /// Scans written code for known insecure patterns across multiple languages.
@@ -225,6 +333,31 @@ impl Check for SecurityPatternScanner {
         }
 
         let ext = path.rsplit('.').next().unwrap_or("");
+        if !PATTERNS.iter().any(|sp| sp.extensions.contains(&ext)) {
+            return CheckResult::allow();
+        }
+        let in_test_file = is_test_path(&path);
+
+        // For Edit/MultiEdit, only nudge when the edit actually introduces a
+        // pattern rather than re-emitting pre-existing hints on every unrelated
+        // edit to the file.
+        let is_edit = input
+            .tool_input
+            .as_ref()
+            .is_some_and(|ti| ti.content.is_none());
+        let edit_fragments = if is_edit {
+            input.edit_fragments()
+        } else {
+            None
+        };
+        let introduced = edit_fragments
+            .as_deref()
+            .map(|frags| introduced_messages(frags, ext, in_test_file));
+        if let Some(ref intro) = introduced
+            && intro.is_empty()
+        {
+            return CheckResult::allow();
+        }
 
         // Scan the *resulting* document, not the raw edit fragment (#131).
         // effective_content() simulates Edit/MultiEdit against the on-disk file
@@ -240,7 +373,23 @@ impl Check for SecurityPatternScanner {
             },
         };
 
-        let warnings = scan_content(&content, ext);
+        let mut warnings = scan_content_filtered(&content, ext, in_test_file);
+        if let Some(ref intro) = introduced {
+            warnings.retain(|(_, msg)| intro.contains(msg));
+            if let Some(ref frags) = edit_fragments {
+                let ranges = edited_line_ranges(&content, frags);
+                if !ranges.is_empty() {
+                    let in_ranges: Vec<_> = warnings
+                        .iter()
+                        .copied()
+                        .filter(|(line, _)| ranges.iter().any(|(s, e)| line >= s && line <= e))
+                        .collect();
+                    if !in_ranges.is_empty() {
+                        warnings = in_ranges;
+                    }
+                }
+            }
+        }
         if warnings.is_empty() {
             return CheckResult::allow();
         }
@@ -780,5 +929,68 @@ mod tests {
         let result = SecurityPatternScanner.run(&input);
         assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.unwrap().contains("injection"));
+    }
+
+    #[test]
+    fn run_edit_unrelated_to_preexisting_pattern_allows() {
+        // An Edit that touches line 3 must NOT re-emit a pre-existing hint on
+        // line 1.
+        let (_dir, path) = on_disk_source("py", "os.system('preexisting')\n\nprint('old')\n");
+        let input = make_edit(&path, "print('old')", "print('new')");
+        let result = SecurityPatternScanner.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "unrelated edit should not re-nudge: {:?}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn run_edit_carrying_through_preexisting_pattern_allows() {
+        let (_dir, path) = on_disk_source("py", "os.system('preexisting')\nprint('old')\n");
+        let input = make_edit(
+            &path,
+            "os.system('preexisting')\nprint('old')",
+            "os.system('preexisting')\nprint('new')",
+        );
+        let result = SecurityPatternScanner.run(&input);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn run_ts_type_assertion_skipped_in_test_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("register.test.ts");
+        let content = "const x = getMock() as UserData;\n";
+        std::fs::write(&path, content).unwrap();
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(path.to_string_lossy().into_owned()),
+                content: Some(content.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(SecurityPatternScanner.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn run_real_security_pattern_still_fires_in_test_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.test.tsx");
+        let content = "<div dangerouslySetInnerHTML={{ __html: raw }} />\n";
+        std::fs::write(&path, content).unwrap();
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(path.to_string_lossy().into_owned()),
+                content: Some(content.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(SecurityPatternScanner.run(&input).outcome, Outcome::Nudge);
     }
 }

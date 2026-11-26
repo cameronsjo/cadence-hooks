@@ -1,7 +1,9 @@
-//! Block inclusive terminology violations in written content.
+//! Nudge on inclusive terminology violations in written content.
 //!
-//! Detects prohibited terms and suggests neutral alternatives.
+//! Detects dated terms and suggests neutral alternatives.
 //! Case-insensitive with word-boundary matching to avoid false positives.
+//! Advisory only (cadence-hooks#1638, ADR-0046): a style rule is not a costly
+//! harm that justifies a hard block.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use glob::{MatchOptions, Pattern};
@@ -46,7 +48,7 @@ const BLOCK_VIOLATIONS: &[(&str, &str, &str)] = &[
     ),
     (
         term!("sla", "ve"),
-        r"(?i)\bslave(s|d|ry)?\b",
+        r"(?i)\bslave(s|d)?\b",
         "replica, follower, secondary",
     ),
     (
@@ -378,7 +380,24 @@ fn apply_exemptions(
     loaded.warnings
 }
 
-/// Blocks content containing prohibited terminology and suggests alternatives.
+/// Maximum size of an existing file on disk read to subtract pre-existing
+/// terminology matches on a `Write` overwrite.
+const MAX_DIFF_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read an existing regular file on disk up to [`MAX_DIFF_FILE_BYTES`] so a
+/// whole-file `Write` overwrite does not re-flag terms that were already
+/// present on disk (cadence-hooks#1692). Missing, unreadable, non-regular
+/// (FIFO/device), oversized, or non-UTF-8 files return `None` (fail-open).
+fn read_existing_for_diff(path: &str) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_DIFF_FILE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Nudges when written content introduces non-inclusive terminology and
+/// suggests neutral alternatives.
 pub struct TerminologyGuard;
 
 impl Check for TerminologyGuard {
@@ -400,12 +419,18 @@ impl Check for TerminologyGuard {
             return CheckResult::allow();
         }
 
+        let is_write = input
+            .tool_input
+            .as_ref()
+            .is_some_and(|ti| ti.content.is_some());
+
         // Per-edit introduced-vs-existing diff, accumulated and deduped. Only
         // violations *introduced* by this call fire; a term carried through
-        // (present in an edit's old_string) is pre-existing context, not new
-        // content (#63). Folding per-edit — not over a concatenated document —
-        // keeps each edit's subtraction scoped and stops a phrase pattern
-        // matching across an edit boundary.
+        // (present in an edit's old_string, or already on disk before a Write
+        // overwrite) is pre-existing context, not new content (#63, #1692).
+        // Folding per-edit — not over a concatenated document — keeps each
+        // edit's subtraction scoped and stops a phrase pattern matching across
+        // an edit boundary.
         let mut blocks: Vec<(String, String)> = Vec::new();
         let mut nudges: Vec<(String, String)> = Vec::new();
         for (new_text, old_text) in &fragments {
@@ -415,6 +440,13 @@ impl Check for TerminologyGuard {
             }
             if !old_text.is_empty() {
                 let existing = check_terminology(old_text);
+                found.blocks = subtract_existing(found.blocks, &existing.blocks);
+                found.nudges = subtract_existing(found.nudges, &existing.nudges);
+            } else if is_write
+                && let Some(ref path) = input.file_path()
+                && let Some(on_disk) = read_existing_for_diff(path)
+            {
+                let existing = check_terminology(&on_disk);
                 found.blocks = subtract_existing(found.blocks, &existing.blocks);
                 found.nudges = subtract_existing(found.nudges, &existing.nudges);
             }
@@ -441,9 +473,7 @@ impl Check for TerminologyGuard {
             config_warnings = apply_exemptions(path, &mut blocks, &mut nudges);
         }
         // Render config anomalies (a dropped malformed key, an unknown key)
-        // as one appended block — #536 family: a dropped exemption key means
-        // MORE blocking here, so the user needs the drop named to understand
-        // why an exemption they wrote is not softening.
+        // as one appended block — #536 family.
         let warning_block = if config_warnings.is_empty() {
             String::new()
         } else {
@@ -453,37 +483,21 @@ impl Check for TerminologyGuard {
             )
         };
 
-        // Tier 1: hard block
-        if !blocks.is_empty() {
-            let mut msg = String::new();
-            msg.push_str("🚫 BLOCKED: Inclusive terminology violation detected");
-            if let Some(ref path) = input.file_path() {
-                msg.push_str(&format!(" in {path}"));
+        // Advisory nudge for all terminology findings (#1638, ADR-0046).
+        let mut findings = blocks;
+        for n in nudges {
+            if !findings.contains(&n) {
+                findings.push(n);
             }
-            msg.push_str("\n\nFound prohibited terms:\n");
-
-            for (term, _) in &blocks {
-                msg.push_str(&format!("  - \"{term}\"\n"));
-            }
-
-            msg.push_str("\nRequired alternatives:\n");
-            for (term, replacement) in &blocks {
-                msg.push_str(&format!("  {term} → {replacement}\n"));
-            }
-            msg.push_str(&warning_block);
-
-            return CheckResult::block(msg);
         }
-
-        // Tier 2: nudge (advisory)
-        if !nudges.is_empty() {
+        if !findings.is_empty() {
             let mut msg = String::new();
             msg.push_str("⚠️  Terminology nudge");
             if let Some(ref path) = input.file_path() {
                 msg.push_str(&format!(" in {path}"));
             }
-            msg.push_str(" — consider alternatives if technical context:\n");
-            for (term, replacement) in &nudges {
+            msg.push_str(" — consider inclusive alternatives if technical context:\n");
+            for (term, replacement) in &findings {
                 msg.push_str(&format!("  {term} → {replacement}\n"));
             }
             msg.push_str(&warning_block);
@@ -539,11 +553,19 @@ mod tests {
 
     #[test]
     fn detects_slave_derived_forms() {
-        for form in ["slaves", "slaved", "slavery"] {
+        for form in ["slaves", "slaved"] {
             let r = check_terminology(form);
             assert_eq!(r.blocks.len(), 1, "should detect '{form}'");
             assert_eq!(r.blocks[0].1, "replica, follower, secondary");
         }
+    }
+
+    #[test]
+    fn slavery_is_not_flagged() {
+        // #1692: "slavery" is historical/literary prose, not the technical
+        // replica/follower metaphor.
+        let r = check_terminology("the history of slavery in Haiti");
+        assert!(r.blocks.is_empty() && r.nudges.is_empty());
     }
 
     #[test]
@@ -724,7 +746,7 @@ mod tests {
         );
         assert_eq!(
             TerminologyGuard.run(&input).outcome,
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -744,7 +766,7 @@ mod tests {
         };
         assert_eq!(
             TerminologyGuard.run(&input).outcome,
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -761,7 +783,7 @@ mod tests {
         );
         assert_eq!(
             TerminologyGuard.run(&input).outcome,
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -870,7 +892,7 @@ mod tests {
             let (_s, meta, _inner) = meta_with_nested("meta-deny", nested, ignored);
             assert_eq!(
                 outcome_for(&meta.join(rel), &meta),
-                cadence_hooks_core::Outcome::Block,
+                cadence_hooks_core::Outcome::Nudge,
                 "{label}"
             );
         }
@@ -884,7 +906,7 @@ mod tests {
         let (_s2, _meta2, elsewhere) = meta_with_nested("foreign-b", "cadence-hooks", true);
         assert_eq!(
             outcome_for(&elsewhere.join("src/foo.rs"), &meta),
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -895,7 +917,7 @@ mod tests {
         let (_s, meta, inner) = meta_with_nested("enclosing", "cadence-hooks", true);
         assert_eq!(
             outcome_for(&meta.join("notes.md"), &inner),
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -917,7 +939,7 @@ mod tests {
         };
         assert_eq!(
             TerminologyGuard.run(&input).outcome,
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -934,7 +956,7 @@ mod tests {
         };
         assert_eq!(
             TerminologyGuard.run(&input).outcome,
-            cadence_hooks_core::Outcome::Block
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 
@@ -955,7 +977,7 @@ mod tests {
             ..Default::default()
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // --- Unhappy path: bypass scenarios ---
@@ -1053,7 +1075,7 @@ mod tests {
             ..Default::default()
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
         assert!(result.message.unwrap().contains("config.rs"));
     }
 
@@ -1122,7 +1144,7 @@ mod tests {
             ..Default::default()
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -1143,7 +1165,7 @@ mod tests {
             ..Default::default()
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
         let msg = result.message.unwrap();
         assert!(msg.contains(BLOCK_VIOLATIONS[0].0));
         assert!(msg.contains(BLOCK_VIOLATIONS[1].0));
@@ -1167,7 +1189,7 @@ mod tests {
             ..Default::default()
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // --- Edit tool: only introduced violations fire (#63) ---
@@ -1198,7 +1220,7 @@ mod tests {
             &format!("value = 2 // uses the {term}"),
         );
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -1225,15 +1247,15 @@ mod tests {
             &format!("{term_a} config and {term_b}"),
         );
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
         let msg = result.message.unwrap();
         assert!(msg.contains(term_b));
-        assert!(!msg.contains(&format!("\"{term_a}\"")));
+        assert!(!msg.contains(term_a));
     }
 
     #[test]
-    fn write_with_term_still_blocks() {
-        // Write behavior is unchanged: no old_string, so every violation fires.
+    fn write_with_term_nudges() {
+        // New file Write with no on-disk file nudges on the flagged term.
         let input = HookInput {
             tool_name: Some("Write".into()),
             tool_input: Some(cadence_hooks_core::ToolInput {
@@ -1245,7 +1267,55 @@ mod tests {
             ..Default::default()
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn write_overwriting_file_with_preexisting_term_allowed() {
+        // #1692: rewriting an existing file that already contains a flagged
+        // term does not re-flag the carried-through term.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        let term = BLOCK_VIOLATIONS[0].0;
+        std::fs::write(&file, format!("line 1: {term}\nline 2: old\n")).unwrap();
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(file.to_string_lossy().into_owned()),
+                content: Some(format!("line 1: {term}\nline 2: updated\n")),
+                ..Default::default()
+            }),
+            cwd: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn write_overwriting_file_introducing_new_term_nudges_only_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        let term_a = BLOCK_VIOLATIONS[0].0;
+        let term_b = BLOCK_VIOLATIONS[1].0;
+        std::fs::write(&file, format!("existing {term_a}\n")).unwrap();
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(file.to_string_lossy().into_owned()),
+                content: Some(format!("existing {term_a}\nadded {term_b}\n")),
+                ..Default::default()
+            }),
+            cwd: None,
+            ..Default::default()
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+        let msg = result.message.unwrap();
+        assert!(msg.contains(term_b));
+        assert!(!msg.contains(term_a));
     }
 
     // --- MultiEdit: edits[] folded per-edit, same #63 semantics (#83) ---
@@ -1263,7 +1333,7 @@ mod tests {
             ],
         );
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
         assert!(result.message.unwrap().contains(term));
     }
 
@@ -1420,7 +1490,7 @@ mod tests {
         // Config absent → a violation in a normal file still blocks.
         let repo = temp_repo_no_config();
         let input = write_at(repo.path(), "src/main.rs", BLOCK_VIOLATIONS[0].0);
-        assert_eq!(outcome(&input), Outcome::Block);
+        assert_eq!(outcome(&input), Outcome::Nudge);
     }
 
     #[test]
@@ -1455,15 +1525,15 @@ mod tests {
         let repo = temp_repo(&json);
         let input = write_at(repo.path(), "acl.yml", &format!("{term_a} then {term_b}"));
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, Outcome::Block);
+        assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap();
         assert!(
             msg.contains(term_b),
             "unexempted term must still block: {msg}"
         );
         assert!(
-            !msg.contains(&format!("\"{term_a}\"")),
-            "exempted term must be dropped from the block list: {msg}"
+            !msg.contains(term_a),
+            "exempted term must be dropped from the findings list: {msg}"
         );
     }
 
@@ -1497,7 +1567,7 @@ mod tests {
         assert_eq!(outcome(&inside), Outcome::Allow);
         // Outside config/ → the same term still blocks.
         let outside = write_at(repo.path(), "other/acl.yml", term);
-        assert_eq!(outcome(&outside), Outcome::Block);
+        assert_eq!(outcome(&outside), Outcome::Nudge);
     }
 
     #[test]
@@ -1528,7 +1598,7 @@ mod tests {
     fn invalid_json_fails_open_and_still_blocks() {
         let repo = temp_repo("{not valid json");
         let input = write_at(repo.path(), "acl.yml", BLOCK_VIOLATIONS[0].0);
-        assert_eq!(outcome(&input), Outcome::Block);
+        assert_eq!(outcome(&input), Outcome::Nudge);
     }
 
     #[cfg(unix)]
@@ -1543,7 +1613,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
         std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/cadence.json")).unwrap();
         let input = write_at(dir.path(), "src/main.rs", BLOCK_VIOLATIONS[0].0);
-        assert_eq!(outcome(&input), Outcome::Block);
+        assert_eq!(outcome(&input), Outcome::Nudge);
     }
 
     #[test]
@@ -1569,7 +1639,7 @@ mod tests {
         // A file with no ancestor .git → no config possible → block stands.
         let dir = tempfile::tempdir().unwrap();
         let input = write_at(dir.path(), "acl.yml", BLOCK_VIOLATIONS[0].0);
-        assert_eq!(outcome(&input), Outcome::Block);
+        assert_eq!(outcome(&input), Outcome::Nudge);
     }
 
     #[test]

@@ -80,7 +80,7 @@ Rules for wiring:
 
 | Hook | Event | What it does | Remote |
 |------|-------|--------------|--------|
-| `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations | run |
+| `terminology` | PreToolUse (Write, Edit) | Nudge on inclusive terminology violations | run |
 | `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK | run |
 | `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) | run |
 | `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files | run |
