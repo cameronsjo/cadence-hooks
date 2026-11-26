@@ -639,6 +639,9 @@ fn test_group_stall() {
 /// a duplicate). They ride the merged output so they stay visible.
 pub fn run_logged_group(members: Vec<GroupMember>, notices: Vec<String>) -> ! {
     let started = Instant::now();
+    // Share `find_git_root`, `GitState::resolve`, and `.claude/cadence.json`
+    // lookups across all members of this single-shot group process.
+    cadence_hooks_core::repo_cache::enable();
     guard_interactive_terminal("group", members.first().map(|m| m.plan.event), None);
     let names: Vec<&'static str> = members.iter().map(|m| m.hook).collect();
     let (input, expanded_inputs) = parse_or_exit(&names);

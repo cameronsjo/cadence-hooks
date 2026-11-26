@@ -27,6 +27,7 @@ pub mod pathclass;
 pub mod paths;
 pub mod push;
 pub mod remote;
+pub mod repo_cache;
 pub mod shell;
 pub mod stdout;
 pub mod target_repo;

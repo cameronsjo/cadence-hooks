@@ -445,6 +445,16 @@ pub struct SectionLoad<T> {
 /// `#[serde(default)]`, which every current section uses). A section type
 /// with `deny_unknown_fields`, `flatten`, or jointly-validated required
 /// fields would misbehave under the probe — don't hand one to this loader.
+/// Read and parse `<root>/.claude/cadence.json` (JSONC), using the per-process
+/// `repo_cache` when active.
+pub(crate) fn load_cadence_json(root: &Path) -> Option<std::sync::Arc<serde_json::Value>> {
+    crate::repo_cache::cadence_json(root, || {
+        let path = root.join(CADENCE_CONFIG_REL);
+        let content = read_untrusted_config(&path)?;
+        parse_jsonc(&content)
+    })
+}
+
 pub fn load_cadence_section_lenient<T: Default + DeserializeOwned>(
     root: &Path,
     section: &str,
@@ -453,11 +463,7 @@ pub fn load_cadence_section_lenient<T: Default + DeserializeOwned>(
         config,
         warnings: Vec::new(),
     };
-    let path = root.join(CADENCE_CONFIG_REL);
-    let Some(content) = read_untrusted_config(&path) else {
-        return clean(T::default());
-    };
-    let Some(value) = parse_jsonc(&content) else {
+    let Some(value) = load_cadence_json(root) else {
         return clean(T::default());
     };
     let Some(section_value) = value.get(section) else {
