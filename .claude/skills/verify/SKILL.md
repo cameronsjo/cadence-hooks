@@ -13,7 +13,7 @@ Tests prove the code does what the tests say. This proves the shipped binary doe
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-V="$(mktemp -d)"; mkdir "$V/payloads" "$V/metrics"
+V="$(mktemp -d)"; mkdir "$V/payloads" "$V/metrics" "$V/markers" "$V/home" "$V/tmp"
 CARGO_TARGET_DIR="$PWD/target" cargo build --bin cadence-hooks \
   && git fetch -q origin main \
   && git worktree add -q --detach "$V/base" origin/main \
@@ -39,21 +39,31 @@ One JSON file per case in `$V/payloads/<hook>/`, named for the case, so each hoo
 - **The shape owner.** Check the hook owns each payload's shape (reads vs writes, Bash vs Write). A payload sent to the wrong guard reads as a false ALLOW.
 
 ```json
-{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"},"session_id":"verify","cwd":"/tmp"}
+{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"},"session_id":"verify","cwd":"$V/repo"}
 ```
+
+Write the real path into the file (expand `$V` when you generate it); a literal `$V` is not a directory.
 
 ## 4. Run them at head and at the base
 
-Run it once per changed hook, with `<ns> <hook>` and the payload dir set to that hook. Run under a scratch metrics dir, with the three exemption variables cleared. Otherwise every deny lands in the real `denials.jsonl`, and a disabled guard passes for the wrong reason.
+Run it once per changed hook, with `<ns> <hook>` and the payload dir set to that hook. Each try runs under `env -i`: an empty environment plus a short allowlist (`PATH`, a scratch `HOME` and `TMPDIR`, and scratch metrics and marker dirs). The binary reads dozens of variables, and any one left over from your shell can change a verdict or write to real state:
+
+- **Exemptions and escapes** turn a block into ALLOW: `CADENCE_DISABLE`, `CADENCE_BYPASS`, `CADENCE_ALLOW_MAIN`, `CADENCE_NO_ENFORCE_WORKTREE`, `CADENCE_ALLOW_SUBAGENT_FROM_MAIN`, `CADENCE_ALLOW_BRANCH_INTENT`, `CADENCE_ALLOW_SECRET_PUSH`, `CADENCE_ALLOW_SECRET_OUTPUT`, `CADENCE_ALLOW_SENSITIVE_TERMS`, `CADENCE_ALLOW_CRITICAL_GRADE`, `CADENCE_ALLOW_SOPS_DECRYPT`, `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK`, `CADENCE_SKIP_OVERSHARE_AUDIT`, `CADENCE_NO_DAILY_GATE`, `CADENCE_NO_PERSIST_PLAN`, `CADENCE_NO_OUTRO_BACKSTOP`.
+- **Policy inputs** change what counts as owned, sensitive or held: `CADENCE_ALLOWED_OWNERS`, `CADENCE_ALLOWED_REPOS` (and the legacy `GIT_GUARDRAILS_ALLOWED_*`), `GH_REPO`, `GH_HOST`, `GITLAB_HOST`, `GITEA_INSTANCE_URL`, `CADENCE_REDACTION_TERMS`, `CADENCE_AUDIENCE`, `CADENCE_ISSUE_TRACKER(S)`, `CADENCE_DRAIN_HELD`, `CADENCE_GUARD_DOTFILES`, `CADENCE_READ_MODEL_GUARD_*`, `CADENCE_RUNBOOKS_DIR`, `OBSIDIAN_VAULT`, `CLAUDE_CODE_REMOTE`, `CLAUDECODE`, `AI_AGENT`, `CLAUDE_EFFORT`, `GIT_DIR`, `GIT_WORK_TREE`, `CDPATH`.
+- **State locations** decide where markers, ledgers and config are read and written: `CADENCE_METRICS_DIR`, `CADENCE_MARKER_DIR` (a nudge that already fired in a live session reads as ALLOW, and a probe uses up a live session's nudge), `CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECT_DIR`, `CADENCE_PLANS_DIR`, `HOME`, `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, `TMPDIR`, `CLAUDE_CODE_SESSION_ID`.
+
+The list comes from `rg 'env::var' crates/*/src src` and the `const ..._VAR` names beside them; re-run it when a hook adds a variable. A claim case that needs one (most often `CADENCE_ALLOWED_OWNERS=<owner>` for an ownership guard, since the scratch `HOME` has no saved config) adds it to `CASE_ENV` for that hook, and the PR table says so. The scratch `HOME` also means `gh` has no login, so a hook that asks GitHub sees an unauthenticated `gh`.
 
 ```bash
+CASE_ENV=""   # e.g. CASE_ENV="CADENCE_ALLOWED_OWNERS=<owner>"; space-separated, no spaces in values
 for p in "$V"/payloads/<hook>/*.json; do
   for side in base head; do
     b="$BASE_BIN"; [ "$side" = head ] && b="$HEAD_BIN"
     printf '%s %s: ' "$(basename "$p")" "$side"
     [ -n "$b" ] || { echo n/a; continue; }
-    out="$(env -u CADENCE_DISABLE -u CADENCE_ALLOW_MAIN -u CADENCE_BYPASS \
-      CADENCE_METRICS_DIR="$V/metrics" "$b" try <ns> <hook> --payload "$p" 2>&1)"
+    out="$(env -i PATH="$PATH" HOME="$V/home" TMPDIR="$V/tmp" \
+      CADENCE_METRICS_DIR="$V/metrics" CADENCE_MARKER_DIR="$V/markers" \
+      $CASE_ENV "$b" try <ns> <hook> --payload "$p" 2>&1)"
     printf '%s\n' "$out" | sed -n 's/^Outcome: *//p' | grep . \
       || { echo "ERROR (no outcome line):"; printf '%s\n' "$out" | tail -3; }
   done
