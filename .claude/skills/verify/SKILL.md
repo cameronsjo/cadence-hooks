@@ -50,10 +50,10 @@ Run it once per changed hook, with `<ns> <hook>` and the payload dir set to that
 - **Policy inputs** change what counts as owned, sensitive or held: `CADENCE_ALLOWED_OWNERS`, `CADENCE_ALLOWED_REPOS` (and the legacy `GIT_GUARDRAILS_ALLOWED_*`), `GH_REPO`, `GH_HOST`, `GITLAB_HOST`, `GITEA_INSTANCE_URL`, `CADENCE_REDACTION_TERMS`, `CADENCE_AUDIENCE`, `CADENCE_ISSUE_TRACKER(S)`, `CADENCE_DRAIN_HELD`, `CADENCE_GUARD_DOTFILES`, `CADENCE_READ_MODEL_GUARD_*`, `CADENCE_RUNBOOKS_DIR`, `OBSIDIAN_VAULT`, `CLAUDE_CODE_REMOTE`, `CLAUDECODE`, `AI_AGENT`, `CLAUDE_EFFORT`, `GIT_DIR`, `GIT_WORK_TREE`, `CDPATH`.
 - **State locations** decide where markers, ledgers and config are read and written: `CADENCE_METRICS_DIR`, `CADENCE_MARKER_DIR` (a nudge that already fired in a live session reads as ALLOW, and a probe uses up a live session's nudge), `CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECT_DIR`, `CADENCE_PLANS_DIR`, `HOME`, `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, `TMPDIR`, `CLAUDE_CODE_SESSION_ID`.
 
-The list comes from `rg 'env::var' crates/*/src src` and the `const ..._VAR` names beside them; re-run it when a hook adds a variable. A claim case that needs one (most often `CADENCE_ALLOWED_OWNERS=<owner>` for an ownership guard, since the scratch `HOME` has no saved config) adds it to `CASE_ENV` for that hook, and the PR table says so. The scratch `HOME` also means `gh` has no login, so a hook that asks GitHub sees an unauthenticated `gh`.
+The list comes from `rg 'env::var' crates/*/src src` and the `const ..._VAR` names beside them; re-run it when a hook adds a variable. A claim case that needs one (most often `CADENCE_ALLOWED_OWNERS=<owner>` for an ownership guard, since the scratch `HOME` has no saved config) adds it to the `CASE_ENV` array for that hook, and the PR table says so. Keep it an array: a plain string expanded bare does not word-split in zsh (the Bash tool's shell), so two variables would reach `env` as one. `"${CASE_ENV[@]}"` expands to one argument per element in both bash and zsh. Run steps 1 to 5 in one shell session, or re-set `V`, `HEAD_BIN` and `BASE_BIN` first. The scratch `HOME` also means `gh` has no login, so a hook that asks GitHub sees an unauthenticated `gh`.
 
 ```bash
-CASE_ENV=""   # e.g. CASE_ENV="CADENCE_ALLOWED_OWNERS=<owner>"; space-separated, no spaces in values
+CASE_ENV=()   # an array, one VAR=value per element: CASE_ENV=(CADENCE_ALLOWED_OWNERS=<owner> GH_HOST=github.com)
 for p in "$V"/payloads/<hook>/*.json; do
   for side in base head; do
     b="$BASE_BIN"; [ "$side" = head ] && b="$HEAD_BIN"
@@ -61,7 +61,7 @@ for p in "$V"/payloads/<hook>/*.json; do
     [ -n "$b" ] || { echo n/a; continue; }
     out="$(env -i PATH="$PATH" HOME="$V/home" TMPDIR="$V/tmp" \
       CADENCE_METRICS_DIR="$V/metrics" CADENCE_MARKER_DIR="$V/markers" \
-      $CASE_ENV "$b" try <ns> <hook> --payload "$p" 2>&1)"
+      "${CASE_ENV[@]}" "$b" try <ns> <hook> --payload "$p" 2>&1)"
     printf '%s\n' "$out" | sed -n 's/^Outcome: *//p' | grep . \
       || { echo "ERROR (no outcome line):"; printf '%s\n' "$out" | tail -3; }
   done
@@ -72,8 +72,8 @@ done
 
 ## 5. Read the result
 
-- **PASS:** every claim case gives its stated verdict at head, every everyday control is ALLOW at head, and the known red is not ALLOW at base (at head for a new hook, whose base rows are `n/a`).
-- **FAIL:** any claim case gives another verdict, any control is not ALLOW at head (NUDGE, BLOCK or LOOP-BLOCK), the known red is ALLOW (at base, or at head for a new hook), or any row says ERROR (other than a new hook's base rows). Fix it before committing.
+- **PASS:** every claim case gives its stated verdict at head, every everyday control is ALLOW at head, and the known red is not ALLOW at base and not ALLOW at head (for a new hook, whose base rows are `n/a`, at head only). A known red that turns ALLOW at head means the change weakened an existing block; it fails unless that case is also a stated claim.
+- **FAIL:** any claim case gives another verdict, any control is not ALLOW at head (NUDGE, BLOCK or LOOP-BLOCK), the known red is ALLOW at base or at head (unless the head ALLOW is a stated claim), or any row says ERROR (other than a new hook's base rows). Fix it before committing.
 
 This is a smoke check, not the everyday-corpus score ADR-0046 rule 4 asks of a guard review (a few hundred routine commands). For that, follow the per-change compare scripts in `scripts/` (`confirm-tier-compare.py`, `consumer-differential.sh`).
 
