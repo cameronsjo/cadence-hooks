@@ -79,6 +79,10 @@ impl GitState {
     /// guard scoping "same repo" that way would silently loosen. `git_dir` stays
     /// raw — it is only used here to read `HEAD`, never compared.
     pub fn resolve(start: &Path) -> Option<GitState> {
+        crate::repo_cache::git_state(start, || Self::resolve_uncached(start))
+    }
+
+    fn resolve_uncached(start: &Path) -> Option<GitState> {
         // Canonicalize `start` (resolving symlinks) BEFORE the lexical
         // `find_git_root` walk, so the walk climbs the **physical** ancestor
         // chain `git rev-parse` itself would follow. Two facts this closes:

@@ -135,8 +135,9 @@ pub fn load_nudges(root: &Path) -> SectionLoad<NudgesConfig> {
 /// The top-level `feedbackFooter` boolean, `None` when the file, key, or value
 /// shape is absent or wrong (the default: footer on).
 pub fn feedback_footer_setting(root: &Path) -> Option<bool> {
-    let content = read_untrusted_config(&root.join(CADENCE_CONFIG_REL))?;
-    parse_jsonc(&content)?.get("feedbackFooter")?.as_bool()
+    crate::config::load_cadence_json(root)?
+        .get("feedbackFooter")?
+        .as_bool()
 }
 
 /// True when `feedbackFooter` is present but not a boolean — the value is

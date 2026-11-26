@@ -89,15 +89,17 @@ pub(crate) fn non_empty_var(key: &str) -> Option<String> {
 /// `Path::exists` catches both. Returns `None` if no ancestor has one. Used by
 /// guards that read a per-repo `<git-root>/.claude/*.json` override file.
 pub fn find_git_root(start: &str) -> Option<PathBuf> {
-    let mut dir = PathBuf::from(start);
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir);
+    crate::repo_cache::find_git_root(start, || {
+        let mut dir = PathBuf::from(start);
+        loop {
+            if dir.join(".git").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                return None;
+            }
         }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    })
 }
 
 /// Path fragments that mark a cloud-sync provider's local mirror.
