@@ -34,16 +34,170 @@ pub fn filter_untracked(porcelain: &str) -> Vec<&str> {
         .collect()
 }
 
+/// What a `git add` segment in the same command is already about to stage.
+#[derive(Debug, PartialEq, Eq)]
+enum StagedByCommand {
+    /// No `git add` segment stages untracked files.
+    None,
+    /// A `git add` stages everything (`-A`, `--all`, `.`, `./`, `:/`).
+    All,
+    /// Specific repo-relative pathspecs being staged by `git add`.
+    Paths(Vec<String>),
+}
+
+/// Separate-arg git global flags that can appear between `git` and `add`.
+const GIT_GLOBAL_FLAGS_WITH_ARG: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+    "--attr-source",
+];
+
+/// Extract the subcommand and trailing args from a `git` segment, skipping
+/// global flags between `git` and the subcommand.
+fn git_subcommand_and_args(tokens: &[String]) -> Option<(&str, &[String])> {
+    if !tokens
+        .first()
+        .is_some_and(|first| command_word(first).as_ref() == "git")
+    {
+        return None;
+    }
+    let mut i = 1;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if GIT_GLOBAL_FLAGS_WITH_ARG.contains(&tok) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some((tok, &tokens[i + 1..]));
+    }
+    None
+}
+
+/// Normalize a `git add` pathspec into a repo-relative path without leading
+/// `./` or trailing `/`.
+fn normalize_staged_pathspec(arg: &str, subdir_prefix: Option<&str>) -> String {
+    let trimmed = arg.trim_start_matches("./").trim_end_matches('/');
+    if let Some(prefix) = subdir_prefix
+        && !prefix.is_empty()
+        && !trimmed.starts_with('/')
+    {
+        format!("{prefix}/{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Inspect `git add` segments in `command` to determine which untracked files
+/// the command itself is about to stage before any subsequent `git commit`.
+fn staged_by_command(command: &str, cmd_dir: &Path, repo_root: &Path) -> StagedByCommand {
+    let canonical_dir = std::fs::canonicalize(cmd_dir).ok();
+    let subdir_prefix = canonical_dir
+        .as_deref()
+        .and_then(|d| d.strip_prefix(repo_root).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+
+    let mut paths = Vec::new();
+    for segment in command_segments(command) {
+        let tokens = tokenize(strip_group_wrappers(&segment));
+        let Some((subcmd, args)) = git_subcommand_and_args(&tokens) else {
+            continue;
+        };
+        if subcmd != "add" {
+            continue;
+        }
+
+        // Dry-run does not stage anything.
+        let mut after_dashdash = false;
+        let is_dry_run = args.iter().any(|a| {
+            if after_dashdash {
+                return false;
+            }
+            if a == "--" {
+                after_dashdash = true;
+                return false;
+            }
+            a == "--dry-run" || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('n'))
+        });
+        if is_dry_run {
+            continue;
+        }
+
+        let mut after_dd = false;
+        let mut skip_next = false;
+        for arg in args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if !after_dd {
+                if arg == "--" {
+                    after_dd = true;
+                    continue;
+                }
+                if arg == "-A"
+                    || arg == "--all"
+                    || arg == "--no-ignore-removal"
+                    || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('A'))
+                {
+                    return StagedByCommand::All;
+                }
+                if arg == "--pathspec-from-file" {
+                    skip_next = true;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
+            }
+            if matches!(arg.as_str(), "." | "./" | ":/" | ":/*") {
+                return StagedByCommand::All;
+            }
+            let norm = normalize_staged_pathspec(arg, subdir_prefix.as_deref());
+            if !norm.is_empty() {
+                paths.push(norm);
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        StagedByCommand::None
+    } else {
+        StagedByCommand::Paths(paths)
+    }
+}
+
+/// True when an untracked path (from `git ls-files --others --directory`) is
+/// already covered by one of the normalized pathspecs in `staged`.
+fn is_covered_by_staged(untracked: &str, staged: &[String]) -> bool {
+    let norm = untracked.trim_end_matches('/');
+    staged.iter().any(|s| {
+        norm == s
+            || norm
+                .strip_prefix(s.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// True when any executable segment is `git add` or `git commit`.
 ///
 /// Only the command word folds. Git subcommands remain case-sensitive.
 fn is_git_add_or_commit(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
         let tokens = tokenize(strip_group_wrappers(&segment));
-        tokens
-            .first()
-            .is_some_and(|first| command_word(first).as_ref() == "git")
-            && matches!(tokens.get(1).map(String::as_str), Some("add" | "commit"))
+        matches!(
+            git_subcommand_and_args(&tokens).map(|(sub, _)| sub),
+            Some("add" | "commit")
+        )
     })
 }
 
@@ -183,7 +337,14 @@ impl Check for WarnUntrackedFiles {
             return CheckResult::allow();
         };
         let porcelain: String = listing.lines().map(|l| format!("?? {l}\n")).collect();
-        let important = filter_untracked(&porcelain);
+        let mut important = filter_untracked(&porcelain);
+        match staged_by_command(command, Path::new(&dir), &repo_root) {
+            StagedByCommand::All => important.clear(),
+            StagedByCommand::Paths(staged) => {
+                important.retain(|file| !is_covered_by_staged(file, &staged));
+            }
+            StagedByCommand::None => {}
+        }
 
         let mut msg = String::new();
         if !important.is_empty() {
@@ -206,20 +367,21 @@ impl Check for WarnUntrackedFiles {
         // It needs `git status`, which refreshes the index and so can run a
         // repo's clean filter — so it runs only in the session's own checkout
         // (as it always has), never in a repo a `cd` moved to, and only over
-        // `docs/plans`.
+        // the plans folders (the configured one and `docs/plans`).
         let in_session_checkout = cwd
             .and_then(canonical_repo_root)
             .is_some_and(|session| session == repo_root);
-        if in_session_checkout
-            && commit_takes_only_staged(command)
-            && repo_root.join("docs/plans").is_dir()
-            && let Some(status) = run_advisory_git(hardened_git(&repo_root).args([
-                "status",
-                "--porcelain",
-                "--untracked-files=no",
-                "--",
-                "docs/plans",
-            ]))
+        let plan_dirs = if in_session_checkout && commit_takes_only_staged(command) {
+            cadence_hooks_session::plan_guards::plan_status_pathspecs(&repo_root)
+        } else {
+            Vec::new()
+        };
+        if !plan_dirs.is_empty()
+            && let Some(status) = run_advisory_git(
+                hardened_git(&repo_root)
+                    .args(["status", "--porcelain", "-z", "--untracked-files=no", "--"])
+                    .args(&plan_dirs),
+            )
             && let Some(plan) = cadence_hooks_session::plan_guards::unstaged_plan_at_commit(
                 &repo_root.to_string_lossy(),
                 &status,
@@ -444,6 +606,69 @@ mod tests {
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("docs/plans/2026-09-29-p.md"), "{msg}");
         assert!(msg.contains("not staged"), "{msg}");
+    }
+
+    #[test]
+    fn dirty_unstaged_plan_in_the_configured_plans_folder_nudges() {
+        // cadence#2153: a repo's CADENCE_PLANS_DIR plan gets the same check,
+        // including in a folder with a space (git quotes such a path in plain
+        // porcelain output).
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        // (CADENCE_PLANS_DIR, a symlink to make, the folder it resolves to)
+        let mut cases = vec![("Meta/plans", None, "Meta/plans")];
+        if cfg!(unix) {
+            cases.push((
+                "Vault/plans",
+                Some(("Vault", "Second Brain")),
+                "Second Brain/plans",
+            ));
+        }
+        for (configured, link, folder) in cases {
+            let dir = plan_repo();
+            let git = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(args)
+                        .current_dir(dir.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+            if let Some((_name, _target)) = link {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(_target, dir.path().join(_name)).unwrap();
+            }
+            std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+            std::fs::write(
+                dir.path().join(".claude/settings.json"),
+                format!(r#"{{"env":{{"CADENCE_PLANS_DIR":"{configured}"}}}}"#),
+            )
+            .unwrap();
+            let plan = format!("{folder}/2026-11-18-v.md");
+            std::fs::write(
+                dir.path().join(&plan),
+                "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [ ] a\n",
+            )
+            .unwrap();
+            git(&["add", ".claude/settings.json", &plan]);
+            git(&["commit", "-q", "-m", "vault plan"]);
+            std::fs::write(
+                dir.path().join(&plan),
+                "---\nstatus: in-flight\nbranch: feat/x\n---\n\n- [x] a\n",
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("work2.rs"), "fn b() {}\n").unwrap();
+            git(&["add", "work2.rs"]);
+            let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
+                "git commit -m x",
+                dir.path().to_str().unwrap(),
+            ));
+            assert_eq!(result.outcome, Outcome::Nudge, "{folder}");
+            let msg = result.message.unwrap_or_default();
+            assert!(msg.contains(&plan), "{folder}: {msg}");
+        }
     }
 
     #[test]
@@ -729,5 +954,66 @@ mod tests {
         assert_eq!(msg.matches("  ?? ").count(), MAX_LISTED_FILES, "{msg}");
         assert!(msg.contains("26 untracked file(s)"), "{msg}");
         assert!(msg.contains("… 6 more"), "{msg}");
+    }
+
+    #[test]
+    fn git_add_named_file_in_same_command_suppresses_that_file() {
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let (_s, meta, _nested) = meta_with_nested("staged-named");
+        // meta_with_nested creates `meta_only.rs` as the sole untracked file.
+        let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
+            "git add 'meta_only.rs' && git commit -m 'add file'",
+            meta.to_str().unwrap(),
+        ));
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "file staged in the same command should not warn: {:?}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn git_add_named_file_still_warns_about_other_untracked_files() {
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let (_s, meta, _nested) = meta_with_nested("staged-partial");
+        std::fs::write(meta.join("forgotten.rs"), "x").unwrap();
+        let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
+            "git add -- meta_only.rs && git commit -m 'partial'",
+            meta.to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(msg.contains("?? forgotten.rs"), "{msg}");
+        assert!(!msg.contains("meta_only.rs"), "{msg}");
+    }
+
+    #[test]
+    fn git_add_all_or_dot_suppresses_untracked_warning() {
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let (_s, meta, _nested) = meta_with_nested("staged-all");
+        for cmd in [
+            "git add -A && git commit -m 'all'",
+            "git add . && git commit -m 'dot'",
+        ] {
+            let result = WarnUntrackedFiles.run(&make_bash_with_cwd(cmd, meta.to_str().unwrap()));
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "{cmd} should not warn: {:?}",
+                result.message
+            );
+        }
+    }
+
+    #[test]
+    fn git_add_dry_run_still_warns() {
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+        let (_s, meta, _nested) = meta_with_nested("staged-dry");
+        let result = WarnUntrackedFiles.run(&make_bash_with_cwd(
+            "git add -n meta_untracked.rs && git commit -m 'dry'",
+            meta.to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, Outcome::Nudge);
     }
 }

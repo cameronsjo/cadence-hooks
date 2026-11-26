@@ -80,7 +80,7 @@ Rules for wiring:
 
 | Hook | Event | What it does | Remote |
 |------|-------|--------------|--------|
-| `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations | run |
+| `terminology` | PreToolUse (Write, Edit) | Nudge on inclusive terminology violations | run |
 | `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK | run |
 | `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) | run |
 | `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files | run |
@@ -98,18 +98,50 @@ Rules for wiring:
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` | run |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files (allows when the CLI is missing; `doctor` notes it) | run |
 | `audit-runner-pool` | PostToolUse (Write, Edit, MultiEdit) | After an edit to `.github/workflows/*.yml`/`*.yaml`, run `cadence-forge:auditing-runner-pool-workflows`' `audit-workflows.py` (newest copy under `<config dir>/plugins/cache/*/cadence-forge/`; 3.5s cap) and return FAIL findings as a nudge. Never blocks: a missing script, no `python3`, a timeout or an unknown exit is silent; the audit's exit 2 ("could not run") becomes a one-line note | run |
-| `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger | run |
+| `guard-held-close` | PreToolUse (Bash) | Block `gh issue close` when a candidate target is on the HELD ledger (`--ledger <file>` of `owner/repo#N` entries; `CADENCE_DRAIN_HELD` overrides). Errs toward blocking: every issue-shaped operand counts, an unreadable repo matches the number anywhere on the ledger. Confirm tier: the same command again in the same session passes once ([confirm tier](configuration.md#confirming-a-blocked-action-the-confirm-tier)) | run |
 | `redact-external-content` | PreToolUse (Write, Edit, every `mcp__*` tool, Bash) | Nudge when an external post mentions internal harness vocabulary; block a work-identifiable term in a post, an authored file, or any string of an MCP call, and a credential token in a post or any MCP call. Named local tools (`c3`, `easel`, `herdr-bridge` `panes`/`read`, `rea` tools that neither launch a process, reach the network, nor write files) skip the identity tier only; no path exempts an MCP call | run |
 | `redact-secret-output` | PostToolUse (Bash) | Mask secret values in Bash output via `updatedToolOutput`: credential tokens, private keys, URL passwords, and values whose name is secret-shaped (env, YAML, JSON, k8s/ECS name/value, flags, headers, tables, `.netrc`), after stripping ANSI codes and decoding JSON escapes. Emits nothing when nothing was masked; `CADENCE_ALLOW_SECRET_OUTPUT` passes output through | run |
-| `guard-secret-dump` | PreToolUse (Bash) | Ask before a bare-value producer prints (`security … -w`, `kubectl get secret` jsonpath/template/custom-columns or json/yaml into `jq`/`yq`, `op read`, `op item get --reveal`, `vault … -field`, `aws secretsmanager get-secret-value`, `gcloud secrets versions access`, `pass show`), unless the pipeline's last stage is a hash (`sha256sum`-family) or stdout goes to a real file; stdin consumers such as `docker login --password-stdin` ask too | run |
+| `guard-secret-dump` | PreToolUse (Bash) | Judge a bare-value producer (`security … -w`, `kubectl get secret` jsonpath/template/custom-columns or json/yaml into `jq`/`yq`, `op read`, `op item get --reveal`, `vault … -field`, `aws secretsmanager get-secret-value`, `gcloud secrets versions access`, `pass show`, `op inject` with no output file) by where the value goes: **block** when it would be the command's output (the producer ends its pipeline or pipes only into pass-through commands such as `cat`, `tee`, `base64 -d`, or `jq`/`yq` with any filter, which is never read; `>&2`; `echo "$(…)"`; a printing `sh -c`/`eval`; never confirm-tier); **ask** when it goes to a consumer (a pipe such as `docker login --password-stdin`, a substitution used as an argument or assignment, a here-string or heredoc into a consumer, a clipboard flag) or to default JSON the output redactor masks; silent when the pipeline's last stage is a hash (`sha256sum`-family) or stdout goes to a real file. See `docs/configuration.md` § Secret values in command output | run |
 | `platform-drift` | SessionStart | Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline (`--baseline <file>`) | run |
 | `model-posture` | SessionStart, PostModelSwitch (onto Fable) | Inject the Fable seat posture at session start and on a switch onto Fable | run |
 
-`warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
+`warn-overshare` does path triage only — it fires on push/PR/issue/post Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
 judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
+
+A command fires `warn-overshare` when any of four things holds:
+
+1. It is a `gh` or `tea` post, as above.
+2. The parsed push reader sees a push: a `git` command whose subcommand is
+   `push`, past git's global options (`git -C dir push`, `git -c k=v push`,
+   `git --no-pager push`), before a separator or a `)` (`git push;`,
+   `git push|cat`), and inside a subshell, a group, a `sh -c` script, an `eval`
+   or a command substitution (`(cd x && git push)`, `bash -c 'git push'`).
+3. The two words `git push` stand side by side in the whitespace-split command,
+   exactly as the hook always matched them, with no trimming: behind a runner
+   the parsed reader does not know (`ssh host git push`, `docker exec c git push`,
+   `parallel git push ::: a b`), in a heredoc body, or in an unquoted
+   `echo git push`.
+4. The command is a commit and its text contains the substring `push` anywhere
+   (case-sensitive, raw text, no parsing).
+
+The fourth is the guarantee. A `git commit` leaves the machine only when it is
+pushed, so a commit that never contains `push` no longer fires, in any form (a
+`cd`, a `git -C`, a chain, a substitution, a heredoc). Every command that
+reminded through its commit before and holds a push in any shape that spells the
+word still reminds: `ssh host 'git push'`, `docker exec c git -C d push`,
+`time -p git -C d push`, `make push`. So does a commit whose message or path
+contains `push`, as before. The one boundary: a push that never spells the word
+(a make target with another name, a script file) after a commit is silent. A
+word that only starts with `push` (`git push-hook`) and `push` as an argument to
+another subcommand (`git stash push`) do not fire through arms 2 and 3.
+
+The `cadence` plugin starts the hook only for commands that contain `git push`,
+`git commit`, `gh ` or `tea ` (its `if:` filters), so a push spelled
+`git -C dir push`, with none of those, does not reach the hook until those
+filters are widened (cameronsjo/cadence#2211).
 
 ## guardrails (git-guardrails)
 
@@ -122,7 +154,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) | run |
 | `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` | run |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch | run |
-| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths) | self-disable |
+| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths). Confirm tier: a second attempt at the same edit, or the identical Bash command, in the same session passes and arms the 30-minute dismiss snooze ([confirm tier](configuration.md#confirming-a-blocked-action-the-confirm-tier)) | self-disable |
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base | run |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs | run |
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit | run |
@@ -132,7 +164,8 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body | run |
 | `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo that is not a known ecosystem tracker | run |
 | `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge | run |
-| `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed | run |
+| `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed. Confirm tier: the same command again in the same session passes once ([confirm tier](configuration.md#confirming-a-blocked-action-the-confirm-tier)) | run |
+| `guard-container-rm` | PreToolUse (Bash) | Ask before `docker rm`, `docker container rm` or `docker container remove` removes a container, with or without `-f`; the block names the containers. `stop`, `kill`, `run --rm`, `image rm`, `compose`, `system prune`, volume and network removal pass. Confirm tier: the identical command again in the same session passes once ([confirm tier](configuration.md#confirming-a-blocked-action-the-confirm-tier)). Reads command text only, so a script file, the Docker API socket or `ssh host 'docker rm …'` is not seen | run |
 | `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` | run |
 | `guard-runbook-scrub` | PreToolUse (Write, Edit) | When `CADENCE_RUNBOOKS_DIR` is set, block a Write/Edit/MultiEdit (or MCP write) into that directory unless the resulting document's SHA-256 matches a marker from `cadence record-scrub`. Paths are resolved through symlinks and `..`, case-insensitively. An Edit whose result cannot be simulated literally blocks, and so does any write into the scrub-marker directory. Bash is not judged: what a command writes is not knowable before it runs (cameronsjo/cadence-hooks#1442). Inert when the variable is unset. Escape: `CADENCE_ALLOW_UNSCRUBBED_RUNBOOK=1` | run |
 | `warn-curl-alias` | PreToolUse (Bash) | Retired: exits 0 with no output, kept so older plugin wiring does not print a version notice (cameronsjo/cadence-hooks#1443) | run |
@@ -222,7 +255,7 @@ exit 0. They never block a tool call (see
 | `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed | self-disable |
 | `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` | self-disable |
 | `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` | self-disable |
-| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` | self-disable |
+| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, record `codeMode` (Code Mode session or not), append to `sessions.jsonl` | self-disable |
 | `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd`; the first SessionStart of each UTC day also runs `metrics rotate` for up to 2 s, failing open | self-disable |
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` | self-disable |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` | self-disable |
@@ -321,12 +354,12 @@ frontmatter `approved_session_id`, then by `branch:`.
 |------|-------|--------------|--------|
 | `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched | run |
 | `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip; quiet when the flip names another repo (`-R`, `GH_REPO=`, a PR URL) or another branch | run |
-| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) | run |
+| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan's first `Panel:` line is missing, pending, trivial, or an unfilled template line; any stated outcome settles (`Panel: <seats> ran — …`, `Panel: none — <reason>`, `Panel: skipped — <reason>`, bold or not). The block names only the fix; the allow nudges name other missing template stanzas and carry the presentation reminders (subagents stopped, operator asked to see the plan) | run |
 | `plan-driver` | PreModelSwitch (`source` `command`/`picker`, attended TUI) | Ask the operator to confirm a `/model` switch whose target family differs from the in-flight plan's `## Orchestrator` → `Driver:`; silent unless the hook env shows `CLAUDE_CODE_ENTRYPOINT=cli` and `CLAUDE_CODE_SESSION_ATTENDED=1` with no `CLAUDE_CODE_REMOTE` (with no human attached — SDK, `claude -p`, stream-json — an `ask` refuses the switch outright), on disagreeing or driverless plans, and on an unrecognized model | run |
 
 `nudge-plan-tick` and `warn-plan-ready-flip` only ever warn; `plan-driver` only ever
 asks, and only where a human can answer. `lint-plan-shape` is the
-one plan guard that blocks, and only on the `Panel:` line; subagent-originated calls
+one plan guard that blocks, and only on a `Panel:` line that states no outcome; subagent-originated calls
 (`agent_id` present) and every internal failure allow (ADR-0001).
 
 ### CLI actions (not hooks)
@@ -341,7 +374,7 @@ during maintenance.
 | `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
 | `session status` | List live and stale sessions registered in this repo: the current checkout and every worktree `git worktree list` names, with a footer counting the worktrees checked (exit 1 outside a git repository) |
 | `session timer start\|lap\|stop [LABEL]` | Wall-clock stopwatch scoped to this session (`--session-id`, then `CLAUDE_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`, else a shared scope); `LABEL` defaults to `default`. `lap` prints the elapsed time; `stop` prints it and appends `{ts, sessionId, label, elapsedMs}` to `<metrics_dir>/timers.jsonl`. Exit 1, reason on stderr, when the timer is not running or the label or `--session-id` is invalid |
-| `session plans` | List every in-flight and blocked plan in `docs/plans/` with its next step, branch, and PR — the detail behind the SessionStart plan pointer, with no cap on the file count. Exit 2 outside a git repository, or when an entry in `docs/plans/` could not be listed or read (each named on stderr) |
+| `session plans` | List every in-flight and blocked plan in the repo's plans folder (`CADENCE_PLANS_DIR`, plus `docs/plans/` while it exists) with its next step, branch, and PR — the full list behind the SessionStart plan block, which names at most three, with no cap on the file count. Exit 2 outside a git repository, or when an entry there could not be listed or read (each named on stderr) |
 | `cadence record-scrub --file <path>` | Record that a runbook draft passed the secret scrub: writes a marker keyed on the SHA-256 of the file's bytes (line endings ignored: `\r\n` hashes as `\n`) into the private marker directory, which `guard-runbook-scrub` honors for a write of that same content. It trusts its caller — run it only after `scrub.py --apply` and a check-mode `scrub.py` exit 0. Exit 0 recorded, 1 nothing recorded (unreadable or non-regular file, non-private marker dir), 2 usage |
 | `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |
-| `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation |
+| `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation. A confirmed retry of the blocked action writes the same 30-minute snooze |

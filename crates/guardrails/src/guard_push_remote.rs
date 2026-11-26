@@ -363,6 +363,10 @@ impl Check for PushRemoteGuard {
         "guard-push-remote"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         judge_push(input).map_or_else(CheckResult::allow, CheckResult::nudge)
     }

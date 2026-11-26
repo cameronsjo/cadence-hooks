@@ -224,3 +224,74 @@ A group SHALL merge member verdicts as separate processes would: any block exits
 #### Scenario: Slow member
 - **WHEN** one member is still deciding when the group deadline passes
 - **THEN** the group emits the other members' verdicts, logs `group_deadline` for the slow one, and adds a notice that it did not block
+
+### Requirement: Confirm tier
+A confirm-tier guard SHALL block the first attempt at an action (exit 2) with its reason and a line beginning `Are you sure?`, and SHALL allow the next attempt at the same action from the same `session_id` and `agent_id` within ten minutes, once. The pair is keyed by hook and an action the guard names: what it read, or the whole command normalized for spacing. A pass MUST write a `bypasses.jsonl` `used` row with kind `confirmed` and mechanism `confirm-retry`.
+
+#### Scenario: Second attempt passes once
+- **WHEN** a confirm-tier guard blocks an action in session S1, and S1 attempts the same action again in a new tool call within ten minutes
+- **THEN** the second attempt is allowed and `bypasses.jsonl` gains a `used` row with `"kind":"confirmed"`; a third attempt blocks again
+
+#### Scenario: Nothing else inherits the pass
+- **WHEN** after a first attempt in S1, another session, a subagent of S1 (same `session_id`, its own `agent_id`), or S1 with a different action makes an attempt
+- **THEN** each blocks with the `Are you sure?` line
+
+#### Scenario: Expired attempt
+- **WHEN** the retry comes more than ten minutes after the blocked attempt
+- **THEN** it blocks and starts a new ten-minute window
+
+#### Scenario: Several processes of one tool call
+- **WHEN** a guard wired twice under one matcher runs twice for the blocked call, and twice for the retry
+- **THEN** both processes of the blocked call block, both processes of the retry allow, and `bypasses.jsonl` gains one row
+
+#### Scenario: A whole-command guard names the retry
+- **WHEN** a guard keyed on the whole command arms a confirmation
+- **THEN** its armed line says to run the identical command again, and that extra spaces or tabs between words are ignored
+
+### Requirement: One confirmed row per confirmation
+A confirmation SHALL write exactly one `confirmed` row, however many processes of the hook run for the passing call. The row records that the confirm-tier guard let the action through, not that the call ran: another hook on the same call MAY still block it, and the confirmation is spent either way; for `enforce-worktree` the 30-minute snooze is armed by then too.
+
+#### Scenario: Two processes of the retry at once
+- **WHEN** two processes of the retry start together and both read the blocked attempt's marker before either records the pass
+- **THEN** both allow, and `bypasses.jsonl` gains one row
+
+#### Scenario: Another hook blocks the confirmed call
+- **WHEN** a confirm-tier guard passes a retry and another hook blocks the same tool call
+- **THEN** the `confirmed` row stays, and the next attempt at the action blocks with the `Are you sure?` line
+
+#### Scenario: Another hook blocks a confirmed enforce-worktree retry
+- **WHEN** `enforce-worktree` passes a confirmed retry and another hook blocks the same tool call
+- **THEN** the checkout's 30-minute snooze stays armed
+
+### Requirement: Confirm tier fail directions
+A confirm-tier block SHALL NOT pass, and SHALL end with `A second attempt will be blocked too:` and the reason, when the payload has no `session_id` or no usable `tool_use_id`, when the marker directory is not private, or when the marker cannot be written. An unreadable, malformed, symlinked, expired or future-stamped marker MUST count as absent, never as a confirmation.
+
+#### Scenario: No session id
+- **WHEN** a confirm-tier guard blocks a payload with no `session_id`, and the same payload is sent again
+- **THEN** both attempts block with `A second attempt will be blocked too`
+
+#### Scenario: Marker write fails
+- **WHEN** the confirmation cannot be recorded
+- **THEN** the guard blocks with `the confirmation could not be recorded`, and no attempt passes until a write succeeds
+
+### Requirement: Phone-usable hard blocks
+A hard block whose own escape needs the operator at a keyboard SHALL end with the sentence telling the model to stop and tell the operator in chat what was blocked, why, and what they can approve: `git-safety`'s dangerous-operation block, `prevent-secret-writes`' file blocks, `prevent-secret-push`'s found-secret block, `guard-sops-decrypt`, `guard-runbook-scrub`, `guard-gh-dangerous`'s repo delete, and `guard-gh-write`'s URL-argument fix. What these guards block is unchanged.
+
+#### Scenario: Dangerous git operation
+- **WHEN** `cadence git-safety` blocks `git reset --hard HEAD~1`
+- **THEN** stderr ends with `tell them in chat what was blocked, why, and what they can approve.`
+
+### Requirement: Schema drift rows name the tool and field
+Each `schema_drift` row in `failopen.jsonl` SHALL carry `toolName` and `field`. `toolName` MUST be the payload's `tool_name` when it is 1 to 64 ASCII letters, digits or `_`, `"other"` for any other value, and `null` when the payload has none. `field` MUST be the alphabetically first modeled field of the drifted key whose value fails its typed shape on its own, or the key itself when every field passes alone. Both MUST be static or charset-checked names, never payload values.
+
+#### Scenario: Mistyped tool_input field
+- **WHEN** a Bash payload's `tool_input.description` is an object
+- **THEN** the `schema_drift` row has `toolName` `Bash` and `field` `description`, and does not contain the object's text
+
+#### Scenario: Unplain tool name
+- **WHEN** a drifted payload's `tool_name` is `Bash; rm -rf ~`
+- **THEN** the row's `toolName` is `other`
+
+#### Scenario: Matching payload
+- **WHEN** a Bash payload's `tool_input` matches its typed shape
+- **THEN** no `schema_drift` row is written

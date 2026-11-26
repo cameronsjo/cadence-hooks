@@ -48,8 +48,12 @@ use std::io::Write;
 /// number *judged*, which is deliberately not recoverable from the tally: an
 /// `Allow` target is judged and never tallied.
 pub fn log_denial(hook: &str, event: HookEvent, input: &HookInput, outcomes: &[Outcome]) {
+    let winner = strictest(outcomes);
+    if winner == Outcome::Allow {
+        return;
+    }
     let nudges_on = nudges_enabled();
-    let Some(decision) = decision_for(strictest(outcomes), nudges_on) else {
+    let Some(decision) = decision_for(winner, nudges_on) else {
         return;
     };
 

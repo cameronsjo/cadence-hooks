@@ -12,8 +12,8 @@
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
 use cadence_hooks_core::shell::{
-    command_segments, command_segments_with_dirs, may_spell_word, parse_work_dir,
-    strip_group_wrappers, tokenize, unescape_word,
+    command_segments_with_dirs, may_spell_word, parse_work_dir, strip_group_wrappers, tokenize,
+    unescape_word,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -670,6 +670,10 @@ impl Check for GitSafetyGuard {
         "git-safety"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
         let Some(command) = input.command() else {
             return CheckResult::allow();
@@ -693,8 +697,8 @@ impl Check for GitSafetyGuard {
         // Current-branch resolution for bare-HEAD force pushes (#71): lazy
         // (only when such a segment appears) and memoized across segments.
         let mut resolved_branch: Option<BranchResolution> = None;
-        let segments = command_segments(command);
-        for segment in &segments {
+        let segments = input.command_segments();
+        for segment in segments {
             // Per-segment alias check: a `git config alias.x …` segment is
             // exempt, but a destructive sibling in the same chain is not.
             if is_alias_definition(segment) {
@@ -726,7 +730,8 @@ impl Check for GitSafetyGuard {
                      Found: {found} in `{command}`\n\
                      Fix: this can cause data loss or rewrite shared history — \
                      if it is genuinely needed, ask the user to run it manually \
-                     outside Claude Code."
+                     outside Claude Code.\n{}",
+                    cadence_hooks_core::confirm::OPERATOR_HANDOFF
                 ));
             }
 
@@ -751,6 +756,19 @@ impl Check for GitSafetyGuard {
 mod tests {
     use super::*;
     use cadence_hooks_core::test_builders::{make_bash as make_bash_input, make_bash_with_cwd};
+
+    #[test]
+    fn block_tells_a_phone_operator_what_to_do() {
+        // cameronsjo/cadence-hooks#1658 part 3: "run it manually" needs a
+        // keyboard, so the block names the step that does not.
+        let r = GitSafetyGuard.run(&make_bash_input("git reset --hard HEAD~1"));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+            "{msg}"
+        );
+    }
 
     // ---------------------------------------------------------------
     // normalize_git_command tests

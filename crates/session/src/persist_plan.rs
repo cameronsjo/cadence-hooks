@@ -48,7 +48,10 @@
 //! file its `planFilePath` names (an approval-dialog Ctrl+G edit). That second
 //! match trusts `<config_dir>/plans` as it stands at pickup, so the trust
 //! boundary is write access to `~/.claude` (projects and plans), the same
-//! access that can already rewrite the hooks.
+//! access that can already rewrite the hooks. A plan approved through Code
+//! Mode's `REPL` tool records no plan text in the call, so there the body
+//! must match the plan-store file the parent's `plan_mode` attachment names,
+//! through the same plan-store check.
 //!
 //! The write is body-hash-idempotent through [`persist_and_nudge`]:
 //! `claim_target`'s `O_EXCL` collision ladder, the frontmatter render
@@ -205,18 +208,45 @@ impl Check for PersistPlanApproval {
         "persist-plan-approval"
     }
 
+    fn spawns_subprocesses(&self) -> bool {
+        true
+    }
+
     fn run(&self, input: &HookInput) -> CheckResult {
-        let host = gethostname::gethostname().to_string_lossy().into_owned();
-        let utc_now = cadence_hooks_core::time::utc_timestamp();
-        let local_date = cadence_hooks_core::time::local_date();
         // Narrow defense-in-depth on top of the dispatch-layer panic guard
         // (cameronsjo/cadence-hooks#349): this fires on every PostToolUse
         // call, and a bug here must not eat the approval (or the tool call).
+        // Defer `gethostname()`, timestamps, and `DestinationEnv::from_process()`
+        // behind the fast-path gates so every non-ExitPlanMode call after the
+        // first scan of a session pays only a single `stat(2)` on its marker.
         let result = std::panic::catch_unwind(|| {
-            let env = DestinationEnv::from_process();
             if input.tool_name() == Some("ExitPlanMode") {
+                let host = gethostname::gethostname().to_string_lossy().into_owned();
+                let utc_now = cadence_hooks_core::time::utc_timestamp();
+                let local_date = cadence_hooks_core::time::local_date();
+                let env = DestinationEnv::from_process();
                 run_persist_plan_approval(input, &utc_now, &local_date, &host, &env)
             } else {
+                if input.agent_id().is_some()
+                    || input
+                        .session_id()
+                        .filter(|s| identity::is_safe_session_id(s))
+                        .is_none()
+                {
+                    return CheckResult::allow();
+                }
+                let marker = cadence_hooks_core::markers::session_marker(
+                    input,
+                    INJECTED_SCAN_MARKER_KIND,
+                    None,
+                );
+                if marker.exists() {
+                    return CheckResult::allow();
+                }
+                let host = gethostname::gethostname().to_string_lossy().into_owned();
+                let utc_now = cadence_hooks_core::time::utc_timestamp();
+                let local_date = cadence_hooks_core::time::local_date();
+                let env = DestinationEnv::from_process();
                 run_injected_plan_persist(input, &utc_now, &local_date, &host, &env)
             }
         })
@@ -567,7 +597,12 @@ const POINTER_PATH_LEAD: &str = "transcript at:";
 ///   body being persisted) — or, for a plan edited in the approval dialog
 ///   (Ctrl+G), whose `input.planFilePath` names a plan-store file that now
 ///   holds `body` ([`read_plan_store_file_within`] under `plan_store_root`:
-///   the same contained, no-follow, single-link, size-capped open).
+///   the same contained, no-follow, single-link, size-capped open) — or, for
+///   an approval made through Code Mode's `REPL` tool, a main-chain `REPL`
+///   `tool_use` whose `input.code` calls `tools.ExitPlanMode(` plus a
+///   main-chain `plan_mode` attachment whose `planFilePath` names a
+///   plan-store file that holds `body`, through the same check
+///   ([`CodeModeEvidence`]).
 ///
 /// **Trust boundary.** The evidence is that the parent session PROPOSED this
 /// plan: an `ExitPlanMode` call is recorded whether the operator approved or
@@ -577,6 +612,15 @@ const POINTER_PATH_LEAD: &str = "transcript at:";
 /// file holds NOW, not when the call was made: that file stays writable
 /// after the call (a resumed session, any write under `<config_dir>/plans`),
 /// so write access to `~/.claude/plans` is part of the same boundary.
+///
+/// A Code Mode approval stands on the plan file alone, since its call
+/// records no plan text: the parent must hold a main-chain `plan_mode`
+/// attachment naming a plan-store file that holds `body`, and a later
+/// main-chain `REPL` call whose code contains `tools.ExitPlanMode(`
+/// ([`CodeModeEvidence`]). The call is matched as a substring, so it proves
+/// only that the parent's script spelled the call after plan mode named
+/// the file; the plan-store read and the body match carry the weight, on
+/// the same `~/.claude/plans` boundary as the dialog-edit match.
 ///
 /// `None` is non-approval, never an anonymous approval.
 fn parent_session_id_from_pointer_lines(
@@ -620,9 +664,12 @@ fn is_uuid_shaped(s: &str) -> bool {
 /// for exactly `body`? Only the handle is read, never the path again. It must
 /// be a regular file with one link; when it is larger than
 /// [`PARENT_TRANSCRIPT_READ_MAX_BYTES`] only that tail is read, starting at
-/// the first whole line. Lines that do not mention `ExitPlanMode` are never
-/// parsed. Any read error is a miss. Each distinct `planFilePath` is read at
-/// most once, and at most [`MAX_PLAN_FILE_READS`] of them in all.
+/// the first whole line. Lines that mention neither `"ExitPlanMode"`,
+/// [`CODE_MODE_EXIT_CALL`] nor `"planFilePath"` are never parsed. A Code
+/// Mode approval ([`CodeModeEvidence`]) is judged once the whole window is
+/// read, since its `plan_mode` attachment and its call are separate rows.
+/// Any read error is a miss. Each distinct `planFilePath` is read at most
+/// once, and at most [`MAX_PLAN_FILE_READS`] of them in all.
 fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> bool {
     use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
     let Ok(meta) = file.metadata() else {
@@ -649,10 +696,11 @@ fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> 
         root: plan_store_root,
         seen: std::collections::HashMap::new(),
     };
+    let mut code_mode = CodeModeEvidence::default();
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
-            Ok(0) => return false,
+            Ok(0) => break,
             Ok(_) => {}
             Err(_) => return false,
         }
@@ -662,7 +710,10 @@ fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> 
         let Ok(text) = std::str::from_utf8(&line) else {
             continue;
         };
-        if !text.contains("\"ExitPlanMode\"") {
+        if !text.contains("\"ExitPlanMode\"")
+            && !text.contains(CODE_MODE_EXIT_CALL)
+            && !text.contains("\"planFilePath\"")
+        {
             continue;
         }
         let Ok(row) = serde_json::from_str::<Value>(text) else {
@@ -671,7 +722,139 @@ fn transcript_holds_plan(file: fs::File, body: &str, plan_store_root: &Path) -> 
         if row_has_exit_plan_mode_for(&row, body, &mut plan_files) {
             return true;
         }
+        code_mode.observe(&row);
     }
+    code_mode.holds(body, &mut plan_files)
+}
+
+/// The tool Claude Code's Code Mode gives the model in place of every other
+/// tool: one `REPL` whose `input.code` is a JavaScript script.
+const CODE_MODE_TOOL: &str = "REPL";
+
+/// How a Code Mode script calls `ExitPlanMode`:
+/// `await tools.ExitPlanMode({})`.
+const CODE_MODE_EXIT_CALL: &str = "tools.ExitPlanMode(";
+
+/// The parent transcript's evidence for a Code Mode approval. There the model
+/// calls `ExitPlanMode` from a `REPL` script, so the recorded `tool_use` is
+/// the `REPL` call, carrying no plan text and no `planFilePath`. The plan
+/// file is named instead by the session's `plan_mode` attachment rows,
+/// which come before the call (plan mode is on before the plan is
+/// presented). Neither half alone proves anything: [`Self::holds`] needs a
+/// plan-store file that holds the body, read through the same
+/// [`PlanFileCheck`] as the top-level path, named by an attachment that a
+/// later call follows in transcript order.
+///
+/// The call is recognised by the substring [`CODE_MODE_EXIT_CALL`] in the
+/// script's text, so a script that only spells `tools.ExitPlanMode(` in a
+/// comment or a string literal counts as a call too. A substring test cannot
+/// tell those apart from a real call, and this guard does not parse
+/// JavaScript; the body match against the plan-store file is the proof.
+///
+/// Only the [`MAX_PLAN_FILE_READS`] most recently named distinct paths are
+/// kept, and they are checked newest first: the approving plan's file is the
+/// one named last, so a long session that named more files than the cap
+/// drops the oldest, never the likeliest match.
+#[derive(Default)]
+struct CodeModeEvidence {
+    /// Rows observed so far: the transcript-order position of the next row.
+    rows: u64,
+    /// Position of the latest main-chain `REPL` `tool_use` whose code
+    /// calls `ExitPlanMode`.
+    last_call: Option<u64>,
+    /// Distinct `planFilePath`s from main-chain `plan_mode` attachments:
+    /// the path, the position it was first named at, and the position it was
+    /// last named at. At most [`MAX_PLAN_FILE_READS`]; the least recently
+    /// named is dropped first.
+    plan_files: Vec<(String, u64, u64)>,
+}
+
+impl CodeModeEvidence {
+    /// Record one parsed row, in transcript order.
+    fn observe(&mut self, row: &Value) {
+        let at = self.rows;
+        self.rows += 1;
+        if row_has_code_mode_exit_plan_mode_call(row) {
+            self.last_call = Some(at);
+        }
+        let Some(path) = plan_mode_attachment_path(row) else {
+            return;
+        };
+        if let Some(known) = self.plan_files.iter_mut().find(|(p, _, _)| p == path) {
+            known.2 = at;
+            return;
+        }
+        self.plan_files.push((path.to_string(), at, at));
+        if self.plan_files.len() > MAX_PLAN_FILE_READS
+            && let Some(oldest) = self
+                .plan_files
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, last))| *last)
+                .map(|(i, _)| i)
+        {
+            self.plan_files.remove(oldest);
+        }
+    }
+
+    /// Does a call follow an attachment naming a plan-store file that holds
+    /// `body`? Paths are tried most recently named first.
+    fn holds(&self, body: &str, plan_files: &mut PlanFileCheck) -> bool {
+        let Some(call) = self.last_call else {
+            return false;
+        };
+        let mut candidates: Vec<&(String, u64, u64)> = self
+            .plan_files
+            .iter()
+            .filter(|(_, first, _)| *first < call)
+            .collect();
+        candidates.sort_by_key(|(_, _, last)| std::cmp::Reverse(*last));
+        candidates
+            .into_iter()
+            .any(|(path, _, _)| plan_files.holds(path, body))
+    }
+}
+
+/// Is `row` a main-chain assistant row carrying a Code Mode `REPL`
+/// `tool_use` whose `input.code` calls `ExitPlanMode`? A match alone is no
+/// approval: the body match in [`CodeModeEvidence::holds`] is the proof.
+fn row_has_code_mode_exit_plan_mode_call(row: &Value) -> bool {
+    if row.get("type").and_then(Value::as_str) != Some("assistant")
+        || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    row.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && item.get("name").and_then(Value::as_str) == Some(CODE_MODE_TOOL)
+                    && item
+                        .get("input")
+                        .and_then(|i| i.get("code"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|code| code.contains(CODE_MODE_EXIT_CALL))
+            })
+        })
+}
+
+/// The `planFilePath` a main-chain, top-level `plan_mode` attachment row
+/// names: the session's plan-store file while plan mode is on.
+fn plan_mode_attachment_path(row: &Value) -> Option<&str> {
+    if row.get("type").and_then(Value::as_str) != Some("attachment")
+        || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let attachment = row.get("attachment")?;
+    if attachment.get("type").and_then(Value::as_str) != Some("plan_mode")
+        || attachment.get("isSubAgent").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    attachment.get("planFilePath").and_then(Value::as_str)
 }
 
 /// Cap on the distinct plan-store files one parent-transcript scan reads.
@@ -1214,6 +1397,159 @@ fn is_plain_path_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The plans directory, relative to `repo_root`, that a READER scans: the
+/// repo's `CADENCE_PLANS_DIR` when it passes the same [`is_plain_relative`]
+/// gate the writer applies and does not resolve outside the checkout, else
+/// [`DEFAULT_PLANS_DIR`] (cameronsjo/cadence#2153). Without this the writer
+/// honors the key and every reader keeps scanning `docs/plans`, so a repo that
+/// declares its own folder gets its plans persisted where no scan looks.
+///
+/// Read-only, unlike [`canonical_plans_dir`]: a scan must never create the
+/// directory it was asked to read. An empty value (the writer's opt-out) and a
+/// refused one both fall back to the default, since plans written there by
+/// hand are still plans. The result is `/`-joined plain components, safe to
+/// print: [`is_plain_relative`] already held each one to a narrow charset.
+///
+/// The folder is reported by its real path inside the checkout: a spelling
+/// through an in-repo symlink, or in another letter case on a
+/// case-insensitive filesystem, resolves to the folder the writer saves in
+/// and git tracks.
+///
+/// Readers honor the setting in any repo, while the writer honors it only in
+/// an owned one; the value is held to the same narrow, printable charset
+/// either way.
+pub(crate) fn scan_plans_dir(repo_root: &Path) -> String {
+    let session_root = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    scan_plans_dir_with(repo_root, session_root.as_deref())
+}
+
+/// [`scan_plans_dir`] with the session root passed in, for tests.
+fn scan_plans_dir_with(repo_root: &Path, session_root: Option<&Path>) -> String {
+    // The writer reads the target checkout's settings, then the session
+    // root's (an untracked settings.local.json lives only where it was
+    // written). Mirror that for a linked worktree of the session's repo, so
+    // a reader there looks where the writer wrote. Resolved only when the
+    // repo's own settings don't answer.
+    std::iter::once(repo_root.to_path_buf())
+        .chain(std::iter::from_fn({
+            let mut done = false;
+            move || {
+                if std::mem::replace(&mut done, true) {
+                    return None;
+                }
+                session_root
+                    .and_then(|v| crate::registry::repo_root(&v.to_string_lossy()))
+                    .filter(|session| linked_worktree_of(repo_root, session).is_some())
+            }
+        }))
+        .find_map(|d| cadence_hooks_core::config::repo_env_flag(&d, PLANS_DIR_KEY))
+        .filter(|rel| is_plain_relative(rel))
+        .map(|rel| {
+            Path::new(&rel)
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .filter(|rel| rel.len() <= MAX_SCAN_PLANS_DIR_BYTES)
+        .and_then(|rel| real_folder_in_checkout(repo_root, &rel))
+        .unwrap_or_else(|| DEFAULT_PLANS_DIR.to_string())
+}
+
+/// The longest configured plans folder a reader accepts, in bytes. The name
+/// is repo-authored and lands in SessionStart context, which is kept to short
+/// lines, so a longer value falls back to `docs/plans` (the same 120 bytes
+/// `identity::MAX_FIELD_DISPLAY` allows any other repo-authored field).
+const MAX_SCAN_PLANS_DIR_BYTES: usize = 120;
+
+/// `repo_root` joined with a `/`-separated folder from [`scan_plans_dirs`],
+/// one component at a time so the path uses the platform's separator.
+pub(crate) fn plans_dir_path(repo_root: &Path, rel_dir: &str) -> std::path::PathBuf {
+    rel_dir
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .fold(repo_root.to_path_buf(), |p, c| p.join(c))
+}
+
+/// Every plans directory a reader scans, relative to `repo_root`, in order:
+/// [`scan_plans_dir`], then `docs/plans` as well when the repo configured
+/// another folder and `docs/plans` still exists. Plans written there before
+/// the repo set `CADENCE_PLANS_DIR` finish in place, so a reader that dropped
+/// them would hide live work (cadence-hooks keeps such a plan itself).
+pub(crate) fn scan_plans_dirs(repo_root: &Path) -> Vec<String> {
+    let configured = scan_plans_dir(repo_root);
+    let mut dirs = vec![configured];
+    let default = plans_dir_path(repo_root, DEFAULT_PLANS_DIR);
+    // Compared as resolved paths too, so a symlink or a case-insensitive
+    // spelling of docs/plans is not scanned (and counted) twice.
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if dirs[0] != DEFAULT_PLANS_DIR
+        && default.is_dir()
+        && !same(&plans_dir_path(repo_root, &dirs[0]), &default)
+    {
+        // A configured folder that doesn't exist yet holds no plans, so
+        // naming it beside docs/plans would only mislead.
+        if !plans_dir_path(repo_root, &dirs[0]).is_dir() {
+            dirs.clear();
+        }
+        dirs.push(DEFAULT_PLANS_DIR.to_string());
+    }
+    dirs
+}
+
+/// How a reader names the folders it scanned, without the trailing `/` its
+/// messages add: `docs/plans`, or `Meta/docs/plans/ and docs/plans`.
+pub(crate) fn plans_dirs_label(dirs: &[String]) -> String {
+    dirs.join("/ and ")
+}
+
+/// `<root>/<relative>` as the folder's real path relative to `root`, the
+/// path the writer saves under and git tracks: the nearest existing ancestor
+/// is resolved (symlinks, letter case) and the parts that don't exist yet are
+/// kept as written. `None` when it resolves outside `root`, or when the real
+/// path is over the length cap or uses a character other than the setting's
+/// charset plus a space (a vault folder like `Second Brain` is common, and
+/// the writer saves there). Nothing is created.
+fn real_folder_in_checkout(root: &Path, relative: &str) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
+    let target = root.join(relative);
+    // `symlink_metadata`, not `exists`: a broken in-repo link counts as
+    // existing, so its canonicalize fails and the setting is refused rather
+    // than read through the link later.
+    let existing = target
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a).is_ok())?;
+    let missing = target.strip_prefix(existing).ok()?.to_path_buf();
+    let real = existing.canonicalize().ok()?.join(missing);
+    let rel = real.strip_prefix(&canonical_root).ok()?;
+    let joined = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    let printable = joined.split('/').all(|part| {
+        !part.is_empty()
+            && part.trim() == part
+            && part != ".."
+            && !part.eq_ignore_ascii_case(".git")
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+    });
+    (printable && joined.len() <= MAX_SCAN_PLANS_DIR_BYTES).then_some(joined)
 }
 
 /// Resolve `<root>/<relative>` (default [`DEFAULT_PLANS_DIR`]), creating it if
@@ -4689,7 +5025,7 @@ mod tests {
         assert!(msg.contains("format gate: plan lacks "));
         assert!(msg.contains("a settled Panel: line"));
         assert!(msg.contains("a ## Loop section"));
-        assert!(msg.contains("a ## Concessions section"));
+        assert!(msg.contains("a ## Workarounds section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -4807,10 +5143,10 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(
             msg.contains(
-                "format gate: plan lacks a ## Concessions section — the plan template: \
+                "format gate: plan lacks a ## Workarounds section — the plan template: \
                  `cadence:arrange` `references/plan-template.md`."
             ),
-            "the persist-time sentence names the Concessions stanza alone: {msg}"
+            "the persist-time sentence names the Workarounds stanza alone: {msg}"
         );
         assert!(
             !msg.contains("a ## Loop section")
@@ -6540,6 +6876,93 @@ mod tests {
         );
     }
 
+    /// Fire the injected arm for a child whose parent approved through Code
+    /// Mode's `REPL` tool, with the parent's plan file holding `stored`.
+    /// Returns the repo, the metrics dir, the child id and the verdict.
+    fn code_mode_fire(
+        tag: &str,
+        parent_id: &str,
+        plan: &str,
+        stored: &str,
+    ) -> (TempDir, TempDir, String, CheckResult) {
+        let plans = test_config_dir().join("plans");
+        fs::create_dir_all(&plans).unwrap();
+        let plan_file = plans.join(format!("{}.md", unique_session_id(tag)));
+        fs::write(&plan_file, format!("{stored}\n")).unwrap();
+        let parent = write_code_mode_parent_transcript(
+            test_transcripts_root(),
+            parent_id,
+            CODE_MODE_CALL,
+            Some(&plan_file),
+            false,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = write_child_transcript(
+            tmp.path(),
+            &format!(
+                "Implement the following plan:\n\n{plan}\n\nIf you need specific details from \
+                 before exiting plan mode, read the full transcript at: {}\n\nIf this plan can \
+                 be broken down into multiple independent tasks, consider using the Agent tool.",
+                parent.display()
+            ),
+        );
+        let sid = unique_session_id(tag);
+        let mut input = injected_input(&cwd, &transcript, &sid);
+        input.tool_name = Some("REPL".into());
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(
+                &input,
+                "2026-11-22T00:00:00Z",
+                "2026-11-22",
+                "test-host",
+                &test_env(),
+            )
+        });
+        (tmp, metrics_dir, sid, r)
+    }
+
+    /// An approve-and-clear made through Code Mode's `REPL` tool persists
+    /// the plan, attributed to the parent, with one ledger row.
+    #[test]
+    fn injected_arm_persists_a_code_mode_approval() {
+        let plan = "# Code Mode Plan\n\n- [ ] step one";
+        let parent_id = "11111111-2222-3333-4444-5555555555b1";
+        let (tmp, metrics_dir, sid, r) = code_mode_fire("child-codemode", parent_id, plan, plan);
+        assert_eq!(r.outcome, Outcome::Nudge, "{:?}", r.message);
+        let doc =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-11-22-code-mode-plan.md")).unwrap();
+        assert!(
+            doc.contains(&format!("approved_session_id: \"{parent_id}\"")),
+            "{doc}"
+        );
+        let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        let own: Vec<Value> = rows
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|r: &Value| r["child_session_id"] == sid.as_str())
+            .collect();
+        assert_eq!(own.len(), 1, "one row for this persist; file: {rows}");
+        assert_eq!(own[0]["parent_session_id"], parent_id, "file: {rows}");
+    }
+
+    /// A Code Mode parent whose plan file holds a different plan proves
+    /// nothing: no plan written, no ledger row.
+    #[test]
+    fn injected_arm_code_mode_with_a_differing_plan_file_never_persists() {
+        let (tmp, metrics_dir, _, r) = code_mode_fire(
+            "child-codemode-differs",
+            "11111111-2222-3333-4444-5555555555b2",
+            "# Code Mode Plan\n\n- [ ] step one",
+            "# Code Mode Plan\n\n- [ ] a different step",
+        );
+        assert_eq!(r.outcome, Outcome::Allow, "{:?}", r.message);
+        assert!(!tmp.path().join("docs/plans").exists());
+        assert!(!metrics_dir.path().join("plan-links.jsonl").exists());
+    }
+
     #[test]
     fn injected_arm_targets_the_session_root_repo_from_a_no_repo_first_call() {
         // cadence-hooks#1021: the first tool call running outside any repo no
@@ -6926,6 +7349,276 @@ mod tests {
         }
     }
 
+    /// Write `<root>/-test-project/<parent_id>.jsonl` as a Code Mode session
+    /// records an approval: a user turn, the `plan_mode` attachment naming
+    /// `plan_file` (when given), the assistant's `REPL` `tool_use` running
+    /// `code`, and the denial approve-and-clear records. `sidechain` marks the
+    /// `REPL` row as a subagent's.
+    fn write_code_mode_parent_transcript(
+        root: &Path,
+        parent_id: &str,
+        code: &str,
+        plan_file: Option<&Path>,
+        sidechain: bool,
+    ) -> PathBuf {
+        let dir = root.join("-test-project");
+        fs::create_dir_all(&dir).unwrap();
+        let mut rows = vec![serde_json::json!({
+            "type": "user", "sessionId": parent_id, "isSidechain": false,
+            "message": {"role": "user", "content": "plan it"},
+        })];
+        if let Some(plan_file) = plan_file {
+            rows.push(serde_json::json!({
+                "type": "attachment", "sessionId": parent_id, "isSidechain": false,
+                "attachment": {"type": "plan_mode", "reminderType": "full",
+                               "isSubAgent": false, "planExists": false,
+                               "planFilePath": plan_file.to_string_lossy()},
+            }));
+        }
+        rows.push(serde_json::json!({
+            "type": "assistant", "sessionId": parent_id, "isSidechain": sidechain,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_cm", "name": "REPL",
+                 "input": {"code": code, "description": "Present plan for approval"},
+                 "caller": {"type": "direct"}},
+            ]},
+        }));
+        rows.push(serde_json::json!({
+            "type": "user", "sessionId": parent_id, "isSidechain": false,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_cm", "is_error": true,
+                 "content": "User rejected tool use"},
+            ]},
+        }));
+        let content: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        let path = dir.join(format!("{parent_id}.jsonl"));
+        let staging = tempfile::NamedTempFile::new_in(&dir).unwrap();
+        fs::write(staging.path(), content).unwrap();
+        staging.persist(&path).unwrap();
+        path
+    }
+
+    /// The Code Mode call as a real session records it.
+    const CODE_MODE_CALL: &str = "await tools.ExitPlanMode({})";
+
+    /// Code Mode: the parent's approval is a `REPL` `tool_use` calling
+    /// `tools.ExitPlanMode(` with no plan text. It names an approver only
+    /// when the plan-store file the parent's `plan_mode` attachment names
+    /// holds the child's body, read through the same plan-store check as a
+    /// top-level `planFilePath`.
+    #[test]
+    fn parent_pointer_accepts_a_code_mode_approval_via_the_plan_store() {
+        let store = TempDir::new().unwrap();
+        let root = store.path().join("projects");
+        let plans = store.path().join("plans");
+        fs::create_dir_all(&plans).unwrap();
+        let outside = TempDir::new().unwrap();
+        let matching = plans.join("code-mode.md");
+        fs::write(&matching, format!("{POINTER_BODY}\n")).unwrap();
+        let other = plans.join("other.md");
+        fs::write(&other, "# Some Other Plan\n\nDo that.").unwrap();
+        let foreign = outside.path().join("foreign.md");
+        fs::write(&foreign, POINTER_BODY).unwrap();
+        let mentions_only = "// ExitPlanMode comes later\nlog(\"ExitPlanMode\")";
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases: Vec<(&str, &str, Option<PathBuf>, bool, bool)> = vec![
+            (
+                "REPL call + matching plan file",
+                CODE_MODE_CALL,
+                Some(matching.clone()),
+                false,
+                true,
+            ),
+            (
+                "plan file holds another plan",
+                CODE_MODE_CALL,
+                Some(other),
+                false,
+                false,
+            ),
+            (
+                "REPL code only mentions ExitPlanMode",
+                mentions_only,
+                Some(matching.clone()),
+                false,
+                false,
+            ),
+            (
+                "sidechain REPL call",
+                CODE_MODE_CALL,
+                Some(matching.clone()),
+                true,
+                false,
+            ),
+            (
+                "plan file outside the store",
+                CODE_MODE_CALL,
+                Some(foreign.clone()),
+                false,
+                false,
+            ),
+            (
+                "no plan_mode attachment",
+                CODE_MODE_CALL,
+                None,
+                false,
+                false,
+            ),
+            (
+                "missing plan file",
+                CODE_MODE_CALL,
+                Some(plans.join("missing.md")),
+                false,
+                false,
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            let linked = plans.join("linked.md");
+            std::os::unix::fs::symlink(&foreign, &linked).unwrap();
+            cases.push((
+                "symlinked plan file",
+                CODE_MODE_CALL,
+                Some(linked),
+                false,
+                false,
+            ));
+        }
+        for (i, (label, code, plan_file, sidechain, want)) in cases.into_iter().enumerate() {
+            let parent_id = format!("11111111-2222-3333-4444-5555555555f{i}");
+            let transcript = write_code_mode_parent_transcript(
+                &root,
+                &parent_id,
+                code,
+                plan_file.as_deref(),
+                sidechain,
+            );
+            assert_eq!(
+                resolve_pointer(&transcript.display().to_string(), &root),
+                want.then(|| parent_id.clone()),
+                "{label}"
+            );
+        }
+        // A sidechain or subagent `plan_mode` attachment names no plan file.
+        for (label, attachment) in [
+            (
+                "sidechain attachment",
+                serde_json::json!({"type": "attachment", "isSidechain": true,
+                    "attachment": {"type": "plan_mode", "planFilePath": matching.to_string_lossy()}}),
+            ),
+            (
+                "subagent attachment",
+                serde_json::json!({"type": "attachment", "isSidechain": false,
+                    "attachment": {"type": "plan_mode", "isSubAgent": true,
+                                   "planFilePath": matching.to_string_lossy()}}),
+            ),
+        ] {
+            let transcript =
+                write_code_mode_parent_transcript(&root, PARENT_ID, CODE_MODE_CALL, None, false);
+            let mut content = fs::read_to_string(&transcript).unwrap();
+            content.insert_str(0, &format!("{attachment}\n"));
+            fs::write(&transcript, content).unwrap();
+            assert_eq!(
+                resolve_pointer(&transcript.display().to_string(), &root),
+                None,
+                "{label}"
+            );
+        }
+    }
+
+    /// Code Mode order and cap: the call must follow an attachment naming the
+    /// matching plan file, and only the most recently named distinct paths
+    /// are kept.
+    #[test]
+    fn code_mode_call_follows_its_attachment_and_newest_paths_are_kept() {
+        let store = TempDir::new().unwrap();
+        let root = store.path().join("projects");
+        let dir = root.join("-test-project");
+        fs::create_dir_all(&dir).unwrap();
+        let plans = store.path().join("plans");
+        fs::create_dir_all(&plans).unwrap();
+        let matching = plans.join("code-mode.md");
+        fs::write(&matching, format!("{POINTER_BODY}\n")).unwrap();
+        let attach = |path: &Path| {
+            serde_json::json!({"type": "attachment", "isSidechain": false,
+                "attachment": {"type": "plan_mode", "isSubAgent": false,
+                               "planFilePath": path.to_string_lossy()}})
+        };
+        let call = |code: &str| {
+            serde_json::json!({"type": "assistant", "isSidechain": false,
+                "message": {"content": [{"type": "tool_use", "name": "REPL",
+                                         "input": {"code": code}}]}})
+        };
+        let others = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| attach(&plans.join(format!("other-{i}.md"))))
+                .collect()
+        };
+        let cap = MAX_PLAN_FILE_READS;
+        let cases: Vec<(&str, Vec<Value>, bool)> = vec![
+            (
+                "attachment then call (the real order)",
+                vec![attach(&matching), call(CODE_MODE_CALL)],
+                true,
+            ),
+            (
+                "call before the attachment",
+                vec![call(CODE_MODE_CALL), attach(&matching)],
+                false,
+            ),
+            // A substring test cannot tell a commented call from a real one;
+            // the plan-file body match is what this arm rests on.
+            (
+                "exact spelling inside a comment is read as a call",
+                vec![
+                    attach(&matching),
+                    call("// await tools.ExitPlanMode({}) later"),
+                ],
+                true,
+            ),
+            (
+                "more attachments than the cap, matching one last",
+                [
+                    others(cap + 4),
+                    vec![attach(&matching), call(CODE_MODE_CALL)],
+                ]
+                .concat(),
+                true,
+            ),
+            (
+                "matching one oldest, evicted by the cap",
+                [
+                    vec![attach(&matching)],
+                    others(cap),
+                    vec![call(CODE_MODE_CALL)],
+                ]
+                .concat(),
+                false,
+            ),
+            (
+                "matching one named again after the others",
+                [
+                    vec![attach(&matching)],
+                    others(cap),
+                    vec![attach(&matching), call(CODE_MODE_CALL)],
+                ]
+                .concat(),
+                true,
+            ),
+        ];
+        for (i, (label, rows, want)) in cases.into_iter().enumerate() {
+            let parent_id = format!("11111111-2222-3333-4444-5555555556{i:02}");
+            let path = dir.join(format!("{parent_id}.jsonl"));
+            let content: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            fs::write(&path, content).unwrap();
+            assert_eq!(
+                resolve_pointer(&path.display().to_string(), &root),
+                want.then(|| parent_id.clone()),
+                "{label}"
+            );
+        }
+    }
+
     /// Gate review of #1255 (M-1, M-2): an approve-with-feedback paragraph
     /// after the harness block, and a config dir with a space in its path,
     /// no longer hide the pointer. The body stays the plan alone.
@@ -7219,6 +7912,155 @@ mod tests {
             )],
             ..base_env(user_plans_dir)
         }
+    }
+
+    // --- scan_plans_dir: the readers' view of CADENCE_PLANS_DIR (cadence#2153) ---
+
+    #[test]
+    fn scan_plans_dir_defaults_without_a_setting() {
+        let repo = TempDir::new().unwrap();
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+    }
+
+    #[test]
+    fn scan_plans_dir_reads_the_configured_folder_without_creating_it() {
+        let repo = TempDir::new().unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "./Meta/docs/plans/");
+        assert_eq!(scan_plans_dir(repo.path()), "Meta/docs/plans");
+        assert!(
+            !repo.path().join("Meta").exists(),
+            "a scan must never create the folder it reads"
+        );
+    }
+    #[test]
+    fn scan_plans_dir_falls_back_on_an_overlong_value() {
+        // A repo's settings could otherwise fill SessionStart context with a
+        // long, plain-charset folder name.
+        let repo = TempDir::new().unwrap();
+        let long = "Do-this-now.".repeat(100);
+        write_settings_env(repo.path(), PLANS_DIR_KEY, &long);
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+        let ok = "a".repeat(MAX_SCAN_PLANS_DIR_BYTES);
+        write_settings_env(repo.path(), PLANS_DIR_KEY, &ok);
+        assert_eq!(scan_plans_dir(repo.path()), ok);
+    }
+
+    #[test]
+    fn scan_plans_dir_falls_back_on_an_empty_or_refused_value() {
+        for value in [
+            "",
+            "/etc",
+            "../outside",
+            "a\\b",
+            ".git/plans",
+            "docs/plans\nX",
+        ] {
+            let repo = TempDir::new().unwrap();
+            write_settings_env(repo.path(), PLANS_DIR_KEY, value);
+            assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR, "{value:?}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dir_reports_a_symlinked_folder_by_its_real_path() {
+        // The writer saves under the resolved folder, so the readers must read
+        // that folder: Meta -> vault/Meta makes Meta/plans vault/Meta/plans.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("vault/Meta/plans")).unwrap();
+        std::os::unix::fs::symlink("vault/Meta", repo.path().join("Meta")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/plans");
+        // A folder that doesn't exist yet keeps its missing tail as written.
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/new/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "vault/Meta/new/plans");
+        // A real folder with a space (a vault named `Second Brain`) is read.
+        std::fs::create_dir_all(repo.path().join("Second Brain/Meta/plans")).unwrap();
+        std::os::unix::fs::symlink("Second Brain/Meta", repo.path().join("Brain")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Brain/plans");
+        assert_eq!(scan_plans_dir(repo.path()), "Second Brain/Meta/plans");
+        // A broken link is refused, not treated as a folder still to come.
+        std::os::unix::fs::symlink("/nonexistent/elsewhere", repo.path().join("Gone")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Gone/plans");
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dirs_reads_docs_plans_once_through_an_in_repo_symlink() {
+        // Git tracks the plan at docs/plans/x.md and the writer saves there,
+        // so the symlinked spelling resolves to docs/plans, scanned once.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
+        // Not `Docs`: on a case-insensitive filesystem that name is `docs`.
+        std::os::unix::fs::symlink("docs", repo.path().join("Notes")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Notes/plans");
+        assert_eq!(
+            scan_plans_dirs(repo.path()),
+            vec![DEFAULT_PLANS_DIR.to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_plans_dir_reads_the_session_checkouts_settings_from_a_linked_worktree() {
+        // The writer reads an untracked settings.local.json in the session
+        // checkout when the worktree has none; the readers must too.
+        let primary = TempDir::new().unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(primary.path(), &["init", "-q", "-b", "main"]);
+        git(
+            primary.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::create_dir_all(primary.path().join(".claude")).unwrap();
+        std::fs::write(
+            primary.path().join(".claude/settings.local.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":"Meta/plans"}}"#,
+        )
+        .unwrap();
+        let holder = TempDir::new().unwrap();
+        let wt = holder.path().join("wt");
+        git(
+            primary.path(),
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        assert_eq!(scan_plans_dir_with(&wt, None), DEFAULT_PLANS_DIR);
+        assert_eq!(scan_plans_dir_with(&wt, Some(primary.path())), "Meta/plans");
+        // An unrelated session root is not evidence of anything.
+        let other = TempDir::new().unwrap();
+        git(other.path(), &["init", "-q"]);
+        assert_eq!(
+            scan_plans_dir_with(&wt, Some(other.path())),
+            DEFAULT_PLANS_DIR
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_plans_dir_refuses_a_folder_that_resolves_outside_the_checkout() {
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("Meta")).unwrap();
+        write_settings_env(repo.path(), PLANS_DIR_KEY, "Meta/plans");
+        assert_eq!(scan_plans_dir(repo.path()), DEFAULT_PLANS_DIR);
     }
 
     #[test]

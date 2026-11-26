@@ -6,8 +6,9 @@
 
 use crate::model_breakdown::{by_model_json, unpriced_models};
 use crate::prices::Prices;
-use crate::scan_tokens::{ScanResult, scan_tokens};
+use crate::scan_tokens::{ScanResult, scan_tokens, scan_tokens_file};
 use serde_json::{Value, json};
+use std::path::Path;
 
 /// A successful usage scan.
 ///
@@ -94,8 +95,8 @@ pub enum TranscriptScan {
     Empty,
 }
 
-pub fn scan_transcript(transcript: &str, marker: Option<&str>) -> TranscriptScan {
-    match scan_tokens(transcript, marker) {
+pub(crate) fn from_scan_result(scan: Option<ScanResult>) -> TranscriptScan {
+    match scan {
         Some(scan) => {
             let total_tokens = scan.tokens.input
                 + scan.tokens.cache_create
@@ -113,10 +114,45 @@ pub fn scan_transcript(transcript: &str, marker: Option<&str>) -> TranscriptScan
     }
 }
 
+pub fn scan_transcript(transcript: &str, marker: Option<&str>) -> TranscriptScan {
+    from_scan_result(scan_tokens(transcript, marker))
+}
+
+/// Stream a transcript file from disk, optionally seeking to `hint_offset`
+/// when `marker` is known, and return both the [`TranscriptScan`] and the byte
+/// offset of the last scanned assistant message's line.
+pub fn scan_transcript_file(
+    path: &Path,
+    marker: Option<&str>,
+    hint_offset: Option<u64>,
+) -> std::io::Result<(TranscriptScan, Option<u64>)> {
+    match scan_tokens_file(path, marker, hint_offset)? {
+        Some((scan, offset)) => Ok((from_scan_result(Some(scan)), Some(offset))),
+        None => Ok((TranscriptScan::Empty, None)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scan_tokens::Tokens;
+
+    /// `log-commit` writes no row on `TranscriptScan::Empty`, so a second
+    /// commit in one Code Mode turn, whose range after the marker holds only
+    /// `<synthetic>` records, must scan as `Usage` with zero tokens.
+    #[test]
+    fn a_synthetic_only_range_is_usage_not_empty() {
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        let TranscriptScan::Usage(usage) = scan_transcript(&t, Some("m1")) else {
+            panic!("a synthetic-only range must not be Empty");
+        };
+        assert_eq!(usage.total_tokens, 0);
+        assert!(usage.scan.by_model.is_empty());
+    }
 
     /// A Claude transcript with an unpriced model lists exactly that model.
     ///

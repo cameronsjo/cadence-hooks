@@ -130,7 +130,7 @@ pub const HOOKS: &[HookEntry] = &[
     // cadence
     HookEntry {
         name: "terminology",
-        description: "Block inclusive terminology violations",
+        description: "Nudge on inclusive terminology violations",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only content guard; no machine-local state.
@@ -310,7 +310,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "guard-secret-dump",
-        description: "Ask before a command prints a bare, unnamed secret value",
+        description: "Block a command that prints a bare secret value; ask before one feeds a consumer",
         namespace: "cadence",
         events: &[HookEvent::PreToolUse],
         // Remote: no-op when the producing tools are absent; harmless to keep armed.
@@ -579,6 +579,15 @@ pub const HOOKS: &[HookEntry] = &[
         namespace: "guardrails",
         events: &[HookEvent::PreToolUse],
         // Remote: no-op when the tool is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
+        name: "guard-container-rm",
+        description: "Ask before docker rm removes a container (confirm tier: an identical retry passes once)",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+        // Remote: no-op when docker is absent; harmless to keep armed.
         remote: RemotePolicy::Run,
         suppressible: false,
     },
@@ -924,7 +933,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "lint-plan-shape",
-        description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every outcome carries the presentation reminders (subagents stopped, operator asked to see the plan); subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
+        description: "Block ExitPlanMode when the plan's first Panel: line states no outcome (missing, pending, trivial, or an unfilled template line); the block names only the fix (`Panel: <seats> ran — …` or `Panel: none — <reason>`); nudge when other template stanzas are missing; both allow outcomes carry the presentation reminders (subagents stopped, operator asked to see the plan); subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
         namespace: "session",
         events: &[HookEvent::PreToolUse],
         // Remote: read-only against the repo (#1197).

@@ -1,0 +1,218 @@
+# Everyday Bash commands for scripts/confirm-tier-compare.py (cadence-hooks#1658).
+# One command per line, run as written from a primary checkout and from a
+# linked worktree of a scratch repo. Blank lines and lines starting with `#`
+# are skipped. `../wt` and `../primary` name the two scratch checkouts.
+git status
+git status -sb
+git log --oneline -5
+git diff
+git diff --stat
+git diff --cached
+git add -A
+git add README.md
+git commit -m 'fix: x'
+git commit -am 'wip'
+git add -A && git commit -m x
+git commit --amend --no-edit
+git push
+git push -u origin feat
+git pull
+git fetch origin
+git fetch --all
+git checkout -b topic
+git switch main
+git branch -a
+git branch -d old
+git stash list
+git merge origin/main
+git merge --ff-only origin/main
+git rebase origin/main
+git reset --soft HEAD~1
+git reset --hard HEAD~1
+git restore README.md
+git restore --staged README.md
+git rm --cached x
+git worktree list
+git worktree add ../x -b x
+git tag
+git show HEAD
+git blame README.md
+git log -p -1
+git rev-parse HEAD
+git remote -v
+git clean -n
+git clean -fd
+git cherry-pick abc123
+git revert HEAD --no-edit
+git commit -F msg.txt -- README.md
+git -C ../wt status
+git -C ../primary commit -m x
+cd ../wt && git commit -m x
+cd ../primary && git commit -m x
+git commit -m "$(cat msg.txt)"
+git log --format='%H %s' -3
+op read op://Private/GitHub/token
+op item get 'GitHub Token' --fields label=token
+op whoami
+op signin
+op item list
+op vault list
+op item list --vault Private
+op item list --account a.example
+op item list --account=a.example --vault Private
+OP_ACCOUNT=a.example op item list
+op --format json item list | jq '.[].title'
+op item list | grep api
+op item create --category login --title x
+op document get doc1
+op account list
+echo 'op item list'
+op item get list
+op run -- ./deploy.sh
+gh issue close 354 -R cameronsjo/cadence-ecosystem
+gh issue close 12 -R cameronsjo/cadence-ecosystem
+gh issue close 107 -R cameronsjo/cadence
+gh issue close 354
+gh issue close 99
+gh issue view 354
+gh issue list
+gh issue comment 354 --body x
+gh pr list
+gh pr view 5
+gh pr create --draft --title t --body b
+gh pr checks 5
+gh run list --branch main
+gh issue close 354 -R cameronsjo/forgectl
+gh issue close https://github.com/cameronsjo/cadence-ecosystem/issues/354
+gh issue reopen 354
+gh api repos/cameronsjo/cadence-hooks/pulls/1
+ls
+ls -la
+cat README.md
+head -20 README.md
+tail -f log.txt
+wc -l README.md
+cargo test
+cargo build --release
+cargo clippy --all-targets -- -D warnings
+make ci
+make test
+npm test
+pnpm install
+uv run pytest
+python3 x.py
+echo hi
+echo hi > out.txt
+printf 'a\n' >> notes.md
+grep -rn foo .
+rg TODO
+sed -n 1,5p README.md
+find . -name '*.rs'
+jq . data.json
+curl -s https://example.com
+mkdir -p build
+rm -rf build
+cp a b
+mv a b
+touch new.txt
+chmod +x run.sh
+./run.sh
+bash scripts/x.sh
+docker ps
+kubectl get pods
+tree -L 2
+du -sh .
+df -h
+env | sort
+which cargo
+cat .env.example
+echo KEY=x > .env.example
+echo KEY=x > config.toml
+for f in *.md; do wc -l "$f"; done
+(cd ../wt && git status)
+git status && git diff --stat
+git add -A; git status
+sleep 1
+export FOO=bar && echo $FOO
+true || false
+date -u
+uname -a
+# Docker (guard-container-rm, cameronsjo/cadence-hooks#1661). The removals
+# among these are listed in container-rm-expected-blocks.txt; every other
+# line must stay allowed.
+docker ps -a
+docker ps -aq --filter status=exited
+docker ps --format '{{.Names}}'
+docker logs web
+docker logs -f --tail 100 web
+docker inspect web
+docker exec -it web sh
+docker exec web cat /etc/hosts
+docker run --rm alpine true
+docker run --rm -it -v ./src:/src alpine sh
+docker run -d --name web -p 8080:80 nginx
+docker run --name rm alpine
+docker start web
+docker stop web
+docker stop $(docker ps -q)
+docker restart web
+docker kill web
+docker pause web
+docker cp web:/var/log/app.log .
+docker build -t app .
+docker build --rm -t app .
+docker pull alpine
+docker push registry.example/app:1
+docker tag app registry.example/app:1
+docker images
+docker image ls
+docker image rm alpine
+docker image remove alpine
+docker image prune -f
+docker rmi alpine
+docker compose up -d
+docker compose down
+docker compose down -v
+docker compose rm
+docker compose rm -f web
+docker compose logs web
+docker system prune
+docker system prune -af
+docker system df
+docker container ls -a
+docker container stop web
+docker container prune
+docker volume ls
+docker volume rm data
+docker network ls
+docker network rm appnet
+docker context ls
+docker context use prod
+docker --context rm ps
+docker info
+docker version
+docker stats --no-stream
+docker rm --help
+docker container rm -h
+docker-compose down
+podman rm web
+echo 'docker rm web'
+git commit -m 'docs: explain docker rm'
+grep -rn 'docker rm' docs
+ssh host 'docker rm web'
+rm -f docker-compose.override.yml
+docker rm web
+docker rm -f web
+docker rm -fv web db
+docker rm --force web
+docker container rm web
+docker container rm -f web
+docker container remove web
+docker --context prod rm web
+docker -H tcp://h:2375 rm web
+sudo docker rm web
+DOCKER_HOST=tcp://h:2375 docker rm web
+docker ps -aq | xargs docker rm
+docker rm $(docker ps -aq)
+docker stop web && docker rm web
+bash -c 'docker rm web'

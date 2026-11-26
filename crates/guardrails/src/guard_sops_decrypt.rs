@@ -267,7 +267,9 @@ fn block_message(found: &str, ignored_list: bool) -> String {
          .claude/settings.json, which would turn the bypass on for everyone) allows it and \
          records a bypass row. The hook reads Claude Code's environment, not the command's, \
          so an inline `CADENCE_ALLOW_SOPS_DECRYPT=1 sops …` prefix does nothing; the \
-         setting takes effect next session."
+         setting takes effect next session.\n   \
+         {}",
+        cadence_hooks_core::confirm::OPERATOR_HANDOFF
     )
 }
 
@@ -540,6 +542,17 @@ impl SopsDecryptGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_tells_a_phone_operator_what_to_do() {
+        // cameronsjo/cadence-hooks#1658 part 3: the escape needs a settings
+        // edit, so the block names the step that works without a keyboard.
+        let msg = block_message("sops -d x | cat", false);
+        assert!(
+            msg.ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn escape_hint_says_where_the_override_is_read() {

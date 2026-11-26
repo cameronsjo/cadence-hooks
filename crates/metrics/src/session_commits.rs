@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 const COUNT_FILE: &str = "count";
 const LAST_FILE: &str = "last";
+const OFFSET_FILE: &str = "offset";
 
 /// `<state>/commits/<session>`. `None` for a session id unsafe in a path. Pure.
 fn session_dir(state_dir: &Path, session_id: &str) -> Option<PathBuf> {
@@ -44,6 +45,22 @@ pub fn start(state_dir: &Path, session_id: &str) {
 /// existed, or resumed after its SessionEnd) has earlier commits only in the
 /// ledger, so creating a counter here would hide them; it stays on the ledger.
 pub fn record(state_dir: &Path, session_id: &str, last_message_id: Option<&str>) {
+    record_with_offset(state_dir, session_id, last_message_id, None);
+}
+
+/// Record one commit, its `lastMessageId`, and optionally the byte offset of
+/// that message's line in the transcript so subsequent commits can seek
+/// directly to the tail instead of re-scanning from byte 0.
+///
+/// The offset is stored in a sibling `offset` file (`"<offset>\n<id>"`) so
+/// `last` stays a plain message id (100% backward-compatible with existing
+/// state files and tests).
+pub fn record_with_offset(
+    state_dir: &Path,
+    session_id: &str,
+    last_message_id: Option<&str>,
+    byte_offset: Option<u64>,
+) {
     let Some(dir) = session_dir(state_dir, session_id) else {
         return;
     };
@@ -54,6 +71,7 @@ pub fn record(state_dir: &Path, session_id: &str, last_message_id: Option<&str>)
         return;
     }
     let last = dir.join(LAST_FILE);
+    let offset_path = dir.join(OFFSET_FILE);
     match last_message_id {
         Some(id) => {
             // Write a temp file and rename it over `last`, so a concurrent
@@ -65,11 +83,42 @@ pub fn record(state_dir: &Path, session_id: &str, last_message_id: Option<&str>)
             if written.is_err() || std::fs::rename(&tmp, &last).is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
+            match byte_offset {
+                Some(offset) => {
+                    let payload = format!("{offset}\n{id}");
+                    let offset_tmp = dir.join(format!("{OFFSET_FILE}.{}.tmp", std::process::id()));
+                    let written = common::open_state_marker(&offset_tmp, false)
+                        .and_then(|mut file| file.write_all(payload.as_bytes()));
+                    if written.is_err() || std::fs::rename(&offset_tmp, &offset_path).is_err() {
+                        let _ = std::fs::remove_file(&offset_tmp);
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&offset_path);
+                }
+            }
         }
         None => {
             let _ = std::fs::remove_file(&last);
+            let _ = std::fs::remove_file(&offset_path);
         }
     }
+}
+
+/// Read the cached transcript byte offset for `expected_message_id`, if one
+/// was recorded for this session and matches `expected_message_id`.
+///
+/// Returns `None` when absent, unreadable, malformed, or recorded for a
+/// different message id (e.g. an older state dir or a concurrent update),
+/// causing the caller to fall back to a full streaming scan from byte 0.
+pub fn last_offset(state_dir: &Path, session_id: &str, expected_message_id: &str) -> Option<u64> {
+    let dir = session_dir(state_dir, session_id)?;
+    let text = read_nofollow(&dir.join(OFFSET_FILE)).ok()?;
+    let (offset_str, recorded_id) = text.split_once('\n')?;
+    if recorded_id.trim() != expected_message_id {
+        return None;
+    }
+    offset_str.trim().parse::<u64>().ok()
 }
 
 /// Commits recorded this session, or `None` when the session has no counter
@@ -229,5 +278,27 @@ mod tests {
         record(tmp.path(), "s1", Some("m"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
         assert_eq!(count(tmp.path(), "s1"), None, "a symlink is not a counter");
+    }
+
+    #[test]
+    fn record_with_offset_persists_offset_and_keeps_last_plain() {
+        let tmp = tempfile::tempdir().unwrap();
+        start(tmp.path(), "s1");
+        record_with_offset(tmp.path(), "s1", Some("m1"), Some(4096));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("commits/s1/last")).unwrap(),
+            "m1",
+            "last file must remain a plain message id for backward compatibility"
+        );
+        assert_eq!(last_offset(tmp.path(), "s1", "m1"), Some(4096));
+        assert_eq!(
+            last_offset(tmp.path(), "s1", "m2"),
+            None,
+            "offset for a different message id must not be returned"
+        );
+
+        // Recording without an offset clears any stale offset file.
+        record(tmp.path(), "s1", Some("m2"));
+        assert_eq!(last_offset(tmp.path(), "s1", "m2"), None);
     }
 }

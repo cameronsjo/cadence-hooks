@@ -406,15 +406,12 @@ pub fn enforce_worktree_marker_path(git_common_dir: &Path) -> PathBuf {
 }
 
 /// Resolve the absolute git common dir for `dir` — shared across every
-/// linked worktree of one repo (#179) — via
-/// `git rev-parse --path-format=absolute --git-common-dir`. `None` when
-/// `dir` isn't inside a git repo, or git is unavailable.
+/// linked worktree of one repo (#179). Uses pure-filesystem
+/// [`crate::gitstate::GitState::resolve`] (canonicalized to match
+/// `git rev-parse --path-format=absolute --git-common-dir`), returning `None`
+/// when `dir` isn't inside a git repo.
 fn git_common_dir(dir: &Path) -> Option<PathBuf> {
-    crate::shell::git_command(
-        &dir.to_string_lossy(),
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .map(PathBuf::from)
+    crate::gitstate::GitState::resolve(dir).map(|s| s.git_common_dir)
 }
 
 /// The enforce-worktree snooze marker path for `dir`, resolving the shared
@@ -469,11 +466,6 @@ pub fn should_block(
     is_primary && !allowed_main && !kill_switch && !temp_root && !snoozed
 }
 
-/// Resolve the repo root enclosing `dir`, if any.
-fn repo_root_for(dir: &Path) -> Option<String> {
-    crate::shell::git_command(&dir.to_string_lossy(), &["rev-parse", "--show-toplevel"])
-}
-
 /// Would `enforce-worktree` block a mutation landing directly in `dir`?
 /// The composite predicate — primary checkout, not exempted by
 /// `CADENCE_ALLOW_MAIN` (env or repo-declared), not the kill switch, not a
@@ -490,21 +482,23 @@ pub fn would_block_here(dir: &Path) -> bool {
     if is_claude_managed_dir(dir) || is_plan_doc_dir(dir) {
         return false;
     }
-    let Some(repo_root) = repo_root_for(dir) else {
+    let Some(state) = crate::gitstate::GitState::resolve(dir) else {
         return false;
     };
-    let repo_root_path = Path::new(&repo_root);
-    let is_primary = is_primary_checkout(&repo_root);
+    let is_primary = state.is_primary();
+    if !is_primary {
+        return false;
+    }
+    let repo_root_path = state.repo_root.as_path();
     let home = crate::paths::user_home_lossy_or_default();
     let temp_root = is_temp_root(
         repo_root_path,
         std::env::var("TMPDIR").ok().as_deref(),
         Some(&home),
     );
-    let snoozed = is_snoozed_now(repo_root_path);
+    let snoozed = is_snoozed_in_common_dir(&state.git_common_dir);
     let allow_main_env = is_truthy(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref());
-    let repo_declared = is_primary
-        && !allow_main_env
+    let repo_declared = !allow_main_env
         && is_truthy(crate::config::repo_env_flag(repo_root_path, "CADENCE_ALLOW_MAIN").as_deref());
     let allowed_main = allow_main_env || repo_declared;
     let kill_switch = is_truthy(std::env::var("CADENCE_NO_ENFORCE_WORKTREE").ok().as_deref());

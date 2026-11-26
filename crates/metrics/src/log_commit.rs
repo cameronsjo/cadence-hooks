@@ -8,10 +8,11 @@ use crate::common;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
 use crate::session_commits;
-use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
+use crate::transcript::{TranscriptScan, UsageScan, scan_transcript_file};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
 use std::io::Write;
+use std::path::Path;
 
 /// Appends a cost-per-commit line to `commits.jsonl`. Holds the optional price
 /// table override path supplied via `--prices`.
@@ -76,11 +77,18 @@ impl Logger for LogCommit {
             session_commits::LastMessage::Known(id) => id,
             session_commits::LastMessage::Unknown => previous_message_id(&commits_path, session_id),
         };
+        let hint_offset = last_message_id
+            .as_deref()
+            .and_then(|id| session_commits::last_offset(&state, session_id, id));
 
-        let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
+        let Ok((scan, last_offset)) = scan_transcript_file(
+            Path::new(transcript_path),
+            last_message_id.as_deref(),
+            hint_offset,
+        ) else {
             return;
         };
-        let usage = match scan_transcript(&transcript, last_message_id.as_deref()) {
+        let usage = match scan {
             TranscriptScan::Usage(usage) => usage,
             TranscriptScan::Diagnostic(diagnostic) => {
                 common::append_transcript_diagnostic(
@@ -126,10 +134,11 @@ impl Logger for LogCommit {
             let mut line = record.to_string();
             line.push('\n');
             if file.write_all(line.as_bytes()).is_ok() {
-                session_commits::record(
+                session_commits::record_with_offset(
                     &state,
                     session_id,
                     record.get("lastMessageId").and_then(Value::as_str),
+                    last_offset,
                 );
             }
         }

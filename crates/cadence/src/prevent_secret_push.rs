@@ -1608,6 +1608,9 @@ fn judge(command: &str, cwd: &str, exempt: Exempt) -> Vec<Stop> {
 /// cannot say is `UNRESOLVABLE_DIR`, where every probe fails and the push
 /// goes ahead with a warning.
 fn push_invocations_every_dir(command: &str, cwd: &str) -> Vec<PushInvocation> {
+    if !cadence_hooks_core::shell::may_spell_word(command, "git") {
+        return Vec::new();
+    }
     let mut pushes = push_invocations(command, cwd);
     if !contains_ignoring_ascii_case(command, "push") {
         return pushes;
@@ -1932,6 +1935,8 @@ fn render_found(hits: &[Hit]) -> String {
          removing it in a later commit does not help, the history is what is published.\n",
     );
     out.push_str(ACK);
+    out.push('\n');
+    out.push_str(cadence_hooks_core::confirm::OPERATOR_HANDOFF);
     out
 }
 
@@ -1959,6 +1964,10 @@ pub struct PreventSecretPushGuard;
 impl Check for PreventSecretPushGuard {
     fn name(&self) -> &str {
         "prevent-secret-push"
+    }
+
+    fn spawns_subprocesses(&self) -> bool {
+        true
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
@@ -2015,6 +2024,17 @@ mod tests {
     use cadence_hooks_core::git_fixtures::Scratch;
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn found_block_tells_a_phone_operator_what_to_do() {
+        // cameronsjo/cadence-hooks#1658 part 3: the false-positive escape is
+        // a settings edit, so the block names the step that works without one.
+        let msg = render_found(&[]);
+        assert!(
+            msg.ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+            "{msg}"
+        );
+    }
 
     // Built by concatenation so this file carries no live-shaped literal.
     fn aws_key() -> String {

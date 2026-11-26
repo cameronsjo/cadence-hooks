@@ -2,13 +2,23 @@
 //!
 //! Pure port of `scan-tokens.sh`. Given the transcript contents and an optional
 //! `from` message id, sum the token usage of every assistant message *after*
-//! that id (exclusive). Returns `None` when there is nothing to report — no
+//! that id (exclusive). Locally-synthesized `<synthetic>` records count as
+//! scanned and can be the marker, but add no tokens and no model bucket.
+//! Returns `None` when there is nothing to report — no
 //! matching messages, the marker isn't found, or the range is empty — mirroring
 //! the bash "emit nothing, skip the commit" behavior.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::Path;
 
 use serde::Deserialize;
+
+/// The model string Claude Code writes for a locally-synthesized assistant
+/// record. Such a record carries `usage` but is no model call: the scan adds
+/// no tokens or model bucket for it, and the session grader does not count it
+/// as a turn.
+pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Token totals for a scanned range.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -30,11 +40,16 @@ pub struct ScanResult {
     /// Grand total of all tokens in the range (all models combined).
     pub tokens: Tokens,
     pub last_message_id: String,
+    /// Assistant records in the range, `<synthetic>` ones included, so this
+    /// counts records rather than model calls.
     pub messages_scanned: usize,
-    /// The model of the last assistant message in the range (backward-compat).
+    /// The model of the last non-synthetic assistant message in the range
+    /// (backward-compat), or `unknown` when the range holds only synthetic
+    /// records.
     pub model: String,
     /// Per-model token buckets, sorted by model name (BTreeMap order).
-    /// Always populated; single-model ranges produce a one-entry vec.
+    /// Single-model ranges produce a one-entry vec; a range of only
+    /// `<synthetic>` records produces an empty one.
     pub by_model: Vec<(String, Tokens)>,
 }
 
@@ -79,9 +94,9 @@ struct Usage {
 /// a TTL bucket this struct does not name still lands in the total and simply
 /// bills at the 5-minute rate rather than vanishing.
 #[derive(Deserialize)]
-struct CacheCreation {
+pub(crate) struct CacheCreation {
     #[serde(default)]
-    ephemeral_1h_input_tokens: u64,
+    pub(crate) ephemeral_1h_input_tokens: u64,
 }
 
 /// Deserialize `cache_creation` without letting its shape veto the whole line.
@@ -90,7 +105,9 @@ struct CacheCreation {
 /// authoritative `cache_creation_input_tokens` scalar still lands in the
 /// ledger and only the 1-hour split is lost. The strict form would discard the
 /// message's tokens outright — the failure this parser exists to avoid.
-fn lenient_cache_creation<'de, D>(deserializer: D) -> Result<Option<CacheCreation>, D::Error>
+pub(crate) fn lenient_cache_creation<'de, D>(
+    deserializer: D,
+) -> Result<Option<CacheCreation>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -98,94 +115,267 @@ where
     Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Sum token usage for assistant messages after `from` (exclusive).
+/// Incremental, line-by-line token usage accumulator.
 ///
-/// - `from` is `None` or empty: scan from the start.
-/// - `from` not found among scanned messages: returns `None` (the marker
-///   predates this transcript — skip rather than overcount).
-/// - No assistant messages in range: returns `None`.
-pub fn scan_tokens(transcript: &str, from: Option<&str>) -> Option<ScanResult> {
-    let marker = from.unwrap_or("");
-    // None/"" → sum from the start; otherwise accumulate only after the marker
-    // message. `started` gates accumulation; `marker_seen` distinguishes
-    // "marker found, nothing after" (→ None) from "marker never found" (→ None).
-    let mut started = marker.is_empty();
-    let mut marker_seen = started;
+/// Powers both the in-memory [`scan_tokens`] helper and the streaming
+/// [`scan_tokens_reader`] / [`scan_tokens_file`] paths, as well as the
+/// single-pass scan+grade stream in [`crate::session_grade`].
+pub struct TokenScanner<'a> {
+    from: Option<&'a str>,
+    marker: &'a str,
+    started: bool,
+    marker_seen: bool,
+    tokens: Tokens,
+    by_model: BTreeMap<String, Tokens>,
+    messages_scanned: usize,
+    last_id: Option<String>,
+    last_model: Option<String>,
+    last_message_offset: Option<u64>,
+}
 
-    let mut tokens = Tokens::default();
-    let mut by_model: BTreeMap<String, Tokens> = BTreeMap::new();
-    let mut messages_scanned = 0usize;
-    let mut last_id: Option<String> = None;
-    let mut last_model: Option<String> = None;
+impl<'a> TokenScanner<'a> {
+    /// Start scanning. `from == None` or `Some("")` sums from the first line;
+    /// otherwise accumulation begins strictly after the assistant message with
+    /// `id == from`.
+    #[must_use]
+    pub fn new(from: Option<&'a str>) -> Self {
+        let marker = from.unwrap_or("");
+        let started = marker.is_empty();
+        Self {
+            from,
+            marker,
+            started,
+            marker_seen: started,
+            tokens: Tokens::default(),
+            by_model: BTreeMap::new(),
+            messages_scanned: 0,
+            last_id: None,
+            last_model: None,
+            last_message_offset: None,
+        }
+    }
 
-    for line in transcript.lines() {
+    /// Feed one JSONL line (without trailing newline) at byte offset `0`.
+    pub fn feed_line(&mut self, line: &str) {
+        self.feed_line_at(line, 0);
+    }
+
+    /// Feed one JSONL line (without trailing newline) located at `line_offset`
+    /// in the underlying transcript file.
+    pub fn feed_line_at(&mut self, line: &str, line_offset: u64) {
         // Cheap byte-scan pre-filter (#96): before the marker, only pay for a
         // full JSON parse on a line that could BE the marker. This bounds the
         // O(transcript) parse to the tail past the marker — the hot-path cost
         // on every commit. A candidate is still fully parsed and accepted only
         // when it is an assistant message with id == marker, so a content
         // substring match never false-starts accumulation.
-        if !started && !line.contains(marker) {
-            continue;
+        if !self.started && !line.contains(self.marker) {
+            return;
         }
         let Ok(parsed) = serde_json::from_str::<Line>(line) else {
-            continue;
+            return;
         };
         let Some(m) = parsed.message else {
-            continue;
+            return;
         };
-        if m.usage.is_none() || m.id.is_none() || m.role.as_deref() != Some("assistant") {
-            continue;
+        if m.role.as_deref() != Some("assistant") {
+            return;
         }
-        if !started {
-            if m.id.as_deref() == from {
-                started = true;
-                marker_seen = true;
-            }
-            // The marker message itself is excluded from the sum.
-            continue;
-        }
-
-        let u = m.usage.as_ref().unwrap();
-        // The scalar is the API's authoritative total; the sub-bucket is read
-        // alongside it, never instead of it. Summing the named sub-buckets
-        // would silently drop any future TTL the struct does not name out of
-        // the ledger and out of the cost.
+        let (Some(id), Some(u)) = (m.id, m.usage) else {
+            return;
+        };
         let create_1h = u
             .cache_creation
             .as_ref()
             .map_or(0, |c| c.ephemeral_1h_input_tokens);
-        tokens.input += u.input_tokens;
-        tokens.cache_create += u.cache_creation_input_tokens;
-        tokens.cache_create_1h += create_1h;
-        tokens.cache_read += u.cache_read_input_tokens;
-        tokens.output += u.output_tokens;
+        self.record_assistant_usage(
+            id,
+            m.model,
+            u.input_tokens,
+            u.cache_creation_input_tokens,
+            create_1h,
+            u.cache_read_input_tokens,
+            u.output_tokens,
+            line_offset,
+        );
+    }
 
-        let model_key = m.model.clone().unwrap_or_else(|| "unknown".to_string());
-        let bucket = by_model.entry(model_key.clone()).or_default();
-        bucket.input += u.input_tokens;
-        bucket.cache_create += u.cache_creation_input_tokens;
+    /// Feed an already-parsed assistant message with usage. Used by the
+    /// single-pass streaming scan+grade path so each line is deserialized once.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_assistant_usage(
+        &mut self,
+        id: String,
+        model: Option<String>,
+        input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        create_1h: u64,
+        cache_read_input_tokens: u64,
+        output_tokens: u64,
+        line_offset: u64,
+    ) {
+        if !self.started {
+            if Some(id.as_str()) == self.from {
+                self.started = true;
+                self.marker_seen = true;
+            }
+            // The marker message itself is excluded from the sum.
+            return;
+        }
+
+        // A locally-synthesized record (Code Mode writes many) is no model
+        // call: it bills nothing and has no price, so a bucket for it would
+        // add `<synthetic>` to `byModel` and a false gap to `unpricedModels`.
+        // It still counts as scanned and still moves the marker: a second
+        // commit in the same Code Mode turn has only synthetic records after
+        // the first commit's marker, and `log-commit` writes no row for an
+        // empty range.
+        if model.as_deref() == Some(SYNTHETIC_MODEL) {
+            self.messages_scanned += 1;
+            self.last_id = Some(id);
+            self.last_message_offset = Some(line_offset);
+            return;
+        }
+
+        // The scalar is the API's authoritative total; the sub-bucket is read
+        // alongside it, never instead of it. Summing the named sub-buckets
+        // would silently drop any future TTL the struct does not name out of
+        // the ledger and out of the cost.
+        self.tokens.input += input_tokens;
+        self.tokens.cache_create += cache_creation_input_tokens;
+        self.tokens.cache_create_1h += create_1h;
+        self.tokens.cache_read += cache_read_input_tokens;
+        self.tokens.output += output_tokens;
+
+        let model_key = model.unwrap_or_else(|| "unknown".to_string());
+        let bucket = self.by_model.entry(model_key.clone()).or_default();
+        bucket.input += input_tokens;
+        bucket.cache_create += cache_creation_input_tokens;
         bucket.cache_create_1h += create_1h;
-        bucket.cache_read += u.cache_read_input_tokens;
-        bucket.output += u.output_tokens;
+        bucket.cache_read += cache_read_input_tokens;
+        bucket.output += output_tokens;
 
-        messages_scanned += 1;
-        last_id = m.id.clone();
-        last_model = Some(model_key);
+        self.messages_scanned += 1;
+        self.last_id = Some(id);
+        self.last_model = Some(model_key);
+        self.last_message_offset = Some(line_offset);
     }
 
-    if !marker_seen || messages_scanned == 0 {
-        // Marker predated this transcript, or nothing new since it — skip
-        // rather than overcount (mirrors the bash "emit nothing" behavior).
-        return None;
+    /// Finish scanning and return the aggregated [`ScanResult`], or `None` if
+    /// the marker was not found or no assistant messages followed it.
+    #[must_use]
+    pub fn finish(self) -> Option<ScanResult> {
+        self.finish_with_offset().map(|(result, _)| result)
     }
-    Some(ScanResult {
-        tokens,
-        last_message_id: last_id?,
-        messages_scanned,
-        model: last_model.unwrap_or_else(|| "unknown".to_string()),
-        by_model: by_model.into_iter().collect(),
-    })
+
+    /// Finish scanning and return both the [`ScanResult`] and the byte offset
+    /// of the line containing `last_message_id`.
+    #[must_use]
+    pub fn finish_with_offset(self) -> Option<(ScanResult, u64)> {
+        if !self.marker_seen || self.messages_scanned == 0 {
+            // Marker predated this transcript, or nothing new since it — skip
+            // rather than overcount (mirrors the bash "emit nothing" behavior).
+            return None;
+        }
+        let result = ScanResult {
+            tokens: self.tokens,
+            last_message_id: self.last_id?,
+            messages_scanned: self.messages_scanned,
+            model: self.last_model.unwrap_or_else(|| "unknown".to_string()),
+            by_model: self.by_model.into_iter().collect(),
+        };
+        Some((result, self.last_message_offset.unwrap_or(0)))
+    }
+}
+
+/// True when `line` is an assistant message with `usage` and `id == expected_id`.
+fn line_matches_marker(line: &str, expected_id: &str) -> bool {
+    if !line.contains(expected_id) {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<Line>(line) else {
+        return false;
+    };
+    let Some(m) = parsed.message else {
+        return false;
+    };
+    m.usage.is_some()
+        && m.role.as_deref() == Some("assistant")
+        && m.id.as_deref() == Some(expected_id)
+}
+
+/// Sum token usage for assistant messages after `from` (exclusive).
+///
+/// - `from` is `None` or empty: scan from the start.
+/// - `from` not found among scanned messages: returns `None` (the marker
+///   predates this transcript — skip rather than overcount).
+/// - No assistant messages in range: returns `None`. A range holding only
+///   `<synthetic>` records is not empty: it returns zero tokens, so a commit
+///   made later in the same Code Mode turn still gets its row.
+pub fn scan_tokens(transcript: &str, from: Option<&str>) -> Option<ScanResult> {
+    let mut scanner = TokenScanner::new(from);
+    for line in transcript.lines() {
+        scanner.feed_line(line);
+    }
+    scanner.finish()
+}
+
+/// Stream token usage from a [`BufRead`] starting at `initial_offset`,
+/// returning both the [`ScanResult`] and the byte offset of the last scanned
+/// assistant message's line.
+pub fn scan_tokens_reader<R: BufRead>(
+    mut reader: R,
+    from: Option<&str>,
+    initial_offset: u64,
+) -> std::io::Result<Option<(ScanResult, u64)>> {
+    let mut scanner = TokenScanner::new(from);
+    let mut buf = String::new();
+    let mut pos = initial_offset;
+    loop {
+        buf.clear();
+        let line_offset = pos;
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        pos += n as u64;
+        let line = buf.trim_end_matches(['\r', '\n']);
+        scanner.feed_line_at(line, line_offset);
+    }
+    Ok(scanner.finish_with_offset())
+}
+
+/// Stream token usage from a transcript file, seeking directly to `hint_offset`
+/// when both `from` and `hint_offset` are provided and the line at
+/// `hint_offset` is confirmed to be the `from` assistant message.
+///
+/// If the file was truncated, rewritten, or `hint_offset` does not point at
+/// the expected `from` message line, rewinds to byte 0 and performs a full
+/// streaming scan.
+pub fn scan_tokens_file(
+    path: &Path,
+    from: Option<&str>,
+    hint_offset: Option<u64>,
+) -> std::io::Result<Option<(ScanResult, u64)>> {
+    let mut file = std::fs::File::open(path)?;
+    if let (Some(marker), Some(offset)) = (from.filter(|m| !m.is_empty()), hint_offset) {
+        let file_len = file.metadata()?.len();
+        if offset < file_len {
+            file.seek(SeekFrom::Start(offset))?;
+            let mut reader = BufReader::new(&mut file);
+            let mut marker_line = String::new();
+            let n = reader.read_line(&mut marker_line)?;
+            let trimmed = marker_line.trim_end_matches(['\r', '\n']);
+            if n > 0 && line_matches_marker(trimmed, marker) {
+                // Verified the marker line at `offset`; stream only the tail.
+                return scan_tokens_reader(reader, None, offset + n as u64);
+            }
+            // Hint was stale (file truncated/rewritten): rewind and scan from 0.
+            drop(reader);
+            file.seek(SeekFrom::Start(0))?;
+        }
+    }
+    scan_tokens_reader(BufReader::new(file), from, 0)
 }
 
 #[cfg(test)]
@@ -261,6 +451,59 @@ mod tests {
     }
 
     // --- by_model bucket tests ---
+
+    #[test]
+    fn synthetic_records_add_no_tokens_or_bucket() {
+        // Non-zero usage on purpose: the filter keys on the model string, not
+        // on the record happening to carry zeros.
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":3}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":500,"cache_read_input_tokens":7,"output_tokens":9}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, None).expect("the range is scanned");
+        assert_eq!(r.by_model.len(), 1, "{:?}", r.by_model);
+        assert_eq!(r.by_model[0].0, "claude-opus-4-7");
+        assert_eq!(r.tokens.input, 10);
+        assert_eq!(r.tokens.cache_read, 0);
+        assert_eq!(r.tokens.output, 3);
+        assert_eq!(r.model, "claude-opus-4-7");
+        assert_eq!(r.messages_scanned, 2);
+        assert_eq!(
+            r.last_message_id, "s1",
+            "a synthetic record still moves the marker"
+        );
+    }
+
+    #[test]
+    fn a_marker_on_a_synthetic_id_resolves() {
+        let t = [
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0}}}"#,
+            r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, Some("s1")).expect("marker found");
+        assert_eq!(r.tokens.input, 4);
+        assert_eq!(r.last_message_id, "m2");
+    }
+
+    /// Two commits in one Code Mode turn: after the first commit's marker the
+    /// range holds only synthetic records, and it must still scan (zero
+    /// tokens, no bucket) so `log-commit` writes the second row.
+    #[test]
+    fn a_range_of_only_synthetic_records_scans_as_zero() {
+        let t = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":4}}}"#,
+            r#"{"message":{"id":"s1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":1}}}"#,
+            r#"{"message":{"id":"s2","role":"assistant","model":"<synthetic>","usage":{"input_tokens":1}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&t, Some("s1")).expect("a synthetic-only range is not empty");
+        assert_eq!(r.tokens, Tokens::default());
+        assert!(r.by_model.is_empty(), "{:?}", r.by_model);
+        assert_eq!(r.model, "unknown");
+        assert_eq!(r.last_message_id, "s2");
+    }
 
     /// Single-model range: by_model has exactly one entry matching the totals.
     #[test]
@@ -408,5 +651,59 @@ mod tests {
         );
         assert_eq!(r.messages_scanned, 1);
         assert_eq!(r.last_message_id, "m2");
+    }
+
+    #[test]
+    fn scan_tokens_file_resumes_from_verified_byte_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let line1 = r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":1}}}"#;
+        let line2 = r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":20,"output_tokens":2}}}"#;
+        let line3 = r#"{"message":{"id":"m3","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":30,"output_tokens":3}}}"#;
+        std::fs::write(&path, format!("{line1}\n{line2}\n")).unwrap();
+
+        let (first, offset) = scan_tokens_file(&path, None, None).unwrap().unwrap();
+        assert_eq!(first.last_message_id, "m2");
+        assert_eq!(offset, (line1.len() + 1) as u64);
+
+        // Append m3 and resume directly from m2's byte offset.
+        std::fs::write(&path, format!("{line1}\n{line2}\n{line3}\n")).unwrap();
+        let (second, offset2) = scan_tokens_file(&path, Some("m2"), Some(offset))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.tokens.input, 30);
+        assert_eq!(second.messages_scanned, 1);
+        assert_eq!(second.last_message_id, "m3");
+        assert_eq!(offset2, (line1.len() + 1 + line2.len() + 1) as u64);
+
+        // No new lines after m3 -> None even with a valid offset hint.
+        assert!(
+            scan_tokens_file(&path, Some("m3"), Some(offset2))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scan_tokens_file_falls_back_when_offset_is_stale_or_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let line1 = r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":10,"output_tokens":1}}}"#;
+        let line2 = r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":25,"output_tokens":4}}}"#;
+        std::fs::write(&path, format!("{line1}\n{line2}\n")).unwrap();
+
+        // Stale offset pointing into the middle of line1 must rewind and still find m1 -> m2.
+        let (res, _) = scan_tokens_file(&path, Some("m1"), Some(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.tokens.input, 25);
+        assert_eq!(res.last_message_id, "m2");
+
+        // Offset past EOF (truncated file) must rewind and still find m1 -> m2.
+        let (res_eof, _) = scan_tokens_file(&path, Some("m1"), Some(999_999))
+            .unwrap()
+            .unwrap();
+        assert_eq!(res_eof.tokens.input, 25);
+        assert_eq!(res_eof.last_message_id, "m2");
     }
 }

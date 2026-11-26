@@ -692,11 +692,20 @@ pub fn head_sha(cwd: Option<&str>) -> Option<String> {
 
 /// Current branch name in `cwd` (empty string on detached HEAD or failure).
 ///
-/// Uses `symbolic-ref --quiet --short HEAD`, which exits non-zero on a detached
-/// HEAD — so [`git_output`] yields `None` and we return empty, as documented.
-/// (`rev-parse --abbrev-ref HEAD` would return the literal string `"HEAD"`.)
+/// Resolved via pure-filesystem [`GitState::resolve`](cadence_hooks_core::gitstate::GitState::resolve)
+/// so metrics loggers pay no `git` subprocess spawn; detached HEAD yields `None`
+/// and returns empty, matching `git symbolic-ref --quiet --short HEAD`.
 pub fn branch(cwd: Option<&str>) -> String {
-    git_output(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default()
+    let dir = match cwd {
+        Some(d) => PathBuf::from(d),
+        None => match std::env::current_dir() {
+            Ok(d) => d,
+            Err(_) => return String::new(),
+        },
+    };
+    cadence_hooks_core::gitstate::GitState::resolve(&dir)
+        .and_then(|state| state.branch)
+        .unwrap_or_default()
 }
 
 /// Repo name: the basename of the repository the checkout at `cwd` belongs

@@ -13,6 +13,7 @@ pub mod branch_diff;
 pub mod bypass;
 pub mod capability;
 pub mod config;
+pub mod confirm;
 pub mod deadline;
 pub mod dir_variables;
 pub mod display;
@@ -26,6 +27,7 @@ pub mod pathclass;
 pub mod paths;
 pub mod push;
 pub mod remote;
+pub mod repo_cache;
 pub mod shell;
 pub mod stdout;
 pub mod target_repo;
@@ -333,16 +335,26 @@ pub struct HookInput {
     /// on payloads that omit it. Carried so the denial audit log can attribute a
     /// guard fire to the subagent that triggered it.
     pub agent_id: Option<String>,
+    /// The id of the tool call this event belongs to (`toolu_…`), sent on
+    /// `PreToolUse` and `PostToolUse`. Every hook process one tool call spawns
+    /// sees the same value, and a retry of the call gets a new one, which is
+    /// what lets the confirm tier ([`confirm`]) tell a sibling process of the
+    /// blocked call from a deliberate second attempt. Lenient: an absent or
+    /// wrong-typed value degrades to `None`, and the confirm tier then blocks
+    /// as a plain guard does.
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub tool_use_id: Option<String>,
     /// The submitted prompt text — present on `UserPromptSubmit`, absent on
     /// every other event. Deserializes to `None` when absent, so existing
     /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
     pub prompt: Option<String>,
     /// Payload keys whose value was a JSON *object* that still failed its typed
-    /// shape, and so degraded to `None` through `lenient_option`. Derived by
+    /// shape, and so degraded to `None` through `lenient_option`, each with the
+    /// first field to blame ([`SchemaDrift`]). Derived by
     /// [`schema_drift`], never deserialized — see that function for why this is
     /// the drift-shaped half of the degradation (cadence-hooks#364).
     #[serde(skip)]
-    pub schema_drift: Vec<&'static str>,
+    pub schema_drift: Vec<SchemaDrift>,
     /// `tool_input` keys that were present but failed their typed shape, and
     /// so were dropped while the rest of `tool_input` was kept (see
     /// [`salvage_tool_input`], cadence-hooks#1087). `"tool_input"` means the
@@ -368,6 +380,70 @@ pub struct HookInput {
     /// deserialized, so a payload cannot supply a sanitized copy of itself.
     #[serde(skip)]
     pub mcp_tool_input: Option<serde_json::Value>,
+    /// True once [`with_resolved_dir_variables`] / [`Self::resolve_dir_variables_in_place`]
+    /// has already run on this input, so `group` members don't re-run it per check.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub dir_vars_resolved: bool,
+    /// Lazily cached [`shell::command_segments`] for `self.command()`, shared
+    /// across checks in a `group` run.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub cached_command_segments: std::sync::OnceLock<Vec<String>>,
+}
+
+/// Strict-typed mirror of [`HookInput`] used for the fast-path single-pass
+/// `serde_json::from_str` parse in [`HookInput::from_json_detailed`].
+///
+/// Unlike [`HookInput`], `tool_input`, `tool_response`, and the string fields
+/// do **not** use `lenient_option`: any non-object `tool_input`/`tool_response`
+/// or mistyped field fails deserialization immediately and falls back to the
+/// `serde_json::Value` + [`schema_drift`] + salvage path.
+#[derive(Deserialize)]
+struct StrictHookInput {
+    tool_name: Option<String>,
+    tool_input: Option<ToolInput>,
+    tool_response: Option<ToolResponse>,
+    cwd: Option<String>,
+    transcript_path: Option<String>,
+    session_id: Option<String>,
+    hook_event_name: Option<String>,
+    source: Option<String>,
+    model: Option<String>,
+    from_model: Option<String>,
+    to_model: Option<String>,
+    agent_id: Option<String>,
+    tool_use_id: Option<String>,
+    prompt: Option<String>,
+}
+
+impl From<StrictHookInput> for HookInput {
+    fn from(s: StrictHookInput) -> Self {
+        Self {
+            tool_name: s.tool_name,
+            normalized_tool: None,
+            tool_input: s.tool_input,
+            tool_response: s.tool_response,
+            cwd: s.cwd,
+            transcript_path: s.transcript_path,
+            session_id: s.session_id,
+            hook_event_name: s.hook_event_name,
+            source: s.source,
+            model: s.model,
+            from_model: s.from_model,
+            to_model: s.to_model,
+            agent_id: s.agent_id,
+            tool_use_id: s.tool_use_id,
+            prompt: s.prompt,
+            schema_drift: Vec::new(),
+            mistyped_tool_input: Vec::new(),
+            tool_input_non_object: false,
+            mistyped_top_level: Vec::new(),
+            mcp_tool_input: None,
+            dir_vars_resolved: false,
+            cached_command_segments: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 /// `tool_input` keys that carry the operation a guard judges, for a
@@ -590,8 +666,9 @@ where
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Payload keys whose value is a JSON object that fails its typed shape —
-/// the drift-shaped half of `lenient_option`'s degradation (cadence-hooks#364).
+/// Payload keys whose value is a JSON object that fails its typed shape, each
+/// with the first field to blame ([`SchemaDrift`]) — the drift-shaped half of
+/// `lenient_option`'s degradation (cadence-hooks#364).
 ///
 /// A non-object `tool_input`/`tool_response` (a `Read` string, a `Glob` array)
 /// is expected per-tool variance and is not reported. An object only fails on
@@ -599,8 +676,8 @@ where
 /// so that case is what a Claude Code rename or reshape looks like. MCP tools
 /// (`mcp__*`) are skipped: their input and response shapes belong to
 /// third-party servers, not to Claude Code's schema, so a mismatch there says
-/// nothing about drift. Only key names are returned, never values.
-fn schema_drift(value: &serde_json::Value) -> Vec<&'static str> {
+/// nothing about drift. Only key and field names are returned, never values.
+fn schema_drift(value: &serde_json::Value) -> Vec<SchemaDrift> {
     let is_mcp = value
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
@@ -609,18 +686,69 @@ fn schema_drift(value: &serde_json::Value) -> Vec<&'static str> {
         return Vec::new();
     }
     let mut drift = Vec::new();
-    if let Some(v @ serde_json::Value::Object(_)) = value.get("tool_input")
+    if let Some(v @ serde_json::Value::Object(map)) = value.get("tool_input")
         && ToolInput::deserialize(v).is_err()
     {
-        drift.push("tool_input");
+        drift.push(SchemaDrift {
+            key: "tool_input",
+            field: first_mistyped::<ToolInput>(map, TOOL_INPUT_KEYS, "tool_input"),
+        });
     }
-    if let Some(v @ serde_json::Value::Object(_)) = value.get("tool_response")
+    if let Some(v @ serde_json::Value::Object(map)) = value.get("tool_response")
         && ToolResponse::deserialize(v).is_err()
     {
-        drift.push("tool_response");
+        drift.push(SchemaDrift {
+            key: "tool_response",
+            field: first_mistyped::<ToolResponse>(map, TOOL_RESPONSE_KEYS, "tool_response"),
+        });
     }
     drift
 }
+
+/// One payload key whose object value failed its typed shape, as reported by
+/// [`schema_drift`] (cadence-hooks#364). Both names are static, so a drift row
+/// built from this carries no payload content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaDrift {
+    /// The payload key: `"tool_input"` or `"tool_response"`.
+    pub key: &'static str,
+    /// The alphabetically first modeled field whose value fails its typed
+    /// shape on its own, from [`TOOL_INPUT_KEYS`] or [`TOOL_RESPONSE_KEYS`].
+    /// Equals [`Self::key`] when every field passes alone and only their
+    /// combination fails (duplicate aliases such as `source` + `sourcePath`).
+    pub field: &'static str,
+}
+
+/// The field [`SchemaDrift::field`] names, found the same way
+/// [`salvage_tool_input`] finds the fields it drops, on a copy so the caller's
+/// payload is untouched. Runs only after the whole object already failed.
+/// "First" is alphabetical because [`salvage_fields`] sorts its result; a
+/// change to that sort changes which field a drift row names.
+fn first_mistyped<T: serde::de::DeserializeOwned>(
+    map: &serde_json::Map<String, serde_json::Value>,
+    known: &[&'static str],
+    whole: &'static str,
+) -> &'static str {
+    salvage_fields::<T>(&mut map.clone(), known, whole)
+        .into_iter()
+        .find(|name| *name != whole)
+        .unwrap_or(whole)
+}
+
+/// Every key [`ToolResponse`] models with a typed shape, as static names, so
+/// [`schema_drift`] can name a drifted response field without carrying a
+/// payload-supplied string.
+const TOOL_RESPONSE_KEYS: &[&str] = &[
+    "stdout",
+    "stderr",
+    "interrupted",
+    "isImage",
+    "answers",
+    "plan",
+    "filePath",
+    "isAgent",
+    "hasTaskTool",
+];
 
 /// Every key [`ToolInput`] models, aliases included, as static names.
 ///
@@ -937,6 +1065,23 @@ impl HookInput {
 
     /// [`HookInput::from_json`], keeping the [`ParseFailure`] classification.
     pub fn from_json_detailed(raw: &str) -> Result<Self, ParseFailure> {
+        // Fast path: single-pass strict deserialization directly from `raw`,
+        // avoiding the `serde_json::Value` DOM tree and 4× deserializations
+        // when the payload is well-formed and neither `apply_patch` nor
+        // `mcp__*`. Any mistyped field, non-object `tool_input`/`tool_response`,
+        // or parse error falls back to the full `Value` + drift + salvage path.
+        if let Ok(strict) = serde_json::from_str::<StrictHookInput>(raw) {
+            let needs_value_path = strict
+                .tool_name
+                .as_deref()
+                .is_some_and(|n| n == "apply_patch" || n.starts_with("mcp__"));
+            if !needs_value_path {
+                let mut input = HookInput::from(strict);
+                input.normalize_aliases();
+                return Ok(input);
+            }
+        }
+
         let plain = |message: String| ParseFailure {
             message,
             patch_targets_unenumerable: false,
@@ -983,7 +1128,14 @@ impl HookInput {
         input.mistyped_top_level = mistyped_top_level;
         input.tool_input_non_object = tool_input_non_object;
         input.mcp_tool_input = mcp_tool_input;
-        if let Some(tool_input) = input.tool_input.as_mut()
+        input.normalize_aliases();
+        Ok(input)
+    }
+
+    /// Normalize harness aliases (`cmd` → `command`, Codex tool names, MCP
+    /// filesystem tool names) in place after deserialization.
+    fn normalize_aliases(&mut self) {
+        if let Some(tool_input) = self.tool_input.as_mut()
             && tool_input.command.is_none()
         {
             tool_input.command = tool_input.cmd.take();
@@ -991,18 +1143,18 @@ impl HookInput {
         // Every alias below writes `normalized_tool`, never `tool_name` — see
         // that field's doc comment for why the literal name has to survive.
         if matches!(
-            input.tool_name.as_deref(),
+            self.tool_name.as_deref(),
             Some("exec_command" | "unified_exec" | "shell")
         ) {
-            input.normalized_tool = Some("Bash".to_string());
+            self.normalized_tool = Some("Bash".to_string());
         }
         if matches!(
-            input.tool_name.as_deref(),
+            self.tool_name.as_deref(),
             Some("spawn_agent" | "spawn_agents_on_csv" | "multi_agents")
         ) {
-            input.normalized_tool = Some("Agent".to_string());
+            self.normalized_tool = Some("Agent".to_string());
         }
-        if let Some(name) = input.tool_name.as_deref()
+        if let Some(name) = self.tool_name.as_deref()
             && name.starts_with("mcp__")
         {
             let lower = name.to_ascii_lowercase();
@@ -1029,25 +1181,25 @@ impl HookInput {
                 None
             };
             if let Some((tool, operation)) = operation {
-                input.normalized_tool = Some(tool.to_string());
-                if let Some(tool_input) = input.tool_input.as_mut() {
+                self.normalized_tool = Some(tool.to_string());
+                if let Some(tool_input) = self.tool_input.as_mut() {
                     tool_input.operation = Some(operation.to_string());
                 }
             }
         }
-        Ok(input)
     }
 
-    /// Expand a Codex `apply_patch` payload into one Claude-shaped input per
-    /// target operation. Non-patch payloads return a single clone.
-    pub fn normalized_inputs(&self) -> Result<Vec<Self>, String> {
+    /// Expand a Codex `apply_patch` (or rename) payload into one Claude-shaped
+    /// input per target operation, returning `Ok(None)` without cloning on the
+    /// common single-input path.
+    pub fn normalized_inputs_if_expanded(&self) -> Result<Option<Vec<Self>>, String> {
         if self.tool_name() != Some("apply_patch") {
             if self.operation() == Some("rename")
                 && let Some(tool_input) = self.tool_input.as_ref()
                 && let (Some(source), Some(destination)) =
                     (tool_input.source.clone(), tool_input.destination.clone())
             {
-                return Ok(vec![
+                return Ok(Some(vec![
                     self.file_operation("Edit", "rename-source", source, None, None),
                     self.file_operation(
                         "Write",
@@ -1056,9 +1208,9 @@ impl HookInput {
                         None,
                         tool_input.content.clone(),
                     ),
-                ]);
+                ]));
             }
-            return Ok(vec![self.clone()]);
+            return Ok(None);
         }
         let patch = self
             .tool_input
@@ -1115,7 +1267,16 @@ impl HookInput {
         if inputs.is_empty() {
             return Err("apply_patch contained no file operations".to_string());
         }
-        Ok(inputs)
+        Ok(Some(inputs))
+    }
+
+    /// Expand a Codex `apply_patch` payload into one Claude-shaped input per
+    /// target operation. Non-patch payloads return a single clone.
+    pub fn normalized_inputs(&self) -> Result<Vec<Self>, String> {
+        match self.normalized_inputs_if_expanded()? {
+            Some(inputs) => Ok(inputs),
+            None => Ok(vec![self.clone()]),
+        }
     }
 
     fn file_operation(
@@ -1177,6 +1338,35 @@ impl HookInput {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.command.as_deref())
+    }
+
+    /// Cached [`shell::command_segments`] for [`Self::command`], computed at
+    /// most once per [`HookInput`] so `group` members on `PreToolUse:Bash`
+    /// parse the command once instead of repeating it per check.
+    pub fn command_segments(&self) -> &[String] {
+        self.cached_command_segments.get_or_init(|| {
+            self.command()
+                .map(shell::command_segments)
+                .unwrap_or_default()
+        })
+    }
+
+    /// Resolve literal directory variables in [`Self::command`] once in place
+    /// and mark this input resolved so per-member [`decide_check`] calls in a
+    /// `group` skip repeating [`with_resolved_dir_variables`].
+    pub fn resolve_dir_variables_in_place(&mut self) {
+        if self.dir_vars_resolved {
+            return;
+        }
+        if let Some(command) = self.command()
+            && let std::borrow::Cow::Owned(resolved) =
+                dir_variables::resolve_literal_dir_variables(command)
+            && let Some(tool_input) = self.tool_input.as_mut()
+        {
+            tool_input.command = Some(resolved);
+            let _ = self.cached_command_segments.take();
+        }
+        self.dir_vars_resolved = true;
     }
 
     /// Is this an MCP tool's call? Keyed on the literal name the harness sent,
@@ -1434,6 +1624,11 @@ impl HookInput {
         self.agent_id.as_deref()
     }
 
+    /// The tool call id, if the payload carried a non-empty one.
+    pub fn tool_use_id(&self) -> Option<&str> {
+        self.tool_use_id.as_deref().filter(|id| !id.is_empty())
+    }
+
     /// The submitted prompt text, if present (`UserPromptSubmit` only).
     pub fn prompt(&self) -> Option<&str> {
         self.prompt.as_deref()
@@ -1539,9 +1734,10 @@ pub struct MetricsInput {
     #[serde(skip)]
     pub raw_keys: Vec<String>,
     /// Mirrors [`HookInput::schema_drift`]: keys whose object value failed its
-    /// typed shape. Populated by [`Self::from_json`], not deserialized.
+    /// typed shape, with the field to blame. Populated by [`Self::from_json`],
+    /// not deserialized.
     #[serde(skip)]
-    pub schema_drift: Vec<&'static str>,
+    pub schema_drift: Vec<SchemaDrift>,
 }
 
 impl MetricsInput {
@@ -1562,16 +1758,18 @@ impl MetricsInput {
         // Same per-field salvage as `HookInput` (cadence-hooks#1087), so one
         // mistyped field does not cost a logger the whole `tool_input`.
         salvage_tool_input(&mut value);
-        let mut input: MetricsInput = serde_json::from_value(value.clone()).map_err(|e| {
+        let raw_keys: Vec<String> = value
+            .as_object()
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut input: MetricsInput = serde_json::from_value(value).map_err(|e| {
             json_parse_failure(&e, s, || {
                 serde_json::from_str::<MetricsInput>(s)
                     .err()
                     .map(|e| (e.line(), e.column()))
             })
         })?;
-        if let Some(obj) = value.as_object() {
-            input.raw_keys = obj.keys().cloned().collect();
-        }
+        input.raw_keys = raw_keys;
         input.schema_drift = drift;
         Ok(input)
     }
@@ -1636,6 +1834,10 @@ pub enum BypassKind {
     /// differently, and the guard nudged instead of blocking
     /// (cameronsjo/cadence-hooks#225).
     ConfigDisagreement,
+    /// A confirm-tier guard blocked an action, and a deliberate second attempt
+    /// at the same action in the same session and agent passed
+    /// (cameronsjo/cadence-hooks#1658, [`confirm`]).
+    Confirmed,
 }
 
 impl BypassKind {
@@ -1648,6 +1850,7 @@ impl BypassKind {
             BypassKind::GlobalBypass => "global_bypass",
             BypassKind::GlobalDisable => "global_disable",
             BypassKind::ConfigDisagreement => "config_disagreement",
+            BypassKind::Confirmed => "confirmed",
         }
     }
 }
@@ -1662,7 +1865,8 @@ impl BypassKind {
 /// never a command, path, or edited content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BypassProvenance {
-    /// Dismissal vs env-switch.
+    /// Which kind of bypass: a dismissal, an env switch, a confirmed retry,
+    /// or one of the other [`BypassKind`] variants.
     pub kind: BypassKind,
     /// The concrete mechanism, e.g. `dismiss-enforce-worktree` or
     /// `CADENCE_ALLOW_MAIN`.
@@ -1836,6 +2040,16 @@ pub trait Check {
     /// the listed levels.
     fn skip_at_effort(&self) -> &[&str] {
         &[]
+    }
+
+    /// Whether this check may spawn external subprocesses (`git`, `gh`, etc.)
+    /// or perform blocking I/O that warrants a dedicated thread and per-thread
+    /// git deadline in `cadence-hooks group`.
+    ///
+    /// Pure in-memory checks return `false` (default) and run inline on the
+    /// main thread in `group` without thread-spawn overhead.
+    fn spawns_subprocesses(&self) -> bool {
+        false
     }
 }
 
@@ -2084,9 +2298,12 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
 /// [`CheckResult`] — e.g. to record a denial — between deciding and exiting,
 /// without changing what [`run_check`] itself does.
 pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult> {
-    let current_effort = std::env::var("CLAUDE_EFFORT").ok();
-    if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
-        return None;
+    let skip_levels = check.skip_at_effort();
+    if !skip_levels.is_empty() {
+        let current_effort = std::env::var("CLAUDE_EFFORT").ok();
+        if should_skip_for_effort(skip_levels, current_effort.as_deref()) {
+            return None;
+        }
     }
     shell::reset_command_unread();
     shell::note_command_home(input.command().unwrap_or(""));
@@ -2105,6 +2322,9 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// when there is none. The rewrite is an identity under bash, so a check reads
 /// the same command, with `git -C "$M"` spelled the way it runs.
 pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, HookInput> {
+    if input.dir_vars_resolved {
+        return std::borrow::Cow::Borrowed(input);
+    }
     let Some(command) = input.command() else {
         return std::borrow::Cow::Borrowed(input);
     };
@@ -2115,6 +2335,8 @@ pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, Ho
             if let Some(tool_input) = owned.tool_input.as_mut() {
                 tool_input.command = Some(resolved);
             }
+            let _ = owned.cached_command_segments.take();
+            owned.dir_vars_resolved = true;
             std::borrow::Cow::Owned(owned)
         }
     }
@@ -2127,7 +2349,10 @@ pub fn with_resolved_dir_variables(input: &HookInput) -> std::borrow::Cow<'_, Ho
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    let (rendered, code) = render_check_result(result, event, feedback_footer().as_deref());
+    let footer = (result.outcome == Outcome::Block)
+        .then(feedback_footer)
+        .flatten();
+    let (rendered, code) = render_check_result(result, event, footer.as_deref());
     if let Some(out) = rendered.stdout {
         crate::outln!("{out}");
     }
@@ -2144,7 +2369,10 @@ pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
 /// and has to merge their outputs into the single response one hook process
 /// may give. Same renderer, same clamp, same footer as [`emit_and_exit`].
 pub fn render_result(result: &CheckResult, event: HookEvent) -> (Option<String>, Option<String>) {
-    let (rendered, _) = render_check_result(result, event, feedback_footer().as_deref());
+    let footer = (result.outcome == Outcome::Block)
+        .then(feedback_footer)
+        .flatten();
+    let (rendered, _) = render_check_result(result, event, footer.as_deref());
     (rendered.stdout, rendered.stderr)
 }
 
@@ -4106,19 +4334,46 @@ mod tests {
         // #364: `stdout` renamed to a non-string is the drift shape.
         let json = r#"{"tool_name":"Bash","tool_input":{"command":["ls"]},"tool_response":{"stdout":{"text":"x"}}}"#;
         let metrics = MetricsInput::from_json(json).unwrap();
-        assert_eq!(metrics.schema_drift, ["tool_input", "tool_response"]);
+        let drifted = |d: &[SchemaDrift]| d.iter().map(|d| (d.key, d.field)).collect::<Vec<_>>();
+        let expected = [("tool_input", "command"), ("tool_response", "stdout")];
+        assert_eq!(drifted(&metrics.schema_drift), expected);
         assert!(
             metrics.tool_response.is_none(),
             "degradation itself is unchanged"
         );
         let hook = HookInput::from_json(json).unwrap();
-        assert_eq!(hook.schema_drift, ["tool_input", "tool_response"]);
+        assert_eq!(drifted(&hook.schema_drift), expected);
         assert_eq!(
             hook.command(),
             Some("ls"),
             "an argv-array command is joined, not dropped"
         );
         assert!(hook.mistyped_tool_input.is_empty());
+    }
+
+    /// Every name in `TOOL_RESPONSE_KEYS` is a typed `ToolResponse` field, so a
+    /// wrong-typed value under it fails the struct and the drift row can name
+    /// it. A key missing from the struct would deserialize into nothing and
+    /// pass, which this catches.
+    #[test]
+    fn tool_response_keys_are_all_typed_fields() {
+        for key in TOOL_RESPONSE_KEYS {
+            let mistyped = serde_json::json!({ *key: [1] });
+            assert!(
+                ToolResponse::deserialize(&mistyped).is_err(),
+                "{key} is not a typed ToolResponse field"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_drift_names_the_whole_object_when_only_the_combination_fails() {
+        // Each alias parses alone; together they collide, so no single field
+        // is to blame and the row names the key itself.
+        let json = r#"{"tool_name":"Write","tool_input":{"source":"a","sourcePath":"b"}}"#;
+        let drift = HookInput::from_json(json).unwrap().schema_drift;
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert_eq!((drift[0].key, drift[0].field), ("tool_input", "tool_input"));
     }
 
     /// Review N3: the joined argv string, run by a real shell, reproduces

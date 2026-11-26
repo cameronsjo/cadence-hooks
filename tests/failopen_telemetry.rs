@@ -294,7 +294,8 @@ fn run_with_payload(args: &[&str], payload: &str) -> tempfile::TempDir {
 }
 
 /// #364: an object whose declared field mismatches writes one `schema_drift`
-/// row naming only the key, on both the check and the logger dispatch paths.
+/// row naming the key, the tool and the field, never a value, on both the
+/// check and the logger dispatch paths.
 #[test]
 fn object_shaped_mismatch_writes_schema_drift_row() {
     let secret = "never-copy-this-value";
@@ -314,6 +315,8 @@ fn object_shaped_mismatch_writes_schema_drift_row() {
             rows[0]["error"],
             "tool_response: object did not match its typed shape"
         );
+        assert_eq!(rows[0]["toolName"], "Bash", "{args:?}");
+        assert_eq!(rows[0]["field"], "stdout", "{args:?}");
         let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
         assert!(!raw.contains(secret), "no payload value reaches the ledger");
     }
@@ -339,6 +342,59 @@ fn group_fan_out_writes_schema_drift_once() {
     assert_eq!(rows[0]["subcommand"], "git-safety");
 }
 
+/// A wrong-typed `tool_input` field is named on the row, and a payload that
+/// matches its typed shape writes no row at all.
+#[test]
+fn drift_row_names_the_mistyped_tool_input_field() {
+    let drifted = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","description":{"text":"never-copy-this"}}}"#;
+    let clean = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","description":"list"}}"#;
+    for args in [
+        &["metrics", "log-subagent"][..],
+        &["cadence", "git-safety"][..],
+    ] {
+        let tmp = run_with_payload(args, drifted);
+        let rows = failopen_rows(tmp.path());
+        assert_eq!(rows.len(), 1, "{args:?}: {rows:?}");
+        assert_eq!(rows[0]["toolName"], "Bash", "{args:?}");
+        assert_eq!(rows[0]["field"], "description", "{args:?}");
+        let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
+        assert!(
+            !raw.contains("never-copy-this"),
+            "no payload value reaches the ledger"
+        );
+
+        let tmp = run_with_payload(args, clean);
+        assert!(failopen_rows(tmp.path()).is_empty(), "{args:?}");
+    }
+}
+
+/// A tool name outside the plain charset is recorded as `"other"`, so a
+/// payload-supplied name cannot put arbitrary text on the row.
+#[test]
+fn drift_row_records_an_unplain_tool_name_as_other() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash; rm -rf ~","tool_input":{"command":"ls"},"tool_response":{"stdout":{"t":"x"}}}"#;
+    let tmp = run_with_payload(&["metrics", "log-subagent"], payload);
+    let rows = failopen_rows(tmp.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["toolName"], "other");
+    let raw = std::fs::read_to_string(tmp.path().join("failopen.jsonl")).unwrap();
+    assert!(
+        !raw.contains("rm -rf"),
+        "the raw name never reaches the ledger"
+    );
+}
+
+/// A drifted payload with no `tool_name` records `toolName: null`.
+#[test]
+fn drift_row_without_a_tool_name_records_null() {
+    let payload = r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_response":{"stdout":{"t":"x"}}}"#;
+    let tmp = run_with_payload(&["metrics", "log-subagent"], payload);
+    let rows = failopen_rows(tmp.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0]["toolName"].is_null(), "{rows:?}");
+    assert_eq!(rows[0]["field"], "stdout");
+}
+
 /// #364: expected per-tool variance (a non-object response) stays silent.
 #[test]
 fn non_object_tool_response_writes_no_failopen_row() {
@@ -353,30 +409,32 @@ fn non_object_tool_response_writes_no_failopen_row() {
 }
 
 /// A panic on the loop parser's thread is contained (cameronsjo/cadence-hooks
-/// #1401 review): the check reads it as a parse failure and judges the command
-/// through its fallback. A looped write to an unowned repo then still blocks
-/// (exit 2) on its own segment. Before the containment the global panic hook
-/// exited the process with 1, which in `group` mode also dropped every other
-/// member's block.
+/// #1401 review); the containment itself is pinned by `loop_analysis`'s unit
+/// tests. `guard-gh-write` no longer runs the loop parser (each write in a
+/// loop body is judged as a single command, cameronsjo/cadence-hooks#1633),
+/// and no other hook does either, so the forced panic never fires here. What
+/// this pins end to end: with the panic forced, the looped write to an
+/// unowned repo still blocks (exit 2) on what the guard read, and nothing
+/// fails open.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "CADENCE_TEST_PANIC exists only in debug builds"
 )]
-fn a_parser_panic_is_contained_and_the_write_still_blocks() {
+fn a_forced_parser_panic_does_not_reach_guard_gh_write() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, _) = run_guardrail("guard-gh-write", tmp.path(), UNOWNED_LOOP, Some("parse"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("the loop parser panicked"),
-        "the synthetic parser panic fired: {stderr}"
+        !stderr.contains("CADENCE_TEST_PANIC"),
+        "guard-gh-write ran the loop parser: {stderr}"
     );
-    // The pin: exit 2, not the 1 an uncontained panic or a timed-out hook
-    // gives. A parse that succeeded would print the same cause.
+    // The pin: exit 2 on the literal unowned target, not the 1 an
+    // uncontained panic gives.
     assert_eq!(
         out.status.code(),
         Some(2),
-        "the guard still exited 2 (contained, not 1 or a signal): {stderr}"
+        "the guard exited 2 on what it read: {stderr}"
     );
     assert!(
         stderr.contains(UNOWNED_CAUSE),
@@ -433,35 +491,38 @@ fn run_guardrail(
     (out, started.elapsed())
 }
 
-/// cameronsjo/cadence-hooks#1401: `parse_command` gives the parser a budget.
-/// The debug-only `hang` mode makes the parse sleep 30 s. Without the budget
-/// the hook waits it out and the 5 s hook timeout lets the write through.
+/// cameronsjo/cadence-hooks#1401: `parse_command` gives the parser a budget,
+/// pinned by `loop_analysis`'s unit tests. The debug-only `hang` mode makes
+/// the parse sleep 30 s. `guard-gh-write` no longer runs the loop parser
+/// (cameronsjo/cadence-hooks#1633), so a forced hang cannot hold it past the
+/// 5 s hook timeout: the looped write to an unowned repo blocks at once, on
+/// what the guard read.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "CADENCE_TEST_PANIC exists only in debug builds"
 )]
-fn a_parser_hang_is_abandoned_within_the_budget_and_the_write_still_blocks() {
+fn a_forced_parser_hang_does_not_delay_guard_gh_write() {
     let tmp = tempfile::tempdir().unwrap();
     let (out, elapsed) = run_guardrail("guard-gh-write", tmp.path(), UNOWNED_LOOP, Some("hang"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("CADENCE_TEST_PANIC=hang"),
-        "the synthetic hang fired: {stderr}"
+        !stderr.contains("CADENCE_TEST_PANIC"),
+        "guard-gh-write ran the loop parser: {stderr}"
     );
-    // The pin: exit 2, not the 1 an uncontained panic or a timed-out hook
-    // gives. A parse that succeeded would print the same cause.
+    // The pin: exit 2 on the literal unowned target, not the 1 a timed-out
+    // hook gives.
     assert_eq!(
         out.status.code(),
         Some(2),
-        "the guard still exited 2 (contained, not 1 or a signal): {stderr}"
+        "the guard exited 2 on what it read: {stderr}"
     );
     assert!(
         stderr.contains(UNOWNED_CAUSE),
         "still blocked as a write to an unowned repo: {stderr}"
     );
     cadence_hooks_core::test_builders::assert_elapsed_under(
-        &format!("judged within the parse budget, under the 5 s hook timeout: {elapsed:?}"),
+        &format!("judged at once, under the 5 s hook timeout: {elapsed:?}"),
         elapsed,
         std::time::Duration::from_secs(4),
     );
@@ -472,18 +533,17 @@ fn a_parser_hang_is_abandoned_within_the_budget_and_the_write_still_blocks() {
 /// enough to overflow the parse thread's stack. An overflow aborts the
 /// process (signal 6), which drops every verdict. Past [`MAX_PARSE_BYTES`]
 /// the command is not parsed, and the guard still exits 2 on the unowned
-/// write. The
-/// `[[ ! …` shape costs 2 bytes per level, the cheapest known; at 16 000
+/// write. The `[[ ! …` shape costs 2 bytes per level, the cheapest known; at 16 000
 /// levels it aborts a debug build when the cap is lifted.
 #[test]
 fn nesting_past_the_byte_cap_still_gets_a_verdict() {
     let tmp = tempfile::tempdir().unwrap();
     let depth = 16_000;
     let just_over = MAX_PARSE_BYTES / 2 + 1;
-    // `(command, judged by the fallback?)`. The `while` and `case` shapes nest
-    // the write where `guard-gh-write` refuses the command as too large
-    // before its fallback judges the write, so only their exit code is
-    // pinned.
+    // `(command, blocked on the unowned target?)`. Every shape is:
+    // `guard-gh-write` no longer refuses a command as too large to read, so
+    // the `while` and `case` shapes are judged on the write they hold too
+    // (cameronsjo/cadence-hooks#1633).
     let shapes = [
         (
             format!("[[ {}x ]] && {UNOWNED_LOOP}", "! ".repeat(just_over)),
@@ -514,7 +574,7 @@ fn nesting_past_the_byte_cap_still_gets_a_verdict() {
                 "while true; do ".repeat(depth),
                 "; done".repeat(depth)
             ),
-            false,
+            true,
         ),
         (
             format!(
@@ -522,7 +582,7 @@ fn nesting_past_the_byte_cap_still_gets_a_verdict() {
                 "case x in x) ".repeat(depth),
                 " ;; esac".repeat(depth)
             ),
-            false,
+            true,
         ),
     ];
     for (command, by_fallback) in &shapes {

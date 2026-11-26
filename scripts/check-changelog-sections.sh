@@ -21,7 +21,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 diff="$(git diff -U0 --no-color --no-ext-diff "${BASE}...HEAD" -- CHANGELOG.md)" || exit 2
 
-# New-file line numbers of the new top-level bullets.
+# New-file line numbers of the new top-level bullets, comma-separated so both
+# macOS BSD awk and GNU awk accept `-v want=...` without embedded newlines (#1643).
 lines="$(awk '
   /^@@ / {
     hunk = 1
@@ -31,7 +32,7 @@ lines="$(awk '
   }
   !hunk {next}
   /^\+/ {if (dels == 0 && substr($0, 2, 2) == "- ") print ln; ln++}
-' <<< "$diff")"
+' <<< "$diff" | paste -sd, -)"
 
 if [[ -z "$lines" ]]; then
   echo "CHANGELOG.md: no new bullets"
@@ -39,7 +40,7 @@ if [[ -z "$lines" ]]; then
 fi
 
 git show "HEAD:CHANGELOG.md" | awk -v want="$lines" '
-  BEGIN {n = split(want, w, "\n"); for (i = 1; i <= n; i++) need[w[i]] = 1}
+  BEGIN {n = split(want, w, ","); for (i = 1; i <= n; i++) if (w[i] != "") need[w[i]] = 1}
   /^## / {heading = $0}
   (NR in need) && heading != "## [Unreleased]" {
     printf "CHANGELOG.md:%d: new bullet under \"%s\", not \"## [Unreleased]\"\n", NR, heading

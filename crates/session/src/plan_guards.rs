@@ -35,17 +35,21 @@
 //!   before the operator ever sees it — the persist-time lint
 //!   (cadence-hooks#675) runs at PostToolUse, after approval, so it could not
 //!   catch a harness-template plan (Context/Changes/Verification, no panel,
-//!   no alternatives, no checkbox tasks) presented unasked. The block names
-//!   only the static stanza names and the in-band escape
-//!   (`Panel: none — <reason>`); a settled `Panel:` line with other stanzas
-//!   missing draws one nudge sentence instead. Subagent-originated calls
+//!   no alternatives, no checkbox tasks) presented unasked. A line settles
+//!   when it states an outcome; only a missing, pending, trivial or
+//!   unfilled-template line blocks ([`plan_scan::panel_line_settled`],
+//!   cameronsjo/cadence-hooks#1675). The block is static text carrying only
+//!   the fix: the first `Panel:` line is the one judged, and the two
+//!   canonical shapes (`Panel: <seats> ran — …`, `Panel: none — <reason>`).
+//!   A settled `Panel:` line with other stanzas missing draws one nudge
+//!   sentence instead. Subagent-originated calls
 //!   (`agent_id` on the payload) allow silently — a planner subagent
 //!   produces a pre-panel draft by design — and every internal failure (no
 //!   plan text obtainable, unreadable plan-store file) allows (ADR-0001).
 //!   The gate enforces the artifact's *shape*, not that attune ran or that
-//!   the operator asked; those stay prose-governed — but every judged
-//!   outcome (block, stanza nudge, and a reminders-only nudge on a
-//!   template-shaped plan) carries two static presentation-time reminders:
+//!   the operator asked; those stay prose-governed — but both allow
+//!   outcomes (a stanza nudge, and a reminders-only nudge on a
+//!   template-shaped plan) carry two static presentation-time reminders:
 //!   subagents stopped, operator asked to see the plan (the
 //!   presentation-reminders plan, 2026-08-26; deliberately not
 //!   telemetry-driven).
@@ -123,6 +127,10 @@ impl Check for LintPlanShape {
 /// text — the block message never carries matched plan content
 /// (cameronsjo/cadence-hooks#715).
 const PANEL_ESCAPE_TEMPLATE: &str = "Panel: none — <reason>";
+
+/// The canonical shape for a panel that ran, named beside the escape. Static
+/// text, like [`PANEL_ESCAPE_TEMPLATE`].
+const PANEL_RAN_TEMPLATE: &str = "Panel: <seats> ran — N findings, M folded in, K declined";
 
 /// Presentation-time reminders, carried on every top-level `ExitPlanMode`
 /// outcome (the presentation-reminders plan, 2026-08-26). Static text by
@@ -204,10 +212,11 @@ fn plan_text(input: &HookInput) -> Option<String> {
         .and_then(crate::persist_plan::read_plan_store_file)
 }
 
-/// The pure decision: block on an unsettled `Panel:` line (naming both
-/// escapes, with any other missing stanza listed as advice), nudge on a
-/// settled line with other stanzas missing, nudge just the presentation
-/// reminders on a template-shaped plan — every outcome carries both reminders.
+/// The pure decision: block on an unsettled `Panel:` line with the fix alone
+/// (the first-line rule and the two canonical shapes); nudge on a settled
+/// line with other stanzas missing; nudge just the presentation reminders on
+/// a template-shaped plan. Both allow paths carry both reminders; the block
+/// carries neither, since the re-call's allow nudge does.
 fn judge_plan_shape(plan: &str) -> CheckResult {
     let missing = plan_scan::missing_stanzas(plan);
     if missing.is_empty() {
@@ -216,33 +225,17 @@ fn judge_plan_shape(plan: &str) -> CheckResult {
         ));
     }
     if missing.contains(&plan_scan::PANEL_STANZA) {
-        // Only the `Panel:` line blocks. The other stanzas draw a nudge once
-        // it settles, so the block names them as advice, never as required:
-        // calling them "mandatory" once led a session to pad an advisory
-        // answer into a full implementation plan (cadence-hooks#1019).
-        let advised: Vec<&str> = missing
-            .iter()
-            .copied()
-            .filter(|s| *s != plan_scan::PANEL_STANZA)
-            .collect();
-        let advisory = if advised.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " Also missing, advisory only (a nudge, never a block): {} — {}. A plan \
-                 with nothing to implement needs only the `Panel:` line.",
-                advised.join(", "),
-                plan_scan::TEMPLATE_POINTER
-            )
-        };
+        // Only the `Panel:` line blocks, and the block carries the fix alone:
+        // the other stanzas, the template pointer and both presentation
+        // reminders come back on the re-call's allow nudge, so repeating them
+        // here only lengthens the round trip (cameronsjo/cadence-hooks#1675).
+        // The other stanzas are never called mandatory (cadence-hooks#1019).
+        // Naming the first-line rule keeps a fix from appending a second
+        // `Panel:` line under the unsettled one, which would block again.
         return CheckResult::block(format!(
-            "plan-shape gate: this plan lacks {} — the one stanza that blocks. \
-             Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N findings, \
-             M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`) and re-call \
-             ExitPlanMode, or leave plan mode with shift-tab.{advisory} {SUBAGENTS_REMINDER} \
-             The gate checks the artifact's shape only; attune's panel is still yours to \
-             honor. {OPERATOR_ASK_REMINDER}",
-            plan_scan::PANEL_STANZA,
+            "plan-shape gate: no settled Panel: line (the first Panel: line is the one \
+             judged; replace it, don't add another). Then re-call ExitPlanMode. \
+             Panel ran: `{PANEL_RAN_TEMPLATE}`. No panel: `{PANEL_ESCAPE_TEMPLATE}`."
         ));
     }
     CheckResult::nudge(format!(
@@ -289,7 +282,7 @@ pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {
         return CheckResult::allow();
     }
 
-    let Some(plan) = plan_for_current_branch(&repo_root) else {
+    let Some(plan) = plan_for_tick_nudge(&repo_root, input.session_id.as_deref()) else {
         return CheckResult::allow();
     };
     let root_str = repo_root.to_string_lossy();
@@ -336,7 +329,7 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(repo_root) = crate::registry::repo_root(cwd) else {
         return CheckResult::allow();
     };
-    let Some(plan) = plan_for_current_branch(&repo_root) else {
+    let Some(plan) = plan_for_tick_nudge(&repo_root, input.session_id.as_deref()) else {
         return CheckResult::allow();
     };
     // The plan speaks for the cwd's branch only, so a flip aimed anywhere
@@ -508,17 +501,72 @@ fn claim_marker(path: &Path) -> bool {
     }
 }
 
-/// The in-flight plan doc bound to the repo's current branch, if any. Binding
-/// is exact `branch:` equality — a plan carrying a stale or absent `branch:`
-/// is a silent no-fire (the guard must not guess), and shared-main repos
-/// match naturally because both sides read `main`. First match wins in
-/// `plan_scan`'s deterministic path order.
-fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
-    let branch =
-        cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)?;
-    plan_scan::in_flight_plans(repo_root)
+/// The in-flight plan doc bound to the repo's current branch for guard checks
+/// (cadence-hooks#1676).
+///
+/// Binding is exact `branch:` equality — a plan carrying a stale or absent
+/// `branch:` is a silent no-fire. When exactly one committable in-flight plan
+/// is bound to the current branch, returns it. When multiple plans share the
+/// branch (e.g. shared `main` with several in-flight plans), narrows to a
+/// unique plan whose `approved_session_id` matches `session_id`; otherwise
+/// returns `None` rather than naming an unrelated plan.
+fn plan_for_tick_nudge(repo_root: &Path, session_id: Option<&str>) -> Option<InFlightPlan> {
+    let plans = plans_for_current_branch(repo_root);
+    if plans.len() <= 1 {
+        return plans.into_iter().next();
+    }
+    let sid = session_id.filter(|s| !s.is_empty())?;
+    let mut owned: Vec<InFlightPlan> = plans
         .into_iter()
-        .find(|plan| plan.branch.as_deref() == Some(branch.as_str()))
+        .filter(|plan| plan.approved_session_id.as_deref() == Some(sid))
+        .collect();
+    if owned.len() == 1 { owned.pop() } else { None }
+}
+
+/// Every committable in-flight plan bound to the current branch, in scan order.
+fn plans_for_current_branch(repo_root: &Path) -> Vec<InFlightPlan> {
+    let Some(branch) =
+        cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)
+    else {
+        return Vec::new();
+    };
+    let plans: Vec<InFlightPlan> = plan_scan::in_flight_plans(repo_root)
+        .into_iter()
+        .filter(|plan| plan.branch.as_deref() == Some(branch.as_str()))
+        .collect();
+    if plans.is_empty() {
+        return plans;
+    }
+    let ignored = git_ignored(
+        &repo_root.to_string_lossy(),
+        plans.iter().map(|p| p.rel_path.as_str()),
+    );
+    plans
+        .into_iter()
+        .filter(|plan| !ignored.contains(&plan.rel_path))
+        .collect()
+}
+
+/// The subset of `rel_paths` git ignores, from one `git check-ignore` spawn,
+/// which prints each ignored path on its own line. No output (or a failed
+/// spawn) reads as "none ignored", so the guards keep their old behavior
+/// when git can't answer.
+fn git_ignored<'a>(repo_root: &str, rel_paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut args = vec!["-c", "core.quotePath=false", "check-ignore", "--"];
+    args.extend(rel_paths);
+    cadence_hooks_core::shell::git_command(repo_root, &args)
+        .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// The plans folders a commit-time check should pass to `git status`,
+/// relative to `repo_root` and existing on disk: the repo's configured
+/// `CADENCE_PLANS_DIR` and `docs/plans` (cadence#2153).
+pub fn plan_status_pathspecs(repo_root: &Path) -> Vec<String> {
+    crate::persist_plan::scan_plans_dirs(repo_root)
+        .into_iter()
+        .filter(|d| crate::persist_plan::plans_dir_path(repo_root, d).is_dir())
+        .collect()
 }
 
 /// The commit-time pre-arm of the plan tick (cadence-hooks#691): the repo
@@ -536,27 +584,61 @@ fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
 /// (`M `, `MM`, `A `) is already in the commit's diff; an untracked plan is
 /// already named by the untracked-files warning. The scan is skipped unless a
 /// ` M docs/plans/*.md` line exists, so an ordinary commit pays nothing.
-/// Fails open on every input (no repo, no plan, a quoted path): `None`.
+/// Fails open on every input (no repo, no plan): `None`.
 ///
-/// `porcelain` is `git status --porcelain` output, whose paths are relative
-/// to the repo root.
+/// `porcelain` is `git status --porcelain -z` output, whose paths are
+/// relative to the repo root and never quoted (plain `--porcelain` puts a
+/// path with a space in double quotes, so a plans folder named
+/// `Second Brain/...` would never match).
 pub fn unstaged_plan_at_commit(cwd: &str, porcelain: &str) -> Option<String> {
-    let candidates: Vec<&str> = porcelain
-        .lines()
-        .filter_map(|line| line.strip_prefix(" M docs/plans/"))
-        .filter(|name| name.ends_with(".md") && !name.contains('/'))
+    let candidates: Vec<&str> = porcelain_z_entries(porcelain)
+        .into_iter()
+        .filter_map(|(code, path)| (code == " M").then_some(path))
+        .filter(|path| path.ends_with(".md"))
         .collect();
     if candidates.is_empty() {
         return None;
     }
     let repo_root = crate::registry::repo_root(cwd)?;
-    let plan = plan_for_current_branch(&repo_root)?;
-    let dirty_unstaged = candidates
-        .iter()
-        .any(|name| format!("docs/plans/{name}") == plan.rel_path);
-    dirty_unstaged.then(|| {
-        crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY)
-    })
+    // Every plan on the branch, not just the first: with a configured plans
+    // folder scanned first, a docs/plans plan must still be caught here.
+    plans_for_current_branch(&repo_root)
+        .into_iter()
+        .find(|plan| candidates.iter().any(|path| *path == plan.rel_path))
+        .map(|plan| {
+            crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY)
+        })
+}
+
+/// Split `git status --porcelain -z` output into `(XY, path)` pairs. Each
+/// entry is `XY path`, NUL-terminated; a rename or copy (`R`/`C` in either
+/// column) is followed by its source path as a bare entry, which is skipped.
+/// A caller whose git runner trimmed the output may have lost the first
+/// entry's leading space (` M x` → `M x`); that entry is read as ` M`.
+pub fn porcelain_z_entries(output: &str) -> Vec<(String, &str)> {
+    let mut entries = Vec::new();
+    let mut skip_next = false;
+    for (i, entry) in output.split('\0').enumerate() {
+        if std::mem::take(&mut skip_next) || entry.is_empty() {
+            continue;
+        }
+        let bytes = entry.as_bytes();
+        let parsed = if bytes.get(2) == Some(&b' ') {
+            entry.get(..2).map(str::to_string).zip(entry.get(3..))
+        } else if i == 0 && bytes.get(1) == Some(&b' ') {
+            entry.get(..1).map(|x| format!(" {x}")).zip(entry.get(2..))
+        } else {
+            None
+        };
+        let Some((code, path)) = parsed.filter(|(_, path)| !path.is_empty()) else {
+            continue;
+        };
+        if code.contains(['R', 'C']) {
+            skip_next = true;
+        }
+        entries.push((code, path));
+    }
+    entries
 }
 
 /// Does git's commit summary line (`[branch abc1234] subject`) appear in
@@ -656,6 +738,23 @@ mod tests {
     // --- lint-plan-shape unjudged allows (cameronsjo/cadence-hooks#1256 M-3) ---
 
     #[test]
+    fn porcelain_z_entries_reads_unquoted_paths() {
+        // A trimmed first entry, a space in a path, a rename's source skipped.
+        let out = "M Second Brain/p.md\0?? new dir/q.md\0R  a.md\0old.md\0 M b.md";
+        let entries = porcelain_z_entries(out);
+        let got: Vec<(&str, &str)> = entries.iter().map(|(c, p)| (c.as_str(), *p)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (" M", "Second Brain/p.md"),
+                ("??", "new dir/q.md"),
+                ("R ", "a.md"),
+                (" M", "b.md"),
+            ]
+        );
+    }
+
+    #[test]
     fn plan_store_miss_table() {
         let root = Path::new("/cfg/plans");
         let cases = [
@@ -722,53 +821,48 @@ mod tests {
 
     // --- judge_plan_shape message pins ---
 
+    /// The block text pinned whole: the fix alone (cameronsjo/cadence-hooks#1675).
+    const BLOCK_MESSAGE: &str = "plan-shape gate: no settled Panel: line (the first Panel: \
+        line is the one judged; replace it, don't add another). Then re-call ExitPlanMode. \
+        Panel ran: `Panel: <seats> ran — N findings, M folded in, K declined`. \
+        No panel: `Panel: none — <reason>`.";
+
     #[test]
-    fn plan_shape_block_message_names_stanzas_and_template_home() {
+    fn plan_shape_block_message_is_the_fix_alone() {
         let r = judge_plan_shape("# T\n\nprose only\n");
         assert_eq!(r.outcome, Outcome::Block);
         let msg = r.message.unwrap();
-        assert!(msg.contains("plan-shape gate: this plan lacks a settled Panel: line"));
-        assert!(
-            msg.contains("the one stanza that blocks"),
-            "the block says only Panel: blocks: {msg}"
-        );
-        assert!(
-            msg.contains(
-                "Also missing, advisory only (a nudge, never a block): a ## Loop section, a ## Concessions section, an Alternatives"
-            ),
-            "the other stanzas are named as advice: {msg}"
-        );
-        assert!(
-            !msg.contains("mandatory"),
-            "advisory stanzas are never called mandatory (cadence-hooks#1019): {msg}"
-        );
-        assert!(
-            msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`"),
-            "the block names the template's home: {msg}"
-        );
-        assert!(
-            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
-            "the block carries both presentation reminders: {msg}"
-        );
-        assert_eq!(
-            msg.matches("ask to see the plan").count(),
-            1,
-            "the operator-ask question is stated once, folded into the tail: {msg}"
-        );
+        assert_eq!(msg, BLOCK_MESSAGE);
+        // What moved off the block: it returns on the re-call's allow nudge.
+        for gone in [
+            SUBAGENTS_REMINDER,
+            OPERATOR_ASK_REMINDER,
+            "Also missing",
+            "shift-tab",
+            "honor",
+            "mandatory",
+            "a ## Loop section",
+        ] {
+            assert!(!msg.contains(gone), "the block drops {gone:?}: {msg}");
+        }
     }
 
     #[test]
-    fn plan_shape_block_with_only_panel_missing_has_no_advisory_tail() {
-        let plan = plan_scan::TEMPLATE_SHAPED_PLAN
-            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
-        let r = judge_plan_shape(&plan);
-        assert_eq!(r.outcome, Outcome::Block);
-        let msg = r.message.unwrap();
-        assert!(msg.contains("the one stanza that blocks"), "{msg}");
-        assert!(
-            !msg.contains("Also missing"),
-            "no advisory list when Panel: is the only gap: {msg}"
-        );
+    fn plan_shape_block_is_the_same_whatever_else_is_missing() {
+        // Panel: alone missing, Panel: + Loop missing, Panel: + Workarounds
+        // missing: one static block, no stanza list riding along.
+        let strip =
+            |p: String| p.replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+        for plan in [
+            strip(plan_scan::TEMPLATE_SHAPED_PLAN.to_string()),
+            strip(plan_scan::template_shaped_plan_without_loop()),
+            strip(plan_scan::template_shaped_plan_without_concessions()),
+            "# T\n\nPanel: pending — seats queued\n".to_string(),
+        ] {
+            let r = judge_plan_shape(&plan);
+            assert_eq!(r.outcome, Outcome::Block, "{plan:?}");
+            assert_eq!(r.message.as_deref(), Some(BLOCK_MESSAGE), "{plan:?}");
+        }
     }
 
     #[test]
@@ -779,7 +873,7 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("plan-shape gate: plan lacks "));
         assert!(msg.contains("a ## Loop section"));
-        assert!(msg.contains("a ## Concessions section"));
+        assert!(msg.contains("a ## Workarounds section"));
         assert!(msg.contains("an Alternatives-declined stanza"));
         assert!(msg.contains("a ## Global Constraints section"));
         assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
@@ -811,7 +905,7 @@ mod tests {
             "the nudge names only the Loop stanza and marks it advisory: {msg}"
         );
         assert!(
-            !msg.contains("the one stanza that blocks"),
+            !msg.contains("no settled Panel: line"),
             "the block wording is for an unsettled Panel: line: {msg}"
         );
         assert!(
@@ -826,53 +920,46 @@ mod tests {
         assert_eq!(
             r.outcome,
             Outcome::Nudge,
-            "a missing Concessions section never blocks"
+            "a missing Workarounds section never blocks"
         );
         let msg = r.message.unwrap();
         assert!(
-            msg.contains("plan-shape gate: plan lacks a ## Concessions section — advisory, from "),
-            "the nudge names only the Concessions stanza and marks it advisory: {msg}"
+            msg.contains("plan-shape gate: plan lacks a ## Workarounds section — advisory, from "),
+            "the nudge names only the Workarounds stanza and marks it advisory: {msg}"
         );
         assert!(
-            !msg.contains("the one stanza that blocks"),
+            !msg.contains("no settled Panel: line"),
             "the block wording is for an unsettled Panel: line: {msg}"
         );
         assert!(
             msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
-            "the Concessions nudge carries both presentation reminders: {msg}"
+            "the Workarounds nudge carries both presentation reminders: {msg}"
         );
     }
 
+    /// The template's current `## Workarounds` name, end to end through the
+    /// gate: a template-shaped plan using it draws the reminders-only nudge
+    /// (cameronsjo/cadence-hooks#1675).
     #[test]
-    fn plan_shape_concessions_is_advisory_when_the_panel_line_blocks() {
-        let plan = plan_scan::template_shaped_plan_without_concessions()
-            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
+    fn plan_shape_workarounds_heading_is_template_shaped() {
+        let plan = plan_scan::TEMPLATE_SHAPED_PLAN.replace(
+            "## Concessions\n\nConcessions: none — nothing is worked around",
+            "## Workarounds\n\nWorkarounds: none — nothing is worked around",
+        );
+        assert_ne!(
+            plan,
+            plan_scan::TEMPLATE_SHAPED_PLAN,
+            "the fixture must carry the section to rename"
+        );
         let r = judge_plan_shape(&plan);
-        assert_eq!(r.outcome, Outcome::Block);
+        assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(
-            msg.contains(
-                "Also missing, advisory only (a nudge, never a block): a ## Concessions section"
-            ),
-            "Concessions is named as advice, not as the blocking stanza: {msg}"
-        );
-    }
-
-    #[test]
-    fn plan_shape_loop_is_advisory_when_the_panel_line_blocks() {
-        // Panel: and Loop both missing: the block is for `Panel:` alone, and
-        // the Loop stanza rides along in the advisory tail.
-        let plan = plan_scan::template_shaped_plan_without_loop()
-            .replace("Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n", "");
-        let r = judge_plan_shape(&plan);
-        assert_eq!(r.outcome, Outcome::Block);
-        let msg = r.message.unwrap();
-        assert!(
-            msg.contains("Also missing, advisory only (a nudge, never a block): a ## Loop section"),
-            "Loop is named as advice, not as the blocking stanza: {msg}"
+            !msg.contains("lacks"),
+            "a Workarounds plan is template-shaped: {msg}"
         );
         assert!(
-            msg.contains("this plan lacks a settled Panel: line — the one stanza that blocks"),
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
             "{msg}"
         );
     }
@@ -1058,6 +1145,59 @@ mod tests {
         // Second qualifying commit in the same session: marker holds, silent.
         let r2 = run_nudge_plan_tick(&input);
         assert_eq!(r2.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn tick_nudge_skips_a_plan_in_a_gitignored_plans_folder() {
+        // cadence#2153: a repo whose CADENCE_PLANS_DIR is gitignored never
+        // commits its plans, so "commit the plan" is the wrong advice.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        fs::create_dir_all(tmp.path().join(".claude/plans")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), ".claude/plans/\n").unwrap();
+        fs::write(
+            tmp.path().join(".claude/settings.json"),
+            r#"{"env":{"CADENCE_PLANS_DIR":".claude/plans"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".claude/plans/2026-11-18-local.md"),
+            "---\nstatus: \"in-flight\"\nbranch: \"main\"\n---\n\n- [ ] build\n",
+        )
+        .unwrap();
+        commit_all(tmp.path(), "settings");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let input = bash_input(
+            "ignored-plan-session",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+
+        // Control: the same plan, once the folder is not ignored, does nudge.
+        fs::write(tmp.path().join(".gitignore"), "").unwrap();
+        commit_all(tmp.path(), "unignore");
+        for i in 3..6 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let control = bash_input(
+            "ignored-plan-control",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&control).outcome,
+            cadence_hooks_core::Outcome::Nudge
+        );
     }
 
     #[test]
@@ -1593,5 +1733,81 @@ mod tests {
             run_nudge_plan_tick(&real).outcome,
             cadence_hooks_core::Outcome::Nudge
         );
+    }
+
+    #[test]
+    fn tick_nudge_stays_silent_when_multiple_plans_share_branch_unowned() {
+        // #1676: on a shared-main repo with multiple in-flight plans, a session
+        // that did not approve any of them must not be nudged with an unrelated
+        // plan.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-28-old-plan.md",
+            "in-flight",
+            "main",
+            "# Old\n\n- [ ] step\n",
+        );
+        write_plan(
+            tmp.path(),
+            "2026-11-25-new-plan.md",
+            "in-flight",
+            "main",
+            "# New\n\n- [ ] step\n",
+        );
+        commit_all(tmp.path(), "plans land");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("w{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let input = bash_input(
+            "unrelated-session",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn tick_nudge_names_session_owned_plan_on_shared_branch() {
+        // #1676: when multiple in-flight plans share `main` and exactly one was
+        // approved by this session, the tick nudge names that plan (not the
+        // first plan in scan order).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-09-28-old-plan.md",
+            "in-flight",
+            "main",
+            "# Old\n\n- [ ] step\n",
+        );
+        let owned_dir = tmp.path().join("docs/plans");
+        fs::write(
+            owned_dir.join("2026-11-25-owned-plan.md"),
+            "---\nstatus: in-flight\nbranch: main\napproved_session_id: my-session-1676\n---\n\n# Owned\n\n- [ ] step\n",
+        )
+        .unwrap();
+        commit_all(tmp.path(), "plans land");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("w{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let input = bash_input(
+            "my-session-1676",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        let res = run_nudge_plan_tick(&input);
+        assert_eq!(res.outcome, cadence_hooks_core::Outcome::Nudge);
+        let msg = res.message.unwrap_or_default();
+        assert!(msg.contains("2026-11-25-owned-plan.md"), "{msg}");
+        assert!(!msg.contains("2026-09-28-old-plan.md"), "{msg}");
     }
 }

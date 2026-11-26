@@ -1,0 +1,19 @@
+# The commands in confirm-tier-commands.txt that remove a Docker container
+# (cameronsjo/cadence-hooks#1661). scripts/confirm-tier-compare.py fails when
+# guard-container-rm's first attempt blocks a command not listed here, allows
+# one listed here, or blocks a listed one on its second attempt.
+docker rm web
+docker rm -f web
+docker rm -fv web db
+docker rm --force web
+docker container rm web
+docker container rm -f web
+docker container remove web
+docker --context prod rm web
+docker -H tcp://h:2375 rm web
+sudo docker rm web
+DOCKER_HOST=tcp://h:2375 docker rm web
+docker ps -aq | xargs docker rm
+docker rm $(docker ps -aq)
+docker stop web && docker rm web
+bash -c 'docker rm web'

@@ -8,17 +8,18 @@
 //! panic handling) lives in [`crate::dispatch::run_logged_group`]; this module
 //! only turns the member names into checks.
 //!
-//! Members resolve through the same clap parser and the same
-//! [`crate::check_plan`] table a standalone run uses, so `group cadence/x` and
-//! `cadence x` cannot dispatch different checks. A member that does not
-//! resolve is skipped with a notice and the rest still run, which is what a
-//! separate process for an unknown hook did: fail open for that one hook.
+//! Members resolve through the same static dispatch table
+//! ([`crate::parse_plain_hook_command`] + [`crate::check_plan`]) a standalone
+//! run uses, so `group cadence/x` and `cadence x` cannot dispatch different
+//! checks and resolving N members never constructs `clap::Command`. A member
+//! that does not resolve is skipped with a notice and the rest still run, which
+//! is what a separate process for an unknown hook did: fail open for that one
+//! hook.
 
 use crate::dispatch::{self, GroupMember};
-use crate::{Cli, check_plan, hook_name};
+use crate::{check_plan, hook_name, is_known_cli_action, parse_plain_hook_command};
 use cadence_hooks_core::HookEvent;
 use cadence_hooks_core::bypass::{self, BypassState};
-use clap::Parser;
 
 /// Why a member spec could not join the group.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,10 +40,13 @@ pub(crate) fn resolve(spec: &str) -> Result<(&'static str, dispatch::CheckPlan),
     if namespace.is_empty() || hook.is_empty() || hook.contains('/') {
         return Err(Rejected::Unknown);
     }
-    let cli =
-        Cli::try_parse_from(["cadence-hooks", namespace, hook]).map_err(|_| Rejected::Unknown)?;
-    let name = hook_name(&cli.command).ok_or(Rejected::NotAToolCheck)?;
-    let plan = check_plan(&cli.command).ok_or(Rejected::NotAToolCheck)?;
+    let cmd = match parse_plain_hook_command(namespace, hook) {
+        Some(cmd) => cmd,
+        None if is_known_cli_action(namespace, hook) => return Err(Rejected::NotAToolCheck),
+        None => return Err(Rejected::Unknown),
+    };
+    let name = hook_name(&cmd).ok_or(Rejected::NotAToolCheck)?;
+    let plan = check_plan(&cmd).ok_or(Rejected::NotAToolCheck)?;
     if plan.is_payload_event()
         || !matches!(plan.event(), HookEvent::PreToolUse | HookEvent::PostToolUse)
     {
@@ -55,6 +59,9 @@ pub(crate) fn resolve(spec: &str) -> Result<(&'static str, dispatch::CheckPlan),
 pub(crate) fn run(specs: &[String]) -> ! {
     let mut members: Vec<GroupMember> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
+    let bypass_env = std::env::var(bypass::BYPASS_VAR).ok();
+    let disable_env = std::env::var(bypass::DISABLE_VAR).ok();
+    let is_remote = cadence_hooks_core::remote::is_remote();
     for spec in specs {
         let resolved = resolve(spec).and_then(|(name, plan)| {
             if members.iter().any(|m| m.hook == name) {
@@ -87,7 +94,7 @@ pub(crate) fn run(specs: &[String]) -> ! {
         };
         // The same per-hook switch `main` applies to a standalone run, with the
         // same stderr trace (#89).
-        match bypass::resolve(name) {
+        match bypass::resolve_from(bypass_env.as_deref(), disable_env.as_deref(), name) {
             BypassState::Disabled => {
                 eprintln!("⚠️  cadence-hooks: '{name}' disabled via CADENCE_DISABLE");
                 continue;
@@ -102,7 +109,7 @@ pub(crate) fn run(specs: &[String]) -> ! {
         // Cloud sessions: a self-disabled member is skipped like a disabled one.
         // (No hook declares BlockWithReason yet; when one does, a group needs its
         // own semantics for it rather than this skip.)
-        if crate::registry::remote_gate(name, cadence_hooks_core::remote::is_remote()).is_some() {
+        if crate::registry::remote_gate(name, is_remote).is_some() {
             continue;
         }
         members.push(GroupMember { hook: name, plan });

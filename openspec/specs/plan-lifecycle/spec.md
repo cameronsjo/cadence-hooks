@@ -17,7 +17,7 @@ On PostToolUse for `ExitPlanMode`, `session persist-plan-approval` SHALL write t
 - **THEN** no plan file is written and the hook exits 0 with no output
 
 ### Requirement: Persist an approve-and-clear pickup
-For an approve-and-clear, the hook SHALL persist from the child session's PostToolUse events when its first user message is the injected `Implement the following plan:` prompt, setting `approved_session_id` to the parent. It MUST persist only when the prompt's pointer names a parent transcript under `<config_dir>/projects` holding an `ExitPlanMode` call with this exact plan. It MUST reach a verdict at most once per session.
+For an approve-and-clear, the hook SHALL persist from the child session's PostToolUse events when its first user message is the injected `Implement the following plan:` prompt, setting `approved_session_id` to the parent. It MUST persist only when the prompt's pointer names a parent transcript under `<config_dir>/projects` holding an `ExitPlanMode` call with this exact plan, or a Code Mode approval of it (next requirement). It MUST reach a verdict at most once per session.
 
 #### Scenario: Genuine approve-and-clear
 - **WHEN** a child session's first message is the injected implement-prompt whose pointer names the parent transcript holding the matching `ExitPlanMode` call
@@ -26,6 +26,21 @@ For an approve-and-clear, the hook SHALL persist from the child session's PostTo
 #### Scenario: Hand-typed implement prompt
 - **WHEN** a session's first message starts with `Implement the following plan:` but its pointer names no transcript holding that plan
 - **THEN** nothing is persisted
+
+### Requirement: Code Mode approval in the parent transcript
+For an approval made through Code Mode's `REPL` tool, the parent transcript SHALL count as holding the plan when a main-chain `plan_mode` attachment names a plan-store file holding this exact plan and a later main-chain `REPL` call's code contains `tools.ExitPlanMode(`. The file MUST pass the same plan-store check as an `ExitPlanMode` `planFilePath`. Only the 16 most recently named distinct attachment paths SHALL be read, newest first.
+
+#### Scenario: Code Mode approve-and-clear
+- **WHEN** the parent transcript records a `plan_mode` attachment naming a plan-store file that holds the child's plan, then a `REPL` call whose code is `await tools.ExitPlanMode({})`
+- **THEN** the plan is persisted once, attributed to the parent session
+
+#### Scenario: Code Mode call without a matching plan file
+- **WHEN** the parent's `REPL` call to `tools.ExitPlanMode(` comes before any `plan_mode` attachment, or the named plan-store file holds a different plan, or lies outside `<config_dir>/plans`
+- **THEN** nothing is persisted
+
+#### Scenario: Matching plan file named first in a long session
+- **WHEN** the matching plan file was named by the earliest `plan_mode` attachment and 16 other distinct plan files were named after it, then the `REPL` call came
+- **THEN** nothing is persisted, since only the 16 most recently named paths are read
 
 ### Requirement: Frontmatter merged into one block
 The persisted file SHALL carry one leading frontmatter block. The hook MUST write `status: "in-flight"`, `updated`, `branch`, `session_id`, `machine` (a salted hostname digest), and, when known, `approved_session_id`, `model`, and `harness`, and MUST drop plan-authored lines for those keys or `session`, `approved_in`, `body_sha256`. A plan's `status: blocked`, and its `branch:` when none resolves, MUST be kept, as MUST all other plan keys.
@@ -95,11 +110,11 @@ A non-empty `CADENCE_NO_PERSIST_PLAN`, in the process environment or a repo's `.
 - **THEN** the hook exits 0 with no output
 
 ### Requirement: Plan-shape gate blocks only on the Panel line
-On PreToolUse for a top-level `ExitPlanMode`, `session lint-plan-shape` SHALL block (exit 2) when the plan has no settled `Panel:` line: `Panel: <seats> ran — <counts>` or `Panel: none — <reason>` with a non-trivial reason, at line start outside fences, quotes, and comments. The reason MUST name the escape `Panel: none — <reason>` and list other missing stanzas as advisory only. Every other shape MUST be allowed.
+On PreToolUse for a top-level `ExitPlanMode`, `session lint-plan-shape` SHALL block (exit 2) when the plan has no settled `Panel:` line (Requirement: Panel line states an outcome). The block reason MUST say the first `Panel:` line is the one judged and name `Panel: <seats> ran — N findings, M folded in, K declined` and `Panel: none — <reason>`; it MUST NOT list other stanzas or carry the presentation reminders. Every other shape MUST be allowed.
 
 #### Scenario: Harness-template plan
 - **WHEN** a top-level session calls `ExitPlanMode` with a plan of Context, Changes, and Verification sections and no `Panel:` line
-- **THEN** the hook exits 2 with a reason naming `Panel: none — <reason>`
+- **THEN** the hook exits 2 with a reason naming `Panel: none — <reason>` and `replace it, don't add another`
 
 #### Scenario: Trivial escape reason
 - **WHEN** the plan's only panel line is `Panel: none — n/a`
@@ -109,8 +124,27 @@ On PreToolUse for a top-level `ExitPlanMode`, `session lint-plan-shape` SHALL bl
 - **WHEN** the plan carries `Panel: none -- docs-only change` and every other stanza
 - **THEN** the hook does not block
 
+### Requirement: Panel line states an outcome
+The first `Panel:` line at line start outside fences, quotes, comments and frontmatter SHALL be judged, with `**Panel:**`, `**Panel**:`, `__Panel:__` and `**Panel: …**` read as `Panel:`. Its value is unsettled when it is trivial (empty, punctuation, `n/a`), starts with `pending`, `tbd` or `todo`, carries a template placeholder (`<name …>` outside code, `[<`, or one `[…]` span), or is `none`, `skipped` or `skip` with a trivial reason. Any other value MUST settle.
+
+#### Scenario: Pending panel line
+- **WHEN** the plan's first panel line is `**Panel: pending**`
+- **THEN** the line is unsettled and `lint-plan-shape` blocks
+
+#### Scenario: Unfilled template line
+- **WHEN** the plan's first panel line is `Panel: none — [<reason — e.g. x>]`
+- **THEN** the line is unsettled and `lint-plan-shape` blocks
+
+#### Scenario: Skipped with a reason
+- **WHEN** the plan carries `Panel: skipped — docs-only`
+- **THEN** the line settles
+
+#### Scenario: Panel stated without the ran form
+- **WHEN** the plan carries `Panel: security-posture-reviewer — 2 HIGH, all folded`
+- **THEN** the line settles
+
 ### Requirement: Plan-shape gate nudges and reminders
-Every judged `session lint-plan-shape` outcome SHALL carry the reminders `Make sure all your subagents have stopped.` and `Did your operator ask to see the plan?`. A plan with a settled `Panel:` line but other stanzas missing MUST draw a nudge naming them, and a fully template-shaped plan MUST draw a nudge with only the reminders. The gate MUST render only static stanza names, never plan text.
+Both allow outcomes of `session lint-plan-shape` SHALL carry the reminders `Make sure all your subagents have stopped.` and `Did your operator ask to see the plan?`. A settled plan with other stanzas missing MUST draw a nudge naming them; a template-shaped plan MUST draw one with only the reminders. `## Workarounds` or `## Concessions` SHALL satisfy the workarounds stanza. The gate MUST render only static stanza names, never plan text.
 
 #### Scenario: Template-shaped plan is allowed
 - **WHEN** the plan carries `Panel: none — docs-only change, no seat warranted` and every other stanza
@@ -120,6 +154,10 @@ Every judged `session lint-plan-shape` outcome SHALL carry the reminders `Make s
 - **WHEN** the plan has a settled `Panel:` line but no `## Tasks` section
 - **THEN** the hook exits 0 with a nudge naming `a ## Tasks section` as advisory
 
+#### Scenario: Settled panel, no workarounds section
+- **WHEN** the plan has every stanza but has neither a `## Workarounds` nor a `## Concessions` heading
+- **THEN** the hook exits 0 with a nudge naming `a ## Workarounds section`
+
 ### Requirement: Plan-shape gate allows what it cannot judge
 `session lint-plan-shape` MUST allow silently when the call carries an `agent_id`. When no plan text is obtainable, inline or from a contained read of the plan-store file, it MUST allow and SHALL record an `unjudged` row in `failopen.jsonl` with a static reason: `no-plan-text`, `plan-file-outside-store`, or `plan-store-file-unreadable`. An internal panic MUST allow.
 
@@ -128,11 +166,15 @@ Every judged `session lint-plan-shape` outcome SHALL carry the reminders `Make s
 - **THEN** the hook exits 0 and `failopen.jsonl` gains a row with reason `plan-file-outside-store`
 
 ### Requirement: Tick nudge after a landed commit
-After a Bash `git commit` whose output shows git's commit summary line, `session nudge-plan-tick` SHALL nudge once per session per repo when the branch's in-flight plan (exact `branch:` match) was touched by neither the last three commits nor the working tree, naming it and mentioning `git commit --amend`. It MUST NOT block; an aborted commit, an unbound plan, or a git failure MUST allow.
+After a Bash `git commit` whose output shows git's commit summary line, `session nudge-plan-tick` SHALL nudge once per session per repo when the branch's in-flight plan (exact `branch:` match; when multiple plans share the branch, only a unique plan matching `approved_session_id`) was untouched by the last three commits and working tree, naming it and `git commit --amend`. It MUST NOT block; ambiguous shared branches, aborted commits, or git failures MUST allow.
 
 #### Scenario: Three commits skip the plan
 - **WHEN** a commit lands on `feat/x` whose in-flight plan was untouched by the last three commits and is clean in the working tree
 - **THEN** the hook nudges `living plan untouched` naming the plan, and a later commit in the same session is silent
+
+#### Scenario: Multiple plans share the branch with no session match
+- **WHEN** two in-flight plans both declare `branch: main`, neither matches the session's `approved_session_id`, and a commit lands on `main`
+- **THEN** the hook exits 0 with no output
 
 #### Scenario: Ordinary commit is allowed
 - **WHEN** a commit lands on a branch with no in-flight plan
@@ -165,11 +207,15 @@ On PreModelSwitch, `session plan-driver` SHALL answer `ask` when the session's i
 - **THEN** the hook exits 0 with no output
 
 ### Requirement: In-flight plans surfaced at session start
-`session start` SHALL add a fixed-size line when `docs/plans/` holds plans with frontmatter `status` `in-flight` or `blocked`, pointing at `cadence-hooks session plans`. Plans without a `status:` key MUST be skipped. The scan MUST be bounded to the newest files, skip symlinks, and say `At least` when cut. A second line SHALL name up to five in-flight plans that are uncommitted. Both MUST appear even when registration fails.
+`session start` SHALL add a bounded block when the plans folder holds `in-flight` or `blocked` plans: the counts and up to three plans (blocked first, then newest) as `session plans` lines, marked as data. When it leaves plans out it SHALL say how many and name `cadence-hooks session plans`. Plans without `status:` MUST be skipped. The scan MUST be bounded, skip symlinks, and say `At least` when cut. A second line SHALL name up to five uncommitted plans. Both MUST survive a failed registration.
 
 #### Scenario: Resuming into in-flight work
 - **WHEN** a session starts in a repo with one in-flight plan in `docs/plans/`
-- **THEN** the start nudge contains `1 in-flight plan in docs/plans/` and names `cadence-hooks session plans`
+- **THEN** the start nudge contains `1 in-flight plan in docs/plans/` and that plan's slug and `next:` step
+
+#### Scenario: More plans than the block names
+- **WHEN** a session starts in a repo with six in-flight plans, one of them blocked
+- **THEN** the block names the blocked plan and the two newest others, and contains `… 3 more not shown: `cadence-hooks session plans` lists every plan.`
 
 #### Scenario: Plan without a status key
 - **WHEN** the only plan in `docs/plans/` has frontmatter with `date:` but no `status:`
@@ -179,8 +225,12 @@ On PreModelSwitch, `session plan-driver` SHALL answer `ask` when the session's i
 - **WHEN** an in-flight plan in `docs/plans/` is untracked
 - **THEN** the start nudge contains `Uncommitted living plan(s):` naming it
 
+#### Scenario: Repo declares its own plans folder
+- **WHEN** the repo's `.claude/settings.json` `env` block sets `CADENCE_PLANS_DIR` to `Meta/docs/plans` and one blocked plan is there
+- **THEN** the start nudge contains `1 in-flight plan in Meta/docs/plans/ (1 blocked)` and no `docs/plans/` folder is created
+
 ### Requirement: Plans CLI action
-`session plans` SHALL list every in-flight and blocked plan in the repo's `docs/plans/` with its next step, branch, and PR, with no cap on file count. It SHALL exit 0 for any complete answer, including none, and exit 2 outside a git repository or when an entry could not be listed or read, naming the root or each failed entry on stderr while printing what it found. It MUST work under `CADENCE_BYPASS=1`.
+`session plans` SHALL list every in-flight and blocked plan in the repo's plans folder (the one `session start` scans) with its next step, branch, and PR, with no cap on file count. It SHALL exit 0 for any complete answer, including none, and exit 2 outside a git repository or when an entry could not be listed or read, naming the root or each failed entry on stderr while printing what it found. It MUST work under `CADENCE_BYPASS=1`.
 
 #### Scenario: Outside a repository
 - **WHEN** `cadence-hooks session plans` runs outside a git repository
@@ -189,6 +239,40 @@ On PreModelSwitch, `session plan-driver` SHALL answer `ask` when the session's i
 #### Scenario: No plans in flight
 - **WHEN** `cadence-hooks session plans` runs in a repo with no in-flight or blocked plans
 - **THEN** it exits 0
+
+#### Scenario: Repo declares its own plans folder
+- **WHEN** `CADENCE_PLANS_DIR` is `Meta/docs/plans` and one in-flight plan is there
+- **THEN** the list starts `1 in-flight plan in Meta/docs/plans/:` and names it
+
+### Requirement: Plan readers use the repo's plans folder
+The `session start` plan lines, `session plans`, and the plan guards SHALL read the repo settings' `CADENCE_PLANS_DIR` when it passes the persist hook's path check and resolves inside the checkout, else `docs/plans/`. When a configured folder is in use and `docs/plans/` also exists, both SHALL be read, so plans written before the setting finish in place. A reader MUST NOT create a folder, and its output MUST name every folder it read.
+
+#### Scenario: Plans left in docs/plans after the setting
+- **WHEN** `CADENCE_PLANS_DIR` is `.claude/plans`, and one in-flight plan is there and one in `docs/plans/`
+- **THEN** `session plans` starts `2 in-flight plans in .claude/plans/ and docs/plans/:`
+
+#### Scenario: Refused folder
+- **WHEN** `CADENCE_PLANS_DIR` is `../outside` or names a symlink that resolves outside the checkout
+- **THEN** the readers scan `docs/plans/`
+
+### Requirement: Plans folder edge cases for readers
+A configured folder over 120 bytes SHALL fall back to `docs/plans/`. A folder spelled through an in-repo symlink or in another letter case SHALL be read at its real path in the checkout. A linked worktree SHALL also read the session checkout's settings, as the persist hook does. The tick nudge, ready-flip warning, and commit-time unstaged-plan check MUST skip a plan git ignores.
+
+#### Scenario: Gitignored plans folder
+- **WHEN** `CADENCE_PLANS_DIR` is a gitignored `.claude/plans` holding the branch's in-flight plan, and three commits land without touching it
+- **THEN** `session nudge-plan-tick` exits 0 with no output
+
+#### Scenario: Symlink to docs/plans
+- **WHEN** `CADENCE_PLANS_DIR` is `Notes/plans` and `Notes` is a symlink to `docs`
+- **THEN** the readers scan only `docs/plans`
+
+#### Scenario: Symlinked vault folder
+- **WHEN** `CADENCE_PLANS_DIR` is `Meta/plans` and `Meta` is a symlink to `Second Brain/Meta`
+- **THEN** the readers scan `Second Brain/Meta/plans`
+
+#### Scenario: Overlong folder name
+- **WHEN** `CADENCE_PLANS_DIR` is a plain-charset value of 1,000 bytes
+- **THEN** the readers scan `docs/plans/` and the SessionStart pointer does not contain the value
 
 ### Requirement: Untrusted plan text and cloud behavior
 Values from plan files, their names, or the ledger MUST have control characters flattened and length capped before reaching additionalContext. Under `CLAUDE_CODE_REMOTE=true`, `persist-plan-approval` SHALL exit 0 with no output, which also stops its liveness refresh, while the four plan guards run. None of these hooks MAY be silenced through `.claude/cadence.json` `nudges`.

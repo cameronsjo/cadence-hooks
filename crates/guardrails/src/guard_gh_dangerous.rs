@@ -409,6 +409,20 @@ mod tests {
     use super::*;
     use cadence_hooks_core::test_builders::make_bash;
 
+    #[test]
+    fn repo_delete_block_tells_a_phone_operator_what_to_do() {
+        // cameronsjo/cadence-hooks#1658 part 3: "delete manually via
+        // github.com" needs a browser at hand, so the block names the step
+        // that does not.
+        let r = GhDangerousGuard.run(&make_bash("gh repo delete o/r --yes"));
+        assert_eq!(r.outcome, cadence_hooks_core::Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.ends_with(cadence_hooks_core::confirm::OPERATOR_HANDOFF),
+            "{msg}"
+        );
+    }
+
     /// cadence-hooks#1115: the delete is read from the brace-expanded argv
     /// bash runs, with the group and verb found the way cobra finds them.
     #[test]
