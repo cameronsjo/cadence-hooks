@@ -185,7 +185,7 @@ The `redaction` section of `.claude/cadence.json` SHALL tune the shaped tier onl
 
 #### Scenario: Push or post after a silenced commit
 - **WHEN** a commit-only command has run silently in the session, and a later Bash call runs `git push`, `gh pr create`, `gh pr comment`, `gh issue create`, `gh release create`, a `gh api` write or `gh repo edit`, or a Write targets `/docs/field-reports/x.md`
-- **THEN** each of those calls exits 0 with a nudge, every time
+- **THEN** the first such call in that session and repo exits 0 with a nudge, and subsequent triggers in the same session and repo stay silent
 
 ### Requirement: Overshare audit escapes
 `warn-overshare` SHALL allow a write whose path starts with a non-empty `OBSIDIAN_VAULT`. With `CADENCE_SKIP_OVERSHARE_AUDIT=1` exactly, it SHALL allow every call and record a bypass row only for a call that would have nudged; any other value MUST NOT silence it. It MAY also be silenced through the `nudges` map of `.claude/cadence.json`.

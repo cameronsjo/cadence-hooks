@@ -59,10 +59,47 @@ fn run_with_env(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) ->
             CheckResult::allow_bypassed(BypassProvenance::env_switch(BYPASS_ENV))
         };
     }
+    if result.outcome == Outcome::Nudge && !claim_session_nudge(input) {
+        return CheckResult::allow();
+    }
     result
 }
 
 const BYPASS_ENV: &str = "CADENCE_SKIP_OVERSHARE_AUDIT";
+const OVERSHARE_MARKER_KIND: &str = "overshare-nudge";
+
+/// Claim a once-per-session-per-repo marker when `session_id` is present so
+/// `warn-overshare` does not repeat identical reminder prose on every push or
+/// PR edit in the same session. Payloads without a `session_id` (unit tests,
+/// synthetic probes) are not deduped; unwritable marker dirs fail open to
+/// nudging (advisory only).
+fn claim_session_nudge(input: &HookInput) -> bool {
+    if !input.session_id.as_deref().is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
+    let repo_root = input.cwd.as_deref().and_then(|cwd| {
+        cadence_hooks_core::paths::find_git_root(cwd)
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| Some(cwd.to_string()))
+    });
+    let marker = cadence_hooks_core::markers::session_marker(
+        input,
+        OVERSHARE_MARKER_KIND,
+        repo_root.as_deref(),
+    );
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
+    }
+}
 
 /// The decision with no bypass consulted.
 fn assess(input: &HookInput, vault: Option<&str>) -> CheckResult {
@@ -226,6 +263,36 @@ mod tests {
         assert_eq!(prov.kind, cadence_hooks_core::BypassKind::EnvSwitch);
         assert!(run_bypassed(&make_bash("ls")).bypass.is_none());
         assert!(run(&make_bash("git push origin main")).bypass.is_none());
+    }
+
+    #[test]
+    fn second_trigger_in_same_session_and_repo_stays_silent() {
+        let unique_sid = format!(
+            "overshare-dedup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let mut first = make_bash("git push origin feat/a");
+        first.session_id = Some(unique_sid.clone());
+        first.cwd = Some(cwd.clone());
+        assert_eq!(run(&first).outcome, Outcome::Nudge);
+
+        let mut second = make_bash("gh pr edit 12 --body-file b.md");
+        second.session_id = Some(unique_sid.clone());
+        second.cwd = Some(cwd);
+        assert_eq!(run(&second).outcome, Outcome::Allow);
+
+        // Different repo in the same session still nudges once.
+        let other_dir = tempfile::tempdir().unwrap();
+        let mut other = make_bash("git push origin feat/b");
+        other.session_id = Some(unique_sid);
+        other.cwd = Some(other_dir.path().to_string_lossy().into_owned());
+        assert_eq!(run(&other).outcome, Outcome::Nudge);
     }
 
     // --- Guard clauses ---
