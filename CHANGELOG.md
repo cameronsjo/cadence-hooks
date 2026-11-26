@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`session nudge-plan-tick` no longer names an unrelated plan when multiple in-flight plans share a branch (e.g. shared `main`).** When more than one committable in-flight plan matches the current branch, the guard now narrows to a unique plan whose `approved_session_id` matches the current session and stays silent otherwise (cameronsjo/cadence-hooks#1676).
+- **`scripts/check-changelog-sections.sh` now works on macOS BSD `awk` when a branch adds two or more CHANGELOG bullets.** Line numbers are passed comma-separated instead of newline-separated, with a two-bullet regression test added to `scripts/test-check-changelog-sections.sh` (cameronsjo/cadence-hooks#1643).
+
 ## [0.139.0] - 2026-11-25
 
 ### Performance

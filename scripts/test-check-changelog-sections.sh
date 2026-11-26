@@ -11,7 +11,7 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
-g() { git -C "$repo" -c core.hooksPath=/dev/null -c init.defaultBranch=main "$@" > /dev/null; }
+g() { git -C "$repo" -c core.hooksPath=/dev/null -c commit.gpgsign=false -c init.defaultBranch=main "$@" > /dev/null; }
 
 # repo <name> <changelog>: a repo on main with one commit, and branch `feat`.
 repo() {
@@ -43,6 +43,17 @@ repo ok "$empty"
 edit feat 's/^(## \[Unreleased\]\n)/$1\n### Fixed\n\n- new\n/m' add
 run main
 check "a bullet under [Unreleased] passes" test "$rc" = 0
+
+repo two_ok "$empty"
+edit feat 's/^(## \[Unreleased\]\n)/$1\n### Fixed\n\n- first\n- second\n/m' add
+run main
+check "two bullets under [Unreleased] pass on BSD and GNU awk" test "$rc" = 0
+
+repo two_old "$empty"
+edit feat 's/^(- old\n)/$1- first\n- second\n/m' add
+run main
+check "two bullets under a released version fail" test "$rc" = 1
+check "both mis-sectioned lines are named" bash -c 'grep -qF "CHANGELOG.md:10:" <<< "$1" && grep -qF "CHANGELOG.md:11:" <<< "$1"' _ "$out"
 
 repo old "$empty"
 edit feat 's/^(- old\n)/$1- new\n/m' add
