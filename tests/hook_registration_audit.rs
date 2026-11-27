@@ -327,6 +327,17 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-curl-alias",
         "cameronsjo/cadence-hooks#1634",
     ),
+    // The cadence-guardrails hooks.json entries land in the cadence monorepo
+    // PR that ships the c3 event pump (deterministic-cadence plan, 2026-11-27);
+    // the fixture refresh and these entries' removal follow it.
+    (
+        "guardrails guard-gh-merge",
+        "deterministic-cadence plan: cadence wiring PR",
+    ),
+    (
+        "guardrails watch-created-pr",
+        "deterministic-cadence plan: cadence wiring PR",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).

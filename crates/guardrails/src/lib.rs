@@ -202,6 +202,8 @@ pub mod guard_dotfiles;
 pub mod guard_forge_write;
 /// Block irreversible `gh` operations (repo delete).
 pub mod guard_gh_dangerous;
+/// Block `gh pr merge` on facts forgectl read about the PR (confirm tier).
+pub mod guard_gh_merge;
 /// Block `gh` write operations targeting repos you don't own.
 pub mod guard_gh_write;
 /// Nudge to scaffold project standards after `git init`.
@@ -263,6 +265,8 @@ pub mod warn_subagent_worktree;
 pub mod warn_unreviewed_ready_flip;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;
+/// After `gh pr create`, have forgectl watch the new PR for this session.
+pub mod watch_created_pr;
 
 #[cfg(test)]
 mod tests {

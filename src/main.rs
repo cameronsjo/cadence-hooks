@@ -466,6 +466,10 @@ enum GuardrailsCommands {
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
     WarnGhMergePreflight,
+    /// Block gh pr merge on facts forgectl read (checks, review, CITL at the head); confirm tier
+    GuardGhMerge,
+    /// After gh pr create, have forgectl watch the new PR for this session
+    WatchCreatedPr,
     /// Warn on gh pr ready/merge when the PR head has no reviewed signal, and on
     /// a gh pr review whose marker values sit off the body's first line
     WarnUnreviewedReadyFlip,
@@ -758,6 +762,8 @@ pub(crate) fn parse_plain_hook_command(namespace: &str, hook: &str) -> Option<Co
             "guard-runbook-scrub" => GuardrailsCommands::GuardRunbookScrub,
             "warn-curl-alias" => GuardrailsCommands::WarnCurlAlias,
             "warn-gh-merge-preflight" => GuardrailsCommands::WarnGhMergePreflight,
+            "guard-gh-merge" => GuardrailsCommands::GuardGhMerge,
+            "watch-created-pr" => GuardrailsCommands::WatchCreatedPr,
             "warn-unreviewed-ready-flip" => GuardrailsCommands::WarnUnreviewedReadyFlip,
             "warn-chezmoi-apply" => GuardrailsCommands::WarnChezmoiApply,
             "warn-entry-posture" => GuardrailsCommands::WarnEntryPosture,
@@ -919,6 +925,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardRunbookScrub => "guard-runbook-scrub",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
+            GuardrailsCommands::GuardGhMerge => "guard-gh-merge",
+            GuardrailsCommands::WatchCreatedPr => "watch-created-pr",
             GuardrailsCommands::WarnUnreviewedReadyFlip => "warn-unreviewed-ready-flip",
             GuardrailsCommands::WarnChezmoiApply => "warn-chezmoi-apply",
             GuardrailsCommands::WarnEntryPosture => "warn-entry-posture",
@@ -1237,6 +1245,14 @@ fn check_plan(cmd: &Commands) -> Option<dispatch::CheckPlan> {
             GuardrailsCommands::WarnGhMergePreflight => CheckPlan::new(
                 Box::new(cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight),
                 pre,
+            ),
+            GuardrailsCommands::GuardGhMerge => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::guard_gh_merge::GuardGhMerge),
+                pre,
+            ),
+            GuardrailsCommands::WatchCreatedPr => CheckPlan::new(
+                Box::new(cadence_hooks_guardrails::watch_created_pr::WatchCreatedPr),
+                post,
             ),
             GuardrailsCommands::WarnUnreviewedReadyFlip => CheckPlan::new(
                 Box::new(

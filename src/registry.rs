@@ -610,6 +610,24 @@ pub const HOOKS: &[HookEntry] = &[
         suppressible: true,
     },
     HookEntry {
+        name: "guard-gh-merge",
+        description: "Block gh pr merge on facts forgectl read: checks, review marker and CITL at the head (confirm tier: an identical retry passes once)",
+        namespace: "guardrails",
+        events: &[HookEvent::PreToolUse],
+        // Remote: no-op when forgectl is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: false,
+    },
+    HookEntry {
+        name: "watch-created-pr",
+        description: "After gh pr create, have forgectl watch the new PR for this session",
+        namespace: "guardrails",
+        events: &[HookEvent::PostToolUse],
+        // Remote: no-op when forgectl is absent; harmless to keep armed.
+        remote: RemotePolicy::Run,
+        suppressible: true,
+    },
+    HookEntry {
         name: "warn-unreviewed-ready-flip",
         description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker), and on a gh pr review whose marker values sit off line 1",
         namespace: "guardrails",
