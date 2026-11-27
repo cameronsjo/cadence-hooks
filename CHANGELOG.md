@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`guardrails guard-gh-merge`** blocks a `gh pr merge` when forgectl's last snapshot of the PR (`forgectl events state`, under 10 minutes old) says checks at the head are not green, no cadence-review marker from your login counts at the head or one has `crit` > 0, the PR carries `CITL`, or `--match-head-commit` names another SHA. Confirm tier: an identical retry passes once. It allows `--auto` and anything it cannot read. Not wired yet.
+- **`guardrails watch-created-pr`** runs `forgectl events watch --session <id>` on the PR a `gh pr create` just opened, so the c3 mod hands the session its checks, reviews and merge. Silent. Not wired yet.
+
 ### Fixed
 
 - **`cadence warn-overshare` now nudges at most once per session per repository.** Repeated pushes, PR edits, or field-report writes in the same session and repo no longer re-emit the identical pre-ship overshare reminder on every call (deduped via a session+repo marker when `session_id` is present; `CADENCE_SKIP_OVERSHARE_AUDIT=1` still records bypass provenance as before).
