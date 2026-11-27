@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.139.1] - 2026-11-27
+
 ### Fixed
 
 - **`cadence warn-overshare` now nudges at most once per session per repository.** Repeated pushes, PR edits, or field-report writes in the same session and repo no longer re-emit the identical pre-ship overshare reminder on every call (deduped via a session+repo marker when `session_id` is present; `CADENCE_SKIP_OVERSHARE_AUDIT=1` still records bypass provenance as before).
